@@ -372,18 +372,36 @@
   </style>
 </head>
 <body>
-  <!-- Setup screen -->
+  <!-- Intro screen (adaptive — shows both workflows) -->
   <div class="setup hidden" id="setup">
     <div class="setup-content">
-      <h1>register key</h1>
-      <p>Plug in your Titan key. This one-time step derives your machine's identity and stores it in the OS keyring. After this, hosting starts without the key.</p>
-      <div class="setup-form">
-        <input class="setup-input" id="setup-pin" type="password" placeholder="PIN" autocomplete="off" />
-        <button class="setup-btn" id="setup-btn" onclick="setupRegister()">register</button>
+      <h1 id="intro-title">keyhome</h1>
+      <p id="intro-desc">Plug in your Titan key and choose an action.</p>
+
+      <!-- Unregistered: register or connect -->
+      <div id="intro-unregistered">
+        <div class="setup-form">
+          <input class="setup-input" id="setup-pin" type="password" placeholder="PIN" autocomplete="off" />
+        </div>
+        <div style="display: flex; gap: 16px; justify-content: center; margin-top: 12px;">
+          <button class="setup-btn" id="setup-btn" onclick="setupRegister()">register</button>
+          <button class="setup-btn" onclick="introConnect()">connect</button>
+        </div>
+        <div class="setup-status" id="setup-status"></div>
       </div>
-      <div class="setup-status" id="setup-status"></div>
-      <div style="margin-top: 20px;">
-        <button class="setup-btn" onclick="skipSetup()">or connect</button>
+
+      <!-- Registered: host or connect -->
+      <div id="intro-registered" style="display: none;">
+        <div style="display: flex; gap: 16px; justify-content: center; margin-bottom: 16px;">
+          <button class="setup-btn" onclick="introHost()">host</button>
+        </div>
+        <div class="setup-form">
+          <input class="setup-input" id="intro-pin" type="password" placeholder="PIN" autocomplete="off" />
+        </div>
+        <div style="display: flex; gap: 16px; justify-content: center; margin-top: 12px;">
+          <button class="setup-btn" onclick="introConnectRegistered()">connect</button>
+        </div>
+        <div class="setup-status" id="setup-status-reg"></div>
       </div>
     </div>
   </div>
@@ -484,8 +502,12 @@
       try {
         const reg = await invoke('host_registration_status');
         registered = reg.registered;
+        const unregDiv = document.getElementById('intro-unregistered');
+        const regDiv = document.getElementById('intro-registered');
         if (reg.registered) {
-          document.getElementById('setup').classList.add('hidden');
+          document.getElementById('setup').classList.remove('hidden');
+          unregDiv.style.display = 'none';
+          regDiv.style.display = 'block';
           document.getElementById('node-id-text').textContent =
             reg.node_id.substring(0, 16) + '...';
           document.getElementById('reg-status').textContent = 'registered';
@@ -493,6 +515,8 @@
             reg.node_id.substring(0, 24) + '...';
         } else {
           document.getElementById('setup').classList.remove('hidden');
+          unregDiv.style.display = 'block';
+          regDiv.style.display = 'none';
           document.getElementById('reg-status').textContent = 'not registered';
         }
       } catch (e) {
@@ -500,11 +524,43 @@
       }
     }
 
-    // ─── Setup ──────────────────────────────────────────────────────────
-    function skipSetup() {
+    // ─── Intro actions ─────────────────────────────────────────────────
+    function hideIntro() {
       document.getElementById('setup').classList.add('hidden');
     }
 
+    async function introConnect() {
+      const pin = document.getElementById('setup-pin').value.trim();
+      if (!pin) {
+        const s = document.getElementById('setup-status');
+        s.className = 'setup-status err';
+        s.textContent = 'enter pin';
+        return;
+      }
+      hideIntro();
+      document.getElementById('pin-input').value = pin;
+      await connectHost();
+    }
+
+    async function introConnectRegistered() {
+      const pin = document.getElementById('intro-pin').value.trim();
+      if (!pin) {
+        const s = document.getElementById('setup-status-reg');
+        s.className = 'setup-status err';
+        s.textContent = 'enter pin';
+        return;
+      }
+      hideIntro();
+      document.getElementById('pin-input').value = pin;
+      await connectHost();
+    }
+
+    async function introHost() {
+      hideIntro();
+      await startHost();
+    }
+
+    // ─── Setup (register from intro) ────────────────────────────────────
     async function setupRegister() {
       const pin = document.getElementById('setup-pin').value.trim();
       const btn = document.getElementById('setup-btn');

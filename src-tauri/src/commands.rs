@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use openh264::encoder::Encoder;
 use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
+use openh264::nal_units;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -893,46 +894,49 @@ pub async fn iroh_client_connect(
             }
 
             // Decode H.264 → YUV → RGB8 → JPEG
-            match decoder.decode(&h264_buf) {
-                Ok(Some(yuv)) => {
-                    let (yw, yh) = yuv.dimensions();
-                    let rgb_len = yuv.rgb8_len();
-                    let mut rgb_raw = vec![0u8; rgb_len];
-                    yuv.write_rgb8(&mut rgb_raw);
+            // Split into individual NAL units — decoder needs them separately
+            for nal in nal_units(&h264_buf) {
+                match decoder.decode(nal) {
+                    Ok(Some(yuv)) => {
+                        let (yw, yh) = yuv.dimensions();
+                        let rgb_len = yuv.rgb8_len();
+                        let mut rgb_raw = vec![0u8; rgb_len];
+                        yuv.write_rgb8(&mut rgb_raw);
 
-                    // Re-encode as JPEG for canvas
-                    let img = image::RgbImage::from_raw(yw as u32, yh as u32, rgb_raw);
-                    if let Some(img) = img {
-                        let mut jpeg_buf = Vec::with_capacity(30_000);
-                        if image::DynamicImage::ImageRgb8(img)
-                            .write_to(&mut Cursor::new(&mut jpeg_buf), image::ImageFormat::Jpeg)
-                            .is_ok()
-                        {
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
-                            let _ = app.emit(
-                                "frame",
-                                FramePayload {
-                                    width: yw as u32,
-                                    height: yh as u32,
-                                    data: b64,
-                                },
-                            );
+                        // Re-encode as JPEG for canvas
+                        let img = image::RgbImage::from_raw(yw as u32, yh as u32, rgb_raw);
+                        if let Some(img) = img {
+                            let mut jpeg_buf = Vec::with_capacity(30_000);
+                            if image::DynamicImage::ImageRgb8(img)
+                                .write_to(&mut Cursor::new(&mut jpeg_buf), image::ImageFormat::Jpeg)
+                                .is_ok()
+                            {
+                                let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
+                                let _ = app.emit(
+                                    "frame",
+                                    FramePayload {
+                                        width: yw as u32,
+                                        height: yh as u32,
+                                        data: b64,
+                                    },
+                                );
+                            }
                         }
-                    }
 
-                    frame_count += 1;
-                    let elapsed = start.elapsed();
-                    let fps = frame_count as f64 / elapsed.as_secs_f64().max(0.001);
-                    let _ = app.emit(
-                        "frame-stats",
-                        serde_json::json!({ "fps": fps, "count": frame_count }),
-                    );
-                }
-                Ok(None) => {
-                    // Need more data — normal for first few NALs
-                }
-                Err(e) => {
-                    eprintln!("[client] decode error: {}", e);
+                        frame_count += 1;
+                        let elapsed = start.elapsed();
+                        let fps = frame_count as f64 / elapsed.as_secs_f64().max(0.001);
+                        let _ = app.emit(
+                            "frame-stats",
+                            serde_json::json!({ "fps": fps, "count": frame_count }),
+                        );
+                    }
+                    Ok(None) => {
+                        // Need more NALs — SPS/PPS or waiting for I-frame
+                    }
+                    Err(e) => {
+                        eprintln!("[client] decode error: {}", e);
+                    }
                 }
             }
         }

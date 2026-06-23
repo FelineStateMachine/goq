@@ -750,13 +750,6 @@
       // Clear intro status fields
       document.getElementById('intro-status-unreg').textContent = '';
       document.getElementById('intro-status-reg').textContent = '';
-      // Reset WebCodecs decoder
-      if (videoDecoder) {
-        try { videoDecoder.close(); } catch(e) {}
-        videoDecoder = null;
-        decoderConfigured = false;
-        pendingKeyframe = true;
-      }
     }
 
     // ─── Unregister ─────────────────────────────────────────────────────
@@ -811,37 +804,9 @@
       document.getElementById('host-conn-count').textContent = event.payload;
     });
 
-    // ─── Frames — WebCodecs hardware H.264 decode ───────────────────────
+    // ─── Frames ─────────────────────────────────────────────────────────
     const canvas = document.getElementById('frame-canvas');
     const ctx = canvas.getContext('2d');
-
-    let videoDecoder = null;
-    let decoderConfigured = false;
-    let frameQueue = [];
-    let pendingKeyframe = true;
-
-    function initDecoder(width, height) {
-      if (videoDecoder) {
-        try { videoDecoder.close(); } catch(e) {}
-      }
-      videoDecoder = new VideoDecoder({
-        output: (frame) => {
-          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-          frame.close();
-        },
-        error: (e) => {
-          console.error('VideoDecoder error:', e);
-          pendingKeyframe = true;
-        }
-      });
-      videoDecoder.configure({
-        codec: 'avc1.42001e',
-        codedWidth: width,
-        codedHeight: height,
-      });
-      decoderConfigured = true;
-      pendingKeyframe = true;
-    }
 
     listen('frame', (event) => {
       const { width, height, data } = event.payload;
@@ -849,29 +814,15 @@
       frameHeight = height;
       if (canvas.width !== width) canvas.width = width;
       if (canvas.height !== height) canvas.height = height;
-
-      // Decode base64 → Uint8Array
-      const h264 = Uint8Array.from(atob(data), c => c.charCodeAt(0));
-
-      // Configure decoder on first frame
-      if (!decoderConfigured) {
-        initDecoder(width, height);
-      }
-
-      // Create EncodedVideoChunk — let the browser split NALs internally
-      const chunk = new EncodedVideoChunk({
-        type: pendingKeyframe ? 'key' : 'delta',
-        timestamp: performance.now() * 1000,
-        data: h264,
-      });
-
-      try {
-        videoDecoder.decode(chunk);
-        pendingKeyframe = false;
-      } catch (e) {
-        console.warn('decode failed, waiting for keyframe:', e);
-        pendingKeyframe = true;
-      }
+      const bytes = Uint8Array.from(atob(data), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: 'image/jpeg' });
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        URL.revokeObjectURL(url);
+      };
+      img.src = url;
     });
 
     listen('frame-stats', (event) => {

@@ -30,4 +30,4 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 base64 = "0.22"
 enigo = { version = "0.2", features = ["serde"] }
 sha2 = "0.10"
-keyring = "3"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }

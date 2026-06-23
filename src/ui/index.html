@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Keyhome</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-dim: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --yellow: #d29922;
+      --mono: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, system-ui, sans-serif;
+      font-size: 14px;
+      padding: 24px;
+    }
+    h1 {
+      font-size: 22px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .subtitle {
+      color: var(--text-dim);
+      font-size: 13px;
+      margin-bottom: 24px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      max-width: 900px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .card h2 {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 12px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .row:last-child { border-bottom: none; }
+    .row .label { color: var(--text-dim); }
+    .row .value { font-family: var(--mono); font-size: 13px; }
+    .status-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .status-ok { background: rgba(63,185,80,0.15); color: var(--green); }
+    .status-err { background: rgba(248,81,73,0.15); color: var(--red); }
+    .status-pending { background: rgba(210,153,34,0.15); color: var(--yellow); }
+    .btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+    .btn:hover { border-color: var(--accent); }
+    .btn-primary {
+      background: rgba(88,166,255,0.1);
+      border-color: rgba(88,166,255,0.3);
+      color: var(--accent);
+    }
+    .btn-bar { display: flex; gap: 8px; margin-top: 12px; }
+    .addr-box {
+      margin-top: 12px;
+      padding: 8px 12px;
+      background: rgba(88,166,255,0.05);
+      border: 1px solid rgba(88,166,255,0.2);
+      border-radius: 6px;
+      font-family: var(--mono);
+      font-size: 11px;
+      word-break: break-all;
+      color: var(--accent);
+      display: none;
+    }
+    .addr-box.visible { display: block; }
+    .connect-section {
+      margin-top: 16px;
+    }
+    .input {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-family: var(--mono);
+      font-size: 12px;
+      margin-top: 8px;
+    }
+    .input:focus { outline: none; border-color: var(--accent); }
+    .error-msg {
+      color: var(--red);
+      font-size: 12px;
+      margin-top: 8px;
+      display: none;
+    }
+    .error-msg.visible { display: block; }
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>Keyhome</h1>
+  <p class="subtitle">FIDO2-secured remote desktop via Iroh</p>
+
+  <div class="grid">
+    <!-- FIDO2 Device Card -->
+    <div class="card">
+      <h2>Security Key</h2>
+      <div class="row">
+        <span class="label">Status</span>
+        <span id="fido-status" class="status-badge status-pending">Not scanned</span>
+      </div>
+      <div class="row">
+        <span class="label">Device</span>
+        <span id="fido-product" class="value">—</span>
+      </div>
+      <div class="row">
+        <span class="label">VID:PID</span>
+        <span id="fido-vidpid" class="value">—</span>
+      </div>
+      <div class="row">
+        <span class="label">CTAP versions</span>
+        <span id="fido-versions" class="value">—</span>
+      </div>
+      <div class="row">
+        <span class="label">Extensions</span>
+        <span id="fido-extensions" class="value">—</span>
+      </div>
+      <div class="row">
+        <span class="label">PIN retries</span>
+        <span id="fido-pin" class="value">—</span>
+      </div>
+      <div class="btn-bar">
+        <button class="btn btn-primary" onclick="scanFido()">Scan for key</button>
+      </div>
+    </div>
+
+    <!-- Iroh Host Card -->
+    <div class="card">
+      <h2>Iroh Host (Server)</h2>
+      <div class="row">
+        <span class="label">Status</span>
+        <span id="host-status" class="status-badge status-pending">Not started</span>
+      </div>
+      <div class="row">
+        <span class="label">Endpoint ID</span>
+        <span id="host-id" class="value">—</span>
+      </div>
+      <div class="btn-bar">
+        <button class="btn btn-primary" onclick="startHost()">Start host</button>
+      </div>
+      <div id="host-addr-box" class="addr-box"></div>
+    </div>
+
+    <!-- Iroh Client Card -->
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>Connect to Host (Client)</h2>
+      <p style="color: var(--text-dim); font-size: 12px; margin-bottom: 8px;">
+        Paste the host's address JSON below to connect.
+      </p>
+      <input class="input" id="connect-addr" placeholder='{"id":"...","addrs":[...]}' />
+      <div class="btn-bar">
+        <button class="btn btn-primary" onclick="connectHost()">Connect</button>
+      </div>
+      <div id="connect-error" class="error-msg"></div>
+    </div>
+  </div>
+
+  <script>
+    const { invoke } = window.__TAURI__.core;
+
+    async function scanFido() {
+      const status = document.getElementById('fido-status');
+      status.className = 'status-badge status-pending';
+      status.innerHTML = '<span class="spinner"></span> Scanning...';
+
+      try {
+        const info = await invoke('fido_device_info');
+        if (info.found && !info.error) {
+          status.className = 'status-badge status-ok';
+          status.textContent = 'Connected';
+          document.getElementById('fido-product').textContent = info.product;
+          document.getElementById('fido-vidpid').textContent =
+            `0x${info.vid.toString(16)}:0x${info.pid.toString(16)}`;
+          document.getElementById('fido-versions').textContent = info.versions.join(', ');
+          document.getElementById('fido-extensions').textContent = info.extensions.join(', ');
+          document.getElementById('fido-pin').textContent = info.pin_retries;
+        } else if (info.found) {
+          status.className = 'status-badge status-err';
+          status.textContent = 'Error';
+          document.getElementById('fido-product').textContent = info.error;
+        } else {
+          status.className = 'status-badge status-err';
+          status.textContent = 'No device';
+        }
+      } catch (e) {
+        status.className = 'status-badge status-err';
+        status.textContent = 'Error';
+        console.error(e);
+      }
+    }
+
+    async function startHost() {
+      const status = document.getElementById('host-status');
+      status.className = 'status-badge status-pending';
+      status.innerHTML = '<span class="spinner"></span> Starting...';
+
+      try {
+        const result = await invoke('iroh_host_start');
+        if (result.running) {
+          status.className = 'status-badge status-ok';
+          status.textContent = 'Running';
+
+          const addrBox = document.getElementById('host-addr-box');
+          addrBox.textContent = result.addr_json;
+          addrBox.classList.add('visible');
+
+          // Extract endpoint ID from the JSON
+          const addr = JSON.parse(result.addr_json);
+          document.getElementById('host-id').textContent = addr.id.substring(0, 16) + '...';
+        } else {
+          status.className = 'status-badge status-err';
+          status.textContent = 'Failed';
+        }
+      } catch (e) {
+        status.className = 'status-badge status-err';
+        status.textContent = 'Error: ' + e;
+      }
+    }
+
+    async function connectHost() {
+      const addr = document.getElementById('connect-addr').value.trim();
+      const errBox = document.getElementById('connect-error');
+      errBox.classList.remove('visible');
+
+      if (!addr) {
+        errBox.textContent = 'Please paste a host address';
+        errBox.classList.add('visible');
+        return;
+      }
+
+      try {
+        const result = await invoke('iroh_client_connect', { addrJson: addr });
+        if (result.connected) {
+          errBox.style.color = 'var(--green)';
+          errBox.textContent = 'Connected!';
+          errBox.classList.add('visible');
+        } else {
+          errBox.style.color = 'var(--red)';
+          errBox.textContent = result.error || 'Connection failed';
+          errBox.classList.add('visible');
+        }
+      } catch (e) {
+        errBox.style.color = 'var(--red)';
+        errBox.textContent = 'Error: ' + e;
+        errBox.classList.add('visible');
+      }
+    }
+  </script>
+</body>
+</html>

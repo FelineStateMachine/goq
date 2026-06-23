@@ -1,0 +1,15 @@
+[package]
+name = "keyhome-hmac-iroh-derivation-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ctap-hid-fido2 = "3.5"
+iroh = "1.0.0"
+iroh-ping = "1.0.0"
+iroh-tickets = "1.0.0"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+ring = "0.17"
+hex = "0.4"

@@ -1,0 +1,16 @@
+[package]
+name = "keyhome-frame-stream-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+iroh = "1.0.0"
+iroh-tickets = "1.0.0"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+xcap = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+bytes = "1"
+rand = "0.10"
+serde_json = "1"

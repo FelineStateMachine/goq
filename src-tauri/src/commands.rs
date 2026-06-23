@@ -937,18 +937,24 @@ pub async fn iroh_client_connect(
         let _ = input_stream.finish();
     });
 
-    // Spawn frame reader (H.264 decode → JPEG for canvas)
+    // Spawn frame reader — dual path based on WebCodecs availability
+    let use_webcodecs = state.webcodecs.load(Ordering::SeqCst);
     tokio::spawn(async move {
-        let mut decoder = match openh264::decoder::Decoder::new() {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = app.emit("frame-error", format!("Decoder init failed: {}", e));
-                return;
-            }
-        };
-
         let mut frame_count = 0u32;
         let start = Instant::now();
+
+        // Initialize software decoder only if WebCodecs is NOT available
+        let mut decoder = if use_webcodecs {
+            None
+        } else {
+            match openh264::decoder::Decoder::new() {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    let _ = app.emit("frame-error", format!("Decoder init failed: {}", e));
+                    return;
+                }
+            }
+        };
 
         loop {
             let mut header = [0u8; 13];
@@ -969,44 +975,60 @@ pub async fn iroh_client_connect(
                 break;
             }
 
-            for nal in nal_units(&h264_buf) {
-                if let Ok(Some(yuv)) = decoder.decode(nal) {
-                    let (yw, yh) = yuv.dimensions();
-                    let rgb_len = yuv.rgb8_len();
-                    let mut rgb_raw = vec![0u8; rgb_len];
-                    yuv.write_rgb8(&mut rgb_raw);
+            if use_webcodecs {
+                // Path 1: Pass raw H.264 to frontend — browser decodes via WebCodecs
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&h264_buf);
+                let _ = app.emit(
+                    "frame",
+                    FramePayload { width: w, height: h, data: b64 },
+                );
 
-                    let img = match image::RgbImage::from_raw(yw as u32, yh as u32, rgb_raw) {
-                        Some(img) => img,
-                        None => continue,
-                    };
-                    let mut jpeg_buf = Vec::with_capacity(30_000);
-                    if image::DynamicImage::ImageRgb8(img)
-                        .write_to(&mut Cursor::new(&mut jpeg_buf), image::ImageFormat::Jpeg)
-                        .is_err()
-                    {
-                        continue;
+                frame_count += 1;
+                let elapsed = start.elapsed();
+                let fps = frame_count as f64 / elapsed.as_secs_f64().max(0.001);
+                let _ = app.emit(
+                    "frame-stats",
+                    serde_json::json!({ "fps": fps, "count": frame_count, "keyframe": is_keyframe }),
+                );
+            } else if let Some(ref mut dec) = decoder {
+                // Path 2: Software decode → JPEG
+                for nal in nal_units(&h264_buf) {
+                    if let Ok(Some(yuv)) = dec.decode(nal) {
+                        let (yw, yh) = yuv.dimensions();
+                        let rgb_len = yuv.rgb8_len();
+                        let mut rgb_raw = vec![0u8; rgb_len];
+                        yuv.write_rgb8(&mut rgb_raw);
+
+                        let img = match image::RgbImage::from_raw(yw as u32, yh as u32, rgb_raw) {
+                            Some(img) => img,
+                            None => continue,
+                        };
+                        let mut jpeg_buf = Vec::with_capacity(30_000);
+                        if image::DynamicImage::ImageRgb8(img)
+                            .write_to(&mut Cursor::new(&mut jpeg_buf), image::ImageFormat::Jpeg)
+                            .is_err()
+                        {
+                            continue;
+                        }
+
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
+                        let _ = app.emit(
+                            "frame",
+                            FramePayload { width: yw as u32, height: yh as u32, data: b64 },
+                        );
+
+                        frame_count += 1;
+                        let elapsed = start.elapsed();
+                        let fps = frame_count as f64 / elapsed.as_secs_f64().max(0.001);
+                        let _ = app.emit(
+                            "frame-stats",
+                            serde_json::json!({ "fps": fps, "count": frame_count, "keyframe": is_keyframe }),
+                        );
                     }
-
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
-                    let _ = app.emit(
-                        "frame",
-                        FramePayload {
-                            width: yw as u32,
-                            height: yh as u32,
-                            data: b64,
-                        },
-                    );
-
-                    frame_count += 1;
-                    let elapsed = start.elapsed();
-                    let fps = frame_count as f64 / elapsed.as_secs_f64().max(0.001);
-                    let _ = app.emit(
-                        "frame-stats",
-                        serde_json::json!({ "fps": fps, "count": frame_count, "keyframe": is_keyframe }),
-                    );
                 }
             }
+
+            tokio::task::yield_now().await;
         }
 
         drop(endpoint);

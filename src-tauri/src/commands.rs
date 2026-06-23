@@ -123,8 +123,6 @@ fn button_from_code(b: u8) -> Button {
     match b {
         2 => Button::Right,
         3 => Button::Middle,
-        4 => Button::Back,
-        5 => Button::Forward,
         _ => Button::Left,
     }
 }
@@ -473,8 +471,24 @@ async fn handle_input(conn: Connection) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut enigo = Enigo::new(&Settings::default())
-        .map_err(|e| anyhow::anyhow!("enigo init: {:?}", e))?;
+    // Enigo is not Send on macOS (holds NonNull<CGEventSource>).
+    // Run it in a dedicated blocking thread, fed via a std channel.
+    let (tx, rx) = std::sync::mpsc::channel::<InputEvent>();
+    std::thread::spawn(move || {
+        let mut enigo = match Enigo::new(&Settings::default()) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[host] enigo init: {:?}", e);
+                return;
+            }
+        };
+        for event in rx {
+            eprintln!("[host] input: {:?}", event);
+            if let Err(e) = event.apply(&mut enigo) {
+                eprintln!("[host] inject error: {}", e);
+            }
+        }
+    });
 
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -508,10 +522,7 @@ async fn handle_input(conn: Connection) -> anyhow::Result<()> {
 
             match serde_json::from_str::<InputEvent>(&line_str) {
                 Ok(event) => {
-                    eprintln!("[host] input: {:?}", event);
-                    if let Err(e) = event.apply(&mut enigo) {
-                        eprintln!("[host] inject error: {}", e);
-                    }
+                    let _ = tx.send(event);
                 }
                 Err(e) => {
                     eprintln!("[host] parse error: {} (line: {})", e, line_str);
@@ -520,6 +531,8 @@ async fn handle_input(conn: Connection) -> anyhow::Result<()> {
         }
     }
 
+    // Drop tx to signal the blocking thread to exit
+    drop(tx);
     let _ = send.write_all(b"bye\n").await;
     Ok(())
 }

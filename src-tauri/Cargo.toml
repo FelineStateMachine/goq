@@ -24,4 +24,7 @@ tauri-plugin-log = "2"
 ctap-hid-fido2 = "3.5"
 iroh = "1.0"
 anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time"] }
+xcap = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+base64 = "0.22"

@@ -25,22 +25,9 @@
       font-size: 14px;
       padding: 24px;
     }
-    h1 {
-      font-size: 22px;
-      font-weight: 600;
-      margin-bottom: 4px;
-    }
-    .subtitle {
-      color: var(--text-dim);
-      font-size: 13px;
-      margin-bottom: 24px;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-      max-width: 900px;
-    }
+    h1 { font-size: 22px; font-weight: 600; margin-bottom: 4px; }
+    .subtitle { color: var(--text-dim); font-size: 13px; margin-bottom: 24px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 1100px; }
     .card {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -48,95 +35,80 @@
       padding: 16px;
     }
     .card h2 {
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--text-dim);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 12px;
+      font-size: 14px; font-weight: 600; color: var(--text-dim);
+      text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;
     }
     .row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 6px 0;
-      border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 0; border-bottom: 1px solid var(--border);
     }
     .row:last-child { border-bottom: none; }
     .row .label { color: var(--text-dim); }
     .row .value { font-family: var(--mono); font-size: 13px; }
     .status-badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 12px;
-      font-size: 12px;
-      font-weight: 500;
+      display: inline-block; padding: 2px 8px; border-radius: 12px;
+      font-size: 12px; font-weight: 500;
     }
     .status-ok { background: rgba(63,185,80,0.15); color: var(--green); }
     .status-err { background: rgba(248,81,73,0.15); color: var(--red); }
     .status-pending { background: rgba(210,153,34,0.15); color: var(--yellow); }
     .btn {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 8px 16px;
-      border-radius: 6px;
-      font-size: 13px;
-      cursor: pointer;
-      transition: border-color 0.2s;
+      background: var(--surface); border: 1px solid var(--border);
+      color: var(--text); padding: 8px 16px; border-radius: 6px;
+      font-size: 13px; cursor: pointer; transition: border-color 0.2s;
     }
     .btn:hover { border-color: var(--accent); }
     .btn-primary {
-      background: rgba(88,166,255,0.1);
-      border-color: rgba(88,166,255,0.3);
+      background: rgba(88,166,255,0.1); border-color: rgba(88,166,255,0.3);
       color: var(--accent);
     }
     .btn-bar { display: flex; gap: 8px; margin-top: 12px; }
     .addr-box {
-      margin-top: 12px;
-      padding: 8px 12px;
-      background: rgba(88,166,255,0.05);
-      border: 1px solid rgba(88,166,255,0.2);
-      border-radius: 6px;
-      font-family: var(--mono);
-      font-size: 11px;
-      word-break: break-all;
-      color: var(--accent);
-      display: none;
+      margin-top: 12px; padding: 8px 12px;
+      background: rgba(88,166,255,0.05); border: 1px solid rgba(88,166,255,0.2);
+      border-radius: 6px; font-family: var(--mono); font-size: 11px;
+      word-break: break-all; color: var(--accent); display: none;
     }
     .addr-box.visible { display: block; }
-    .connect-section {
-      margin-top: 16px;
-    }
+    .connect-section { margin-top: 16px; }
     .input {
-      width: 100%;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 8px 12px;
-      border-radius: 6px;
-      font-family: var(--mono);
-      font-size: 12px;
-      margin-top: 8px;
+      width: 100%; background: var(--bg); border: 1px solid var(--border);
+      color: var(--text); padding: 8px 12px; border-radius: 6px;
+      font-family: var(--mono); font-size: 12px; margin-top: 8px;
     }
     .input:focus { outline: none; border-color: var(--accent); }
-    .error-msg {
-      color: var(--red);
-      font-size: 12px;
-      margin-top: 8px;
-      display: none;
-    }
+    .error-msg { color: var(--red); font-size: 12px; margin-top: 8px; display: none; }
     .error-msg.visible { display: block; }
     .spinner {
-      display: inline-block;
-      width: 14px;
-      height: 14px;
-      border: 2px solid var(--border);
-      border-top-color: var(--accent);
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
+      display: inline-block; width: 14px; height: 14px;
+      border: 2px solid var(--border); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin 0.8s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Frame viewer */
+    .viewer-card { grid-column: 1 / -1; }
+    .viewer-wrap {
+      margin-top: 12px; border: 1px solid var(--border); border-radius: 6px;
+      overflow: hidden; background: #000; position: relative;
+      min-height: 300px; display: flex; align-items: center; justify-content: center;
+    }
+    #frame-canvas { max-width: 100%; max-height: 500px; display: none; }
+    .viewer-placeholder {
+      color: var(--text-dim); font-size: 13px; padding: 60px 20px; text-align: center;
+    }
+    .viewer-stats {
+      position: absolute; top: 8px; right: 8px;
+      background: rgba(0,0,0,0.7); color: var(--green);
+      font-family: var(--mono); font-size: 11px; padding: 4px 8px;
+      border-radius: 4px; display: none;
+    }
+    .viewer-stats.visible { display: block; }
+    .copy-btn {
+      background: none; border: none; color: var(--text-dim); cursor: pointer;
+      font-size: 12px; margin-left: 8px;
+    }
+    .copy-btn:hover { color: var(--accent); }
   </style>
 </head>
 <body>
@@ -191,13 +163,16 @@
         <button class="btn btn-primary" onclick="startHost()">Start host</button>
       </div>
       <div id="host-addr-box" class="addr-box"></div>
+      <div class="btn-bar" id="copy-bar" style="display:none;">
+        <button class="btn" onclick="copyAddr()">Copy address</button>
+      </div>
     </div>
 
     <!-- Iroh Client Card -->
     <div class="card" style="grid-column: 1 / -1;">
       <h2>Connect to Host (Client)</h2>
       <p style="color: var(--text-dim); font-size: 12px; margin-bottom: 8px;">
-        Paste the host's address JSON below to connect.
+        Paste the host's address JSON below to connect and view the remote screen.
       </p>
       <input class="input" id="connect-addr" placeholder='{"id":"...","addrs":[...]}' />
       <div class="btn-bar">
@@ -205,16 +180,31 @@
       </div>
       <div id="connect-error" class="error-msg"></div>
     </div>
+
+    <!-- Frame Viewer -->
+    <div class="card viewer-card">
+      <h2>Remote Screen <span id="viewer-stats" class="viewer-stats"></span></h2>
+      <div class="viewer-wrap">
+        <canvas id="frame-canvas"></canvas>
+        <div id="viewer-placeholder" class="viewer-placeholder">
+          No stream connected. Start a host on one machine, copy the address,
+          and connect from another.
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
     const { invoke } = window.__TAURI__.core;
+    const { listen } = window.__TAURI__.event;
 
+    let hostAddrJson = '';
+
+    // ─── FIDO2 ─────────────────────────────────────────────────────────
     async function scanFido() {
       const status = document.getElementById('fido-status');
       status.className = 'status-badge status-pending';
       status.innerHTML = '<span class="spinner"></span> Scanning...';
-
       try {
         const info = await invoke('fido_device_info');
         if (info.found && !info.error) {
@@ -241,22 +231,21 @@
       }
     }
 
+    // ─── Host ──────────────────────────────────────────────────────────
     async function startHost() {
       const status = document.getElementById('host-status');
       status.className = 'status-badge status-pending';
       status.innerHTML = '<span class="spinner"></span> Starting...';
-
       try {
         const result = await invoke('iroh_host_start');
         if (result.running) {
           status.className = 'status-badge status-ok';
           status.textContent = 'Running';
-
+          hostAddrJson = result.addr_json;
           const addrBox = document.getElementById('host-addr-box');
           addrBox.textContent = result.addr_json;
           addrBox.classList.add('visible');
-
-          // Extract endpoint ID from the JSON
+          document.getElementById('copy-bar').style.display = 'flex';
           const addr = JSON.parse(result.addr_json);
           document.getElementById('host-id').textContent = addr.id.substring(0, 16) + '...';
         } else {
@@ -269,6 +258,16 @@
       }
     }
 
+    function copyAddr() {
+      navigator.clipboard.writeText(hostAddrJson).then(() => {
+        const btn = document.querySelector('#copy-bar .btn');
+        const orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = orig; }, 1500);
+      });
+    }
+
+    // ─── Client ────────────────────────────────────────────────────────
     async function connectHost() {
       const addr = document.getElementById('connect-addr').value.trim();
       const errBox = document.getElementById('connect-error');
@@ -280,12 +279,18 @@
         return;
       }
 
+      errBox.style.color = 'var(--yellow)';
+      errBox.textContent = 'Connecting...';
+      errBox.classList.add('visible');
+
       try {
         const result = await invoke('iroh_client_connect', { addrJson: addr });
         if (result.connected) {
           errBox.style.color = 'var(--green)';
-          errBox.textContent = 'Connected!';
+          errBox.textContent = 'Connected! Streaming frames...';
           errBox.classList.add('visible');
+          document.getElementById('frame-canvas').style.display = 'block';
+          document.getElementById('viewer-placeholder').style.display = 'none';
         } else {
           errBox.style.color = 'var(--red)';
           errBox.textContent = result.error || 'Connection failed';
@@ -297,6 +302,43 @@
         errBox.classList.add('visible');
       }
     }
+
+    // ─── Frame rendering ───────────────────────────────────────────────
+    const canvas = document.getElementById('frame-canvas');
+    const ctx = canvas.getContext('2d');
+    let lastFrameTime = 0;
+
+    listen('frame', (event) => {
+      const { width, height, data } = event.payload;
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+
+      const bytes = Uint8Array.from(atob(data), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: 'image/jpeg' });
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        URL.revokeObjectURL(url);
+      };
+      img.src = url;
+    });
+
+    listen('frame-stats', (event) => {
+      const stats = document.getElementById('viewer-stats');
+      stats.textContent = `${event.payload.fps.toFixed(1)} fps | frame ${event.payload.count}`;
+      stats.classList.add('visible');
+    });
+
+    listen('frame-error', (event) => {
+      const errBox = document.getElementById('connect-error');
+      errBox.style.color = 'var(--red)';
+      errBox.textContent = event.payload;
+      errBox.classList.add('visible');
+      document.getElementById('frame-canvas').style.display = 'none';
+      document.getElementById('viewer-placeholder').style.display = 'block';
+      document.getElementById('viewer-placeholder').textContent = 'Disconnected: ' + event.payload;
+    });
   </script>
 </body>
 </html>

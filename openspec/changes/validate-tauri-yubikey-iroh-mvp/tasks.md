@@ -3,7 +3,7 @@
 ## 1. Research and spike setup
 
 - [x] 1.1 Compare Rust YubiKey/CTAP/PIV crates and document candidate APIs.
-- [ ] 1.2 Scaffold minimal Tauri app with backend commands and a diagnostics UI.
+- [x] 1.2 Scaffold minimal Tauri app with backend commands and a diagnostics UI.
 - [x] 1.3 Add an evidence log template under `docs/evidence/`.
 
 ## 2. Hardware authentication viability

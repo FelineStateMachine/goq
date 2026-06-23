@@ -720,7 +720,8 @@ async fn stream_frames(conn: Connection) -> anyhow::Result<()> {
             _ => {}
         }
 
-        tokio::time::sleep(Duration::from_millis(33)).await;
+        // Backpressure: yield to scheduler, no artificial throttle
+        tokio::task::yield_now().await;
     }
 
     Ok(())

@@ -835,6 +835,7 @@ pub struct FramePayload {
     pub width: u32,
     pub height: u32,
     pub data: String,
+    pub keyframe: bool,
 }
 
 #[derive(Serialize)]
@@ -980,7 +981,7 @@ pub async fn iroh_client_connect(
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&h264_buf);
                 let _ = app.emit(
                     "frame",
-                    FramePayload { width: w, height: h, data: b64 },
+                    FramePayload { width: w, height: h, data: b64, keyframe: is_keyframe },
                 );
 
                 frame_count += 1;
@@ -1014,7 +1015,7 @@ pub async fn iroh_client_connect(
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
                         let _ = app.emit(
                             "frame",
-                            FramePayload { width: yw as u32, height: yh as u32, data: b64 },
+                            FramePayload { width: yw as u32, height: yh as u32, data: b64, keyframe: is_keyframe },
                         );
 
                         frame_count += 1;

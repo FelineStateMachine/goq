@@ -813,7 +813,6 @@
     let hasWebCodecs = ('VideoDecoder' in window);
     let videoDecoder = null;
     let decoderConfigured = false;
-    let pendingKeyframe = true;
 
     (async function detectWebCodecs() {
       const el = document.getElementById('codec-webcodecs');
@@ -831,7 +830,31 @@
       }
     })();
 
-    function initWebCodecsDecoder(width, height) {
+    function parseSpsCodec(h264Data) {
+      // Scan for SPS NAL (type 7) and extract profile/level
+      let i = 0;
+      while (i < h264Data.length - 4) {
+        if (h264Data[i] === 0 && h264Data[i+1] === 0 && h264Data[i+2] === 0 && h264Data[i+3] === 1) {
+          const nalType = h264Data[i+4] & 0x1f;
+          if (nalType === 7) { // SPS
+            const profileIdc = h264Data[i+5];
+            const constraintFlags = h264Data[i+6];
+            const levelIdc = h264Data[i+7];
+            const profileHex = profileIdc.toString(16).padStart(2, '0');
+            const constraintHex = constraintFlags.toString(16).padStart(2, '0');
+            const levelHex = levelIdc.toString(16).padStart(2, '0');
+            return `avc1.${profileHex}${constraintHex}${levelHex}`;
+          }
+          i += 4;
+        } else {
+          i++;
+        }
+      }
+      // Fallback: Baseline, Level 4.0 (supports 1080p)
+      return 'avc1.42e028';
+    }
+
+    function initWebCodecsDecoder(width, height, codecStr) {
       if (videoDecoder) {
         try { videoDecoder.close(); } catch(e) {}
       }
@@ -842,16 +865,15 @@
         },
         error: (e) => {
           console.error('VideoDecoder error:', e);
-          pendingKeyframe = true;
         }
       });
       videoDecoder.configure({
-        codec: 'avc1.42001e',
+        codec: codecStr,
         codedWidth: width,
         codedHeight: height,
+        optimizeForRealtimeUse: true,
       });
       decoderConfigured = true;
-      pendingKeyframe = true;
     }
 
     // ─── Frames — dual path: WebCodecs or openh264→JPEG ─────────────────
@@ -868,17 +890,20 @@
       if (hasWebCodecs) {
         // Path 1: WebCodecs hardware decode
         const h264 = Uint8Array.from(atob(data), c => c.charCodeAt(0));
-        if (!decoderConfigured) initWebCodecsDecoder(width, height);
+        if (!decoderConfigured) {
+          const codecStr = parseSpsCodec(h264);
+          console.log('WebCodecs codec:', codecStr, 'w:', width, 'h:', height);
+          initWebCodecsDecoder(width, height, codecStr);
+        }
         const chunk = new EncodedVideoChunk({
-          type: pendingKeyframe ? 'key' : 'delta',
+          type: event.payload.keyframe ? 'key' : 'delta',
           timestamp: performance.now() * 1000,
           data: h264,
         });
         try {
           videoDecoder.decode(chunk);
-          pendingKeyframe = false;
         } catch (e) {
-          pendingKeyframe = true;
+          console.warn('decode failed:', e);
         }
       } else {
         // Path 2: JPEG from backend (openh264 decode → JPEG encode in Rust)

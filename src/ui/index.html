@@ -424,7 +424,7 @@
   <div class="overlay-screen hidden" id="intro">
     <div class="overlay-content">
       <h1>keyhome</h1>
-      <p id="intro-desc">Plug in your Titan key and choose an action.</p>
+      <p id="intro-desc">Type PIN, then c=connect · r=register · h=host</p>
 
       <!-- Unregistered: register or connect -->
       <div id="intro-unregistered">
@@ -611,7 +611,16 @@
       txt.textContent = text;
     }
 
-    function showIntro() { document.getElementById('intro').classList.remove('hidden'); }
+    function showIntro() {
+      document.getElementById('intro').classList.remove('hidden');
+      // Focus the visible PIN input
+      setTimeout(() => {
+        const unregPin = document.getElementById('intro-pin-unreg');
+        const regPin = document.getElementById('intro-pin-reg');
+        const visible = unregPin.parentElement.parentElement.style.display !== 'none' ? unregPin : regPin;
+        if (visible) visible.focus();
+      }, 50);
+    }
     function hideIntro() { document.getElementById('intro').classList.add('hidden'); }
     function showTap() { document.getElementById('tap-overlay').classList.remove('hidden'); }
     function hideTap() { document.getElementById('tap-overlay').classList.add('hidden'); }
@@ -1544,6 +1553,32 @@
       if (e.key.length === 1) {
         e.preventDefault();
         sendInput({ t: 'tx', s: e.key });
+      }
+    });
+
+    // ─── PIN keyboard shortcuts ─────────────────────────────────────────
+    // When PIN has content: c=connect, r=register, h=host
+    document.addEventListener('keydown', (e) => {
+      const intro = document.getElementById('intro');
+      if (intro.classList.contains('hidden')) return;
+
+      // Only trigger on c/r/h when focused in a PIN field with content
+      const active = document.activeElement;
+      if (!active || !active.classList.contains('overlay-input')) return;
+      const pin = active.value.trim();
+      if (!pin) return;
+
+      const key = e.key.toLowerCase();
+      if (key === 'c') {
+        e.preventDefault();
+        if (active.id === 'intro-pin-unreg') introConnectUnreg();
+        else introConnectReg();
+      } else if (key === 'r' && active.id === 'intro-pin-unreg') {
+        e.preventDefault();
+        introRegister();
+      } else if (key === 'h' && active.id === 'intro-pin-reg') {
+        e.preventDefault();
+        introHost();
       }
     });
 

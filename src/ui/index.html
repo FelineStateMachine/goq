@@ -979,9 +979,12 @@
       await invoke('set_encoder_config', { config });
     }
 
-    // ─── Annex B → AVCC conversion ─────────────────────────────────────
-    // openh264 outputs Annex B (00 00 00 01 start codes).
-    // WebCodecs expects AVCC (4-byte length-prefixed NALs) + description.
+    // ─── Annex B → AVCC/hvcC/av1C conversion ────────────────────────────
+    // ffmpeg outputs Annex B (00 00 00 01 start codes) for H.264/H.265.
+    // WebCodecs expects length-prefixed NALs + description record.
+    // AV1 uses OBU format directly.
+
+    let activeCodec = 'h264'; // updated from host-codec event
 
     function parseAnnexBNals(data) {
       const nals = [];
@@ -1008,26 +1011,7 @@
       return nals;
     }
 
-    function buildAvcDescription(sps, pps) {
-      const buf = new Uint8Array(11 + sps.length + pps.length);
-      let off = 0;
-      buf[off++] = 1;              // configurationVersion
-      buf[off++] = sps[1];         // profile_idc
-      buf[off++] = sps[2];         // constraint_flags
-      buf[off++] = sps[3];         // level_idc
-      buf[off++] = 0xFF;           // lengthSizeMinusOne = 3 (4-byte lengths)
-      buf[off++] = 0xE1;           // numOfSPS = 1
-      buf[off++] = (sps.length >> 8) & 0xFF;
-      buf[off++] = sps.length & 0xFF;
-      buf.set(sps, off); off += sps.length;
-      buf[off++] = 1;              // numOfPPS = 1
-      buf[off++] = (pps.length >> 8) & 0xFF;
-      buf[off++] = pps.length & 0xFF;
-      buf.set(pps, off);
-      return buf.buffer;
-    }
-
-    function nalsToAvcc(nals) {
+    function nalsToLengthPrefixed(nals) {
       let total = 0;
       for (const nal of nals) total += 4 + nal.length;
       const result = new Uint8Array(total);
@@ -1041,20 +1025,188 @@
       return result;
     }
 
-    function codecStrFromSps(sps) {
+    // ─── H.264 ─────────────────────────────────────────────────────────
+
+    function buildAvcDescription(sps, pps) {
+      const buf = new Uint8Array(11 + sps.length + pps.length);
+      let off = 0;
+      buf[off++] = 1;              // configurationVersion
+      buf[off++] = sps[1];         // profile_idc
+      buf[off++] = sps[2];         // constraint_flags
+      buf[off++] = sps[3];         // level_idc
+      buf[off++] = 0xFF;           // lengthSizeMinusOne = 3
+      buf[off++] = 0xE1;           // numOfSPS = 1
+      buf[off++] = (sps.length >> 8) & 0xFF;
+      buf[off++] = sps.length & 0xFF;
+      buf.set(sps, off); off += sps.length;
+      buf[off++] = 1;              // numOfPPS = 1
+      buf[off++] = (pps.length >> 8) & 0xFF;
+      buf[off++] = pps.length & 0xFF;
+      buf.set(pps, off);
+      return buf.buffer;
+    }
+
+    function avcCodecStr(sps) {
       const p = sps[1].toString(16).padStart(2, '0');
       const c = sps[2].toString(16).padStart(2, '0');
       const l = sps[3].toString(16).padStart(2, '0');
       return `avc1.${p}${c}${l}`;
     }
 
-    function initWebCodecsDecoder(width, height, sps, pps) {
+    function h264NalType(nal) { return nal[0] & 0x1f; }
+
+    // ─── H.265 / HEVC ──────────────────────────────────────────────────
+
+    function buildHvcDescription(vps, sps, pps) {
+      // hvcC record format (ISO 14496-15 8.3.3.1.2)
+      const buf = new Uint8Array(23 + 3 + vps.length + sps.length + pps.length);
+      let off = 0;
+      buf[off++] = 1;              // configurationVersion
+      // profile space(2) + tier(1) + profile_idc(5)
+      buf[off++] = sps[1] & 0x1f; // profile_space=0, tier=0, profile_idc from SPS
+      buf[off++] = sps[2];         // general_profile_compatibility_flags[0..7]
+      buf[off++] = sps[3];         // [8..15]
+      buf[off++] = sps[4];         // [16..23]
+      buf[off++] = sps[5];         // [24..31]
+      // constraint flags (6 bytes)
+      for (let i = 0; i < 6; i++) buf[off++] = sps[6 + i] || 0;
+      buf[off++] = sps[12];       // general_level_idc
+      // min_spatial_segmentation_idc (12 bits, 0xF000 = reserved)
+      buf[off++] = 0xF0;
+      buf[off++] = 0x00;
+      // parallelismType (2 bits, 0xFC = reserved)
+      buf[off++] = 0xFC;
+      // chromaFormat (2 bits, 0xFC = reserved) — from SPS
+      buf[off++] = 0xFC | ((sps.length > 2 ? 0 : 0));
+      // bitDepthLumaMinus8 (3 bits, 0xF8 = reserved)
+      buf[off++] = 0xF8;
+      // bitDepthChromaMinus8 (3 bits, 0xF8 = reserved)
+      buf[off++] = 0xF8;
+      // avgFrameRate
+      buf[off++] = 0x00;
+      buf[off++] = 0x00;
+      // constantFrameRate(2) + numTemporalLayers(3) + temporalIdNested(1) + lengthSizeMinusOne(2)
+      buf[off++] = 0x0F; // lengthSizeMinusOne=3
+      // numOfArrays
+      buf[off++] = 3;   // VPS, SPS, PPS
+
+      // Helper to write a NAL array entry
+      const writeNal = (nalType, nal) => {
+        buf[off++] = 0x80 | nalType; // array_completeness=1
+        buf[off++] = 0;             // numNalus high byte
+        buf[off++] = 1;             // numNalus = 1
+        buf[off++] = (nal.length >> 8) & 0xFF;
+        buf[off++] = nal.length & 0xFF;
+        buf.set(nal, off);
+        off += nal.length;
+      };
+
+      writeNal(32, vps);  // VPS
+      writeNal(33, sps);  // SPS
+      writeNal(34, pps);  // PPS
+
+      return buf.buffer;
+    }
+
+    function hevcCodecStr(sps) {
+      // General profile space (2 bits) = 0, tier (1 bit) = 0 (Main tier)
+      const profileIdc = (sps[1] & 0x1f);
+      // General level idc is at byte 12 in the SPS NAL (after the NAL header byte)
+      // For HEVC, NAL header is 2 bytes: byte[0] = (forbidden<<7 | nal_type<<1 | nuh_layer_id>>5)
+      //                                      byte[1] = (nuh_layer_id<<3 | nuh_temporal_id_plus1)
+      // So SPS data starts at byte 2
+      const levelIdc = sps.length > 13 ? sps[13] : 0;
+      // Simplified: use profile_idc from SPS, level from SPS byte 13
+      // Format: hev1.X.Y.L where X=profile_space(0), Y=tier(0 for Main), L=level
+      const p = profileIdc.toString(16).padStart(2, '0');
+      const l = levelIdc.toString(16).padStart(2, '0');
+      // WebCodecs uses 'hev1' or 'hvc1' — 'hev1' is the parameter-set-in-band variant
+      // Use 'hvc1' since we provide description
+      return `hvc1.${p}.4.L${levelIdc}.B0`;
+    }
+
+    function hevcNalType(nal) { return (nal[0] >> 1) & 0x3f; }
+
+    // ─── AV1 ───────────────────────────────────────────────────────────
+
+    // AV1 uses OBU format, no start codes. The sequence header OBU
+    // serves as the description. WebCodecs accepts the raw sequence header
+    // bytes as the description buffer.
+
+    function parseAv1Obus(data) {
+      // AV1 low-overhead bitstream format: each OBU is length-prefixed
+      // With temporal delimiter (td=insert), each frame starts with a TD OBU
+      const obus = [];
+      let i = 0;
+      while (i < data.length) {
+        if (i + 1 >= data.length) break;
+        const header = data[i];
+        const obuType = (header >> 3) & 0x0f;
+        const hasExtension = (header & 0x04) !== 0;
+        const hasSize = (header & 0x02) !== 0;
+        let off = i + 1 + (hasExtension ? 1 : 0);
+        if (!hasSize) {
+          // Rest of data is this OBU
+          obus.push({ type: obuType, data: data.subarray(i, data.length) });
+          break;
+        }
+        // Read leb128 size
+        let size = 0;
+        let shift = 0;
+        let bytesConsumed = 0;
+        for (let j = 0; j < 4 && off + j < data.length; j++) {
+          const b = data[off + j];
+          size |= (b & 0x7f) << shift;
+          shift += 7;
+          bytesConsumed++;
+          if ((b & 0x80) === 0) break;
+        }
+        off += bytesConsumed;
+        obus.push({ type: obuType, data: data.subarray(i, off + size) });
+        i = off + size;
+      }
+      return obus;
+    }
+
+    function av1CodecStr(sequenceHeader) {
+      // Parse the AV1 sequence header to build codec string
+      // seq_profile (3 bits), level (5 bits)
+      // For 'av01.P.LLT.MMM' format
+      const obuData = sequenceHeader;
+      // Skip OBU header byte(s) to get to sequence_header_obu data
+      let off = 1; // obu_header byte
+      // Check for extension flag
+      if ((obuData[0] & 0x04) !== 0) off = 2;
+      // Skip size leb128
+      while (off < obuData.length && (obuData[off] & 0x80) !== 0) off++;
+      off++;
+      // Now at sequence_header_obu data
+      // seq_profile (3 bits) + still_picture (1) + reduced_still_picture_header (1)
+      const b0 = obuData[off] || 0;
+      const profile = (b0 >> 5) & 0x07;
+      const reduced = (b0 >> 3) & 0x01;
+      let levelIdx;
+      if (reduced) {
+        levelIdx = (b0 >> 2) & 0x1f;
+      } else {
+        // More complex parsing needed; use defaults
+        levelIdx = 0;
+      }
+      return `av01.${profile}.${levelIdx.toString().padStart(2, '0')}M.08`;
+    }
+
+    function buildAv1Description(seqHeaderObu) {
+      // WebCodecs accepts the raw sequence header OBU bytes
+      return seqHeaderObu.buffer.slice(seqHeaderObu.byteOffset, seqHeaderObu.byteOffset + seqHeaderObu.byteLength);
+    }
+
+    // ─── WebCodecs init per codec ──────────────────────────────────────
+
+    function initWebCodecsDecoder(width, height, desc, codecStr) {
       if (videoDecoder) {
         try { videoDecoder.close(); } catch(e) {}
       }
-      const codecStr = codecStrFromSps(sps);
-      const description = buildAvcDescription(sps, pps);
-      console.log('WebCodecs configure:', codecStr, 'w:', width, 'h:', height, 'desc:', description.byteLength, 'bytes');
+      console.log('WebCodecs configure:', codecStr, 'w:', width, 'h:', height, 'desc:', desc.byteLength, 'bytes');
       videoDecoder = new VideoDecoder({
         output: (frame) => {
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
@@ -1071,15 +1223,26 @@
         codec: codecStr,
         codedWidth: width,
         codedHeight: height,
-        description: description,
+        description: desc,
         optimizeForRealtimeUse: true,
       });
       decoderConfigured = true;
     }
 
-    // ─── Frames — dual path: WebCodecs or openh264→JPEG ─────────────────
+    // ─── Frames — multi-codec WebCodecs or JPEG fallback ───────────────
     const canvas = document.getElementById('frame-canvas');
     const ctx = canvas.getContext('2d');
+
+    listen('host-codec', (event) => {
+      activeCodec = event.payload || 'h264';
+      console.log('host codec:', activeCodec);
+      // Reset decoder — new codec needs new config
+      decoderConfigured = false;
+      if (videoDecoder) {
+        try { videoDecoder.close(); } catch(_) {}
+        videoDecoder = null;
+      }
+    });
 
     listen('frame', (event) => {
       const { width, height, data } = event.payload;
@@ -1089,45 +1252,111 @@
       if (canvas.height !== height) canvas.height = height;
 
       if (hasWebCodecs) {
-        // Path 1: WebCodecs hardware decode
-        const h264 = Uint8Array.from(atob(data), c => c.charCodeAt(0));
-        const nals = parseAnnexBNals(h264);
+        const raw = Uint8Array.from(atob(data), c => c.charCodeAt(0));
 
-        // Extract SPS/PPS from keyframes to (re)configure decoder
-        if (event.payload.keyframe) {
-          let sps = null, pps = null;
-          for (const nal of nals) {
-            const nalType = nal[0] & 0x1f;
-            if (nalType === 7) sps = nal;
-            else if (nalType === 8) pps = nal;
-          }
-          if (sps && pps) {
-            if (!decoderConfigured) {
-              initWebCodecsDecoder(width, height, sps, pps);
+        if (activeCodec === 'av1') {
+          // ── AV1 path ──
+          const obus = parseAv1Obus(raw);
+
+          if (event.payload.keyframe) {
+            // Find sequence header OBU (type 12)
+            const seqHeader = obus.find(o => o.type === 12);
+            if (seqHeader && !decoderConfigured) {
+              const desc = buildAv1Description(seqHeader.data);
+              const codecStr = av1CodecStr(seqHeader.data);
+              initWebCodecsDecoder(width, height, desc, codecStr);
             }
           }
-        }
 
-        if (!decoderConfigured || !videoDecoder) {
-          // Waiting for first keyframe with SPS/PPS
-        } else {
-          // Filter out SPS/PPS — already in description, decoder doesn't want them again
-          const sliceNals = nals.filter(nal => {
-            const t = nal[0] & 0x1f;
-            return t !== 7 && t !== 8; // skip SPS, PPS
-          });
-          if (sliceNals.length > 0) {
-            const avcc = nalsToAvcc(sliceNals);
+          if (!decoderConfigured || !videoDecoder) return;
+
+          // Filter out TD and sequence header OBUs — already in description
+          const frameObus = obus.filter(o => o.type !== 2 && o.type !== 12);
+          if (frameObus.length > 0) {
+            // Concatenate remaining OBUs as the chunk data
+            let totalLen = 0;
+            for (const o of frameObus) totalLen += o.data.length;
+            const chunkData = new Uint8Array(totalLen);
+            let off = 0;
+            for (const o of frameObus) { chunkData.set(o.data, off); off += o.data.length; }
+
             const chunk = new EncodedVideoChunk({
               type: event.payload.keyframe ? 'key' : 'delta',
               timestamp: performance.now() * 1000,
-              data: avcc,
+              data: chunkData,
             });
-            try {
-              videoDecoder.decode(chunk);
-            } catch (e) {
-              console.warn('decode failed:', e);
+            try { videoDecoder.decode(chunk); } catch (e) { console.warn('av1 decode failed:', e); }
+          }
+
+        } else if (activeCodec === 'h265') {
+          // ── H.265 path ──
+          const nals = parseAnnexBNals(raw);
+
+          if (event.payload.keyframe) {
+            let vps = null, sps = null, pps = null;
+            for (const nal of nals) {
+              const t = hevcNalType(nal);
+              if (t === 32) vps = nal;
+              else if (t === 33) sps = nal;
+              else if (t === 34) pps = nal;
             }
+            if (vps && sps && pps && !decoderConfigured) {
+              const desc = buildHvcDescription(vps, sps, pps);
+              const codecStr = hevcCodecStr(sps);
+              initWebCodecsDecoder(width, height, desc, codecStr);
+            }
+          }
+
+          if (!decoderConfigured || !videoDecoder) return;
+
+          // Filter out VPS/SPS/PPS/AUD — already in description
+          const sliceNals = nals.filter(nal => {
+            const t = hevcNalType(nal);
+            return t !== 32 && t !== 33 && t !== 34 && t !== 35;
+          });
+          if (sliceNals.length > 0) {
+            const lpData = nalsToLengthPrefixed(sliceNals);
+            const chunk = new EncodedVideoChunk({
+              type: event.payload.keyframe ? 'key' : 'delta',
+              timestamp: performance.now() * 1000,
+              data: lpData,
+            });
+            try { videoDecoder.decode(chunk); } catch (e) { console.warn('hevc decode failed:', e); }
+          }
+
+        } else {
+          // ── H.264 path (default) ──
+          const nals = parseAnnexBNals(raw);
+
+          if (event.payload.keyframe) {
+            let sps = null, pps = null;
+            for (const nal of nals) {
+              const t = h264NalType(nal);
+              if (t === 7) sps = nal;
+              else if (t === 8) pps = nal;
+            }
+            if (sps && pps && !decoderConfigured) {
+              const desc = buildAvcDescription(sps, pps);
+              const codecStr = avcCodecStr(sps);
+              initWebCodecsDecoder(width, height, desc, codecStr);
+            }
+          }
+
+          if (!decoderConfigured || !videoDecoder) return;
+
+          // Filter out SPS/PPS/AUD — already in description
+          const sliceNals = nals.filter(nal => {
+            const t = h264NalType(nal);
+            return t !== 7 && t !== 8 && t !== 9;
+          });
+          if (sliceNals.length > 0) {
+            const lpData = nalsToLengthPrefixed(sliceNals);
+            const chunk = new EncodedVideoChunk({
+              type: event.payload.keyframe ? 'key' : 'delta',
+              timestamp: performance.now() * 1000,
+              data: lpData,
+            });
+            try { videoDecoder.decode(chunk); } catch (e) { console.warn('h264 decode failed:', e); }
           }
         }
       } else {

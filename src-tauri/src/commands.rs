@@ -979,6 +979,9 @@ async fn stream_frames_ffmpeg(
         encoder, fmt, bsf, config.bitrate, config.framerate, config.gop
     );
 
+    // Notify frontend of active codec for decoder configuration
+    let _ = app.emit("host-codec", &config.codec);
+
     let mut cmd = TokioCommand::new("ffmpeg");
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())

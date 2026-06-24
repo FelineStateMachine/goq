@@ -830,34 +830,82 @@
       }
     })();
 
-    function parseSpsCodec(h264Data) {
-      // Scan for SPS NAL (type 7) and extract profile/level
+    // ─── Annex B → AVCC conversion ─────────────────────────────────────
+    // openh264 outputs Annex B (00 00 00 01 start codes).
+    // WebCodecs expects AVCC (4-byte length-prefixed NALs) + description.
+
+    function parseAnnexBNals(data) {
+      const nals = [];
       let i = 0;
-      while (i < h264Data.length - 4) {
-        if (h264Data[i] === 0 && h264Data[i+1] === 0 && h264Data[i+2] === 0 && h264Data[i+3] === 1) {
-          const nalType = h264Data[i+4] & 0x1f;
-          if (nalType === 7) { // SPS
-            const profileIdc = h264Data[i+5];
-            const constraintFlags = h264Data[i+6];
-            const levelIdc = h264Data[i+7];
-            const profileHex = profileIdc.toString(16).padStart(2, '0');
-            const constraintHex = constraintFlags.toString(16).padStart(2, '0');
-            const levelHex = levelIdc.toString(16).padStart(2, '0');
-            return `avc1.${profileHex}${constraintHex}${levelHex}`;
-          }
-          i += 4;
+      while (i < data.length) {
+        let scl = 0;
+        if (i + 3 < data.length && data[i] === 0 && data[i+1] === 0 && data[i+2] === 0 && data[i+3] === 1) {
+          scl = 4;
+        } else if (i + 2 < data.length && data[i] === 0 && data[i+1] === 0 && data[i+2] === 1) {
+          scl = 3;
         } else {
-          i++;
+          i++; continue;
         }
+        const nalStart = i + scl;
+        let j = nalStart + 1;
+        while (j < data.length) {
+          if (j + 3 < data.length && data[j] === 0 && data[j+1] === 0 && data[j+2] === 0 && data[j+3] === 1) break;
+          if (j + 2 < data.length && data[j] === 0 && data[j+1] === 0 && data[j+2] === 1) break;
+          j++;
+        }
+        nals.push(data.subarray(nalStart, j));
+        i = j;
       }
-      // Fallback: Baseline, Level 4.0 (supports 1080p)
-      return 'avc1.42e028';
+      return nals;
     }
 
-    function initWebCodecsDecoder(width, height, codecStr) {
+    function buildAvcDescription(sps, pps) {
+      const buf = new Uint8Array(11 + sps.length + pps.length);
+      let off = 0;
+      buf[off++] = 1;              // configurationVersion
+      buf[off++] = sps[1];         // profile_idc
+      buf[off++] = sps[2];         // constraint_flags
+      buf[off++] = sps[3];         // level_idc
+      buf[off++] = 0xFF;           // lengthSizeMinusOne = 3 (4-byte lengths)
+      buf[off++] = 0xE1;           // numOfSPS = 1
+      buf[off++] = (sps.length >> 8) & 0xFF;
+      buf[off++] = sps.length & 0xFF;
+      buf.set(sps, off); off += sps.length;
+      buf[off++] = 1;              // numOfPPS = 1
+      buf[off++] = (pps.length >> 8) & 0xFF;
+      buf[off++] = pps.length & 0xFF;
+      buf.set(pps, off);
+      return buf.buffer;
+    }
+
+    function nalsToAvcc(nals) {
+      let total = 0;
+      for (const nal of nals) total += 4 + nal.length;
+      const result = new Uint8Array(total);
+      let off = 0;
+      for (const nal of nals) {
+        const dv = new DataView(result.buffer, off, 4);
+        dv.setUint32(0, nal.length, false);
+        result.set(nal, off + 4);
+        off += 4 + nal.length;
+      }
+      return result;
+    }
+
+    function codecStrFromSps(sps) {
+      const p = sps[1].toString(16).padStart(2, '0');
+      const c = sps[2].toString(16).padStart(2, '0');
+      const l = sps[3].toString(16).padStart(2, '0');
+      return `avc1.${p}${c}${l}`;
+    }
+
+    function initWebCodecsDecoder(width, height, sps, pps) {
       if (videoDecoder) {
         try { videoDecoder.close(); } catch(e) {}
       }
+      const codecStr = codecStrFromSps(sps);
+      const description = buildAvcDescription(sps, pps);
+      console.log('WebCodecs configure:', codecStr, 'w:', width, 'h:', height, 'desc:', description.byteLength, 'bytes');
       videoDecoder = new VideoDecoder({
         output: (frame) => {
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
@@ -865,12 +913,16 @@
         },
         error: (e) => {
           console.error('VideoDecoder error:', e);
+          decoderConfigured = false;
+          try { videoDecoder.close(); } catch(_) {}
+          videoDecoder = null;
         }
       });
       videoDecoder.configure({
         codec: codecStr,
         codedWidth: width,
         codedHeight: height,
+        description: description,
         optimizeForRealtimeUse: true,
       });
       decoderConfigured = true;
@@ -890,20 +942,44 @@
       if (hasWebCodecs) {
         // Path 1: WebCodecs hardware decode
         const h264 = Uint8Array.from(atob(data), c => c.charCodeAt(0));
-        if (!decoderConfigured) {
-          const codecStr = parseSpsCodec(h264);
-          console.log('WebCodecs codec:', codecStr, 'w:', width, 'h:', height);
-          initWebCodecsDecoder(width, height, codecStr);
+        const nals = parseAnnexBNals(h264);
+
+        // Extract SPS/PPS from keyframes to (re)configure decoder
+        if (event.payload.keyframe) {
+          let sps = null, pps = null;
+          for (const nal of nals) {
+            const nalType = nal[0] & 0x1f;
+            if (nalType === 7) sps = nal;
+            else if (nalType === 8) pps = nal;
+          }
+          if (sps && pps) {
+            if (!decoderConfigured) {
+              initWebCodecsDecoder(width, height, sps, pps);
+            }
+          }
         }
-        const chunk = new EncodedVideoChunk({
-          type: event.payload.keyframe ? 'key' : 'delta',
-          timestamp: performance.now() * 1000,
-          data: h264,
-        });
-        try {
-          videoDecoder.decode(chunk);
-        } catch (e) {
-          console.warn('decode failed:', e);
+
+        if (!decoderConfigured || !videoDecoder) {
+          // Waiting for first keyframe with SPS/PPS
+        } else {
+          // Filter out SPS/PPS — already in description, decoder doesn't want them again
+          const sliceNals = nals.filter(nal => {
+            const t = nal[0] & 0x1f;
+            return t !== 7 && t !== 8; // skip SPS, PPS
+          });
+          if (sliceNals.length > 0) {
+            const avcc = nalsToAvcc(sliceNals);
+            const chunk = new EncodedVideoChunk({
+              type: event.payload.keyframe ? 'key' : 'delta',
+              timestamp: performance.now() * 1000,
+              data: avcc,
+            });
+            try {
+              videoDecoder.decode(chunk);
+            } catch (e) {
+              console.warn('decode failed:', e);
+            }
+          }
         }
       } else {
         // Path 2: JPEG from backend (openh264 decode → JPEG encode in Rust)

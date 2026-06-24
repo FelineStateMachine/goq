@@ -1,15 +1,15 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Keyhome",
+  "productName": "Sigil",
   "version": "0.1.0",
-  "identifier": "com.keyhome.app",
+  "identifier": "com.sigil.app",
   "build": {
     "frontendDist": "../src/ui"
   },
   "app": {
     "windows": [
       {
-        "title": "Keyhome",
+        "title": "Sigil",
         "width": 1024,
         "height": 768,
         "resizable": true,

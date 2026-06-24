@@ -1,10 +1,10 @@
-# Keyhome Setup
+# Sigil Setup
 
 ## Prerequisites
 
 ### Rust (required on all platforms)
 
-Keyhome uses Rust edition 2024 and requires **Rust 1.85 or later**.
+Sigil uses Rust edition 2024 and requires **Rust 1.85 or later**.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -69,8 +69,8 @@ ffmpeg auto-detects the best available encoder in this order: NVENC → QSV → 
 ### Clone
 
 ```bash
-git clone https://github.com/FelineStateMachine/keyhome.git
-cd keyhome
+git clone https://github.com/FelineStateMachine/sigil.git
+cd sigil
 ```
 
 ## Run
@@ -91,26 +91,26 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
 
 ## Usage
 
-Keyhome uses a FIDO2 security key (Google Titan) to derive Iroh peer identities. There is no address copy/paste — the key handles identity for you.
+Sigil uses a FIDO2 security key to derive Iroh peer identities. There is no address copy/paste — the key handles identity for you.
 
 ### 1. Register (one-time per machine)
 
-Click **Register** and tap your Titan key. This creates a resident (discoverable) credential stored on the key itself. You only do this once per machine.
+Click **Register** and tap your key. This creates a resident (discoverable) credential stored on the key itself. You only do this once per machine.
 
 ### 2. Host
 
 Click **Start host**, then either:
 
-- **Tap your Titan key** — the app derives the Iroh identity from the key and starts listening, or
+- **Tap your key** — the app derives the Iroh identity from the key and starts listening, or
 - **Use saved keyring** — if you have previously hosted, the app can reuse the stored identity from the system keyring without requiring a tap.
 
-The host is now reachable over Iroh at an endpoint ID derived from the Titan key.
+The host is now reachable over Iroh at an endpoint ID derived from your key.
 
 ### 3. Connect
 
-Click **Connect** and tap your Titan key. The app derives the same host endpoint ID from the key and dials it over Iroh. The remote screen appears in the viewer canvas. Input (mouse and keyboard) is forwarded to the host.
+Click **Connect** and tap your key. The app derives the same host endpoint ID from the key and dials it over Iroh. The remote screen appears in the viewer canvas. Input (mouse and keyboard) is forwarded to the host.
 
-> Both machines must use the same Titan key (or a key that produces the same hmac-secret output). The key derivation replaces manual address sharing entirely.
+> Both machines must use the same key (or a key that produces the same hmac-secret output). The key derivation replaces manual address sharing entirely.
 
 ## Architecture
 
@@ -122,7 +122,7 @@ Click **Connect** and tap your Titan key. The app derives the same host endpoint
 - **Fallback**: xcap capture + openh264 software encoding (if ffmpeg not installed)
 - **FIDO2**: ctap-hid-fido2 (CTAP 2.0/2.1 over HID)
 - **Input injection**: enigo (cross-platform mouse/keyboard)
-- **Identity**: Iroh SecretKey derived from Titan hmac-secret extension; no address copy/paste
+- **Identity**: Iroh SecretKey derived from FIDO2 hmac-secret extension; no address copy/paste
 - **Protocol**: BiStream with a 14-byte frame header:
 
 ```
@@ -140,8 +140,8 @@ Codec byte: `0` = H.264, `1` = H.265, `2` = AV1.
 |-------|--------|----------------|
 | 001-iroh-native-ping | ✅ PASS | Iroh endpoints + ALPN routing work in native Rust |
 | 002-yubikey-hmac-detection | ⚠️ PARTIAL | challenge_response crate works but only for YubiKey (not Titan) |
-| 003-fido2-hid-enumeration | ✅ PASS | ctap-hid-fido2 communicates with Google Titan v2 |
-| 004-hmac-iroh-derivation | ✅ PASS | Titan hmac-secret → Iroh SecretKey → working endpoint (6.5ms RTT) |
+| 003-fido2-hid-enumeration | ✅ PASS | ctap-hid-fido2 communicates with FIDO2 key |
+| 004-hmac-iroh-derivation | ✅ PASS | hmac-secret → Iroh SecretKey → working endpoint (6.5ms RTT) |
 | 005-frame-stream | ✅ PASS | Screen capture → JPEG → Iroh stream → client receives frames |
 | 006-input-injection | ✅ PASS | enigo input injection works over Iroh bidirectional stream |
-| 007-titan-no-copy | ✅ PASS | Both sides derive the same Iroh identity from Titan — no address sharing needed |
+| 007-titan-no-copy | ✅ PASS | Both sides derive the same Iroh identity from the same key — no address sharing needed |

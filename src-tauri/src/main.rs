@@ -37,7 +37,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::auth::fido_device_info,
             commands::auth::fido_pin_retries,
-            commands::auth::titan_derive_identity,
+            commands::auth::key_derive_identity,
             commands::state::is_daemon_mode,
             commands::state::set_webcodecs_available,
             commands::state::is_webcodecs_available,
@@ -45,7 +45,7 @@ fn main() {
             commands::streaming::set_encoder_config,
             commands::streaming::detect_available_encoders,
             commands::auth::host_registration_status,
-            commands::auth::titan_register_host,
+            commands::auth::key_register_host,
             commands::auth::host_unregister,
             commands::network::iroh_host_start,
             commands::network::iroh_host_stop,

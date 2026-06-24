@@ -50,9 +50,9 @@ pub fn clear_identity_from_keyring() -> anyhow::Result<()> {
     }
 }
 
-// ─── Titan HMAC-Secret Derivation ────────────────────────────────────────────
+// ─── FIDO2 HMAC-Secret Derivation ────────────────────────────────────────────
 
-pub fn derive_secret_from_titan(pin: &str) -> anyhow::Result<[u8; 32]> {
+pub fn derive_secret_from_key(pin: &str) -> anyhow::Result<[u8; 32]> {
     let cfg = Cfg::init();
     let device = FidoKeyHidFactory::create(&cfg)
         .context("Security key not found. Make sure it is plugged in.")?;
@@ -80,9 +80,9 @@ pub fn derive_secret_from_titan(pin: &str) -> anyhow::Result<[u8; 32]> {
 
     // No resident key — create one
     let user_entity = PublicKeyCredentialUserEntity::new(
-        Some(b"keyhome-user"),
-        Some("keyhome"),
-        Some("Keyhome"),
+        Some(b"sigil-user"),
+        Some("sigil"),
+        Some("Sigil"),
     );
 
     let challenge = verifier::create_challenge();
@@ -128,8 +128,8 @@ pub fn extract_hmac_secret(assertions: &[Assertion]) -> anyhow::Result<[u8; 32]>
     anyhow::bail!("No hmac-secret in assertion response")
 }
 
-pub fn derive_iroh_secret_from_titan(pin: &str) -> anyhow::Result<SecretKey> {
-    let secret_bytes = derive_secret_from_titan(pin)?;
+pub fn derive_iroh_secret_from_key(pin: &str) -> anyhow::Result<SecretKey> {
+    let secret_bytes = derive_secret_from_key(pin)?;
     Ok(SecretKey::from_bytes(&secret_bytes))
 }
 
@@ -242,26 +242,26 @@ pub fn fido_pin_retries() -> PinRetries {
 }
 
 #[derive(Serialize)]
-pub struct TitanIdentity {
+pub struct KeyIdentity {
     pub node_id: String,
     pub error: Option<String>,
 }
 
 #[tauri::command]
-pub async fn titan_derive_identity(pin: String) -> TitanIdentity {
+pub async fn key_derive_identity(pin: String) -> KeyIdentity {
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || derive_iroh_secret_from_titan(&pin)),
+        tokio::task::spawn_blocking(move || derive_iroh_secret_from_key(&pin)),
     )
     .await;
     match result {
-        Err(_) => TitanIdentity {
+        Err(_) => KeyIdentity {
             node_id: String::new(),
             error: Some("Security key timed out (30s). Check that your key is connected.".into()),
         },
-        Ok(Err(e)) => TitanIdentity { node_id: String::new(), error: Some(format!("Task error: {}", e)) },
-        Ok(Ok(Err(e))) => TitanIdentity { node_id: String::new(), error: Some(format!("{:?}", e)) },
-        Ok(Ok(Ok(secret))) => TitanIdentity { node_id: secret.public().to_string(), error: None },
+        Ok(Err(e)) => KeyIdentity { node_id: String::new(), error: Some(format!("Task error: {}", e)) },
+        Ok(Ok(Err(e))) => KeyIdentity { node_id: String::new(), error: Some(format!("{:?}", e)) },
+        Ok(Ok(Ok(secret))) => KeyIdentity { node_id: secret.public().to_string(), error: None },
     }
 }
 
@@ -295,10 +295,10 @@ pub fn host_registration_status() -> RegistrationStatus {
 }
 
 #[tauri::command]
-pub async fn titan_register_host(pin: String) -> Result<RegistrationStatus, String> {
+pub async fn key_register_host(pin: String) -> Result<RegistrationStatus, String> {
     let secret = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || derive_secret_from_titan(&pin)),
+        tokio::task::spawn_blocking(move || derive_secret_from_key(&pin)),
     )
     .await
     .map_err(|_| "Security key timed out (30s). Make sure your key is connected.".to_string())?

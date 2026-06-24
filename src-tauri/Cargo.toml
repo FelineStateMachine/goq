@@ -1,10 +1,10 @@
 [package]
-name = "keyhome"
+name = "sigil"
 version = "0.1.0"
 description = "FIDO2-secured remote desktop via Iroh"
 authors = ["Dami"]
 license = "MIT"
-repository = "https://github.com/FelineStateMachine/keyhome"
+repository = "https://github.com/FelineStateMachine/sigil"
 edition = "2024"
 rust-version = "1.85"
 

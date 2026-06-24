@@ -8,8 +8,8 @@ pub mod streaming;
 
 pub use auth::{
     fido_device_info, fido_pin_retries, host_registration_status, host_unregister,
-    titan_derive_identity, titan_register_host, FidoDeviceInfo, PinRetries, RegistrationStatus,
-    TitanIdentity,
+    key_derive_identity, key_register_host, FidoDeviceInfo, KeyIdentity, PinRetries,
+    RegistrationStatus,
 };
 pub use input::InputEvent;
 pub use network::{

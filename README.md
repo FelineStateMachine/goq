@@ -1,10 +1,10 @@
-# keyhome
+# sigil
 
-A native remote desktop app secured by FIDO2 hardware keys. Plug in a Google Titan or YubiKey, tap it, and connect to your machine over an end-to-end encrypted Iroh tunnel. No passwords, no addresses — the key derives the identity.
+A native remote desktop app secured by FIDO2 hardware keys. Plug in a YubiKey or Google Titan, tap it, and connect to your machine over an end-to-end encrypted Iroh tunnel. No passwords, no addresses — the key derives the identity.
 
 ## What is it?
 
-Keyhome is a Tauri v2 desktop app (Rust backend, vanilla JS frontend) that lets you remote into your machine using a FIDO2 security key as the sole authentication factor. The key produces a `hmac-secret` that becomes the 32-byte seed for an Iroh P2P endpoint. Both host and client derive the same identity from the same key — no address sharing, no passwords, no relay configuration.
+Sigil is a Tauri v2 desktop app (Rust backend, vanilla JS frontend) that lets you remote into your machine using a FIDO2 security key as the sole authentication factor. The key produces a `hmac-secret` that becomes the 32-byte seed for an Iroh P2P endpoint. Both host and client derive the same identity from the same key — no address sharing, no passwords, no relay configuration.
 
 Screen capture and encoding run through an ffmpeg subprocess with hardware acceleration (NVENC, VAAPI, QSV, AMF, VideoToolbox) up to 60fps. The client decodes via WebCodecs with hardware acceleration for H.264, H.265, and AV1. A software fallback (xcap + openh264) is available if ffmpeg isn't installed.
 
@@ -23,7 +23,7 @@ Screen capture and encoding run through an ffmpeg subprocess with hardware accel
 
 - **Rust 1.85+** — [install](https://rustup.rs)
 - **ffmpeg** — screen capture + hardware encoding
-- **FIDO2 security key** — Google Titan or YubiKey
+- **FIDO2 security key** — YubiKey, Google Titan, or any FIDO2 key with hmac-secret support
 
 ### Linux (Ubuntu/Debian)
 
@@ -35,8 +35,8 @@ sudo apt install -y ffmpeg libwebkit2gtk-4.1-dev build-essential curl wget file 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 
-git clone https://github.com/FelineStateMachine/keyhome.git
-cd keyhome
+git clone https://github.com/FelineStateMachine/sigil.git
+cd sigil
 cargo tauri dev
 ```
 
@@ -47,8 +47,8 @@ On NVIDIA, set `WEBKIT_DISABLE_DMABUF_RENDERER=1` before running.
 ```bash
 brew install ffmpeg
 cargo install tauri-cli --version "^2"
-git clone https://github.com/FelineStateMachine/keyhome.git
-cd keyhome
+git clone https://github.com/FelineStateMachine/sigil.git
+cd sigil
 cargo tauri dev
 ```
 
@@ -59,14 +59,14 @@ Grant **Accessibility** and **Screen Recording** permissions in System Settings 
 ```powershell
 choco install ffmpeg
 cargo install tauri-cli --version "^2"
-git clone https://github.com/FelineStateMachine/keyhome.git
-cd keyhome
+git clone https://github.com/FelineStateMachine/sigil.git
+cd sigil
 cargo tauri dev
 ```
 
 ### Prebuilt binaries
 
-Download from the [releases page](https://github.com/FelineStateMachine/keyhome/releases).
+Download from the [releases page](https://github.com/FelineStateMachine/sigil/releases).
 
 ### Usage
 
@@ -86,8 +86,8 @@ Full setup details: [docs/SETUP.md](docs/SETUP.md)
 | [Architecture](docs/SETUP.md#architecture) | Transport, encoder backends, wire protocol, connection tracking |
 | [Spikes](docs/SETUP.md#spikes-evidence) | Seven viability spikes with pass/fail evidence |
 | [Agent Guide](AGENTS.md) | Development context for AI agents working on the codebase |
-| [FIDO2 HID Evidence](docs/evidence/2026-06-23-ctap-hid-fido2-titan-communication.md) | ctap-hid-fido2 communication with Google Titan |
-| [HMAC → Iroh Derivation](docs/evidence/2026-06-23-hmac-iroh-derivation.md) | Titan hmac-secret → Iroh SecretKey proof |
+| [FIDO2 HID Evidence](docs/evidence/2026-06-23-ctap-hid-fido2-titan-communication.md) | ctap-hid-fido2 communication with FIDO2 keys |
+| [HMAC → Iroh Derivation](docs/evidence/2026-06-23-hmac-iroh-derivation.md) | hmac-secret → Iroh SecretKey proof |
 | [Iroh Native Ping](docs/evidence/2026-06-23-iroh-native-ping.md) | Iroh connectivity between native endpoints |
 | [YubiKey HMAC Detection](docs/evidence/2026-06-23-yubikey-hmac-detection.md) | YubiKey HMAC-secret detection |
 | [FIDO2 HID vs hidraw](docs/evidence/2026-06-23-fido2-hid-raw-hidraw.md) | HID vs hidraw approach comparison |

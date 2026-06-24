@@ -3,11 +3,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 
-pub const FRAME_ALPN: &[u8] = b"keyhome/frame-stream/0";
-pub const INPUT_ALPN: &[u8] = b"keyhome/input-stream/0";
-pub const RPID: &str = "keyhome";
-pub const SALT_MESSAGE: &str = "keyhome-iroh-identity-v1";
-pub const KEYRING_SERVICE: &str = "keyhome";
+pub const FRAME_ALPN: &[u8] = b"sigil/frame-stream/0";
+pub const INPUT_ALPN: &[u8] = b"sigil/input-stream/0";
+pub const RPID: &str = "sigil";
+pub const SALT_MESSAGE: &str = "sigil-iroh-identity-v1";
+pub const KEYRING_SERVICE: &str = "sigil";
 pub const KEYRING_ENTRY: &str = "host-identity";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

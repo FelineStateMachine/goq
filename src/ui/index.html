@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>keyhome</title>
+  <title>sigil</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Inconsolata:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -447,10 +447,10 @@
   </style>
 </head>
 <body>
-  <!-- Tap titan overlay -->
+  <!-- Tap key overlay -->
   <div class="overlay-screen hidden" id="tap-overlay" style="z-index: 200;">
     <div class="overlay-content">
-      <h1 id="tap-overlay-title">tap titan</h1>
+      <h1 id="tap-overlay-title">tap key</h1>
       <p id="tap-overlay-desc">Touch the sensor on your key when it blinks.</p>
       <div class="overlay-status pending" id="tap-status">waiting...</div>
     </div>
@@ -459,7 +459,7 @@
   <!-- Intro screen -->
   <div class="overlay-screen hidden" id="intro">
     <div class="overlay-content">
-      <h1>keyhome</h1>
+      <h1>sigil</h1>
       <p id="intro-desc">type pin</p>
 
       <!-- Unregistered: register or connect -->
@@ -543,7 +543,7 @@
 
   <!-- Top bar -->
   <div class="topbar">
-    <span class="brand">keyhome</span>
+    <span class="brand">sigil</span>
     <span class="sep">·</span>
     <div class="status-line" id="status-line">
       <span class="dot" id="status-dot"></span>
@@ -710,7 +710,7 @@
     }
     function hideIntro() { document.getElementById('intro').classList.add('hidden'); }
     function showTap() {
-      document.getElementById('tap-overlay-title').textContent = 'tap titan';
+      document.getElementById('tap-overlay-title').textContent = 'tap key';
       document.getElementById('tap-overlay-desc').textContent = 'Touch the sensor on your key when it blinks.';
       document.getElementById('tap-status').textContent = 'waiting...';
       document.getElementById('tap-overlay').classList.remove('hidden');
@@ -770,7 +770,7 @@
       hideIntro();
       showTap();
       try {
-        const result = await invoke('titan_register_host', { pin });
+        const result = await invoke('key_register_host', { pin });
         if (result.registered) {
           hideTap();
           registered = true;

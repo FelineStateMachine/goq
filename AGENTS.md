@@ -1,6 +1,6 @@
-# Keyhome agent guide
+# Sigil agent guide
 
-Keyhome is a Tauri v2 remote desktop app with FIDO2 key authentication over Iroh P2P. The app is built and functional — spikes are done, the core flow works end to end.
+Sigil is a Tauri v2 remote desktop app with FIDO2 key authentication over Iroh P2P. The app is built and functional — spikes are done, the core flow works end to end.
 
 ## Current focus
 

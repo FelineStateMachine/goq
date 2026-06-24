@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
-use super::auth::{derive_iroh_secret_from_titan, load_identity_from_keyring};
+use super::auth::{derive_iroh_secret_from_key, load_identity_from_keyring};
 use super::input::{InputEvent, InputStreamHandler};
 use super::state::{AppState, HostState, INPUT_ALPN, FRAME_ALPN};
 use super::streaming::{byte_to_codec, FrameStreamHandler};
@@ -124,7 +124,7 @@ pub async fn iroh_client_connect(
     // FIDO2 derivation — 30s timeout so a missing/stuck key surfaces quickly
     let host_secret = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || derive_iroh_secret_from_titan(&pin)),
+        tokio::task::spawn_blocking(move || derive_iroh_secret_from_key(&pin)),
     )
     .await
     .map_err(|_| "Security key timed out (30s). Make sure your key is connected.".to_string())?

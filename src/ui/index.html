@@ -518,7 +518,7 @@
         <div class="info-row"><span class="info-label">pin retries</span><span class="info-value" id="fido-pin">—</span></div>
         <button class="link-btn" style="margin-top: 8px;" onclick="scanFido()">rescan</button>
       </div>
-      <div class="panel-section">
+      <div class="panel-section" id="encoder-section">
         <h3># encoder</h3>
         <div class="info-row">
           <span class="info-label">codec</span>
@@ -555,13 +555,19 @@
         <div class="info-row"><span class="info-label">available</span><span class="info-value" id="enc-available">—</span></div>
         <button class="link-btn" style="margin-top: 8px;" onclick="saveEncoderConfig()">apply</button>
       </div>
-      <div class="panel-section">
-        <h3># performance</h3>
+      <div class="panel-section" id="host-perf-section">
+        <h3># host performance</h3>
         <div class="info-row"><span class="info-label">frame time</span><span class="info-value" id="perf-encode">— ms</span></div>
         <div class="info-row"><span class="info-label">encoder</span><span class="info-value" id="perf-capture">—</span></div>
         <div class="info-row"><span class="info-label">frame size</span><span class="info-value" id="perf-size">— KB</span></div>
         <div class="info-row"><span class="info-label">fps</span><span class="info-value" id="perf-fps">—</span></div>
         <canvas id="encode-spark" width="260" height="48" style="width:100%;height:48px;margin-top:8px;display:block;"></canvas>
+      </div>
+      <div class="panel-section" id="stream-section" style="display:none;">
+        <h3># stream</h3>
+        <div class="info-row"><span class="info-label">codec</span><span class="info-value" id="stream-codec">—</span></div>
+        <div class="info-row"><span class="info-label">dropped</span><span class="info-value" id="stream-dropped">0</span></div>
+        <div class="info-row"><span class="info-label">received</span><span class="info-value" id="stream-received">0</span></div>
       </div>
       <div class="panel-section">
         <h3># registration</h3>
@@ -581,6 +587,17 @@
 
     const invoke = (...args) => window.__TAURI__.core.invoke(...args);
     const listen = (...args) => window.__TAURI__.event.listen(...args);
+
+    function updatePanelVisibility() {
+      const encSection = document.getElementById('encoder-section');
+      const hostPerfSection = document.getElementById('host-perf-section');
+      const streamSection = document.getElementById('stream-section');
+      // Show encoder config + host perf when hosting (or idle)
+      // Show stream stats when connected as client
+      encSection.style.display = connected ? 'none' : '';
+      hostPerfSection.style.display = connected ? 'none' : '';
+      streamSection.style.display = connected ? '' : 'none';
+    }
 
     // ─── Status ──────────────────────────────────────────────────────────
     function setStatus(state, text) {
@@ -717,6 +734,7 @@
         if (result.running) {
           hosting = true;
           setStatus('ok', 'hosting');
+          updatePanelVisibility();
           document.getElementById('node-id-text').textContent =
             result.node_id.substring(0, 16) + '...';
           // Show "stop hosting" disconnect button, hide main action
@@ -748,6 +766,7 @@
       } catch (e) { console.error(e); }
       hosting = false;
       setStatus('', 'idle');
+      updatePanelVisibility();
       document.getElementById('action-main').style.display = '';
       document.getElementById('action-main').textContent = registered ? 'host' : 'register';
       document.getElementById('action-unreg').style.display = registered ? '' : 'none';
@@ -786,6 +805,9 @@
         if (result.connected) {
           connected = true;
           setStatus('ok', 'connected');
+          droppedFrames = 0;
+          receivedFrames = 0;
+          updatePanelVisibility();
           document.getElementById('node-id-text').textContent =
             result.host_node_id.substring(0, 16) + '...';
           document.getElementById('frame-canvas').style.display = 'block';
@@ -816,6 +838,7 @@
       connected = false;
       controlMode = false;
       updateControlUI();
+      updatePanelVisibility();
       setStatus('', 'idle');
       document.getElementById('frame-canvas').style.display = 'none';
       document.getElementById('placeholder').classList.remove('hidden');
@@ -984,7 +1007,9 @@
     // WebCodecs expects length-prefixed NALs + description record.
     // AV1 uses OBU format directly.
 
-    let activeCodec = 'h264'; // updated from host-codec event
+    let activeCodec = 'h264'; // updated from frame payload
+    let droppedFrames = 0;
+    let receivedFrames = 0;
 
     function parseAnnexBNals(data) {
       const nals = [];
@@ -1233,23 +1258,31 @@
     const canvas = document.getElementById('frame-canvas');
     const ctx = canvas.getContext('2d');
 
-    listen('host-codec', (event) => {
-      activeCodec = event.payload || 'h264';
-      console.log('host codec:', activeCodec);
-      // Reset decoder — new codec needs new config
-      decoderConfigured = false;
-      if (videoDecoder) {
-        try { videoDecoder.close(); } catch(_) {}
-        videoDecoder = null;
-      }
-    });
+    function updateStreamStats() {
+      document.getElementById('stream-received').textContent = receivedFrames;
+      document.getElementById('stream-dropped').textContent = droppedFrames;
+      document.getElementById('stream-codec').textContent = activeCodec;
+    }
 
     listen('frame', (event) => {
-      const { width, height, data } = event.payload;
+      const { width, height, data, codec } = event.payload;
       frameWidth = width;
       frameHeight = height;
       if (canvas.width !== width) canvas.width = width;
       if (canvas.height !== height) canvas.height = height;
+
+      // Update codec from payload — reset decoder if codec changed
+      if (codec && codec !== activeCodec) {
+        activeCodec = codec;
+        decoderConfigured = false;
+        if (videoDecoder) {
+          try { videoDecoder.close(); } catch(_) {}
+          videoDecoder = null;
+        }
+        console.log('codec changed:', activeCodec);
+      }
+
+      receivedFrames++;
 
       if (hasWebCodecs) {
         const raw = Uint8Array.from(atob(data), c => c.charCodeAt(0));
@@ -1268,7 +1301,11 @@
             }
           }
 
-          if (!decoderConfigured || !videoDecoder) return;
+          if (!decoderConfigured || !videoDecoder) {
+            droppedFrames++;
+            updateStreamStats();
+            return;
+          }
 
           // Filter out TD and sequence header OBUs — already in description
           const frameObus = obus.filter(o => o.type !== 2 && o.type !== 12);
@@ -1285,7 +1322,7 @@
               timestamp: performance.now() * 1000,
               data: chunkData,
             });
-            try { videoDecoder.decode(chunk); } catch (e) { console.warn('av1 decode failed:', e); }
+            try { videoDecoder.decode(chunk); } catch (e) { droppedFrames++; console.warn('av1 decode failed:', e); }
           }
 
         } else if (activeCodec === 'h265') {
@@ -1307,7 +1344,11 @@
             }
           }
 
-          if (!decoderConfigured || !videoDecoder) return;
+          if (!decoderConfigured || !videoDecoder) {
+            droppedFrames++;
+            updateStreamStats();
+            return;
+          }
 
           // Filter out VPS/SPS/PPS/AUD — already in description
           const sliceNals = nals.filter(nal => {
@@ -1321,7 +1362,7 @@
               timestamp: performance.now() * 1000,
               data: lpData,
             });
-            try { videoDecoder.decode(chunk); } catch (e) { console.warn('hevc decode failed:', e); }
+            try { videoDecoder.decode(chunk); } catch (e) { droppedFrames++; console.warn('hevc decode failed:', e); }
           }
 
         } else {
@@ -1342,7 +1383,11 @@
             }
           }
 
-          if (!decoderConfigured || !videoDecoder) return;
+          if (!decoderConfigured || !videoDecoder) {
+            droppedFrames++;
+            updateStreamStats();
+            return;
+          }
 
           // Filter out SPS/PPS/AUD — already in description
           const sliceNals = nals.filter(nal => {
@@ -1356,7 +1401,7 @@
               timestamp: performance.now() * 1000,
               data: lpData,
             });
-            try { videoDecoder.decode(chunk); } catch (e) { console.warn('h264 decode failed:', e); }
+            try { videoDecoder.decode(chunk); } catch (e) { droppedFrames++; console.warn('h264 decode failed:', e); }
           }
         }
       } else {
@@ -1371,6 +1416,8 @@
         };
         img.src = url;
       }
+
+      updateStreamStats();
     });
 
     listen('frame-stats', (event) => {

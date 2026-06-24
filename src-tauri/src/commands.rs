@@ -43,6 +43,22 @@ const N0_RELAY: &str = "https://usw1-1.relay.n0.iroh.link./";
 const KEYRING_SERVICE: &str = "keyhome";
 const KEYRING_ENTRY: &str = "host-identity";
 
+fn codec_to_byte(codec: &str) -> u8 {
+    match codec {
+        "h265" => 1,
+        "av1" => 2,
+        _ => 0,
+    }
+}
+
+fn byte_to_codec(b: u8) -> &'static str {
+    match b {
+        1 => "h265",
+        2 => "av1",
+        _ => "h264",
+    }
+}
+
 // ─── Keyring Persistence ─────────────────────────────────────────────────────
 
 fn store_identity_in_keyring(secret: &[u8; 32]) -> anyhow::Result<()> {
@@ -1118,7 +1134,7 @@ async fn stream_frames_ffmpeg(
                         let frame_ms = now.duration_since(last_frame_time).as_secs_f64() * 1000.0;
                         last_frame_time = now;
 
-                        // Header: width(4) + height(4) + size(4) + is_keyframe(1) = 13 bytes
+                        // Header: width(4) + height(4) + size(4) + keyframe(1) + codec(1) = 14 bytes
                         let header = [
                             (width as u32).to_be_bytes(),
                             (height as u32).to_be_bytes(),
@@ -1126,9 +1142,10 @@ async fn stream_frames_ffmpeg(
                         ]
                         .concat();
                         let kf_byte = if is_keyframe { 1u8 } else { 0u8 };
+                        let codec_byte = codec_to_byte(&config.codec);
 
                         send.write_all(&header).await?;
-                        send.write_all(&[kf_byte]).await?;
+                        send.write_all(&[kf_byte, codec_byte]).await?;
                         send.write_all(frame_data).await?;
 
                         frame_count += 1;
@@ -1218,7 +1235,7 @@ async fn stream_frames_xcap(
         let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
         let h264_size = h264_data.len();
 
-        // Header: width(4) + height(4) + size(4) + is_keyframe(1) = 13 bytes
+        // Header: width(4) + height(4) + size(4) + keyframe(1) + codec(1) = 14 bytes
         let header = [
             (w as u32).to_be_bytes(),
             (h as u32).to_be_bytes(),
@@ -1228,7 +1245,7 @@ async fn stream_frames_xcap(
         let kf_byte = if is_keyframe { 1u8 } else { 0u8 };
 
         send.write_all(&header).await?;
-        send.write_all(&[kf_byte]).await?;
+        send.write_all(&[kf_byte, 0u8]).await?; // xcap path is always h264
         send.write_all(&h264_data).await?;
 
         frame_count += 1;
@@ -1362,6 +1379,7 @@ pub struct FramePayload {
     pub height: u32,
     pub data: String,
     pub keyframe: bool,
+    pub codec: String,
 }
 
 #[derive(Serialize)]
@@ -1484,7 +1502,7 @@ pub async fn iroh_client_connect(
         };
 
         loop {
-            let mut header = [0u8; 13];
+            let mut header = [0u8; 14];
             if frame_recv.read_exact(&mut header).await.is_err() {
                 let _ = app.emit("frame-error", "Connection lost");
                 break;
@@ -1495,6 +1513,7 @@ pub async fn iroh_client_connect(
             let h264_len =
                 u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
             let is_keyframe = header[12] == 1;
+            let codec = byte_to_codec(header[13]).to_string();
 
             let mut h264_buf = vec![0u8; h264_len];
             if frame_recv.read_exact(&mut h264_buf).await.is_err() {
@@ -1507,7 +1526,7 @@ pub async fn iroh_client_connect(
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&h264_buf);
                 let _ = app.emit(
                     "frame",
-                    FramePayload { width: w, height: h, data: b64, keyframe: is_keyframe },
+                    FramePayload { width: w, height: h, data: b64, keyframe: is_keyframe, codec: codec.clone() },
                 );
 
                 frame_count += 1;
@@ -1541,7 +1560,7 @@ pub async fn iroh_client_connect(
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
                         let _ = app.emit(
                             "frame",
-                            FramePayload { width: yw as u32, height: yh as u32, data: b64, keyframe: is_keyframe },
+                            FramePayload { width: yw as u32, height: yh as u32, data: b64, keyframe: is_keyframe, codec: codec.clone() },
                         );
 
                         frame_count += 1;

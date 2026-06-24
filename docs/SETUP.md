@@ -25,6 +25,9 @@ sudo apt install -y libudev-dev libusb-1.0-0-dev pkg-config
 
 # xcap Wayland support (needed even on X11)
 sudo apt install -y libwayland-dev libpipewire-0.3-dev libgbm-dev
+
+# ffmpeg — screen capture + hardware encoding (NVENC/VAAPI)
+sudo apt install -y ffmpeg
 ```
 
 If you are on Linux with an NVIDIA GPU, set this environment variable before running or building:
@@ -39,6 +42,9 @@ Install the Tauri CLI (v2):
 
 ```bash
 cargo install tauri-cli --version "^2"
+
+# ffmpeg — screen capture + hardware encoding (VideoToolbox)
+brew install ffmpeg
 ```
 
 Grant the following permissions in **System Settings > Privacy & Security**:
@@ -95,9 +101,10 @@ Click **Connect** and tap your Titan key. The app derives the same host endpoint
 ## Architecture
 
 - **Transport**: Iroh 1.0 (peer-to-peer, relay-assisted)
-- **Screen capture**: xcap (X11/PipeWire on Linux, CoreGraphics on macOS)
+- **Screen capture + encoding**: ffmpeg subprocess (x11grab + NVENC/VAAPI on Linux, avfoundation + VideoToolbox on macOS)
+- **Fallback**: xcap capture + openh264 software encoding (if ffmpeg not installed)
 - **FIDO2**: ctap-hid-fido2 (CTAP 2.0/2.1 over HID)
-- **Frame encoding**: H.264 via openh264
+- **Frame encoding**: H.264 (ffmpeg/NVENC primary, openh264 fallback for client-side decode)
 - **Input injection**: enigo (cross-platform mouse/keyboard)
 - **Protocol**: BiStream with frame header `[width:u32][height:u32][h264_len:u32][keyframe:u8][h264_data]`
 - **Identity**: Iroh SecretKey derived from Titan hmac-secret extension; no address copy/paste

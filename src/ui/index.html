@@ -486,13 +486,15 @@
     </div>
   </div>
 
-  <!-- Bottom bar -->
+    <!-- Bottom bar -->
   <div class="bottombar">
     <span class="action primary" id="action-main" onclick="mainAction()">host</span>
     <span class="sep hidden" id="sep-disconnect-main">·</span>
     <span class="action danger hidden" id="action-disconnect" onclick="disconnect()">disconnect</span>
     <span class="sep hidden" id="sep-disconnect">·</span>
     <span class="action" id="action-unreg" onclick="unregister()">unregister</span>
+    <span class="action danger hidden" id="action-unreg-confirm" onclick="unregisterConfirm()">yes</span>
+    <span class="action hidden" id="action-unreg-cancel" onclick="unregisterCancel()">no</span>
     <div class="spacer"></div>
     <span class="pin-label" id="pin-label">pin</span>
     <input class="pin-input" id="pin-input" type="password" placeholder="····" autocomplete="off" />
@@ -855,8 +857,22 @@
     }
 
     // ─── Unregister ─────────────────────────────────────────────────────
-    async function unregister() {
-      if (!confirm('Remove identity from keyring?')) return;
+    function unregister() {
+      // Show inline yes/no instead of confirm dialog
+      document.getElementById('action-unreg').style.display = 'none';
+      document.getElementById('action-unreg-confirm').classList.remove('hidden');
+      document.getElementById('action-unreg-cancel').classList.remove('hidden');
+    }
+
+    function unregisterCancel() {
+      document.getElementById('action-unreg-confirm').classList.add('hidden');
+      document.getElementById('action-unreg-cancel').classList.add('hidden');
+      document.getElementById('action-unreg').style.display = '';
+    }
+
+    async function unregisterConfirm() {
+      document.getElementById('action-unreg-confirm').classList.add('hidden');
+      document.getElementById('action-unreg-cancel').classList.add('hidden');
       try {
         await invoke('host_unregister');
         registered = false;
@@ -869,6 +885,7 @@
         showIntro();
       } catch (e) {
         alert('unregister failed: ' + e);
+        document.getElementById('action-unreg').style.display = '';
       }
     }
 
@@ -1084,7 +1101,8 @@
 
     function buildHvcDescription(vps, sps, pps) {
       // hvcC record format (ISO 14496-15 8.3.3.1.2)
-      const buf = new Uint8Array(23 + 3 + vps.length + sps.length + pps.length);
+      // Header: 23 bytes. Per array: 1 (type) + 2 (count) + 2 (length) + nal data = 5 + nal
+      const buf = new Uint8Array(23 + 15 + vps.length + sps.length + pps.length);
       let off = 0;
       buf[off++] = 1;              // configurationVersion
       // profile space(2) + tier(1) + profile_idc(5)

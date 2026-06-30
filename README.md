@@ -52,7 +52,7 @@ choco install ffmpeg
 ### Install
 
 ```bash
-cargo install --git https://args.io/cat/sigil
+cargo install --git https://args.io/cat/sigil sigil
 ```
 
 ### Usage

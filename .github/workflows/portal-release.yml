@@ -45,7 +45,9 @@ jobs:
     environment:
       name: main
     permissions:
+      attestations: write
       contents: write
+      id-token: write
     env:
       RELEASE_TAG: ${{ inputs.tag }}
     steps:
@@ -54,6 +56,11 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
+
+      - name: Require workflow execution from the exact tag
+        run: |
+          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
 
       - name: Verify native arm64 runner
         run: |
@@ -112,6 +119,11 @@ jobs:
           ./scripts/package-macos-client.sh \
             --release-tag "$RELEASE_TAG" \
             --output-dir "$release_dir"
+
+      - name: Attest exact Portal build provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.1.0
+        with:
+          subject-path: '${{ runner.temp }}/portal-release/Portal-*'
 
       - name: Require the exact Sigil candidate draft
         env:

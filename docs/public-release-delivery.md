@@ -137,6 +137,12 @@ notarization credentials only in the protected GitHub `main` environment with
 required reviewers. The release workflow uses those secrets only in its macOS
 arm64 publication job.
 
+Pin the public Apple TeamIdentifier in `release/portal-apple-team-id.txt` before
+the first tag. The protected secret, produced app signature, promotion verifier,
+and UAT verifier must all equal that committed value. The Portal tag-ref build
+also emits GitHub artifact attestations; promotion requires each of the three
+Portal assets to verify against the exact workflow, tag ref, and source commit.
+
 The first release automation must verify that the git tag, every Cargo package
 version, Tauri version, artifact filenames, and manifests agree before it
 publishes the GitHub Release. Upload every required asset to a draft release,

@@ -200,6 +200,10 @@ class PortalReleaseVerifierTests(unittest.TestCase):
         self.assertIn("release-assets", workflow)
         self.assertIn("Require the exact Sigil candidate draft", workflow)
         self.assertIn("five-asset pre-signature contract", workflow)
+        self.assertIn("actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6", workflow)
+        self.assertIn('test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"', workflow)
+        self.assertIn("attestations: write", workflow)
+        self.assertIn("id-token: write", workflow)
         self.assertNotIn("release create", workflow)
         self.assertNotIn("--draft=false --prerelease", workflow)
         self.assertNotIn("demo-direct-node", workflow)
@@ -211,6 +215,11 @@ class PortalReleaseVerifierTests(unittest.TestCase):
         self.assertIn("verify-portal-release.py assets", sigil_workflow)
         self.assertIn("runs-on: macos-26", sigil_workflow)
         self.assertIn("verify-macos-portal-signature.sh", sigil_workflow)
+        self.assertIn("gh attestation verify", sigil_workflow)
+        self.assertIn("--signer-workflow", sigil_workflow)
+        self.assertIn("--source-ref", sigil_workflow)
+        self.assertIn("--source-digest", sigil_workflow)
+        self.assertIn("portal-apple-team-id.txt", sigil_workflow)
         self.assertLess(
             sigil_workflow.index("verify-portal-release.py assets"),
             sigil_workflow.index("--draft=false"),
@@ -224,6 +233,14 @@ class PortalReleaseVerifierTests(unittest.TestCase):
         self.assertIn('[[ "$architectures" == arm64 ]]', package)
         self.assertNotIn("--expected-arch", package)
         self.assertNotIn("--features", package)
+        self.assertIn("portal-apple-team-id.txt", package)
+        self.assertIn('[[ "${APPLE_TEAM_ID:-}" == "$expected_team_id" ]]', package)
+
+        native_verifier = (REPO_DIR / "scripts" / "verify-macos-portal-signature.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--expected-team-id", native_verifier)
+        self.assertIn('[[ "$team_identifier" == "$expected_team_id" ]]', native_verifier)
 
 
 if __name__ == "__main__":

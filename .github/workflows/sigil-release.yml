@@ -194,17 +194,30 @@ jobs:
             --public-key-file "$GITHUB_WORKSPACE/release/sigil-minisign.pub"
 
       - name: Verify signed Portal assets against the same source tag
+        env:
+          PORTAL_APPLE_TEAM_ID: ${{ secrets.PORTAL_APPLE_TEAM_ID }}
         run: |
           portal_dir="$RUNNER_TEMP/portal-release"
           install -d -m 0700 "$portal_dir"
           gh release download "$RELEASE_TAG" --dir "$portal_dir" --pattern 'Portal-*'
+          expected_team_id="$(<release/portal-apple-team-id.txt)"
+          test "$PORTAL_APPLE_TEAM_ID" = "$expected_team_id"
           python3 scripts/verify-portal-release.py assets \
             --repo-dir "$GITHUB_WORKSPACE" \
             --release-tag "$RELEASE_TAG" \
             --asset-dir "$portal_dir"
+          for asset in "$portal_dir"/*; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/portal-release.yml" \
+              --source-ref "refs/tags/$RELEASE_TAG" \
+              --source-digest "${{ steps.source.outputs.commit }}" \
+              --deny-self-hosted-runners > /dev/null
+          done
           ./scripts/verify-macos-portal-signature.sh \
             --dmg "$portal_dir/Portal-${RELEASE_TAG#v}-arm64.dmg" \
-            --expected-version "${RELEASE_TAG#v}"
+            --expected-version "${RELEASE_TAG#v}" \
+            --expected-team-id "$expected_team_id"
 
       - name: Publish verified prerelease
         run: |

@@ -65,7 +65,7 @@ if find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
   die "output directory must be empty"
 fi
 
-for command in cargo codesign find git grep hdiutil lipo plutil python3 rustup security shasum spctl xcrun; do
+for command in cargo codesign find git grep hdiutil lipo plutil python3 rustup security sed shasum spctl xcrun; do
   command -v "$command" >/dev/null 2>&1 || die "$command is required"
 done
 
@@ -80,6 +80,14 @@ signing_identity="${APPLE_SIGNING_IDENTITY:-}"
   || die "APPLE_SIGNING_IDENTITY must name a Developer ID Application identity"
 security find-identity -v -p codesigning | grep -Fq "\"$signing_identity\"" \
   || die "APPLE_SIGNING_IDENTITY is not available in the keychain"
+expected_team_id_file="$repo_dir/release/portal-apple-team-id.txt"
+[[ -f "$expected_team_id_file" && ! -L "$expected_team_id_file" ]] \
+  || die "committed Portal Apple team identifier is missing or unsafe"
+expected_team_id="$(<"$expected_team_id_file")"
+[[ "$expected_team_id" =~ ^[A-Z0-9]{10}$ ]] \
+  || die "release/portal-apple-team-id.txt must contain one Apple TeamIdentifier"
+[[ "${APPLE_TEAM_ID:-}" == "$expected_team_id" ]] \
+  || die "APPLE_TEAM_ID does not match the committed Portal signer"
 
 api_credentials=false
 apple_id_credentials=false
@@ -113,8 +121,9 @@ codesign --verify --deep --strict --verbose=2 "$app_path"
 signature_details="$(codesign -d --verbose=4 "$app_path" 2>&1)"
 grep -Fq "Authority=$signing_identity" <<<"$signature_details" \
   || die "application is not signed by the configured Developer ID identity"
-grep -Eq '^TeamIdentifier=[A-Z0-9]+$' <<<"$signature_details" \
-  || die "application signature has no TeamIdentifier"
+team_identifier="$(sed -n 's/^TeamIdentifier=//p' <<<"$signature_details")"
+[[ "$team_identifier" == "$expected_team_id" ]] \
+  || die "application TeamIdentifier does not match the committed Portal signer"
 grep -Eq '^flags=.*runtime' <<<"$signature_details" \
   || die "application signature does not enable hardened runtime"
 spctl --assess --type execute --verbose=4 "$app_path"

@@ -8,15 +8,17 @@ die() {
 }
 
 usage() {
-  printf 'Usage: %s --dmg /absolute/path/Portal-VERSION-arm64.dmg [--expected-version VERSION]\n' "$0"
+  printf 'Usage: %s --dmg /absolute/path/Portal-VERSION-arm64.dmg --expected-team-id TEAMID [--expected-version VERSION]\n' "$0"
 }
 
 dmg=''
 expected_version=''
+expected_team_id=''
 while (($#)); do
   case "$1" in
     --dmg) [[ $# -ge 2 ]] || die "$1 requires a value"; dmg="$2"; shift 2 ;;
     --expected-version) [[ $# -ge 2 ]] || die "$1 requires a value"; expected_version="$2"; shift 2 ;;
+    --expected-team-id) [[ $# -ge 2 ]] || die "$1 requires a value"; expected_team_id="$2"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -24,7 +26,8 @@ done
 
 [[ "$(uname -s)" == Darwin ]] || die 'verification must run on macOS'
 [[ "$dmg" == /* && -f "$dmg" && ! -L "$dmg" ]] || die 'DMG must be an absolute regular file'
-for command_name in codesign find grep hdiutil lipo plutil spctl xcrun; do
+[[ "$expected_team_id" =~ ^[A-Z0-9]{10}$ ]] || die 'expected Apple TeamIdentifier is required'
+for command_name in codesign find grep hdiutil lipo plutil sed spctl xcrun; do
   command -v "$command_name" >/dev/null 2>&1 || die "$command_name is required"
 done
 
@@ -57,8 +60,9 @@ codesign --verify --deep --strict --verbose=4 "$app_path"
 signature_details="$(codesign -d --verbose=4 "$app_path" 2>&1)"
 grep -Eq '^Authority=Developer ID Application:' <<<"$signature_details" \
   || die 'application is not signed by a Developer ID Application identity'
-grep -Eq '^TeamIdentifier=[A-Z0-9]+$' <<<"$signature_details" \
-  || die 'application signature has no team identifier'
+team_identifier="$(sed -n 's/^TeamIdentifier=//p' <<<"$signature_details")"
+[[ "$team_identifier" == "$expected_team_id" ]] \
+  || die 'application TeamIdentifier does not match the pinned Portal signer'
 grep -Eq '^flags=.*runtime' <<<"$signature_details" \
   || die 'application signature does not enable hardened runtime'
 spctl --assess --type execute --verbose=4 "$app_path"

@@ -29,6 +29,14 @@ the repository, workflow artifacts, release notes, or website manifest. The
 workflow imports the certificate into an ephemeral keychain and removes it in
 an always-running cleanup step.
 
+The Apple team identifier itself is public release policy, not a credential.
+Before the first release tag, replace `unconfigured` in
+`release/portal-apple-team-id.txt` with the exact ten-character TeamIdentifier
+for the protected Developer ID certificate. The protected
+`PORTAL_APPLE_TEAM_ID` secret must match that committed pin. Packaging,
+promotion, and hardware UAT all fail closed if the pin is missing, malformed,
+or different from the application signature.
+
 ## Prepare an exact tag
 
 Choose a SemVer tag such as `v0.3.0-alpha.1`. Before tagging, update every
@@ -46,7 +54,9 @@ python3 scripts/verify-portal-release.py website \
 ./scripts/verify-website.sh
 ```
 
-Create and push the tag only from the reviewed clean release commit. First run
+Create and push the tag only from the reviewed clean release commit. Dispatch
+the workflows from that tag ref, not from `main`; the Portal build refuses to
+attest an input tag checked out by a different workflow ref. First run
 the **Sigil Release** workflow with `build-candidate`; it creates the shared
 draft release and attaches the two verified Sigil candidate assets. Then
 manually run **Portal release** for the same tag. Both workflows share a
@@ -62,24 +72,29 @@ The workflow performs this fail-closed sequence:
 3. Builds without feature flags and requires Developer ID Application signing,
    hardened runtime, notarization, app and DMG stapling, strict code-signature
    verification, and Gatekeeper acceptance.
-4. Confirms the executable contains only arm64 and that the DMG, digest, and
-   JSON manifest agree with the source tag and commit.
-5. Requires the existing draft to contain exactly the two Sigil candidate
+4. Confirms the executable contains only arm64, the Apple TeamIdentifier equals
+   the committed signer pin, and the DMG, digest, and JSON manifest agree with
+   the source tag and commit.
+5. Creates GitHub/Sigstore build-provenance attestations for the exact three
+   Portal assets from the protected tag-ref workflow.
+6. Requires the existing draft to contain exactly the two Sigil candidate
    assets, then uploads exactly:
 
    - `Portal-VERSION-arm64.dmg`
    - `Portal-VERSION-arm64.dmg.sha256`
    - `Portal-VERSION-arm64.json`
 
-6. Reads GitHub's remote asset list and requires the exact five-file combined
+7. Reads GitHub's remote asset list and requires the exact five-file combined
    pre-signature set. It deliberately leaves the release as a draft.
 
 The operator next attaches the offline Sigil `.minisig`. The **Sigil Release**
 `promote-signed-draft` operation requires exactly all six Portal and Sigil
 assets, re-verifies the Sigil signature/archive/provenance and Portal
-digest/manifest against the same tag, mounts the downloaded DMG on a native
-arm64 macOS runner, repeats Developer ID/Gatekeeper/stapling checks, and only
-then publishes the prerelease with final notes.
+digest/manifest against the same tag, verifies every Portal asset's attestation
+against the exact Portal workflow, source tag, and source commit, mounts the
+downloaded DMG on a native arm64 macOS runner, repeats the pinned Developer ID,
+Gatekeeper, and stapling checks, and only then publishes the prerelease with
+final notes.
 
 If signing, upload, or remote verification fails, the shared release remains a
 draft for diagnosis. Do not replace assets on an existing tag; fix the source,

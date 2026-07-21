@@ -24,7 +24,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId};
 use sigil_protocol::{
     AUDIO_ALPN_V1, INPUT_ALPN_V1, InvitationGrants, MAX_INVITATION_TTL_SECS, MEDIA_ALPN_V1,
-    MEDIA_ALPN_V2, SignedInvitation,
+    MEDIA_ALPN_V2, MEDIA_ALPN_V3, SignedInvitation,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -35,7 +35,9 @@ use crate::authorization::{
 use crate::config::{HostConfig, InputMode, VideoSource};
 use crate::cursor::PointerPositionTracker;
 use crate::input::InputBackend;
-use crate::server::{AudioHandler, InputHandler, MediaHandler, MediaV2Handler, SessionRegistry};
+use crate::server::{
+    AudioHandler, InputHandler, MediaHandler, MediaV2Handler, MediaV3Handler, SessionRegistry,
+};
 
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
@@ -637,6 +639,14 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
 
     let sessions = Arc::new(SessionRegistry::default());
     let router = Router::builder(endpoint)
+        .accept(
+            MEDIA_ALPN_V3,
+            MediaV3Handler {
+                config: config.clone(),
+                sessions: Arc::clone(&sessions),
+                authorization: authorization.clone(),
+            },
+        )
         .accept(
             MEDIA_ALPN_V2,
             MediaV2Handler {

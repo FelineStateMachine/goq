@@ -50,6 +50,7 @@ fn main() {
             commands::auth::key_derive_identity,
             commands::state::development_connection_mode,
             commands::state::set_client_cursor_grab,
+            commands::state::set_client_window_size,
             commands::state::set_webcodecs_available,
             commands::state::is_webcodecs_available,
             commands::network::iroh_client_connect,

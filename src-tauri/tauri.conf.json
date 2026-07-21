@@ -12,6 +12,7 @@
         "title": "Sigil Spark",
         "width": 1024,
         "height": 768,
+        "maximized": true,
         "resizable": true,
         "visible": false
       }

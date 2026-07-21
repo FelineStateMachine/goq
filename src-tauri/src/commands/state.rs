@@ -394,6 +394,53 @@ pub fn development_connection_mode(state: tauri::State<'_, AppState>) -> Develop
     }
 }
 
+fn validate_client_window_size(width: f64, height: f64) -> Result<(f64, f64), String> {
+    const MIN_WIDTH: f64 = 480.0;
+    const MIN_HEIGHT: f64 = 320.0;
+    const MAX_DIMENSION: f64 = 8192.0;
+    if !width.is_finite()
+        || !height.is_finite()
+        || width.fract() != 0.0
+        || height.fract() != 0.0
+        || !(MIN_WIDTH..=MAX_DIMENSION).contains(&width)
+        || !(MIN_HEIGHT..=MAX_DIMENSION).contains(&height)
+    {
+        return Err("Client window size is outside the supported logical bounds".to_owned());
+    }
+    Ok((width, height))
+}
+
+#[tauri::command]
+pub fn set_client_window_size(
+    window: tauri::WebviewWindow,
+    logical_width: f64,
+    logical_height: f64,
+    unmaximize: bool,
+) -> Result<bool, String> {
+    let (width, height) = validate_client_window_size(logical_width, logical_height)?;
+    if window
+        .is_fullscreen()
+        .map_err(|error| format!("Could not inspect client fullscreen state: {error}"))?
+    {
+        return Ok(false);
+    }
+    if window
+        .is_maximized()
+        .map_err(|error| format!("Could not inspect client maximize state: {error}"))?
+    {
+        if !unmaximize {
+            return Ok(false);
+        }
+        window
+            .unmaximize()
+            .map_err(|error| format!("Could not restore the client window: {error}"))?;
+    }
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|error| format!("Could not set the client stream geometry: {error}"))?;
+    Ok(true)
+}
+
 #[tauri::command]
 pub fn set_client_cursor_grab(window: tauri::WebviewWindow, grab: bool) -> Result<bool, String> {
     if grab {
@@ -452,6 +499,19 @@ mod tests {
         assert!(should_apply_native_cursor_association(false, true));
         assert!(should_apply_native_cursor_association(true, false));
         assert!(!should_apply_native_cursor_association(false, false));
+    }
+
+    #[test]
+    fn client_window_size_requires_bounded_integral_logical_dimensions() {
+        assert_eq!(
+            validate_client_window_size(1280.0, 864.0).unwrap(),
+            (1280.0, 864.0)
+        );
+        assert!(validate_client_window_size(479.0, 864.0).is_err());
+        assert!(validate_client_window_size(1280.0, 319.0).is_err());
+        assert!(validate_client_window_size(8193.0, 864.0).is_err());
+        assert!(validate_client_window_size(1280.5, 864.0).is_err());
+        assert!(validate_client_window_size(f64::NAN, 864.0).is_err());
     }
 
     #[test]

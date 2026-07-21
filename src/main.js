@@ -82,6 +82,11 @@ import {
   selectPreferredController,
   toGamepadInputState,
 } from './controller-state.mjs';
+import {
+  constrainStreamWindowResize,
+  fitInitialStreamWindow,
+  fitStreamSurface,
+} from './window-geometry.mjs';
 
 let controlMode = false;
 let connected = false;
@@ -99,6 +104,9 @@ let inputCapabilities = {
 };
 let frameWidth = 0;
 let frameHeight = 0;
+let fittedStreamDimensions = null;
+let lastObservedWindowSize = null;
+let streamWindowResizeTimer = null;
 let pointerSurfaceDimensions = null;
 let remotePointerPosition = null;
 let remotePointerVisible = false;
@@ -712,6 +720,7 @@ async function connectHost() {
       document.getElementById('frame-canvas').style.display = 'block';
       document.getElementById('placeholder').classList.add('hidden');
       document.getElementById('control-bar').classList.add('visible');
+      void fitWindowToIncomingStream();
       updateControlUI();
       // Land controller users on the deliberate view-only/control boundary.
       // The connect button is hidden at this point, so retaining its focus
@@ -797,6 +806,10 @@ async function disconnect() {
     control: false,
   };
   pointerSurfaceDimensions = null;
+  fittedStreamDimensions = null;
+  lastObservedWindowSize = null;
+  if (streamWindowResizeTimer !== null) clearTimeout(streamWindowResizeTimer);
+  streamWindowResizeTimer = null;
   remotePointerPosition = null;
   remotePointerVisible = false;
   clearPendingInput();
@@ -1154,16 +1167,100 @@ setInterval(() => {
   if (connected) updateStreamStats();
 }, 250);
 
+function clientChromeHeight() {
+  const topbar = document.querySelector('.topbar');
+  const bottombar = document.querySelector('.bottombar');
+  return Math.max(0, (topbar?.offsetHeight ?? 0) + (bottombar?.offsetHeight ?? 0));
+}
+
+function sizeCanvasToIncomingStream() {
+  if (frameWidth < 1 || frameHeight < 1) return;
+  const main = canvas.parentElement;
+  if (!main) return;
+  const bounds = main.getBoundingClientRect();
+  if (bounds.width <= 0 || bounds.height <= 0) return;
+  const surface = fitStreamSurface({
+    frameWidth,
+    frameHeight,
+    availableWidth: bounds.width,
+    availableHeight: bounds.height,
+  });
+  canvas.style.width = `${surface.width}px`;
+  canvas.style.height = `${surface.height}px`;
+}
+
+async function applyClientWindowGeometry(geometry, unmaximize) {
+  try {
+    const applied = await invoke('set_client_window_size', {
+      logicalWidth: geometry.width,
+      logicalHeight: geometry.height,
+      unmaximize,
+    });
+    if (applied) lastObservedWindowSize = { ...geometry };
+    return applied;
+  } catch (error) {
+    console.warn('could not apply stream window geometry:', error);
+    return false;
+  }
+}
+
+async function fitWindowToIncomingStream() {
+  if (!connected || frameWidth < 1 || frameHeight < 1) return false;
+  const dimensions = `${frameWidth}x${frameHeight}`;
+  if (fittedStreamDimensions === dimensions) return false;
+  const geometry = fitInitialStreamWindow({
+    frameWidth,
+    frameHeight,
+    chromeHeight: clientChromeHeight(),
+    availableWidth: window.screen.availWidth,
+    availableHeight: window.screen.availHeight,
+  });
+  const applied = await applyClientWindowGeometry(geometry, true);
+  if (applied) fittedStreamDimensions = dimensions;
+  return applied;
+}
+
+function scheduleStreamWindowAspectCorrection() {
+  const observed = { width: window.innerWidth, height: window.innerHeight };
+  const previous = lastObservedWindowSize ?? observed;
+  lastObservedWindowSize = observed;
+  if (streamWindowResizeTimer !== null) clearTimeout(streamWindowResizeTimer);
+  streamWindowResizeTimer = setTimeout(() => {
+    streamWindowResizeTimer = null;
+    if (!connected || frameWidth < 1 || frameHeight < 1) return;
+    const current = { width: window.innerWidth, height: window.innerHeight };
+    let geometry;
+    try {
+      geometry = constrainStreamWindowResize({
+        frameWidth,
+        frameHeight,
+        chromeHeight: clientChromeHeight(),
+        width: current.width,
+        height: current.height,
+        previousWidth: previous.width,
+        previousHeight: previous.height,
+      });
+    } catch (error) {
+      console.warn('could not constrain stream window geometry:', error);
+      return;
+    }
+    if (geometry !== null) void applyClientWindowGeometry(geometry, false);
+  }, 80);
+}
+
 function processFramePayload(payload, binaryData = null) {
   const receivedAt = performance.now();
   frontendDeliveryRate.record(receivedAt);
   frontendDeliveryCadence.record(receivedAt);
   const { width, height, data, codec, keyframe, pts_micros: ptsMicros, discontinuity } = payload;
   if (discontinuity) resetAvSyncTelemetry();
+  const dimensionsChanged = frameWidth !== width || frameHeight !== height;
   frameWidth = width;
   frameHeight = height;
   if (canvas.width !== width) canvas.width = width;
   if (canvas.height !== height) canvas.height = height;
+  if (dimensionsChanged) sizeCanvasToIncomingStream();
+  if (dimensionsChanged && connected) void fitWindowToIncomingStream();
 
   if (codec && codec !== activeCodec) {
     activeCodec = codec;
@@ -2349,7 +2446,11 @@ document.addEventListener('pointerdown', () => {
   document.querySelectorAll('.controller-focus').forEach((item) => item.classList.remove('controller-focus'));
 }, { capture: true });
 
-window.addEventListener('resize', renderRemotePointer);
+window.addEventListener('resize', () => {
+  sizeCanvasToIncomingStream();
+  renderRemotePointer();
+  scheduleStreamWindowAspectCorrection();
+});
 
 window.addEventListener('focus', () => {
   if (!controlMode || !inputCapabilities.relativePointer) return;

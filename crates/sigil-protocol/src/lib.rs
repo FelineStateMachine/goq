@@ -27,7 +27,7 @@ pub use input::{
 };
 pub use media::{
     FrameFlags, MEDIA_HEADER_LEN, MediaCodec, MediaFrame, MediaFrameHeader, read_media_frame,
-    write_media_frame,
+    read_media_object, write_media_frame,
 };
 
 /// Protocol version encoded in v1 messages.
@@ -35,6 +35,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 /// ALPN for the v1 encoded video stream.
 pub const MEDIA_ALPN_V1: &[u8] = b"sigil/media/1";
+/// ALPN for one encoded video object per host-opened unidirectional stream.
+pub const MEDIA_ALPN_V2: &[u8] = b"sigil/media/2";
 /// ALPN for the v1 latency-independent input stream.
 pub const INPUT_ALPN_V1: &[u8] = b"sigil/input/1";
 /// ALPN for the v1 session-control stream.
@@ -43,7 +45,8 @@ pub const CONTROL_ALPN_V1: &[u8] = b"sigil/control/1";
 pub const AUDIO_ALPN_V1: &[u8] = b"sigil/audio/1";
 
 /// The inherited frame-stream ALPN, provided only for an explicit migration
-/// adapter. New peers must advertise [`MEDIA_ALPN_V1`].
+/// adapter. New peers should prefer [`MEDIA_ALPN_V2`] and may retain
+/// [`MEDIA_ALPN_V1`] only as a compatibility fallback.
 pub const LEGACY_FRAME_ALPN_V0: &[u8] = b"sigil/frame-stream/0";
 /// The inherited input-stream ALPN, provided only for an explicit migration
 /// adapter. New peers must advertise [`INPUT_ALPN_V1`].
@@ -72,6 +75,7 @@ mod tests {
     #[test]
     fn alpn_values_are_deployment_golden_vectors() {
         assert_eq!(MEDIA_ALPN_V1, b"sigil/media/1");
+        assert_eq!(MEDIA_ALPN_V2, b"sigil/media/2");
         assert_eq!(INPUT_ALPN_V1, b"sigil/input/1");
         assert_eq!(CONTROL_ALPN_V1, b"sigil/control/1");
         assert_eq!(AUDIO_ALPN_V1, b"sigil/audio/1");

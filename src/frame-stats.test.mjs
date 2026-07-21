@@ -80,6 +80,8 @@ test('normalizes exact v2 drop, queue, timing, and resync units', () => {
   }), {
     statsVersion: 2,
     transportDroppedFrames: 3,
+    objectDroppedFrames: null,
+    lateObjectDroppedFrames: null,
     frontendDroppedFrames: 9,
     queueDroppedFrames: 4,
     resyncDroppedFrames: 5,
@@ -98,6 +100,8 @@ test('uses legacy aggregate drop aliases without inventing v2 splits', () => {
   });
   assert.equal(stats.statsVersion, 1);
   assert.equal(stats.transportDroppedFrames, 7);
+  assert.equal(stats.objectDroppedFrames, null);
+  assert.equal(stats.lateObjectDroppedFrames, null);
   assert.equal(stats.frontendDroppedFrames, 11);
   assert.equal(stats.queueDroppedFrames, null);
   assert.equal(stats.resyncDroppedFrames, null);
@@ -106,6 +110,24 @@ test('uses legacy aggregate drop aliases without inventing v2 splits', () => {
   assert.equal(stats.transportIntervals, null);
   assert.equal(stats.ipcSendDurations, null);
   assert.equal(stats.timingWindow, null);
+});
+
+test('normalizes bounded v3 independent-object discard counters', () => {
+  const stats = normalizeFrameStatsPayload({
+    stats_version: 3,
+    transport_object_dropped_total: 8,
+    transport_late_object_dropped_total: 3,
+  });
+  assert.equal(stats.objectDroppedFrames, 8);
+  assert.equal(stats.lateObjectDroppedFrames, 3);
+
+  const malformed = normalizeFrameStatsPayload({
+    stats_version: 3,
+    transport_object_dropped_total: 2,
+    transport_late_object_dropped_total: 3,
+  });
+  assert.equal(malformed.objectDroppedFrames, null);
+  assert.equal(malformed.lateObjectDroppedFrames, null);
 });
 
 test('does not display malformed or unit-ambiguous v2 diagnostics', () => {

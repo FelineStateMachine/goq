@@ -240,6 +240,31 @@ where
     Ok(Some(MediaFrame { header, payload }))
 }
 
+/// Read exactly one complete frame followed by a clean stream EOF.
+///
+/// This is the object boundary used by the v2 media ALPN. An empty stream or
+/// any bytes after the declared frame are rejected so one QUIC stream can
+/// never be interpreted as zero or multiple media objects.
+pub async fn read_media_object<R>(reader: &mut R) -> Result<MediaFrame>
+where
+    R: AsyncRead + Unpin,
+{
+    let frame = read_media_frame(reader)
+        .await?
+        .ok_or(ProtocolError::InvalidMessage {
+            message_type: "media object",
+            reason: "stream ended before the media frame",
+        })?;
+    let mut trailing = [0_u8; 1];
+    if reader.read(&mut trailing).await? != 0 {
+        return Err(ProtocolError::InvalidMessage {
+            message_type: "media object",
+            reason: "trailing bytes after the media frame",
+        });
+    }
+    Ok(frame)
+}
+
 /// Validate and write one complete frame.
 pub async fn write_media_frame<W>(writer: &mut W, frame: &MediaFrame) -> Result<()>
 where
@@ -349,6 +374,42 @@ mod tests {
             Some(expected)
         );
         assert_eq!(read_media_frame(&mut receiver).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn media_object_requires_exactly_one_frame_and_clean_eof() {
+        let expected = MediaFrame::new(header(), vec![0, 0, 0, 1]).unwrap();
+        let (mut sender, mut receiver) = duplex(256);
+        write_media_frame(&mut sender, &expected).await.unwrap();
+        sender.shutdown().await.unwrap();
+
+        assert_eq!(read_media_object(&mut receiver).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn media_object_rejects_empty_and_trailing_streams() {
+        let (mut empty_sender, mut empty_receiver) = duplex(16);
+        empty_sender.shutdown().await.unwrap();
+        assert!(matches!(
+            read_media_object(&mut empty_receiver).await,
+            Err(ProtocolError::InvalidMessage {
+                message_type: "media object",
+                ..
+            })
+        ));
+
+        let frame = MediaFrame::new(header(), vec![0, 0, 0, 1]).unwrap();
+        let (mut sender, mut receiver) = duplex(256);
+        write_media_frame(&mut sender, &frame).await.unwrap();
+        sender.write_all(&[0xff]).await.unwrap();
+        sender.shutdown().await.unwrap();
+        assert!(matches!(
+            read_media_object(&mut receiver).await,
+            Err(ProtocolError::InvalidMessage {
+                message_type: "media object",
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

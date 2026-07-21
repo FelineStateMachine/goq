@@ -13,6 +13,10 @@ probe_timeout_seconds=15
 command_timeout_seconds=45
 readiness_timeout_seconds=30
 host_runtime_seconds=120
+media_transport="independent-v2"
+media_accept_log="media v2 client accepted"
+media_release_log="media v2 client released"
+media_v1=false
 
 usage() {
   cat <<'EOF'
@@ -28,6 +32,8 @@ Options:
   --reconnect-cycles COUNT      Fresh sessions after the primary (default: 3)
   --reconnect-frames COUNT      Frames per reconnect session (default: 30)
   --probe-timeout-seconds SEC   Probe per-operation timeout (default: 15)
+  --media-v1                    Exercise ordered media v1 compatibility
+                                instead of independent media v2
   --help                        Show this help
 EOF
 }
@@ -74,6 +80,13 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "--probe-timeout-seconds requires a value"
       probe_timeout_seconds="$2"
       shift 2
+      ;;
+    --media-v1)
+      media_transport="reliable-v1"
+      media_accept_log="media client accepted"
+      media_release_log="media client released"
+      media_v1=true
+      shift
       ;;
     --help|-h)
       usage
@@ -298,10 +311,23 @@ validate_probe_log() {
   grep -Fxq "frames=${expected_frames}" "$log_path" || return 1
   grep -Fxq 'dimensions=1280x800' "$log_path" || return 1
   grep -Fxq 'sequence_gaps=0' "$log_path" || return 1
+  grep -Fxq "transport=${media_transport}" "$log_path" || return 1
+  awk -F= '$1 == "media_objects_dropped" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
+    "$log_path" || return 1
+  awk -F= '$1 == "media_objects_late" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
+    "$log_path" || return 1
   awk -F= '$1 == "keyframes" && $2 ~ /^[0-9]+$/ && $2 > 0 { found=1 } END { exit !found }' \
     "$log_path" || return 1
   awk -F= '$1 == "input_ack_micros" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
     "$log_path"
+}
+
+run_probe() {
+  if [[ "$media_v1" == true ]]; then
+    "$probe_bin" --media-v1 "$@"
+  else
+    "$probe_bin" "$@"
+  fi
 }
 
 cd "$workspace_dir"
@@ -344,7 +370,7 @@ wait_for_log_line "$host_log" 'status=ready' "$host_pid" 'sigil-host' || die "ho
 host_node_id="$(sed -n 's/^node_id=//p' "$host_log" | tail -n 1)"
 [[ "$host_node_id" == "$node_id" ]] || die "ready host node ID does not match its identity"
 
-"$probe_bin" \
+run_probe \
   --node-id "$node_id" \
   --frames "$primary_frames" \
   --timeout-seconds "$probe_timeout_seconds" \
@@ -354,14 +380,14 @@ primary_pid=$!
 start_watchdog "$primary_pid" "$command_timeout_seconds" "$tmp_root/primary.timeout"
 primary_watchdog_pid="$watchdog_pid"
 
-wait_for_log_count "$host_log" 'media client accepted' 1 "$primary_pid" 'primary probe' \
+wait_for_log_count "$host_log" "$media_accept_log" 1 "$primary_pid" 'primary probe' \
   || die "primary session did not become active"
 if ! kill -0 "$primary_pid" 2>/dev/null; then
   die "primary probe ended before the concurrent rejection check"
 fi
 
 if run_bounded "$probe_timeout_seconds" "$secondary_log" \
-  "$probe_bin" --node-id "$node_id" --frames 1 \
+  run_probe --node-id "$node_id" --frames 1 \
   --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800; then
   die "secondary client was accepted while the primary was active"
 fi
@@ -392,7 +418,7 @@ validate_probe_log "$primary_log" "$primary_frames" || {
   die "primary probe evidence is incomplete"
 }
 
-wait_for_log_count "$host_log" 'media client released' 1 "$host_pid" 'sigil-host' \
+wait_for_log_count "$host_log" "$media_release_log" 1 "$host_pid" 'sigil-host' \
   || die "primary session was not released"
 wait_for_log_count "$host_log" 'input client released' 1 "$host_pid" 'sigil-host' \
   || die "primary input session was not drained"
@@ -401,7 +427,7 @@ cycle=1
 while [[ "$cycle" -le "$reconnect_cycles" ]]; do
   reconnect_log="$tmp_root/reconnect-${cycle}.log"
   if ! run_bounded "$command_timeout_seconds" "$reconnect_log" \
-    "$probe_bin" --node-id "$node_id" --frames "$reconnect_frames" \
+    run_probe --node-id "$node_id" --frames "$reconnect_frames" \
     --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800; then
     sed -n '1,240p' "$reconnect_log" >&2 || true
     die "reconnect cycle $cycle failed"
@@ -410,7 +436,7 @@ while [[ "$cycle" -le "$reconnect_cycles" ]]; do
     sed -n '1,240p' "$reconnect_log" >&2 || true
     die "reconnect cycle $cycle evidence is incomplete"
   }
-  wait_for_log_count "$host_log" 'media client released' "$((cycle + 1))" "$host_pid" 'sigil-host' \
+  wait_for_log_count "$host_log" "$media_release_log" "$((cycle + 1))" "$host_pid" 'sigil-host' \
     || die "reconnect cycle $cycle was not released"
   wait_for_log_count "$host_log" 'input client released' "$((cycle + 1))" "$host_pid" 'sigil-host' \
     || die "reconnect input cycle $cycle was not drained"
@@ -441,7 +467,7 @@ printf 'probe_binary=%s\n' "$probe_bin"
 printf 'probe_sha256=%s\n' "$(sha256_file "$probe_bin")"
 printf 'node_id=%s\n' "$node_id"
 printf 'primary_frames=%s\n' "$primary_frames"
-grep -E '^(keyframes|sequence_gaps|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
+grep -E '^(transport|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
 printf 'active_client_rejection=ok\n'
 printf 'reconnect_cycles=%s\n' "$reconnect_cycles"
 printf 'cleanup=ok\n'

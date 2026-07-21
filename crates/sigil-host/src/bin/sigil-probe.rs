@@ -5,16 +5,15 @@ use clap::Parser;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::presets};
 use sigil_protocol::{
     Capability, ClientHello, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN, GAMEPAD_TRIGGER_MAX,
-    GamepadState, INPUT_ALPN_V1, InputEvent, MEDIA_ALPN_V1, PointerSurfaceDimensions,
-    read_host_hello, read_input_ack, read_media_frame, write_client_hello, write_input_event,
+    GamepadState, INPUT_ALPN_V1, InputEvent, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MediaFrame,
+    PointerSurfaceDimensions, ProtocolError, read_host_hello, read_input_ack, read_media_frame,
+    read_media_object, write_client_hello, write_input_event,
 };
 
+const MEDIA_OBJECT_CAPACITY: usize = 4;
+
 #[derive(Debug, Parser)]
-#[command(
-    name = "sigil-probe",
-    version,
-    about = "Bounded Sigil v1 transport probe"
-)]
+#[command(name = "sigil-probe", version, about = "Bounded Sigil transport probe")]
 struct Args {
     #[arg(long)]
     node_id: EndpointId,
@@ -24,6 +23,10 @@ struct Args {
     timeout_seconds: u64,
     #[arg(long, default_value = "1280x800", value_parser = parse_size)]
     expect_size: (u16, u16),
+    /// Exercise the reliable ordered v1 media stream instead of independent
+    /// v2 media objects. Intended only for compatibility validation.
+    #[arg(long)]
+    media_v1: bool,
     /// Require gamepad negotiation and emit one bounded non-neutral snapshot
     /// followed by neutral. Intended for evtest-backed uinput proof.
     #[arg(long)]
@@ -32,6 +35,166 @@ struct Args {
     /// complete left-click. Intended for libinput/Gamescope-backed proof.
     #[arg(long)]
     pointer_smoke: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaTransport {
+    IndependentV2,
+    ReliableV1,
+}
+
+impl MediaTransport {
+    fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::IndependentV2 => MEDIA_ALPN_V2,
+            Self::ReliableV1 => MEDIA_ALPN_V1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::IndependentV2 => "independent-v2",
+            Self::ReliableV1 => "reliable-v1",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MediaObjectOutcome {
+    Frame { index: u64, frame: MediaFrame },
+    Dropped { index: u64 },
+    Malformed { index: u64, error: ProtocolError },
+}
+
+struct MediaObjectReceiver {
+    connection: iroh::endpoint::Connection,
+    reads: tokio::task::JoinSet<MediaObjectOutcome>,
+    next_index: u64,
+    accepting: bool,
+    read_timeout: Duration,
+}
+
+impl MediaObjectReceiver {
+    fn new(connection: iroh::endpoint::Connection, read_timeout: Duration) -> Self {
+        Self {
+            connection,
+            reads: tokio::task::JoinSet::new(),
+            next_index: 0,
+            accepting: true,
+            read_timeout,
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<MediaObjectOutcome>> {
+        loop {
+            if !self.accepting && self.reads.is_empty() {
+                return Ok(None);
+            }
+
+            tokio::select! {
+                accepted = self.connection.accept_uni(),
+                    if self.accepting && self.reads.len() < MEDIA_OBJECT_CAPACITY => {
+                    match accepted {
+                        Ok(mut stream) => {
+                            let index = self.next_index;
+                            self.next_index = self
+                                .next_index
+                                .checked_add(1)
+                                .context("media object index overflowed")?;
+                            let read_timeout = self.read_timeout;
+                            self.reads.spawn(async move {
+                                match tokio::time::timeout(read_timeout, read_media_object(&mut stream)).await {
+                                    Ok(Ok(frame)) => MediaObjectOutcome::Frame { index, frame },
+                                    Ok(Err(ProtocolError::Io(_))) => MediaObjectOutcome::Dropped { index },
+                                    Ok(Err(error)) => MediaObjectOutcome::Malformed { index, error },
+                                    Err(_) => MediaObjectOutcome::Dropped { index },
+                                }
+                            });
+                        }
+                        Err(_) => self.accepting = false,
+                    }
+                }
+                completed = self.reads.join_next(), if !self.reads.is_empty() => {
+                    return match completed.expect("guarded by non-empty media object task set") {
+                        Ok(outcome) => Ok(Some(outcome)),
+                        Err(error) if error.is_cancelled() => continue,
+                        Err(error) => Err(error).context("media object read task failed"),
+                    };
+                }
+            }
+        }
+    }
+}
+
+impl Drop for MediaObjectReceiver {
+    fn drop(&mut self) {
+        self.reads.abort_all();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaObjectDecision {
+    Deliver,
+    DropLate,
+    DropUntilKeyframe,
+}
+
+#[derive(Debug, Default)]
+struct MediaObjectSequence {
+    completion_watermark: Option<u64>,
+    last_sequence: Option<u64>,
+    waiting_for_keyframe: bool,
+}
+
+impl MediaObjectSequence {
+    fn new() -> Self {
+        Self {
+            waiting_for_keyframe: true,
+            ..Self::default()
+        }
+    }
+
+    fn note_drop(&mut self, index: u64) -> bool {
+        if self
+            .completion_watermark
+            .is_some_and(|watermark| index <= watermark)
+        {
+            return false;
+        }
+        self.completion_watermark = Some(index);
+        self.waiting_for_keyframe = true;
+        true
+    }
+
+    fn classify(&mut self, index: u64, frame: &MediaFrame) -> MediaObjectDecision {
+        if self
+            .completion_watermark
+            .is_some_and(|watermark| index <= watermark)
+        {
+            return MediaObjectDecision::DropLate;
+        }
+        self.completion_watermark = Some(index);
+
+        let independently_decodable = frame.header.flags.contains(FrameFlags::KEYFRAME)
+            && frame.header.flags.contains(FrameFlags::CODEC_CONFIG);
+        let sequence_contiguous = self
+            .last_sequence
+            .is_none_or(|last| last.checked_add(1) == Some(frame.header.sequence));
+        let sequence_monotonic = self
+            .last_sequence
+            .is_none_or(|last| frame.header.sequence > last);
+
+        let resync_required =
+            !sequence_monotonic || self.waiting_for_keyframe || !sequence_contiguous;
+        if resync_required && (!independently_decodable || !sequence_monotonic) {
+            self.waiting_for_keyframe = true;
+            return MediaObjectDecision::DropUntilKeyframe;
+        }
+
+        self.last_sequence = Some(frame.header.sequence);
+        self.waiting_for_keyframe = false;
+        MediaObjectDecision::Deliver
+    }
 }
 
 #[tokio::main]
@@ -52,9 +215,14 @@ async fn main() -> Result<()> {
         .context("binding probe endpoint")?;
     let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
     let address = EndpointAddr::new(args.node_id);
+    let media_transport = if args.media_v1 {
+        MediaTransport::ReliableV1
+    } else {
+        MediaTransport::IndependentV2
+    };
 
     let media_connection = endpoint
-        .connect(address.clone(), MEDIA_ALPN_V1)
+        .connect(address.clone(), media_transport.alpn())
         .await
         .context("connecting media protocol")?;
     let (mut media_send, mut media_recv) = media_connection
@@ -71,6 +239,16 @@ async fn main() -> Result<()> {
     )
     .await?;
     let session_id = media_negotiation.session_id;
+    let mut media_send = Some(media_send);
+    let mut media_recv = Some(media_recv);
+    if media_transport == MediaTransport::IndependentV2 {
+        media_send
+            .take()
+            .expect("media handshake stream is present")
+            .finish()
+            .context("finishing media v2 handshake request")?;
+        drop(media_recv.take());
+    }
 
     let input_connection = endpoint
         .connect(address, INPUT_ALPN_V1)
@@ -178,17 +356,68 @@ async fn main() -> Result<()> {
     let mut bytes = 0_u64;
     let mut keyframes = 0_u32;
     let mut gaps = 0_u64;
+    let mut media_objects_dropped = 0_u64;
+    let mut media_objects_late = 0_u64;
     let mut last_sequence: Option<u64> = None;
     let mut dimensions = None;
+    let mut object_receiver = (media_transport == MediaTransport::IndependentV2).then(|| {
+        MediaObjectReceiver::new(
+            media_connection.clone(),
+            Duration::from_secs(args.timeout_seconds),
+        )
+    });
+    let mut object_sequence = MediaObjectSequence::new();
 
     while received < args.frames {
-        let frame = tokio::time::timeout(
-            Duration::from_secs(args.timeout_seconds),
-            read_media_frame(&mut media_recv),
-        )
-        .await
-        .context("timed out waiting for media frame")??
-        .context("host closed the media stream")?;
+        let frame = match media_transport {
+            MediaTransport::ReliableV1 => tokio::time::timeout(
+                Duration::from_secs(args.timeout_seconds),
+                read_media_frame(
+                    media_recv
+                        .as_mut()
+                        .expect("v1 media receive stream is present"),
+                ),
+            )
+            .await
+            .context("timed out waiting for media frame")??
+            .context("host closed the media stream")?,
+            MediaTransport::IndependentV2 => loop {
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(args.timeout_seconds)
+                        .saturating_add(Duration::from_secs(1)),
+                    object_receiver
+                        .as_mut()
+                        .expect("v2 media object receiver is present")
+                        .next(),
+                )
+                .await
+                .context("timed out waiting for media object")??
+                .context("host closed the media object connection")?;
+                match outcome {
+                    MediaObjectOutcome::Dropped { index } => {
+                        if object_sequence.note_drop(index) {
+                            media_objects_dropped = media_objects_dropped.saturating_add(1);
+                        } else {
+                            media_objects_late = media_objects_late.saturating_add(1);
+                        }
+                    }
+                    MediaObjectOutcome::Malformed { index, error } => {
+                        bail!("media object {index} is malformed: {error}");
+                    }
+                    MediaObjectOutcome::Frame { index, frame } => {
+                        match object_sequence.classify(index, &frame) {
+                            MediaObjectDecision::Deliver => break frame,
+                            MediaObjectDecision::DropLate => {
+                                media_objects_late = media_objects_late.saturating_add(1);
+                            }
+                            MediaObjectDecision::DropUntilKeyframe => {
+                                media_objects_dropped = media_objects_dropped.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            },
+        };
 
         if received == 0 {
             ensure!(
@@ -229,9 +458,11 @@ async fn main() -> Result<()> {
     ensure!(gaps == 0, "probe observed {gaps} media sequence gaps");
     let (path_mode, path_rtt_ms) = selected_path_diagnostics(&media_connection);
     input_send.finish().context("finishing input stream")?;
-    media_send
-        .finish()
-        .context("finishing media request stream")?;
+    if let Some(mut media_send) = media_send {
+        media_send
+            .finish()
+            .context("finishing media request stream")?;
+    }
     // Close both protocol connections explicitly. Relying only on endpoint
     // teardown can leave a peer waiting for QUIC idle timeout during repeated
     // short-lived probes, which obscures whether the host released its
@@ -247,6 +478,9 @@ async fn main() -> Result<()> {
     println!("dimensions={width}x{height}");
     println!("keyframes={keyframes}");
     println!("sequence_gaps={gaps}");
+    println!("media_objects_dropped={media_objects_dropped}");
+    println!("media_objects_late={media_objects_late}");
+    println!("transport={}", media_transport.label());
     println!("input_ack_micros={input_ack_micros}");
     println!(
         "pointer_smoke={}",
@@ -428,6 +662,97 @@ mod tests {
             error
                 .to_string()
                 .contains("host did not advertise pointer surface dimensions")
+        );
+    }
+
+    fn media_frame(sequence: u64, flags: FrameFlags) -> MediaFrame {
+        let payload = vec![0x65, 0x88, 0x84];
+        MediaFrame::new(
+            sigil_protocol::MediaFrameHeader::h264(
+                1_280,
+                800,
+                payload.len(),
+                sequence,
+                sequence * 1_000,
+                i64::try_from(sequence * 1_000).unwrap(),
+                flags,
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn media_objects_wait_for_a_decodable_keyframe_then_deliver_contiguous_frames() {
+        let mut sequence = MediaObjectSequence::new();
+        let delta = media_frame(1, FrameFlags::NONE);
+        let keyframe = media_frame(2, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        let next_delta = media_frame(3, FrameFlags::NONE);
+
+        assert_eq!(
+            sequence.classify(0, &delta),
+            MediaObjectDecision::DropUntilKeyframe
+        );
+        assert_eq!(
+            sequence.classify(1, &keyframe),
+            MediaObjectDecision::Deliver
+        );
+        assert_eq!(
+            sequence.classify(2, &next_delta),
+            MediaObjectDecision::Deliver
+        );
+    }
+
+    #[test]
+    fn dropped_objects_force_resync_and_late_completions_cannot_rewind() {
+        let mut sequence = MediaObjectSequence::new();
+        let first_keyframe = media_frame(10, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        let stale_delta = media_frame(11, FrameFlags::NONE);
+        let replacement_keyframe =
+            media_frame(20, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+
+        assert_eq!(
+            sequence.classify(0, &first_keyframe),
+            MediaObjectDecision::Deliver
+        );
+        assert!(sequence.note_drop(1));
+        assert_eq!(
+            sequence.classify(2, &replacement_keyframe),
+            MediaObjectDecision::Deliver
+        );
+        assert_eq!(
+            sequence.classify(1, &stale_delta),
+            MediaObjectDecision::DropLate
+        );
+        assert!(!sequence.note_drop(1));
+
+        let next_delta = media_frame(21, FrameFlags::NONE);
+        assert_eq!(
+            sequence.classify(3, &next_delta),
+            MediaObjectDecision::Deliver
+        );
+    }
+
+    #[test]
+    fn media_sequence_gap_drops_deltas_until_replacement_keyframe() {
+        let mut sequence = MediaObjectSequence::new();
+        let keyframe = media_frame(40, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        let gap_delta = media_frame(42, FrameFlags::NONE);
+        let replacement_keyframe =
+            media_frame(50, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+
+        assert_eq!(
+            sequence.classify(0, &keyframe),
+            MediaObjectDecision::Deliver
+        );
+        assert_eq!(
+            sequence.classify(1, &gap_delta),
+            MediaObjectDecision::DropUntilKeyframe
+        );
+        assert_eq!(
+            sequence.classify(2, &replacement_keyframe),
+            MediaObjectDecision::Deliver
         );
     }
 }

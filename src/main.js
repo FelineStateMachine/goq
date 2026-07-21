@@ -666,6 +666,13 @@ async function connectHost() {
         gamepad: result.gamepad_available === true,
         control: result.control_available === true,
       };
+      streamTransportMode = [
+        'independent-v2',
+        'reliable-v1',
+        'reliable-v0',
+      ].includes(result.media_transport)
+        ? result.media_transport
+        : 'unknown';
       pointerSurfaceDimensions = connectedPointerSurfaceDimensions;
       if (!inputCapabilities.pointerPositionFeedback) {
         remotePointerPosition = null;
@@ -878,6 +885,8 @@ let decoderConfigured = false;
 let activeCodec = 'h264';
 let droppedFrames = 0;
 let transportDroppedFrames = 0;
+let transportObjectDroppedFrames = null;
+let transportLateObjectDroppedFrames = null;
 let frontendDroppedFrames = 0;
 let frontendQueueDroppedFrames = null;
 let frontendResyncDroppedFrames = null;
@@ -908,6 +917,7 @@ const avSkew = new BoundedValueWindow();
 const decodeTimings = new Map();
 const MAX_DECODE_TIMINGS = 8;
 let streamPathMode = 'unknown';
+let streamTransportMode = 'unknown';
 let streamRttMs = null;
 const MAX_DECODE_QUEUE_SIZE = 2;
 let waitingForDecoderKeyframe = true;
@@ -999,6 +1009,8 @@ function resetStreamTelemetry() {
   teardownDecoderPipeline();
   droppedFrames = 0;
   transportDroppedFrames = 0;
+  transportObjectDroppedFrames = null;
+  transportLateObjectDroppedFrames = null;
   frontendDroppedFrames = 0;
   frontendQueueDroppedFrames = null;
   frontendResyncDroppedFrames = null;
@@ -1026,6 +1038,7 @@ function resetStreamTelemetry() {
   clientPresentationLatency.reset();
   drawLatency.reset();
   streamPathMode = 'unknown';
+  streamTransportMode = 'unknown';
   streamRttMs = null;
   waitingForDecoderKeyframe = true;
 }
@@ -1120,6 +1133,11 @@ function updateStreamStats() {
   });
   document.getElementById('stream-dropped').textContent = discardTelemetry.total;
   document.getElementById('stream-transport-dropped').textContent = discardTelemetry.transport;
+  document.getElementById('stream-transport-object-dropped').textContent =
+    transportObjectDroppedFrames === null ? '—' : `${transportObjectDroppedFrames} frames`;
+  document.getElementById('stream-transport-late-object-dropped').textContent =
+    transportLateObjectDroppedFrames === null
+      ? '—' : `${transportLateObjectDroppedFrames} frames`;
   document.getElementById('stream-frontend-dropped').textContent = discardTelemetry.frontend;
   document.getElementById('stream-frontend-queue-dropped').textContent = frontendQueueDroppedFrames === null
     ? '—' : `${frontendQueueDroppedFrames} frames`;
@@ -1161,6 +1179,7 @@ function updateStreamStats() {
   document.getElementById('stream-decoder-output-cadence').textContent = formatCadence(decoderOutputIntervals);
   document.getElementById('stream-present-cadence').textContent = formatCadence(presentationIntervals);
   document.getElementById('stream-codec').textContent = activeCodec;
+  document.getElementById('stream-transport').textContent = streamTransportMode;
   document.getElementById('stream-path').textContent = streamPathMode;
   document.getElementById('stream-rtt').textContent = Number.isFinite(streamRttMs)
     ? `${streamRttMs.toFixed(1)} ms`
@@ -1569,6 +1588,8 @@ listen('frame-stats', (event) => {
   if (!isCurrentFrameGeneration(event.payload?.generation, activeFrameGeneration)) return;
   const diagnostics = normalizeFrameStatsPayload(event.payload);
   transportDroppedFrames = diagnostics.transportDroppedFrames ?? transportDroppedFrames;
+  transportObjectDroppedFrames = diagnostics.objectDroppedFrames;
+  transportLateObjectDroppedFrames = diagnostics.lateObjectDroppedFrames;
   frontendDroppedFrames = diagnostics.frontendDroppedFrames ?? frontendDroppedFrames;
   frontendQueueDroppedFrames = diagnostics.queueDroppedFrames;
   frontendResyncDroppedFrames = diagnostics.resyncDroppedFrames;

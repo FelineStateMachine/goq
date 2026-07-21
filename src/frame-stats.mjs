@@ -81,12 +81,20 @@ export function normalizeFrameStatsPayload(payload) {
 
   const statsVersion = exactUnsigned(payload.stats_version) ?? 1;
   const v2 = statsVersion >= 2;
+  const v3 = statsVersion >= 3;
   const queueDroppedFrames = v2 ? exactUnsigned(payload.frontend_queue_dropped_total) : null;
   const resyncDroppedFrames = v2 ? exactUnsigned(payload.frontend_resync_dropped_total) : null;
   const splitFrontendTotal = queueDroppedFrames !== null && resyncDroppedFrames !== null
     && Number.isSafeInteger(queueDroppedFrames + resyncDroppedFrames)
     ? queueDroppedFrames + resyncDroppedFrames
     : null;
+  const rawObjectDroppedFrames = v3
+    ? exactUnsigned(payload.transport_object_dropped_total) : null;
+  const rawLateObjectDroppedFrames = v3
+    ? exactUnsigned(payload.transport_late_object_dropped_total) : null;
+  const objectCountersValid = rawObjectDroppedFrames !== null
+    && rawLateObjectDroppedFrames !== null
+    && rawLateObjectDroppedFrames <= rawObjectDroppedFrames;
 
   let queue = null;
   let resync = null;
@@ -128,6 +136,8 @@ export function normalizeFrameStatsPayload(payload) {
       payload.sequence_dropped_total,
       payload.host_dropped_frames,
     ),
+    objectDroppedFrames: objectCountersValid ? rawObjectDroppedFrames : null,
+    lateObjectDroppedFrames: objectCountersValid ? rawLateObjectDroppedFrames : null,
     frontendDroppedFrames: firstExactUnsigned(
       payload.frontend_dropped_total,
       payload.frontend_dropped_frames,

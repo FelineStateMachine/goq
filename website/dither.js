@@ -358,22 +358,13 @@
     begin();
   }
 
-  /* ── Client / host install toggle: swap the command live. ──
-        TODO(install-script): confirm exact one-liners once goq.sh
-        serves the install scripts (client app + host runtime pkg). */
-  var INSTALL_CMD = {
-    client: "curl -fsSL https://goq.sh | sh",
-    host: "curl -fsSL https://goq.sh/host | sh",
-  };
-  document.querySelectorAll('input[name="install-target"]').forEach(function (radio) {
+  /* ── Portal is a signed download; Sigil is a machine install command. ── */
+  document.querySelectorAll('input[name="release-target"]').forEach(function (radio) {
     radio.addEventListener("change", function () {
       if (!radio.checked) return;
-      var cmd = INSTALL_CMD[radio.value] || INSTALL_CMD.client;
-      var box = document.querySelector(".install");
-      if (!box) return;
-      box.setAttribute("data-copy", cmd);
-      var textEl = box.querySelector(".install-text");
-      if (textEl) textEl.textContent = cmd;
+      document.querySelectorAll("[data-release-target]").forEach(function (panel) {
+        panel.hidden = panel.getAttribute("data-release-target") !== radio.value;
+      });
     });
   });
 

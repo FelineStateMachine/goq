@@ -81,8 +81,8 @@ authentication.
    the remaining integration gate is forwarding a physical controller attached
    to the client. Keyboard injection is hardware-proven, and the conventional
    relative mouse replaces Gamescope-incompatible absolute motion.
-7. **Live-proven:** bounded PipeWire audio capture, Opus delivery, and client
-   playback. Add a persistent headless sink and quantify A/V synchronization.
+7. **Live-proven:** bounded PipeWire audio capture, a persistent headless sink,
+   Opus delivery, and client playback. Quantify longer-run A/V synchronization.
 8. Replace or supplement FIDO pairing with short-lived capability tickets.
 
 ## Development
@@ -200,6 +200,20 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
 The static `website/` directory is published through Cloudflare Pages after a
 merge to `main`. See the [Cloudflare Pages release setup](docs/cloudflare-pages.md)
 for the one-time project and GitHub environment configuration.
+
+Portal is distributed as a compiled, signed desktop application; it is never
+installed through a shell pipe. Sigil uses a separate Bazzite machine bootstrap
+at `https://goq.sh/install-sigil`. That bootstrap intentionally fails closed
+until the Minisign publisher trust root and first signed release exist. The
+[public release delivery contract](docs/public-release-delivery.md) defines the
+remaining signing and asset gates.
+
+The promoted streaming-hardening roadmap is tracked as bounded
+[Iroh/MoQ media objects](https://github.com/FelineStateMachine/goq/issues/7),
+[adaptive bitrate](https://github.com/FelineStateMachine/goq/issues/8),
+[motion-sensitive resolution](https://github.com/FelineStateMachine/goq/issues/9),
+and [Auto Codec](https://github.com/FelineStateMachine/goq/issues/10). H.264 at
+1280×800/60 remains the known-safe first target while that work lands.
 
 ## License
 

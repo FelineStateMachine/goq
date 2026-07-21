@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { audioButtonPresentation } from './audio-ui.mjs';
 
-test('audio button uses a loud speaker and mute action while playing', () => {
+test('audio button uses a speaker glyph with a mute action while playing', () => {
   assert.deepEqual(audioButtonPresentation({
     available: true,
     muted: false,
@@ -16,7 +16,7 @@ test('audio button uses a loud speaker and mute action while playing', () => {
   });
 });
 
-test('audio button uses a muted speaker and unmute action while muted', () => {
+test('audio button uses a muted glyph with an unmute action while muted', () => {
   const presentation = audioButtonPresentation({
     available: true,
     muted: true,
@@ -27,13 +27,13 @@ test('audio button uses a muted speaker and unmute action while muted', () => {
   assert.match(presentation.ariaLabel, /^Unmute audio\. Audio muted\./);
 });
 
-test('audio button distinguishes priming from unavailable without visible text', () => {
+test('audio button distinguishes priming from unavailable', () => {
   assert.equal(audioButtonPresentation({
     available: true,
     muted: false,
     state: 'priming',
     detail: 'Waiting for bounded Opus prebuffer',
-  }).glyph, '🔉');
+  }).glyph, 'audio ...');
   const unavailable = audioButtonPresentation({
     available: false,
     muted: false,

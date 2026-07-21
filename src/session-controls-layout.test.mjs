@@ -36,4 +36,6 @@ test('stream diagnostics remain exclusive to the Info panel', () => {
   assert.ok(streamIds.length > 0);
   for (const id of streamIds) assert.match(panel, new RegExp(`id="${id}"`));
   assert.match(html, /id="audio-toggle"[^>]*aria-label="Audio unavailable\. Not connected"/);
+  assert.match(html, /type="button"[^>]*id="audio-toggle"/);
+  assert.match(css, /#audio-toggle\s*\{[^}]*min-width:\s*40px;[^}]*min-height:\s*32px;/s);
 });

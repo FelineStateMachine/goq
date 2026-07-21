@@ -21,3 +21,4 @@ Thumbs.db
 # Temp
 /tmp/
 *.log
+.playwright-cli/

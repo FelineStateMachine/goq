@@ -10,7 +10,7 @@ export function audioButtonPresentation({ available, muted, state, detail }) {
   } else if (normalizedState === 'playing') {
     glyph = '🔊';
   } else {
-    glyph = '🔉';
+    glyph = 'audio ...';
   }
 
   const action = available

@@ -3,12 +3,24 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sigil Spark</title>
+  <title>Portal</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
   <div class="overlay-screen hidden" id="tap-overlay" style="z-index: 200;">
     <div class="overlay-content">
+      <div class="flow-steps" aria-hidden="true">
+        <span class="flow-step">01 pin</span>
+        <span class="flow-step active">02 tap</span>
+        <span class="flow-step">03 play</span>
+      </div>
+      <svg class="pixel-key" viewBox="0 0 26 12" width="78" height="36" aria-hidden="true">
+        <rect x="0"  y="1" width="8"  height="10" fill="var(--terracotta)" />
+        <rect x="3"  y="5" width="2"  height="2"  fill="var(--paper)" />
+        <rect x="8"  y="5" width="18" height="2"  fill="var(--ochre)" />
+        <rect x="14" y="7" width="2"  height="3"  fill="var(--moss)" />
+        <rect x="19" y="7" width="2"  height="2"  fill="var(--moss)" />
+      </svg>
       <h1 id="tap-overlay-title">tap key</h1>
       <p id="tap-overlay-desc">Touch the sensor on your key when it blinks.</p>
       <div class="overlay-status pending" id="tap-status">waiting...</div>
@@ -30,7 +42,7 @@
         <button class="pin-pad-key" data-controller-focus data-pin-digit="7" onclick="pinPadDigit('7')">7</button>
         <button class="pin-pad-key" data-controller-focus data-pin-digit="8" onclick="pinPadDigit('8')">8</button>
         <button class="pin-pad-key" data-controller-focus data-pin-digit="9" onclick="pinPadDigit('9')">9</button>
-        <button class="pin-pad-key pin-pad-action" data-controller-focus onclick="pinPadBackspace()" aria-label="Backspace">⌫</button>
+        <button class="pin-pad-key pin-pad-action" data-controller-focus onclick="pinPadBackspace()" aria-label="Backspace">del</button>
         <button class="pin-pad-key" data-controller-focus data-pin-digit="0" onclick="pinPadDigit('0')">0</button>
         <button class="pin-pad-key pin-pad-action" data-controller-focus onclick="closePinPad()">done</button>
       </div>
@@ -40,7 +52,12 @@
 
   <div class="overlay-screen hidden" id="intro">
     <div class="overlay-content">
-      <h1>sigil spark</h1>
+      <div class="flow-steps" aria-hidden="true">
+        <span class="flow-step active">01 pin</span>
+        <span class="flow-step">02 tap</span>
+        <span class="flow-step">03 play</span>
+      </div>
+      <h1>portal</h1>
       <p id="intro-desc">enter the host security-key pin</p>
       <div class="dev-warning hidden" id="dev-connect-warning" role="alert">
         DEVELOPMENT DIRECT NODE<br />PASSKEY LOOKUP BYPASSED · NOT CLIENT AUTHORIZATION
@@ -58,7 +75,7 @@
   </div>
 
   <div class="topbar">
-    <span class="brand">sigil spark</span>
+    <span class="brand">portal</span>
     <span class="dev-badge hidden" id="dev-connect-badge" title="Skips passkey identity lookup. This is not client authorization.">dev direct-node · not auth</span>
     <span class="sep">·</span>
     <div class="status-line" id="status-line">
@@ -88,7 +105,7 @@
       <button class="control-toggle" id="control-toggle" data-controller-focus onclick="toggleControl()">
         view only · input unavailable
       </button>
-      <button class="control-toggle disabled" id="audio-toggle" data-controller-focus onclick="toggleAudioMute()" aria-disabled="true" aria-label="Audio unavailable. Not connected" title="Audio unavailable: not connected">
+      <button type="button" class="control-toggle disabled" id="audio-toggle" data-controller-focus onclick="toggleAudioMute()" aria-disabled="true" aria-label="Audio unavailable. Not connected" title="Audio unavailable: not connected">
         🔇
       </button>
     </div>
@@ -109,7 +126,7 @@
     </div>
     <div class="panel-body">
       <div class="panel-section">
-        <h3># security key</h3>
+        <h3><span class="hash" aria-hidden="true">#</span> security key</h3>
         <div class="info-row"><span class="info-label">status</span><span class="info-value" id="fido-status">—</span></div>
         <div class="info-row"><span class="info-label">product</span><span class="info-value" id="fido-product">—</span></div>
         <div class="info-row"><span class="info-label">vid:pid</span><span class="info-value" id="fido-vidpid">—</span></div>
@@ -119,7 +136,7 @@
         <button class="link-btn panel-action" data-controller-focus onclick="scanFido()">rescan</button>
       </div>
       <div class="panel-section" id="stream-section">
-        <h3># stream</h3>
+        <h3><span class="hash" aria-hidden="true">#</span> stream</h3>
         <div class="info-row"><span class="info-label">codec</span><span class="info-value" id="stream-codec">—</span></div>
         <div class="info-row"><span class="info-label">transport</span><span class="info-value" id="stream-transport">—</span></div>
         <div class="info-row"><span class="info-label">path</span><span class="info-value" id="stream-path">—</span></div>

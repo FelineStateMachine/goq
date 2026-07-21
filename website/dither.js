@@ -3,6 +3,8 @@
    Vanilla, no dependencies. Ordered (Bayer 8x8) dithering of a
    slowly drifting earth-tone gradient, rendered at low resolution
    and scaled up (CSS image-rendering: pixelated) into chunky pixels.
+   The pointer dents a damped wave field on the same grid, so moving
+   the mouse leaves a rippling wake dithered into the terrain.
    ───────────────────────────────────────────────────────────── */
 (function () {
   "use strict";
@@ -133,7 +135,81 @@
       dctx.imageSmoothingEnabled = false;
       palette = readPalette();
       img = bctx.createImageData(W, H);
+      waveA = new Float32Array(W * H);
+      waveB = new Float32Array(W * H);
+      lastCellX = -1;
     }
+
+    /* ── Pointer ripples: a damped wave automaton on the dither grid.
+          The pointer dents the height field; the dent propagates as
+          rings that get dithered into the same ramps as the terrain. */
+    var waveA, waveB; // waveA = current heights, waveB = previous
+    var WAVE_DAMP = 0.975;
+    var WAVE_WARP = 14;   // wave gradient displaces the noise-sampling coords (refraction)
+    var WAVE_SHADE = 0.1; // faint crest/trough shading on top of the refraction
+    var lastCellX = -1, lastCellY = -1;
+
+    // Soft 5x5 dent: a wider impulse makes longer-wavelength rings
+    // that survive the busy terrain instead of vanishing into it.
+    function splash(cx, cy, strength) {
+      var x = cx | 0, y = cy | 0;
+      if (x < 2 || y < 2 || x >= W - 2 || y >= H - 2) return;
+      for (var dy = -2; dy <= 2; dy++) {
+        var row = (y + dy) * W + x;
+        for (var dx = -2; dx <= 2; dx++) {
+          var w = 1 - (dx * dx + dy * dy) / 6;
+          if (w > 0) waveA[row + dx] -= strength * w;
+        }
+      }
+    }
+
+    function stepWaves() {
+      var a = waveA, b = waveB;
+      for (var y = 1; y < H - 1; y++) {
+        var row = y * W;
+        for (var x = 1; x < W - 1; x++) {
+          var i = row + x;
+          b[i] = ((a[i - 1] + a[i + 1] + a[i - W] + a[i + W]) * 0.5 - b[i]) * WAVE_DAMP;
+        }
+      }
+      waveA = b;
+      waveB = a;
+    }
+
+    function pointerCell(e) {
+      var r = display.getBoundingClientRect();
+      return [
+        ((e.clientX - r.left) / r.width) * W,
+        ((e.clientY - r.top) / r.height) * H,
+      ];
+    }
+
+    // Listen on the hero (not the canvas) so the trail continues
+    // under the floating panel instead of dying at its edge.
+    var hero = display.parentElement;
+    hero.addEventListener("pointermove", function (e) {
+      if (reduced.matches || !raf) return;
+      var c = pointerCell(e);
+      if (lastCellX >= 0) {
+        var dx = c[0] - lastCellX;
+        var dy = c[1] - lastCellY;
+        var steps = Math.min(48, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy))) || 1);
+        for (var s = 1; s <= steps; s++) {
+          splash(lastCellX + (dx * s) / steps, lastCellY + (dy * s) / steps, 0.4);
+        }
+      } else {
+        splash(c[0], c[1], 0.4);
+      }
+      lastCellX = c[0];
+      lastCellY = c[1];
+    });
+    hero.addEventListener("pointerdown", function (e) {
+      if (reduced.matches || !raf) return;
+      var c = pointerCell(e);
+      splash(c[0], c[1], 2);
+    });
+    hero.addEventListener("pointerleave", function () { lastCellX = -1; });
+    hero.addEventListener("pointercancel", function () { lastCellX = -1; });
 
     // Per-load random seed: shifts sampling into a different region of
     // the infinite noise field so the background doesn't start the same
@@ -182,7 +258,18 @@
         var brow = BAYER[y & 7];
         var brow2 = BAYER[(y + 4) & 7];
         for (var x = 0; x < W; x++) {
-          var v = field(x, y, t);
+          // refract the terrain through the wave: the height-field
+          // gradient bends where this cell samples the noise, so the
+          // marbling itself churns inside the rings.
+          var wi = i >> 2;
+          var wx = x, wy = y;
+          if (x > 0 && x < W - 1 && y > 0 && y < H - 1) {
+            wx += (waveA[wi + 1] - waveA[wi - 1]) * WAVE_WARP;
+            wy += (waveA[wi + W] - waveA[wi - W]) * WAVE_WARP;
+          }
+          var v = field(wx, wy, t) + waveA[wi] * WAVE_SHADE;
+          if (v < 0) v = 0;
+          else if (v > 1) v = 1;
           // ordered-dither the luminance ramp between neighbouring stops
           var scaled = v * last;
           var lo = Math.floor(scaled);
@@ -191,7 +278,7 @@
           var frac = scaled - lo;
           var idx = frac > brow[x & 7] ? lo + 1 : lo;
           // ordered-dither the region to pick which ramp this pixel uses
-          var region = regionField(x, y, t);
+          var region = regionField(wx, wy, t);
           var arr = region > brow2[(x + 4) & 7] ? warm : green;
           var c = arr[idx];
           data[i] = c[0];
@@ -214,6 +301,8 @@
     function loop(now) {
       if (start === null) start = now;
       if (now - lastDraw >= FRAME_MS) {
+        stepWaves();
+        stepWaves(); // two sim ticks per drawn frame: rings spread faster
         render((now - start) / 1000);
         lastDraw = now;
       }

@@ -2143,11 +2143,10 @@ canvas.addEventListener('mousemove', (e) => {
   sendInput({ t: 'mm', x, y });
 });
 
-function handlePointerDown(e) {
+function handleMouseDown(e) {
   if (!controlMode || !pointerInputAvailable()) return;
   if (inputCapabilities.relativePointer) e.stopPropagation();
   else if (e.target !== canvas) return;
-  if (e.pointerType !== 'mouse') return;
   const btn = browserMouseButtonCode(e.button);
   if (btn === null) return;
   e.preventDefault();
@@ -2157,33 +2156,25 @@ function handlePointerDown(e) {
     });
   }
   if (!heldInputs.trackMouseButton(btn)) return;
-  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
   if (!sendInput({ t: 'md', b: btn })) heldInputs.takeMouseButtonRelease(btn);
 }
 
-window.addEventListener('pointerdown', handlePointerDown, { capture: true });
+window.addEventListener('mousedown', handleMouseDown, { capture: true });
 
-function releasePointerButton(e) {
+function releaseMouseButton(e) {
   if (!connected || !pointerInputAvailable()) return;
-  if (e.pointerType !== 'mouse') return;
   const btn = browserMouseButtonCode(e.button);
   if (btn === null) return;
   const release = heldInputs.takeMouseButtonRelease(btn);
   if (!release) return;
   e.preventDefault();
-  try {
-    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
-  } catch (_) {}
   sendInput(release, { release: true });
 }
 
-window.addEventListener('pointerup', (e) => {
+window.addEventListener('mouseup', (e) => {
   if (controlMode && inputCapabilities.relativePointer) e.stopPropagation();
-  releasePointerButton(e);
+  releaseMouseButton(e);
 }, { capture: true });
-window.addEventListener('pointercancel', (e) => {
-  if (e.pointerType === 'mouse') releaseHeldInputs();
-});
 
 window.addEventListener('contextmenu', (e) => {
   if (!controlMode || !pointerInputAvailable()) return;

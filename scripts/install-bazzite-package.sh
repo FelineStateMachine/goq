@@ -43,7 +43,7 @@ done
 [[ "$(uname -s)" == Linux ]] || die "this package must be installed on Linux"
 [[ "$(uname -m)" == x86_64 ]] || die "expected x86_64, got $(uname -m)"
 [[ "$(id -u)" -ne 0 ]] || die "run as the dedicated gaming user, not root"
-for command in diff flock ldd sha256sum systemctl systemd-analyze timeout; do
+for command in cmp diff flock ldd sha256sum systemctl systemd-analyze timeout; do
   command -v "$command" >/dev/null 2>&1 || die "$command is required"
 done
 
@@ -111,6 +111,7 @@ next_current="$install_root/.current-package-$release_id-$$"
 next_previous="$install_root/.previous-package-$release_id-$$"
 lock_path="$install_root/.install.lock"
 verify_unit="$install_root/.verify-package-$release_id-$$.service"
+next_managed_links=()
 
 install -d -m 0755 "$HOME/.local" "$HOME/.local/libexec" "$install_root" "$releases_root"
 exec 9>"$lock_path"
@@ -125,6 +126,9 @@ cleanup() {
   fi
   [[ ! -L "$next_current" ]] || rm -f -- "$next_current"
   [[ ! -L "$next_previous" ]] || rm -f -- "$next_previous"
+  for next_managed_link in "${next_managed_links[@]}"; do
+    [[ ! -L "$next_managed_link" ]] || rm -f -- "$next_managed_link"
+  done
   [[ ! -f "$verify_unit" ]] || rm -f -- "$verify_unit"
   exit "$status"
 }
@@ -204,25 +208,90 @@ local_bin="$HOME/.local/bin"
 asset_dir="$HOME/.local/share/sigil-spark/package-assets"
 install -d -m 0700 "$config_root" "$pipewire_dir" "$systemd_dir" "$local_bin" "$asset_dir"
 
-ensure_managed_link() {
+# BEGIN managed asset helpers (exercised directly by bazzite-package-assets.sh)
+preflight_managed_link() {
   local link="$1"
   local target="$2"
-  if [[ -e "$link" || -L "$link" ]]; then
-    [[ -L "$link" && "$(readlink -- "$link")" == "$target" ]] \
-      || die "refusing to replace unmanaged path: $link"
-    return
+  local release_asset="$3"
+
+  if [[ -L "$link" ]]; then
+    [[ "$(readlink "$link")" == "$target" ]] \
+      || die "refusing to replace unmanaged symlink: $link"
+    managed_link_action=keep
+  elif [[ -e "$link" ]]; then
+    [[ -f "$link" && -O "$link" ]] \
+      || die "refusing to replace unsafe or unowned path: $link"
+    cmp -s "$link" "$release_asset" \
+      || die "refusing to replace modified path: $link"
+    managed_link_action=replace
+  else
+    managed_link_action=create
   fi
-  ln -s "$target" "$link"
 }
 
-ensure_managed_link "$pipewire_dir/50-sigil-spark-audio.conf" \
+install_managed_links() {
+  local -a actions=()
+  local -a prepared_links=()
+  local index link next_link
+
+  [[ "${#managed_links[@]}" -eq 4 \
+    && "${#managed_links[@]}" -eq "${#managed_targets[@]}" \
+    && "${#managed_links[@]}" -eq "${#managed_release_assets[@]}" ]] \
+    || die "internal managed asset list mismatch"
+
+  # Classify every destination before changing any of them. This prevents a
+  # late unmanaged path from leaving an earlier package asset half-migrated.
+  for index in "${!managed_links[@]}"; do
+    preflight_managed_link \
+      "${managed_links[$index]}" \
+      "${managed_targets[$index]}" \
+      "${managed_release_assets[$index]}"
+    actions+=("$managed_link_action")
+  done
+
+  next_managed_links=()
+  for index in "${!managed_links[@]}"; do
+    [[ "${actions[$index]}" == keep ]] && continue
+    link="${managed_links[$index]}"
+    next_link="${link}.sigil-package-$release_id-$$-$index"
+    [[ ! -e "$next_link" && ! -L "$next_link" ]] \
+      || die "temporary managed link path already exists: $next_link"
+    prepared_links[index]="$next_link"
+    next_managed_links+=("$next_link")
+  done
+
+  for index in "${!managed_links[@]}"; do
+    [[ "${actions[$index]}" == keep ]] && continue
+    next_link="${prepared_links[$index]}"
+    ln -s "${managed_targets[$index]}" "$next_link"
+    if mv --help 2>&1 | grep -q -- '--no-target-directory'; then
+      mv -Tf -- "$next_link" "${managed_links[$index]}"
+    else
+      mv -f "$next_link" "${managed_links[$index]}"
+    fi
+  done
+}
+# END managed asset helpers
+
+managed_links=(
+  "$pipewire_dir/50-sigil-spark-audio.conf"
+  "$systemd_dir/sigil-host.service"
+  "$local_bin/sigil-spark-host-rollback"
+  "$asset_dir/70-sigil-remote-input.rules"
+)
+managed_targets=(
   "$install_root/current/assets/50-sigil-spark-audio.conf"
-ensure_managed_link "$systemd_dir/sigil-host.service" \
   "$install_root/current/assets/sigil-host.service"
-ensure_managed_link "$local_bin/sigil-spark-host-rollback" \
   "$install_root/current/tools/rollback-bazzite-release.sh"
-ensure_managed_link "$asset_dir/70-sigil-remote-input.rules" \
   "$install_root/current/assets/70-sigil-remote-input.rules"
+)
+managed_release_assets=(
+  "$release_path/assets/50-sigil-spark-audio.conf"
+  "$release_path/assets/sigil-host.service"
+  "$release_path/tools/rollback-bazzite-release.sh"
+  "$release_path/assets/70-sigil-remote-input.rules"
+)
+install_managed_links
 
 ln -s "releases/$release_id" "$next_current"
 if [[ -n "$current_release_id" && "$current_release_id" != "$release_id" ]]; then

@@ -501,6 +501,10 @@ stages and validates the entire release, then changes `current` last. It records
 the former release as `previous`; `sigil-spark-host-rollback` revalidates every
 target file before swapping `current`/`previous`. Neither path creates identity
 or `host.toml`, changes `/etc`, restarts PipeWire, or starts/enables the service.
+Before changing any package-managed user asset, the installer preflights all of
+them. It can adopt an operator-owned regular file only when it is byte-identical
+to the new release asset; any local modification or unsafe target rejects the
+whole asset migration without changing an earlier destination.
 
 For a temporary dirty and unsigned development package only, replace the
 Minisign option with `--allow-dirty --allow-unsigned`. The manifest records that

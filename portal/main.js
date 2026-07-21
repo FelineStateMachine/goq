@@ -291,6 +291,7 @@ async function refreshEnrollment() {
   currentEnrollmentStatus = status;
   enrollmentReady = status.enrolled === true;
   document.getElementById('reset-enrollment').classList.toggle('hidden', !enrollmentReady);
+  document.getElementById('reset-enrollment-intro').classList.toggle('hidden', !enrollmentReady);
   if (status.pending) {
     showInvitationSummary(status.pending);
     return enrollmentReady;
@@ -329,6 +330,7 @@ async function confirmEnrollmentReset() {
     enrollmentReady = false;
     currentEnrollmentStatus = null;
     document.getElementById('reset-enrollment').classList.add('hidden');
+    document.getElementById('reset-enrollment-intro').classList.add('hidden');
     document.getElementById('reset-enrollment-overlay').classList.add('hidden');
     showEnrollment();
   } catch (error) {

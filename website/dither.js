@@ -368,6 +368,76 @@
     });
   });
 
+  /* ── Portal platform matrix. One map is the single source of truth:
+        flip a null to an entry when an artifact passes the signing gate.
+        Combos without an artifact grey out the download button — the
+        matrix is shown, but nothing unavailable is advertised as a link. */
+  var PORTAL_BUILDS = {
+    "macos-arm": null,
+    "macos-x86": null,
+    "linux-arm": null,
+    "linux-x86": null,
+    "windows-arm": null,
+    "windows-x86": null,
+  };
+  var ARCH_NAMES = { arm: "arm64", x86: "x86_64" };
+
+  function pickedPortalValue(name) {
+    var el = document.querySelector('input[name="' + name + '"]:checked');
+    return el ? el.value : null;
+  }
+
+  function updatePortalDownload() {
+    var button = document.getElementById("portal-download");
+    var note = document.getElementById("portal-release-status");
+    var os = pickedPortalValue("portal-os");
+    var arch = pickedPortalValue("portal-arch");
+    if (!button || !note || !os || !arch) return;
+    var build = PORTAL_BUILDS[os + "-" + arch];
+    if (build) {
+      button.classList.remove("disabled");
+      button.removeAttribute("aria-disabled");
+      button.setAttribute("href", build.href);
+      button.textContent = build.label;
+      note.textContent = build.note;
+    } else {
+      button.classList.add("disabled");
+      button.setAttribute("aria-disabled", "true");
+      button.removeAttribute("href"); // href-less anchor: unfocusable, unclickable
+      button.textContent = "no " + os + " " + ARCH_NAMES[arch] + " build yet";
+      note.textContent = "portal for " + os + "/" + ARCH_NAMES[arch] +
+        " is not released yet · macos arm64 comes first";
+    }
+  }
+
+  document.querySelectorAll('input[name="portal-os"], input[name="portal-arch"]').forEach(function (radio) {
+    radio.addEventListener("change", updatePortalDownload);
+  });
+
+  // Best-effort platform preselect: a visitor lands on their own OS/arch
+  // and immediately sees whether a build exists. Falls back to macos+arm.
+  (function preselectPortalPlatform() {
+    var uad = navigator.userAgentData;
+    var platform = ((uad && uad.platform) || navigator.platform || "").toLowerCase();
+    var ua = (navigator.userAgent || "").toLowerCase();
+    var os = null;
+    if (platform.indexOf("mac") >= 0) os = "macos";
+    else if (platform.indexOf("win") >= 0) os = "windows";
+    else if (platform.indexOf("linux") >= 0 || ua.indexOf("linux") >= 0) os = "linux";
+    // Plain UA can't distinguish Apple Silicon from Intel; default macs to
+    // arm (the shipping target). Elsewhere, x86 unless the UA says ARM.
+    var arch = os === "macos"
+      ? "arm"
+      : /aarch64|arm64|armv8/.test(ua) ? "arm" : "x86";
+    if (os) {
+      var osRadio = document.querySelector('input[name="portal-os"][value="' + os + '"]');
+      var archRadio = document.querySelector('input[name="portal-arch"][value="' + arch + '"]');
+      if (osRadio) osRadio.checked = true;
+      if (archRadio) archRadio.checked = true;
+    }
+    updatePortalDownload();
+  })();
+
   /* ── Copy-to-clipboard for the install command(s). ── */
   document.querySelectorAll(".install").forEach(function (box) {
     var btn = box.querySelector(".install-copy");

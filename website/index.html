@@ -52,8 +52,34 @@
             </label>
           </div>
           <div class="release-action" data-release-target="portal">
-            <a class="portal-download" href="https://github.com/FelineStateMachine/goq/releases" rel="noopener">Portal downloads</a>
-            <p class="release-note">signed + notarized macOS builds will appear here · public alpha pending</p>
+            <div class="portal-picker">
+              <div class="seg" role="radiogroup" aria-label="Operating system">
+                <label class="seg-opt">
+                  <input type="radio" name="portal-os" value="macos" checked />
+                  <span>macos</span>
+                </label>
+                <label class="seg-opt">
+                  <input type="radio" name="portal-os" value="linux" />
+                  <span>linux</span>
+                </label>
+                <label class="seg-opt">
+                  <input type="radio" name="portal-os" value="windows" />
+                  <span>windows</span>
+                </label>
+              </div>
+              <div class="seg" role="radiogroup" aria-label="Architecture">
+                <label class="seg-opt">
+                  <input type="radio" name="portal-arch" value="arm" checked />
+                  <span>arm</span>
+                </label>
+                <label class="seg-opt">
+                  <input type="radio" name="portal-arch" value="x86" />
+                  <span>x86</span>
+                </label>
+              </div>
+            </div>
+            <a class="portal-download disabled" id="portal-download" aria-disabled="true">no macos arm64 build yet</a>
+            <p class="release-note"><span id="portal-release-status">portal for macos/arm64 is not released yet · macos arm64 comes first</span> · <a class="release-history" href="https://github.com/FelineStateMachine/goq/releases" rel="noopener">release history</a></p>
           </div>
           <div class="release-action" data-release-target="sigil" hidden>
             <div class="install" data-copy="curl --proto '=https' --tlsv1.2 -fsS https://goq.sh/install-sigil -o /tmp/install-sigil && bash /tmp/install-sigil">

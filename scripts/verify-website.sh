@@ -35,6 +35,9 @@ grep -Fq 'src="./dither.js"' "$site_dir/index.html"
 grep -Fq 'Content-Security-Policy:' "$site_dir/_headers"
 grep -Fq 'https://goq.sh/install-sigil' "$site_dir/index.html"
 grep -Fq 'github.com/FelineStateMachine/goq/releases' "$site_dir/index.html"
+grep -Fq 'class="portal-download disabled"' "$site_dir/index.html"
+grep -Fq 'id="portal-download" aria-disabled="true"' "$site_dir/index.html"
+grep -Fq '"macos-arm": null' "$site_dir/dither.js"
 for issue_number in 7 8 9 10; do
   grep -Fq "github.com/FelineStateMachine/goq/issues/$issue_number" "$site_dir/index.html"
 done

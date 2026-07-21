@@ -234,28 +234,67 @@ a { color: inherit; }
 .portal-download {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  min-height: 44px;
-  padding: 10px 22px;
-  border: 1px solid var(--ink);
-  background: var(--ink);
-  color: var(--paper);
+  gap: 10px;
+  min-height: 40px;
+  padding: 9px 18px;
+  border: 1px solid var(--hair-strong);
+  background: color-mix(in srgb, var(--paper-2) 82%, transparent);
+  color: var(--ink);
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 700;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.04em;
   text-decoration: none;
-  text-transform: uppercase;
-  transition: background 0.12s, color 0.12s;
+  text-transform: lowercase;
+  box-shadow: 4px 4px 0 var(--hair);
+  transition: background 0.12s, color 0.12s, box-shadow 0.12s, transform 0.12s;
 }
-.portal-download:hover { background: var(--terracotta); }
+/* pixel marker, same language as the hero-note square */
+.portal-download::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  background: var(--terracotta);
+}
+.portal-download:hover { background: var(--ink); color: var(--paper); }
+.portal-download:hover::before { background: var(--ochre); }
+.portal-download:active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 var(--hair);
+}
 .portal-download:focus-visible { outline: 2px solid var(--moss); outline-offset: 3px; }
+.portal-picker {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+/* combo without an artifact: dashed slot, no shadow — a pending space,
+   not a pressable thing */
+.portal-download.disabled {
+  background: transparent;
+  color: var(--ink-muted);
+  border: 1px dashed var(--hair-strong);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+.portal-download.disabled::before { background: var(--hair-strong); }
+.portal-download.disabled:hover {
+  background: transparent;
+  color: var(--ink-muted);
+}
+@media (prefers-reduced-motion: reduce) {
+  .portal-download:active { transform: none; }
+}
 .release-note {
   color: var(--ink-muted);
   font-family: var(--mono);
   font-size: 10.5px;
   line-height: 1.45;
 }
+.release-history { text-decoration: underline; text-underline-offset: 2px; }
+.release-history:hover { color: var(--ink); }
 /* platform segmented radio */
 .seg {
   display: inline-flex;

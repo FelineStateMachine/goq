@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod enrollment;
 pub mod network;
 pub mod state;
 

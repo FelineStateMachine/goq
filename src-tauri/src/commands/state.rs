@@ -329,6 +329,7 @@ where
 }
 
 pub struct AppState {
+    pub enrollment: super::enrollment::EnrollmentState,
     pub input_send: TokioMutex<Option<tokio::sync::mpsc::Sender<sigil_protocol::InputEvent>>>,
     pub client_endpoint: TokioMutex<Option<iroh::Endpoint>>,
     pub media_connection: TokioMutex<Option<(u64, iroh::endpoint::Connection)>>,
@@ -360,6 +361,7 @@ impl AppState {
 
     fn new(options: LaunchOptions) -> Self {
         Self {
+            enrollment: super::enrollment::EnrollmentState::default(),
             input_send: TokioMutex::new(None),
             client_endpoint: TokioMutex::new(None),
             media_connection: TokioMutex::new(None),

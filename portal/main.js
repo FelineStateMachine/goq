@@ -88,11 +88,20 @@ import {
   fitStreamSurface,
 } from './window-geometry.mjs';
 import { buildVideoDecoderConfig } from './video-decoder-config.mjs';
+import {
+  formatInvitationExpiry,
+  grantLabel,
+  normalizeInvitationSummary,
+  shortPeerFingerprint,
+} from './enrollment.mjs';
 
 let controlMode = false;
 let connected = false;
 let connecting = false;
 let developmentConnectionMode = false;
+let enrollmentReady = false;
+let pendingInvitationSummary = null;
+let currentEnrollmentStatus = null;
 let disconnecting = false;
 let inputCapabilities = {
   relativePointer: false,
@@ -250,6 +259,150 @@ function showTap() {
 }
 function hideTap() { document.getElementById('tap-overlay').classList.add('hidden'); }
 
+function hideEnrollment() { document.getElementById('enrollment-overlay').classList.add('hidden'); }
+function showEnrollment() {
+  if (!document.getElementById('invitation-overlay').classList.contains('hidden')) return;
+  hideIntro();
+  document.getElementById('enrollment-overlay').classList.remove('hidden');
+  setTimeout(() => document.getElementById('enrollment-pin')?.focus(), 50);
+}
+
+function showInvitationSummary(value) {
+  const summary = normalizeInvitationSummary(value);
+  pendingInvitationSummary = summary;
+  hideEnrollment();
+  document.getElementById('invitation-host').textContent = summary.hostFingerprint;
+  document.getElementById('invitation-peer').textContent = summary.peerFingerprint;
+  document.getElementById('invitation-expiry').textContent = formatInvitationExpiry(summary.expiresAtUnix);
+  document.getElementById('invitation-grants').textContent = summary.grants.map(grantLabel).join(' · ');
+  document.getElementById('invitation-status').textContent = '';
+  document.getElementById('invitation-overlay').classList.remove('hidden');
+  setTimeout(() => setControllerFocus(document.getElementById('confirm-invitation')), 0);
+}
+
+async function refreshEnrollment() {
+  if (developmentConnectionMode) {
+    enrollmentReady = true;
+    hideEnrollment();
+    showIntro();
+    return true;
+  }
+  const status = await invoke('portal_enrollment_status');
+  currentEnrollmentStatus = status;
+  enrollmentReady = status.enrolled === true;
+  document.getElementById('reset-enrollment').classList.toggle('hidden', !enrollmentReady);
+  if (status.pending) {
+    showInvitationSummary(status.pending);
+    return enrollmentReady;
+  }
+  if (enrollmentReady) {
+    hideEnrollment();
+    showIntro();
+  } else {
+    showEnrollment();
+  }
+  return enrollmentReady;
+}
+
+function openEnrollmentReset() {
+  if (!currentEnrollmentStatus?.enrolled || !currentEnrollmentStatus.host_node_id) return;
+  togglePanel(false);
+  document.getElementById('reset-enrollment-host').textContent =
+    shortPeerFingerprint(currentEnrollmentStatus.host_node_id);
+  document.getElementById('reset-enrollment-status').textContent = '';
+  document.getElementById('reset-enrollment-overlay').classList.remove('hidden');
+  setTimeout(() => setControllerFocus(document.getElementById('confirm-reset-enrollment')), 0);
+}
+
+function cancelEnrollmentReset() {
+  document.getElementById('reset-enrollment-overlay').classList.add('hidden');
+}
+
+async function confirmEnrollmentReset() {
+  const hostNodeId = currentEnrollmentStatus?.host_node_id;
+  if (!hostNodeId) return;
+  const status = document.getElementById('reset-enrollment-status');
+  status.className = 'overlay-status pending';
+  status.textContent = 'erasing enrollment';
+  try {
+    await invoke('portal_reset_enrollment', { expectedHostNodeId: hostNodeId });
+    enrollmentReady = false;
+    currentEnrollmentStatus = null;
+    document.getElementById('reset-enrollment').classList.add('hidden');
+    document.getElementById('reset-enrollment-overlay').classList.add('hidden');
+    showEnrollment();
+  } catch (error) {
+    status.className = 'overlay-status err';
+    status.textContent = String(error);
+  }
+}
+
+async function derivePortalIdentity() {
+  const pin = document.getElementById('enrollment-pin').value.trim();
+  const status = document.getElementById('enrollment-status');
+  if (!pin) {
+    status.className = 'overlay-status err';
+    status.textContent = 'enter pin';
+    return;
+  }
+  status.className = 'overlay-status pending';
+  status.textContent = 'tap the security key';
+  showTap();
+  try {
+    const result = await invoke('key_derive_identity', { pin });
+    if (result.error || !result.node_id) throw new Error(result.error || 'identity derivation failed');
+    document.getElementById('enrollment-peer-id').textContent = result.node_id;
+    document.getElementById('enrollment-peer-wrap').classList.remove('hidden');
+    status.className = 'overlay-status ok';
+    status.textContent = `portal ${shortPeerFingerprint(result.node_id)} ready for an invitation`;
+  } catch (error) {
+    status.className = 'overlay-status err';
+    status.textContent = String(error);
+  } finally {
+    hideTap();
+  }
+}
+
+async function chooseInvitationFile() {
+  const status = document.getElementById('enrollment-status');
+  try {
+    const path = await window.__TAURI__.dialog.open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: 'goq invitation', extensions: ['goq-invite'] }],
+    });
+    if (!path) return;
+    const summary = await invoke('portal_import_invitation_file', { path });
+    showInvitationSummary(summary);
+  } catch (error) {
+    status.className = 'overlay-status err';
+    status.textContent = String(error);
+  }
+}
+
+async function confirmInvitation() {
+  if (!pendingInvitationSummary) return;
+  const status = document.getElementById('invitation-status');
+  status.className = 'overlay-status pending';
+  status.textContent = 'saving enrollment';
+  try {
+    await invoke('portal_confirm_invitation');
+    pendingInvitationSummary = null;
+    document.getElementById('invitation-overlay').classList.add('hidden');
+    await refreshEnrollment();
+  } catch (error) {
+    status.className = 'overlay-status err';
+    status.textContent = String(error);
+  }
+}
+
+async function cancelInvitation() {
+  try { await invoke('portal_cancel_invitation'); } catch (error) { console.warn(error); }
+  pendingInvitationSummary = null;
+  document.getElementById('invitation-overlay').classList.add('hidden');
+  showEnrollment();
+}
+
 async function checkDevelopmentConnectionMode() {
   const mode = await invoke('development_connection_mode');
   developmentConnectionMode = mode.enabled;
@@ -275,6 +428,10 @@ async function checkDevelopmentConnectionMode() {
 // ─── Intro actions ────────────────────────────────────────────────────────────
 async function introConnect() {
   if (connecting || connected) return;
+  if (!developmentConnectionMode && !enrollmentReady) {
+    showEnrollment();
+    return;
+  }
   const pin = document.getElementById('intro-pin').value.trim();
   const status = document.getElementById('intro-status');
   if (!developmentConnectionMode && !pin) {
@@ -2296,11 +2453,12 @@ function pinPadClear() {
   renderPinPad();
 }
 
-for (const id of ['intro-pin', 'pin-input']) {
+for (const id of ['enrollment-pin', 'intro-pin', 'pin-input']) {
   document.getElementById(id).addEventListener('keydown', (event) => {
     if (event.key !== 'Enter') return;
     event.preventDefault();
-    if (id === 'intro-pin') void introConnect();
+    if (id === 'enrollment-pin') void derivePortalIdentity();
+    else if (id === 'intro-pin') void introConnect();
     else void connectHost();
   });
 }
@@ -2334,6 +2492,12 @@ function controllerScope() {
   if (!tap.classList.contains('hidden')) return tap;
   const pinPad = document.getElementById('pin-pad-overlay');
   if (!pinPad.classList.contains('hidden')) return pinPad;
+  const resetEnrollment = document.getElementById('reset-enrollment-overlay');
+  if (!resetEnrollment.classList.contains('hidden')) return resetEnrollment;
+  const invitation = document.getElementById('invitation-overlay');
+  if (!invitation.classList.contains('hidden')) return invitation;
+  const enrollment = document.getElementById('enrollment-overlay');
+  if (!enrollment.classList.contains('hidden')) return enrollment;
   const intro = document.getElementById('intro');
   if (!intro.classList.contains('hidden')) return intro;
   const panel = document.getElementById('panel');
@@ -2385,6 +2549,8 @@ function activateControllerFocus() {
 function controllerBack() {
   if (!document.getElementById('pin-pad-overlay').classList.contains('hidden')) {
     closePinPad();
+  } else if (!document.getElementById('reset-enrollment-overlay').classList.contains('hidden')) {
+    cancelEnrollmentReset();
   } else if (document.getElementById('panel').classList.contains('visible')) {
     togglePanel(false);
   }
@@ -2495,11 +2661,18 @@ listen('dev-connect-routing', (event) => {
   console.warn('[development direct-node routing]', event.payload.warning, event.payload.host_node_id);
 });
 
+listen('invitation-pending', (event) => {
+  try { showInvitationSummary(event.payload); }
+  catch (error) { console.error('invalid native invitation summary:', error); }
+});
+
 // ─── Expose to HTML onclick handlers ─────────────────────────────────────────
 Object.assign(window, {
   introConnect, connectHost, disconnect,
   scanFido, togglePanel, toggleControl, toggleAudioMute,
   openPinPad, closePinPad, pinPadDigit, pinPadBackspace, pinPadClear,
+  openEnrollmentReset, cancelEnrollmentReset, confirmEnrollmentReset,
+  derivePortalIdentity, chooseInvitationFile, confirmInvitation, cancelInvitation,
   sigilController: Object.freeze({
     getLatestState: () => controllerPublisher.latest,
     setObserver: (observer) => {
@@ -2518,7 +2691,15 @@ async function initialize() {
   }
   updatePanelVisibility();
   updateControlUI();
-  showIntro();
+  try {
+    await refreshEnrollment();
+  } catch (error) {
+    console.error('enrollment status check failed:', error);
+    showEnrollment();
+    const status = document.getElementById('enrollment-status');
+    status.className = 'overlay-status err';
+    status.textContent = 'could not load enrollment';
+  }
   if (!developmentConnectionMode) scanFido();
   requestAnimationFrame(pollControllers);
 }

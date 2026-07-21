@@ -1,4 +1,5 @@
 mod audio;
+mod authorization;
 mod clock;
 mod config;
 mod cursor;
@@ -7,19 +8,30 @@ mod input;
 mod server;
 mod source;
 
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use iroh::Endpoint;
 use iroh::endpoint::{QuicTransportConfig, presets};
 use iroh::protocol::Router;
-use sigil_protocol::{AUDIO_ALPN_V1, INPUT_ALPN_V1, MEDIA_ALPN_V1, MEDIA_ALPN_V2};
+use iroh::{Endpoint, EndpointId};
+use sigil_protocol::{
+    AUDIO_ALPN_V1, INPUT_ALPN_V1, InvitationGrants, MAX_INVITATION_TTL_SECS, MEDIA_ALPN_V1,
+    MEDIA_ALPN_V2, SignedInvitation,
+};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::authorization::{
+    AuthorizationPolicy, AuthorizationStore, grant_names, unix_timestamp_now,
+};
 use crate::config::{HostConfig, InputMode, VideoSource};
 use crate::cursor::PointerPositionTracker;
 use crate::input::InputBackend;
@@ -52,6 +64,16 @@ enum Command {
         #[command(subcommand)]
         command: CaptureCommand,
     },
+    /// Create a short-lived, peer-bound Portal enrollment invitation.
+    Invitation {
+        #[command(subcommand)]
+        command: InvitationCommand,
+    },
+    /// Inspect or revoke the one enrolled Portal peer.
+    Enrollment {
+        #[command(subcommand)]
+        command: EnrollmentCommand,
+    },
     /// Run the headless host daemon in the foreground.
     Serve(ServeArgs),
 }
@@ -83,6 +105,42 @@ enum ConfigCommand {
 enum CaptureCommand {
     /// Consume a finite number of frames without starting iroh.
     Probe(CaptureProbeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum InvitationCommand {
+    /// Create a signed invitation file using create-new semantics.
+    Create {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        peer: EndpointId,
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=MAX_INVITATION_TTL_SECS))]
+        expires_in_seconds: u64,
+        #[arg(long)]
+        pointer_keyboard: bool,
+        #[arg(long)]
+        gamepad: bool,
+        #[arg(long)]
+        output: PathBuf,
+        /// Also print the short-lived invitation as a goq:// deep link.
+        #[arg(long)]
+        print_deep_link: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnrollmentCommand {
+    /// Print the current enrollment without exposing secret material.
+    Show {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Remove the enrolled peer and invalidate every outstanding invitation.
+    Revoke {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -162,8 +220,103 @@ async fn main() -> Result<()> {
         Command::Identity { command } => identity_command(command),
         Command::Config { command } => config_command(command).await,
         Command::Capture { command } => capture_command(command).await,
+        Command::Invitation { command } => invitation_command(command),
+        Command::Enrollment { command } => enrollment_command(command),
         Command::Serve(args) => serve_command(args).await,
     }
+}
+
+fn authorization_store_from_config(
+    path: &Path,
+) -> Result<(HostConfig, iroh::SecretKey, AuthorizationStore)> {
+    let config = HostConfig::load(path)?;
+    config.ensure_runtime_directory()?;
+    let secret = identity::load(&config.identity_path)?;
+    let store = AuthorizationStore::open(config.state_path.clone(), secret.public())?;
+    Ok((config, secret, store))
+}
+
+fn invitation_command(command: InvitationCommand) -> Result<()> {
+    match command {
+        InvitationCommand::Create {
+            config,
+            peer,
+            expires_in_seconds,
+            pointer_keyboard,
+            gamepad,
+            output,
+            print_deep_link,
+        } => {
+            let (_config, secret, store) = authorization_store_from_config(&config)?;
+            let mut grants = InvitationGrants::VIEW;
+            if pointer_keyboard {
+                grants = grants.union(InvitationGrants::POINTER_KEYBOARD);
+            }
+            if gamepad {
+                grants = grants.union(InvitationGrants::GAMEPAD);
+            }
+            let mut nonce = [0_u8; 32];
+            getrandom::fill(&mut nonce).context("generating invitation nonce")?;
+            let now = unix_timestamp_now()?;
+            let claims = store.issue_claims(peer, grants, expires_in_seconds, now, nonce)?;
+            let expires_at = claims.expires_at_unix;
+            let invitation = SignedInvitation::issue(claims, &secret.to_bytes())?;
+            let token = invitation.encode();
+            write_invitation_file(&output, &token)?;
+            println!("invitation={}", output.display());
+            println!("host_node_id={}", secret.public());
+            println!("peer_node_id={peer}");
+            println!("grants={}", grant_names(grants));
+            println!("expires_at_unix={expires_at}");
+            if print_deep_link {
+                println!("deep_link=goq://invite/{token}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn enrollment_command(command: EnrollmentCommand) -> Result<()> {
+    match command {
+        EnrollmentCommand::Show { config } => {
+            let (_config, _secret, store) = authorization_store_from_config(&config)?;
+            let snapshot = store.snapshot()?;
+            println!("enrollment_epoch={}", snapshot.epoch);
+            match (snapshot.peer, snapshot.grants) {
+                (Some(peer), Some(grants)) => {
+                    println!("enrollment=active");
+                    println!("peer_node_id={peer}");
+                    println!("grants={}", grant_names(grants));
+                }
+                (None, None) => println!("enrollment=none"),
+                _ => unreachable!("validated authorization state is internally consistent"),
+            }
+        }
+        EnrollmentCommand::Revoke { config } => {
+            let (_config, _secret, store) = authorization_store_from_config(&config)?;
+            let revoked = store.revoke(unix_timestamp_now()?)?;
+            let snapshot = store.snapshot()?;
+            println!("revoked={revoked}");
+            println!("enrollment_epoch={}", snapshot.epoch);
+        }
+    }
+    Ok(())
+}
+
+fn write_invitation_file(path: &Path, token: &str) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("creating invitation {}", path.display()))?;
+    file.write_all(token.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn identity_command(command: IdentityCommand) -> Result<()> {
@@ -398,6 +551,14 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     config.validate()?;
     config.ensure_runtime_directory()?;
     let secret = identity::load(&config.identity_path)?;
+    let authorization = if args.config.is_some() {
+        AuthorizationPolicy::Required(AuthorizationStore::open(
+            config.state_path.clone(),
+            secret.public(),
+        )?)
+    } else {
+        AuthorizationPolicy::TestPatternProof
+    };
     let input_backend = InputBackend::initialize(&config)?;
 
     let pointer_surface_dimensions = if config.source == VideoSource::TestPattern {
@@ -481,6 +642,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
             MediaV2Handler {
                 config: config.clone(),
                 sessions: Arc::clone(&sessions),
+                authorization: authorization.clone(),
             },
         )
         .accept(
@@ -488,6 +650,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
             MediaHandler {
                 config: config.clone(),
                 sessions: Arc::clone(&sessions),
+                authorization,
             },
         )
         .accept(
@@ -598,6 +761,8 @@ fn parse_size(value: &str) -> std::result::Result<(u32, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn parses_expected_size() {
@@ -618,6 +783,68 @@ mod tests {
                 "test-pattern"
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn invitation_and_enrollment_commands_parse_strictly() {
+        let peer = iroh::SecretKey::from_bytes(&[19; 32]).public().to_string();
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "invitation",
+                "create",
+                "--config",
+                "/tmp/host.toml",
+                "--peer",
+                &peer,
+                "--pointer-keyboard",
+                "--gamepad",
+                "--print-deep-link",
+                "--output",
+                "/tmp/portal.goq-invite",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "invitation",
+                "create",
+                "--config",
+                "/tmp/host.toml",
+                "--peer",
+                &peer,
+                "--expires-in-seconds",
+                "901",
+                "--output",
+                "/tmp/portal.goq-invite",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "enrollment",
+                "revoke",
+                "--config",
+                "/tmp/host.toml"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn invitation_file_uses_create_new_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("portal.goq-invite");
+        write_invitation_file(&path, "token").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "token\n");
+        assert!(write_invitation_file(&path, "replacement").is_err());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 

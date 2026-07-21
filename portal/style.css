@@ -475,12 +475,60 @@ body.native-pointer-control * { cursor: none !important; }
 }
 #intro .flow-step.active { color: var(--terracotta); }
 #tap-overlay .flow-step.active { color: var(--ochre); }
+.enrollment-content,
+.invitation-content { width: 460px; }
+.enrollment-peer {
+  margin: 20px 0 4px;
+  padding: 12px;
+  border: 1px solid var(--border-strong);
+  background: var(--background);
+  font-family: var(--mono);
+  text-align: left;
+}
+.enrollment-peer.hidden { display: none; }
+.enrollment-peer span {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--muted-fg);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.enrollment-peer output {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--sand);
+  font-size: 11px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.invitation-summary {
+  margin: 18px 0;
+  border-block: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: left;
+}
+.invitation-summary > div {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 12px;
+  padding: 9px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.invitation-summary > div:last-child { border-bottom: 0; }
+.invitation-summary dt { color: var(--muted-fg); }
+.invitation-summary dd { color: var(--foreground); overflow-wrap: anywhere; }
 .overlay-actions {
   display: flex;
   gap: 16px;
   justify-content: center;
   align-items: center;
   margin-top: 14px;
+}
+.overlay-btn.danger {
+  color: var(--destructive);
+  border-color: color-mix(in srgb, var(--destructive) 55%, var(--border));
 }
 .shortcut-key {
   color: var(--foreground);

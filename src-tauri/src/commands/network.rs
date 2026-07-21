@@ -1011,7 +1011,7 @@ async fn negotiate_v1(
     required: Option<Capability>,
     stream_name: &str,
 ) -> Result<NegotiatedV1Stream, String> {
-    let hello = ClientHello::new("sigil-spark/0.1.0", nonce, capabilities.clone());
+    let hello = ClientHello::new("portal/0.1.0", nonce, capabilities.clone());
     write_client_hello(send, &hello)
         .await
         .map_err(|e| format!("Failed to send {stream_name} handshake: {e}"))?;

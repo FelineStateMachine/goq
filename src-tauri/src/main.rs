@@ -9,7 +9,7 @@ fn main() {
     let state = match AppState::from_args(std::env::args_os()) {
         Ok(state) => state,
         Err(error) => {
-            eprintln!("sigil-spark: {error}");
+            eprintln!("portal: {error}");
             std::process::exit(2);
         }
     };
@@ -28,7 +28,7 @@ fn main() {
             use tauri::Manager;
 
             // The Tauri application is the installed client. Hosting is owned
-            // exclusively by the separate, headless `sigil-host` daemon.
+            // exclusively by the separate, headless `sigil` daemon.
             if let Some(window) = app.get_webview_window("main") {
                 let focus_window = window.clone();
                 window.on_window_event(move |event| {

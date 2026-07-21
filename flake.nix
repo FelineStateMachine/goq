@@ -1,5 +1,5 @@
 {
-  description = "Sigil Spark reproducible Linux host proof environment";
+  description = "Sigil reproducible Linux host proof environment";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/d407951447dcd00442e97087bf374aad70c04cea";
 

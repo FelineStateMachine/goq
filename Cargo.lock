@@ -4098,6 +4098,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "ctap-hid-fido2",
+ "getrandom 0.4.3",
+ "image",
+ "iroh",
+ "log",
+ "openh264",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sigil-protocol",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-log",
+ "tokio",
+]
+
+[[package]]
 name = "portmapper"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4971,28 +4993,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
- "tokio",
-]
-
-[[package]]
-name = "sigil-spark"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "ctap-hid-fido2",
- "getrandom 0.4.3",
- "image",
- "iroh",
- "log",
- "openh264",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sigil-protocol",
- "tauri",
- "tauri-build",
- "tauri-plugin-log",
  "tokio",
 ]
 

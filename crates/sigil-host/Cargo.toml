@@ -1,12 +1,21 @@
 [package]
 name = "sigil-host"
 version = "0.1.0"
-description = "Headless Sigil Spark streaming host"
+description = "Headless Sigil streaming host"
 authors = ["Dami"]
 license = "MIT"
 edition = "2024"
 rust-version = "1.91"
-default-run = "sigil-host"
+autobins = false
+default-run = "sigil"
+
+[[bin]]
+name = "sigil"
+path = "src/main.rs"
+
+[[bin]]
+name = "sigil-probe"
+path = "src/bin/sigil-probe.rs"
 
 [dependencies]
 anyhow = "1"

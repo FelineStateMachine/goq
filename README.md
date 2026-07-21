@@ -1,9 +1,9 @@
-# Sigil Spark
+# goq.sh
 
-Sigil Spark is a native Tauri client and bare-metal Linux host for one-to-one,
-low-latency Steam streaming over iroh.
+goq.sh is one-to-one, low-latency Steam streaming over iroh: Portal is the
+installed Tauri client, and Sigil is the pure Rust bare-metal Linux host.
 
-The project starts from Sigil's working remote-desktop implementation. Native
+The project starts from an inherited working remote-desktop implementation. Native
 iroh connectivity, hardware video encoding, WebCodecs decoding, FIDO-derived
 identity, and remote input are already present. The next phase replaces the
 desktop-oriented hot path with a headless Gamescope pipeline.
@@ -11,13 +11,13 @@ desktop-oriented hot path with a headless Gamescope pipeline.
 ## Target architecture
 
 ```text
-Bare-metal Linux host
+Sigil · bare-metal Linux host
   Gamescope headless
     -> PipeWire video/audio
     -> hardware H.264 + Opus
     -> iroh/MoQ
 
-Tauri client
+Portal · Tauri client
   native iroh endpoint
     -> binary Tauri channel
     -> WebCodecs video
@@ -35,10 +35,11 @@ Steam and games.
 
 - A shared, bounded and versioned protocol crate owns handshakes, H.264 media,
   input messages, limits, and ALPNs.
-- The Linux host is a pure Rust binary with no Tauri or webview dependency.
+- The Linux host is the pure Rust `sigil` binary with no Tauri or webview
+  dependency.
 - The Bazzite path captures the exact Gamescope PipeWire node and uses AMD
   GstVA H.264 at the fixed 1280×800/60 first target.
-- The client delivers encoded frames to WebCodecs through a raw Tauri binary
+- Portal delivers encoded frames to WebCodecs through a raw Tauri binary
   channel. The handoff is capped at four frames, the decode queue and
   presentation queue at two, and a bounded watchdog recovers a suspended
   webview animation-frame callback without presenting a frame twice. Its
@@ -47,7 +48,7 @@ Steam and games.
 - Linux `uinput` supports bounded relative-mouse and keyboard injection plus a
   separate Xbox-style virtual gamepad, with strict device
   ownership/mode/ACL preflight and neutralization when a session ends.
-- The installed Tauri application is client-only: it contains no host daemon,
+- The installed Portal application is client-only: it contains no host daemon,
   host registration, capture, encoder, or desktop input-injection path.
 - FIDO2 `hmac-secret` identity derivation remains in the normal client flow.
   Debug builds have an explicit, visibly labeled direct-node bypass for test
@@ -68,7 +69,7 @@ authentication.
 
 ## Immediate milestones
 
-1. **Done:** split the bare-metal host into a pure Rust binary; keep Tauri client-only.
+1. **Done:** split Sigil into a pure Rust host binary; keep Portal client-only.
 2. **Hardware-proven:** capture the Gamescope PipeWire node without an XDG portal or physical display; cold-boot service proof remains.
 3. **Hardware-proven:** encode H.264 at 1280x800/60 with bounded buffers and no B-frames.
 4. **Done:** replace base64 WebCodecs delivery with a bounded binary Tauri channel.
@@ -121,6 +122,11 @@ binaries, their dynamic libraries, and bounded startup commands validate. Host
 identity, hardware-specific configuration, and service activation remain
 separate gates in the Bazzite runbook.
 
+The thin binary stager is only for unmanaged development layouts. It refuses
+activation when package-managed service, audio, rollback, or udev links follow
+`current`; use the complete runtime package installer for those hosts so the
+active release always includes matching assets and rollback metadata.
+
 Create the Bazzite runtime package from a committed source revision. Product
 mode exports clean `HEAD` and builds the host and probe itself with locked
 `cargo-zigbuild` in an isolated target directory; it never accepts externally
@@ -142,17 +148,24 @@ scripts/package-bazzite-release.sh \
 scripts/package-bazzite-release.sh \
   --output /tmp/sigil-spark-host-prebuilt-dev.tar.gz \
   --allow-dirty --allow-unsigned \
-  --host-binary /absolute/path/to/sigil-host \
+  --host-binary /absolute/path/to/sigil \
   --probe-binary /absolute/path/to/sigil-probe
 ```
 
-The package contains only the two Linux binaries, installer/rollback tools,
-service/audio/udev assets, license, checksums, and build provenance. It cannot
-contain the source tree, `.env` files, identities, host configuration, or test
-evidence. Its release ID is the SHA-256 of the complete installed-file checksum
-manifest. Identical inputs produce a byte-identical archive. The manifest marks
-product binaries as built from clean `HEAD`; caller-supplied development
-binaries are explicitly marked as having unverified provenance.
+The package contains the primary `sigil` host executable, its byte-identical
+`sigil-host` compatibility copy, the `sigil-probe` diagnostic, installer and
+rollback tools, service/audio/udev assets, license, checksums, and build
+provenance. It cannot contain the source tree, `.env` files, identities, host
+configuration, or test evidence. Its release ID is the SHA-256 of the complete
+installed-file checksum manifest. Identical inputs produce a byte-identical
+archive. The manifest marks product binaries as built from clean `HEAD`;
+caller-supplied development binaries are explicitly marked as having
+unverified provenance.
+
+During the legacy rollback window, `sigil-host.service` deliberately starts
+the byte-identical `sigil-host` compatibility filename. Interactive and
+documented host commands use `sigil`; retaining the service filename allows an
+older installed rollback helper to validate and reactivate a newer release.
 
 Verify the detached signature against the separately trusted public key before
 extracting, then run `payload/stage-this-release.sh` as the gaming user. Install
@@ -160,8 +173,8 @@ and upgrade never restart PipeWire or start/enable the service. Roll back an
 installed upgrade with `sigil-spark-host-rollback`; add `--restart` only when a
 service interruption is intended.
 
-The macOS Tauri build currently produces an arm64 DMG for development. A public
-client release additionally requires Developer ID signing with hardened
+The macOS Portal build currently produces an arm64 DMG for development. A public
+Portal release additionally requires Developer ID signing with hardened
 runtime, notarization, stapling, and strict Gatekeeper verification; ad-hoc
 development signatures are not a distributable package. With Apple credentials
 configured as described by the official
@@ -171,7 +184,7 @@ configured as described by the official
 scripts/package-macos-client.sh --output-dir /absolute/release/directory
 ```
 
-Run the current client/host application:
+Run Portal against Sigil during development:
 
 ```bash
 source ~/.cargo/env

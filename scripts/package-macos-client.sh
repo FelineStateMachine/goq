@@ -87,7 +87,7 @@ source "$HOME/.cargo/env"
 )
 
 bundle_root="$repo_dir/target/release/bundle"
-app_path="$bundle_root/macos/Sigil Spark.app"
+app_path="$bundle_root/macos/Portal.app"
 [[ -d "$app_path" ]] || die "Tauri app bundle is missing"
 dmg_count="$(find "$bundle_root/dmg" -maxdepth 1 -type f -name '*.dmg' -print | wc -l | tr -d ' ')"
 [[ "$dmg_count" -eq 1 ]] || die "expected exactly one DMG artifact"
@@ -107,23 +107,23 @@ xcrun stapler validate "$app_path"
 xcrun stapler validate "$dmg_path"
 spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
 
-executable="$app_path/Contents/MacOS/sigil-spark"
+executable="$app_path/Contents/MacOS/portal"
 [[ -x "$executable" ]] || die "client executable is missing"
 architectures="$(lipo -archs "$executable")"
 grep -Eq "(^| )$expected_arch( |$)" <<<"$architectures" \
   || die "client executable does not contain $expected_arch"
 identifier="$(plutil -extract CFBundleIdentifier raw "$app_path/Contents/Info.plist")"
-[[ "$identifier" == com.sigil.spark ]] || die "unexpected bundle identifier: $identifier"
-if find "$app_path" -type f \( -name sigil-host -o -name sigil-probe -o -name host.toml -o -name '*.key' \) \
+[[ "$identifier" == sh.goq.portal ]] || die "unexpected bundle identifier: $identifier"
+if find "$app_path" -type f \( -name sigil -o -name sigil-host -o -name sigil-probe -o -name host.toml -o -name '*.key' \) \
   | grep -q .
 then
   die "client bundle contains a forbidden host or credential artifact"
 fi
 
 version="$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")"
-artifact_name="Sigil-Spark-${version}-${expected_arch}.dmg"
+artifact_name="Portal-${version}-${expected_arch}.dmg"
 artifact_path="$output_dir/$artifact_name"
-manifest_path="$output_dir/Sigil-Spark-${version}-${expected_arch}.json"
+manifest_path="$output_dir/Portal-${version}-${expected_arch}.json"
 [[ ! -e "$artifact_path" && ! -e "$manifest_path" && ! -e "$artifact_path.sha256" ]] \
   || die "release output already exists"
 install -m 0644 "$dmg_path" "$artifact_path"
@@ -137,9 +137,9 @@ import sys
 path, version, expected_arch, architectures, digest = sys.argv[1:]
 manifest = {
     "format": 1,
-    "product": "sigil-spark-client",
+    "product": "portal-client",
     "version": version,
-    "bundle_identifier": "com.sigil.spark",
+    "bundle_identifier": "sh.goq.portal",
     "expected_arch": expected_arch,
     "architectures": architectures.split(),
     "sha256": digest,

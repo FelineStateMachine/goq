@@ -19,7 +19,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-host_binary="$temp_root/sigil-host"
+host_binary="$temp_root/sigil"
 probe_binary="$temp_root/sigil-probe"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$host_binary"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$probe_binary"
@@ -76,11 +76,29 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     if manifest_file is None:
         raise SystemExit("release manifest is missing")
     manifest = json.load(manifest_file)
+    primary = archive.extractfile("payload/release/sigil")
+    compatibility = archive.extractfile("payload/release/sigil-host")
+    service = archive.extractfile("payload/release/assets/sigil-host.service")
+    if primary is None or compatibility is None:
+        raise SystemExit("primary or compatibility host executable is missing")
+    if service is None:
+        raise SystemExit("service asset is missing")
+    if primary.read() != compatibility.read():
+        raise SystemExit("sigil-host compatibility executable differs from sigil")
+    service_text = service.read().decode("utf-8")
+    if "current/sigil-host serve" not in service_text:
+        raise SystemExit("service does not retain the compatibility executable")
+    if "current/sigil serve" in service_text:
+        raise SystemExit("service bypasses the legacy compatibility executable")
 
 if manifest.get("binary_provenance") != "caller-supplied-unverified":
     raise SystemExit("caller-supplied binary provenance is not marked unverified")
 if manifest.get("binary_provenance_verified") is not False:
     raise SystemExit("caller-supplied binary provenance must not be verified")
+if manifest.get("primary_executable") != "sigil":
+    raise SystemExit("primary executable is not sigil")
+if manifest.get("compatibility_executable") != "sigil-host":
+    raise SystemExit("compatibility executable is not sigil-host")
 PY
 
 printf 'package_bazzite_provenance_tests=ok\n'

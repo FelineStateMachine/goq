@@ -71,8 +71,8 @@ assert_contains "$wrong_user_session_output" \
 
 pass_journal='[0.500000] host systemd[1]: Reached target Basic System
 [1.000000] host gamescope-session-plus[100]: starting Gamescope
-[2.000000] host systemd[1000]: Started sigil-host.service - Sigil Spark streaming host
-[3.000000] host sigil-host[200]: INFO sigil host ready
+[2.000000] host systemd[1000]: Started sigil-host.service - Sigil streaming host
+[3.000000] host sigil[200]: INFO sigil host ready
 [4.000000] host sshd-session[300]: Accepted publickey for tank'
 journalctl() {
   printf '%s\n' "$pass_journal"
@@ -85,8 +85,8 @@ assert_not_contains "$pass_output" 'cold_boot_failure='
 assert_not_contains "$pass_output" 'cold_boot_evidence_insufficient='
 
 late_journal='[301.000000] host gamescope-session-plus[100]: starting Gamescope
-[302.000000] host systemd[1000]: Started sigil-host.service - Sigil Spark streaming host
-[303.000000] host sigil-host[200]: INFO sigil host ready
+[302.000000] host systemd[1000]: Started sigil-host.service - Sigil streaming host
+[303.000000] host sigil[200]: INFO sigil host ready
 [304.000000] host sshd-session[300]: Accepted publickey for tank'
 journalctl() {
   printf '%s\n' "$late_journal"
@@ -98,8 +98,8 @@ assert_contains "$late_output" \
 bad_order_journal='[0.500000] host systemd[1]: Reached target Basic System
 [1.000000] host sshd-session[300]: Accepted publickey for tank
 [2.000000] host gamescope-session-plus[100]: starting Gamescope
-[3.000000] host systemd[1000]: Started sigil-host.service - Sigil Spark streaming host
-[4.000000] host sigil-host[200]: INFO sigil host ready'
+[3.000000] host systemd[1000]: Started sigil-host.service - Sigil streaming host
+[4.000000] host sigil[200]: INFO sigil host ready'
 journalctl() {
   printf '%s\n' "$bad_order_journal"
 }
@@ -113,8 +113,8 @@ assert_contains "$bad_order_output" \
 
 missing_ssh_journal='[0.500000] host systemd[1]: Reached target Basic System
 [1.000000] host gamescope-session-plus[100]: starting Gamescope
-[2.000000] host systemd[1000]: Started sigil-host.service - Sigil Spark streaming host
-[3.000000] host sigil-host[200]: INFO sigil host ready'
+[2.000000] host systemd[1000]: Started sigil-host.service - Sigil streaming host
+[3.000000] host sigil[200]: INFO sigil host ready'
 journalctl() {
   printf '%s\n' "$missing_ssh_journal"
 }

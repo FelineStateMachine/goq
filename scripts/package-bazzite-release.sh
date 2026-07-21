@@ -26,7 +26,7 @@ tree, host identity, hardware configuration, environment files, or evidence.
 
 Options:
   --output PATH          New .tar.gz bundle path (required; must not exist)
-  --host-binary PATH     Development-only prebuilt generic Linux sigil-host
+  --host-binary PATH     Development-only prebuilt generic Linux sigil
   --probe-binary PATH    Development-only prebuilt generic Linux sigil-probe
   --minisign-key PATH    Create detached PACKAGE.minisig with this secret key
   --allow-dirty          Permit development packaging from a dirty worktree
@@ -173,10 +173,10 @@ else
     CARGO_TARGET_DIR="$build_target" cargo zigbuild --locked -p sigil-host --bins \
       --target "$linux_target" --release
   )
-  host_binary="$build_target/$linux_output_target/release/sigil-host"
+  host_binary="$build_target/$linux_output_target/release/sigil"
   probe_binary="$build_target/$linux_output_target/release/sigil-probe"
   [[ -f "$host_binary" && -x "$host_binary" ]] \
-    || die "product build did not produce sigil-host"
+    || die "product build did not produce sigil"
   [[ -f "$probe_binary" && -x "$probe_binary" ]] \
     || die "product build did not produce sigil-probe"
   binary_provenance="self-built-clean-head"
@@ -186,6 +186,8 @@ fi
 payload="$temp_root/payload"
 release_tree="$payload/release"
 install -d -m 0700 "$payload" "$release_tree" "$release_tree/assets" "$release_tree/tools"
+install -m 0755 "$host_binary" "$release_tree/sigil"
+# Retain one byte-identical compatibility executable for existing automation.
 install -m 0755 "$host_binary" "$release_tree/sigil-host"
 install -m 0755 "$probe_binary" "$release_tree/sigil-probe"
 install -m 0755 "$script_dir/rollback-bazzite-release.sh" \
@@ -225,7 +227,9 @@ import sys
 ) = sys.argv[1:]
 manifest = {
     "format": 2,
-    "product": "sigil-spark-host",
+    "product": "sigil-host",
+    "primary_executable": "sigil",
+    "compatibility_executable": "sigil-host",
     "version": version,
     "target": target,
     "profile": "release",
@@ -246,6 +250,7 @@ chmod 0644 "$release_tree/release-manifest.json"
 release_sums="$release_tree/SHA256SUMS"
 : >"$release_sums"
 for relative in \
+  sigil \
   sigil-host \
   sigil-probe \
   assets/50-sigil-spark-audio.conf \
@@ -313,7 +318,7 @@ package_sha256="$(sha256_file "$output_path")"
 printf '%s  %s\n' "$package_sha256" "$(basename -- "$output_path")" >"$output_path.sha256"
 if [[ -n "$minisign_secret_key" ]]; then
   minisign -S -s "$minisign_secret_key" -m "$output_path" -x "$output_path.minisig" \
-    -t "Sigil Spark host $product_version" \
+    -t "Sigil host $product_version" \
     -c "release $release_id"
   signature_status="detached-minisign"
 else

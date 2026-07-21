@@ -279,19 +279,19 @@ where
     let mut args = args.into_iter().map(Into::into);
 
     // The first value is the executable path. Unknown values are left for the
-    // platform/Tauri runtime, but Sigil-owned flags are parsed strictly.
+    // platform/Tauri runtime, but Portal-owned flags are parsed strictly.
     let _ = args.next();
     while let Some(arg) = args.next() {
         if arg == "--daemon" {
             return Err(
-                "--daemon is not supported by the client application; run the separate sigil-host binary"
+                "--daemon is not supported by Portal; run the separate sigil executable"
                     .to_string(),
             );
         }
 
         let arg = arg
             .into_string()
-            .map_err(|_| "Sigil command-line arguments must be valid UTF-8".to_string())?;
+            .map_err(|_| "Portal command-line arguments must be valid UTF-8".to_string())?;
         let node_id = if arg == "--dev-connect" {
             Some(
                 args.next()
@@ -599,23 +599,22 @@ mod tests {
     #[test]
     fn parses_debug_direct_node_flag() {
         let node_id = test_node_id();
-        let options =
-            parse_launch_options(["sigil-spark", "--dev-connect", &node_id], true).unwrap();
+        let options = parse_launch_options(["portal", "--dev-connect", &node_id], true).unwrap();
 
         assert_eq!(options.dev_connect_node_id.unwrap().to_string(), node_id);
     }
 
     #[test]
     fn rejects_legacy_daemon_mode() {
-        let error = parse_launch_options(["sigil-spark", "--daemon"], true).unwrap_err();
-        assert!(error.contains("separate sigil-host binary"));
+        let error = parse_launch_options(["portal", "--daemon"], true).unwrap_err();
+        assert!(error.contains("separate sigil executable"));
     }
 
     #[test]
     fn parses_equals_form() {
         let node_id = test_node_id();
         let flag = format!("--dev-connect={node_id}");
-        let options = parse_launch_options(["sigil-spark", &flag], true).unwrap();
+        let options = parse_launch_options(["portal", &flag], true).unwrap();
 
         assert_eq!(options.dev_connect_node_id.unwrap().to_string(), node_id);
     }
@@ -623,8 +622,7 @@ mod tests {
     #[test]
     fn rejects_direct_node_when_debug_mode_is_disabled() {
         let node_id = test_node_id();
-        let error =
-            parse_launch_options(["sigil-spark", "--dev-connect", &node_id], false).unwrap_err();
+        let error = parse_launch_options(["portal", "--dev-connect", &node_id], false).unwrap_err();
 
         assert!(error.contains("debug build or the explicit demo-direct-node feature"));
     }
@@ -632,7 +630,7 @@ mod tests {
     #[test]
     fn app_state_accepts_direct_node_only_in_debug_builds() {
         let node_id = test_node_id();
-        let result = AppState::from_args(["sigil-spark", "--dev-connect", &node_id]);
+        let result = AppState::from_args(["portal", "--dev-connect", &node_id]);
 
         assert_eq!(result.is_ok(), development_direct_node_available());
     }
@@ -649,12 +647,12 @@ mod tests {
     #[test]
     fn rejects_missing_invalid_and_duplicate_node_ids() {
         assert!(
-            parse_launch_options(["sigil-spark", "--dev-connect"], true)
+            parse_launch_options(["portal", "--dev-connect"], true)
                 .unwrap_err()
                 .contains("requires an iroh node ID")
         );
         assert!(
-            parse_launch_options(["sigil-spark", "--dev-connect", "not-a-node-id"], true)
+            parse_launch_options(["portal", "--dev-connect", "not-a-node-id"], true)
                 .unwrap_err()
                 .contains("Invalid iroh node ID")
         );
@@ -663,7 +661,7 @@ mod tests {
         assert!(
             parse_launch_options(
                 [
-                    "sigil-spark",
+                    "portal",
                     "--dev-connect",
                     &node_id,
                     "--dev-connect",

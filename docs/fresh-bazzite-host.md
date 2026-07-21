@@ -1,7 +1,7 @@
 # Fresh Bazzite AMD host setup
 
 This runbook takes a dedicated AMD x86_64 machine from a fresh Bazzite install
-to a remotely managed Sigil Spark host. It also defines how `slate` is used as
+to a remotely managed Sigil host. It also defines how `slate` is used as
 the temporary Linux stand-in while Steps 0–2 are being built.
 
 The dedicated Bazzite machine is the only target for Gamescope, PipeWire,
@@ -12,7 +12,7 @@ changes on `slate`.
 
 | Machine | Role | Allowed work |
 | --- | --- | --- |
-| Development Mac | Tauri client and primary source tree | Client development, tests, evidence collection |
+| Development Mac | Portal client and primary source tree | Client development, tests, evidence collection |
 | `tank@slate` | Temporary Linux stand-in | Protocol tests, pure Rust host, synthetic H.264, iroh transport, reconnect tests |
 | Dedicated Bazzite AMD host | Final appliance | Everything above plus Gamescope, PipeWire, hardware H.264, audio, and `uinput` |
 
@@ -25,15 +25,15 @@ Step 3.
 The repository provides these interfaces:
 
 ```text
-sigil-host identity init --output <path>
-sigil-host identity show --identity <path>
-sigil-host config check --config <path>
-sigil-host capture probe --source test-pattern --frames <count> --expect-size 1280x800
-sigil-host capture probe --source gamescope-pipewire --config <path> --frames <count>
-sigil-host serve --identity <path> --source test-pattern
-sigil-host serve --config <path>
+sigil identity init --output <path>
+sigil identity show --identity <path>
+sigil config check --config <path>
+sigil capture probe --source test-pattern --frames <count> --expect-size 1280x800
+sigil capture probe --source gamescope-pipewire --config <path> --frames <count>
+sigil serve --identity <path> --source test-pattern
+sigil serve --config <path>
 sigil-probe --node-id <host-node-id> --frames <count>
-sigil-spark --dev-connect <host-node-id>
+portal --dev-connect <host-node-id>
 ```
 
 The Gamescope source uses GStreamer's `pipewiresrc` and GstVA H.264 encoder,
@@ -309,8 +309,8 @@ Use these locations consistently:
 
 | Content | Location |
 | --- | --- |
-| Host releases | `~/.local/libexec/sigil-spark/releases/<commit>/sigil-host` |
-| Current binary | `~/.local/libexec/sigil-spark/current/sigil-host` |
+| Host releases | `~/.local/libexec/sigil-spark/releases/<commit>/sigil` (`sigil-host` is a compatibility copy) |
+| Current binary | `~/.local/libexec/sigil-spark/current/sigil` |
 | Configuration | `~/.config/sigil-spark/host.toml` |
 | Read-only host identity | `~/.local/share/sigil-spark/identity/host.key` |
 | Writable runtime state | `~/.local/state/sigil-spark/runtime/` |
@@ -422,25 +422,31 @@ sigil_root="$HOME/.local/libexec/sigil-spark"
 sigil_release="$sigil_root/releases/$sigil_rev"
 install -d -m 0755 "$sigil_release"
 install -m 0755 \
-  "$HOME/Developer/sigil-spark-revisions/$sigil_short/target/release/sigil-host" \
-  "$sigil_release/sigil-host"
-sha256sum "$sigil_release/sigil-host"
-ldd "$sigil_release/sigil-host" | tee "$HOME/sigil-host-${sigil_short}.ldd"
-if grep -q 'not found' "$HOME/sigil-host-${sigil_short}.ldd"; then
+  "$HOME/Developer/sigil-spark-revisions/$sigil_short/target/release/sigil" \
+  "$sigil_release/sigil"
+install -m 0755 "$sigil_release/sigil" "$sigil_release/sigil-host"
+sha256sum "$sigil_release/sigil" "$sigil_release/sigil-host"
+ldd "$sigil_release/sigil" | tee "$HOME/sigil-${sigil_short}.ldd"
+if grep -q 'not found' "$HOME/sigil-${sigil_short}.ldd"; then
   echo "Host runtime dependency missing." >&2
   exit 1
 fi
-"$sigil_release/sigil-host" --version
+"$sigil_release/sigil" --version
 cd "$sigil_root"
 test ! -e current || test -L current
 ln -sfnT "releases/$sigil_rev" current
-sha256sum current/sigil-host
-current/sigil-host --version
+sha256sum current/sigil current/sigil-host
+current/sigil --version
 ```
 
 For a demo deployment built and hashed on the development Mac, transfer both
-`sigil-host` and `sigil-probe` plus `scripts/stage-bazzite-release.sh`, then use
+`sigil` and `sigil-probe` plus `scripts/stage-bazzite-release.sh`, then use
 the stager instead of the manual install block above:
+
+The thin stager is restricted to an unmanaged development layout. If the
+service, audio, rollback, or udev assets are package-managed links that follow
+`current`, it fails before staging and instructs you to build the complete
+runtime package and run `payload/stage-this-release.sh` instead.
 
 ```bash
 scripts/stage-bazzite-release.sh \
@@ -517,7 +523,7 @@ as an all-or-none pair with both development flags, and their manifest records
 scripts/package-bazzite-release.sh \
   --output /tmp/sigil-spark-host-prebuilt-dev.tar.gz \
   --allow-dirty --allow-unsigned \
-  --host-binary /absolute/path/to/sigil-host \
+  --host-binary /absolute/path/to/sigil \
   --probe-binary /absolute/path/to/sigil-probe
 ```
 
@@ -530,13 +536,13 @@ the public node ID:
 umask 077
 identity="$HOME/.local/share/sigil-spark/identity/host.key"
 if ! test -e "$identity"; then
-  "$HOME/.local/libexec/sigil-spark/current/sigil-host" identity init \
+  "$HOME/.local/libexec/sigil-spark/current/sigil" identity init \
     --output "$identity"
 fi
 test ! -L "$identity"
 chmod 0600 "$identity"
 stat -c '%a %U %G %n' "$identity"
-"$HOME/.local/libexec/sigil-spark/current/sigil-host" identity show \
+"$HOME/.local/libexec/sigil-spark/current/sigil" identity show \
   --identity "$identity"
 ```
 
@@ -565,11 +571,11 @@ ffmpeg_path = "$ffmpeg_path"
 EOF
 chmod 0600 "$config"
 stat -c '%a %U %G %n' "$config"
-"$HOME/.local/libexec/sigil-spark/current/sigil-host" config check \
+"$HOME/.local/libexec/sigil-spark/current/sigil" config check \
   --config "$config"
 install -m 0600 "$config" \
   "$HOME/.local/libexec/sigil-spark/current/host.toml"
-"$HOME/.local/libexec/sigil-spark/current/sigil-host" serve \
+"$HOME/.local/libexec/sigil-spark/current/sigil" serve \
   --config "$config" --max-runtime-seconds 10
 ```
 
@@ -589,7 +595,7 @@ Create `~/.config/systemd/user/sigil-host.service`:
 
 ```ini
 [Unit]
-Description=Sigil Spark streaming host
+Description=Sigil streaming host
 Wants=pipewire.socket
 After=pipewire.socket
 ConditionPathExists=%h/.config/sigil-spark/host.toml
@@ -598,6 +604,8 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 Environment=DISPLAY=:0
+# Compatibility window: the service uses the byte-identical legacy filename
+# so an older rollback helper can still validate and reactivate this release.
 ExecStart=%h/.local/libexec/sigil-spark/current/sigil-host serve --config %h/.config/sigil-spark/host.toml
 Restart=on-failure
 RestartSec=1
@@ -736,7 +744,7 @@ On the Mac, connect with the node ID printed by `slate`:
 ```bash
 cd /Users/dami/Developer/sigil-spark
 source "$HOME/.cargo/env"
-cargo run -p sigil-spark -- --dev-connect <slate-node-id>
+cargo run -p portal -- --dev-connect <slate-node-id>
 ```
 
 Before opening the UI, prove the same v1 media and input session headlessly:
@@ -821,7 +829,7 @@ At cutover, confirm there is no running probe before removing only the exact
 run-specific paths:
 
 ```bash
-pgrep -a sigil-host && {
+pgrep -a sigil && {
   echo "Stop the foreground Sigil probe before cleanup." >&2
   exit 1
 }
@@ -1164,7 +1172,7 @@ device plus all low-latency properties used by the pipeline, and—when audio is
 configured—prints the exact resolved sink target:
 
 ```bash
-"$HOME/.local/libexec/sigil-spark/current/sigil-host" config check \
+"$HOME/.local/libexec/sigil-spark/current/sigil" config check \
   --config "$probe_config"
 # Expected with audio enabled:
 # audio_pipewire_target_object=<current numeric target>
@@ -1175,7 +1183,7 @@ Node enumeration and preflight are not enough. Consume 300 frames and verify a
 decodable H.264 keyframe, the configured output size, and a changing sequence:
 
 ```bash
-"$HOME/.local/libexec/sigil-spark/current/sigil-host" capture probe \
+"$HOME/.local/libexec/sigil-spark/current/sigil" capture probe \
   --source gamescope-pipewire \
   --config "$probe_config" \
   --frames 300 \
@@ -1269,7 +1277,7 @@ systemctl --user stop sigil-host.service
 install -m 0600 \
   "$HOME/.config/sigil-spark/host-gamescope-probe.toml" \
   "$HOME/.config/sigil-spark/host.toml"
-"$HOME/.local/libexec/sigil-spark/current/sigil-host" config check \
+"$HOME/.local/libexec/sigil-spark/current/sigil" config check \
   --config "$HOME/.config/sigil-spark/host.toml"
 systemctl --user start sigil-host.service
 systemctl --user status sigil-host.service --no-pager
@@ -1363,7 +1371,7 @@ On the first SSH login after reboot:
 ```bash
 systemctl --user status sigil-host.service --no-pager
 sudo journalctl -b -o short-monotonic --no-pager | \
-  grep -Ei 'sigil-host|sshd.*accepted|gamescope|steam'
+  grep -Ei 'sigil|sshd.*accepted|gamescope|steam'
 ```
 
 The Sigil unit start must predate the first accepted SSH login; otherwise SSH
@@ -1425,9 +1433,13 @@ sigil_root="$HOME/.local/libexec/sigil-spark"
 previous_commit="<validated-full-commit>"
 previous_config="$sigil_root/releases/$previous_commit/host.toml"
 cd "$sigil_root"
-test -x "releases/$previous_commit/sigil-host"
+previous_host="releases/$previous_commit/sigil"
+if [[ ! -x "$previous_host" ]]; then
+  previous_host="releases/$previous_commit/sigil-host"
+fi
+test -x "$previous_host"
 test -f "$previous_config"
-"releases/$previous_commit/sigil-host" config check --config "$previous_config"
+"$previous_host" config check --config "$previous_config"
 test ! -e current || test -L current
 ln -sfnT "releases/$previous_commit" current
 install -m 0600 "$previous_config" "$HOME/.config/sigil-spark/host.toml"
@@ -1436,7 +1448,7 @@ systemctl --user is-active --quiet sigil-host.service
 ```
 
 Keep a validated backup of `host.toml` with each application release and run
-`sigil-host config check` before restoring it. An OSTree rollback does not roll
+`sigil config check` before restoring it. An OSTree rollback does not roll
 back binaries or configuration in the user's home directory, and it does not
 necessarily remove the SSH drop-in under `/etc`.
 

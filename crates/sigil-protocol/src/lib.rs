@@ -1,4 +1,4 @@
-//! Shared, platform-independent wire protocol for Sigil Spark.
+//! Shared, platform-independent wire protocol for Sigil.
 //!
 //! Every allocation driven by a peer-controlled length is checked against a
 //! protocol limit first. The version is carried both in the ALPN and in each

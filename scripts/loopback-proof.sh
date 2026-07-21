@@ -22,7 +22,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/loopback-proof.sh [options]
 
-Build and exercise the exact sigil-host and sigil-probe binaries over a real
+Build and exercise the exact sigil and sigil-probe binaries over a real
 loopback Iroh connection. The proof covers the decodable first media frame,
 input acknowledgment, single-active-client rejection, and clean reconnects.
 
@@ -338,7 +338,7 @@ case "$target_root" in
   /*) ;;
   *) target_root="$workspace_dir/$target_root" ;;
 esac
-host_bin="$target_root/$profile_dir/sigil-host"
+host_bin="$target_root/$profile_dir/sigil"
 probe_bin="$target_root/$profile_dir/sigil-probe"
 [[ -x "$host_bin" ]] || die "built host binary is missing: $host_bin"
 [[ -x "$probe_bin" ]] || die "built probe binary is missing: $probe_bin"
@@ -366,7 +366,7 @@ RUST_LOG=info "$host_bin" serve \
 host_pid=$!
 start_watchdog "$host_pid" "$host_runtime_seconds" "$tmp_root/host.timeout"
 host_watchdog_pid="$watchdog_pid"
-wait_for_log_line "$host_log" 'status=ready' "$host_pid" 'sigil-host' || die "host did not become ready"
+wait_for_log_line "$host_log" 'status=ready' "$host_pid" 'sigil' || die "host did not become ready"
 host_node_id="$(sed -n 's/^node_id=//p' "$host_log" | tail -n 1)"
 [[ "$host_node_id" == "$node_id" ]] || die "ready host node ID does not match its identity"
 
@@ -418,9 +418,9 @@ validate_probe_log "$primary_log" "$primary_frames" || {
   die "primary probe evidence is incomplete"
 }
 
-wait_for_log_count "$host_log" "$media_release_log" 1 "$host_pid" 'sigil-host' \
+wait_for_log_count "$host_log" "$media_release_log" 1 "$host_pid" 'sigil' \
   || die "primary session was not released"
-wait_for_log_count "$host_log" 'input client released' 1 "$host_pid" 'sigil-host' \
+wait_for_log_count "$host_log" 'input client released' 1 "$host_pid" 'sigil' \
   || die "primary input session was not drained"
 
 cycle=1
@@ -436,9 +436,9 @@ while [[ "$cycle" -le "$reconnect_cycles" ]]; do
     sed -n '1,240p' "$reconnect_log" >&2 || true
     die "reconnect cycle $cycle evidence is incomplete"
   }
-  wait_for_log_count "$host_log" "$media_release_log" "$((cycle + 1))" "$host_pid" 'sigil-host' \
+  wait_for_log_count "$host_log" "$media_release_log" "$((cycle + 1))" "$host_pid" 'sigil' \
     || die "reconnect cycle $cycle was not released"
-  wait_for_log_count "$host_log" 'input client released' "$((cycle + 1))" "$host_pid" 'sigil-host' \
+  wait_for_log_count "$host_log" 'input client released' "$((cycle + 1))" "$host_pid" 'sigil' \
     || die "reconnect input cycle $cycle was not drained"
   cycle=$((cycle + 1))
 done

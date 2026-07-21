@@ -29,7 +29,7 @@ const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
-#[command(name = "sigil-host", version, about)]
+#[command(name = "sigil", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -607,10 +607,10 @@ mod tests {
 
     #[test]
     fn direct_serve_requires_identity_and_source() {
-        assert!(Cli::try_parse_from(["sigil-host", "serve"]).is_err());
+        assert!(Cli::try_parse_from(["sigil", "serve"]).is_err());
         assert!(
             Cli::try_parse_from([
-                "sigil-host",
+                "sigil",
                 "serve",
                 "--identity",
                 "/tmp/host.key",

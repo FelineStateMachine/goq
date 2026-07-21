@@ -84,6 +84,24 @@ a { color: inherit; }
 
 ::selection { background: var(--ochre); color: var(--ink); }
 
+/* ─── Selection policy: prose and the install command are content
+       and stay selectable; controls, nav chrome, and decorative
+       glyphs are not. The $ prompt is excluded so a hand-selected
+       command never carries it into a terminal paste. ──────────── */
+.skip,
+.topbar-github,
+.topbar-nav,
+.seg,
+.install-copy,
+.install-prompt,
+.section-title span,
+.start-num,
+.dg-channel,
+.hero-key {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
 /* ─── Top bar ──────────────────────────────────────────────── */
 .topbar {
   display: flex;

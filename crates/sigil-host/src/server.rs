@@ -44,7 +44,7 @@ const GAMESCOPE_STARTUP_SAMPLE_WINDOW: Duration = Duration::from_millis(500);
 const GAMESCOPE_STARTUP_MIN_OBSERVATION_SPAN: Duration = Duration::from_millis(100);
 const GAMESCOPE_STARTUP_HEALTHY_MIN_FRAMES: u64 = 8;
 const GAMESCOPE_STARTUP_HEALTHY_MIN_FPS: f64 = 45.0;
-const GAMESCOPE_STARTUP_MATERIAL_FPS_GAIN: f64 = 15.0;
+const SOURCE_REAP_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct SessionRegistry {
@@ -240,6 +240,19 @@ impl SourceTaskGuard {
             let _ = task.await;
         }
     }
+
+    async fn wait_or_abort(mut self, grace_timeout: Duration) {
+        let Some(mut task) = self.0.take() else {
+            return;
+        };
+        if tokio::time::timeout(grace_timeout, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 impl Drop for SourceTaskGuard {
@@ -309,6 +322,10 @@ impl StartupCadenceSample {
     }
 }
 
+fn startup_source_needs_restart(sample: StartupCadenceSample) -> bool {
+    !sample.is_healthy()
+}
+
 async fn sample_startup_cadence(
     receiver: &mut tokio::sync::watch::Receiver<Option<EncodedFrame>>,
     window: Duration,
@@ -338,40 +355,31 @@ async fn sample_startup_cadence(
     sample
 }
 
-fn prefer_startup_challenger(
-    primary: StartupCadenceSample,
-    challenger: StartupCadenceSample,
-) -> bool {
-    if !challenger.receiver_open {
-        return false;
-    }
-    if !primary.receiver_open {
-        return true;
-    }
-    let primary_frames = primary.frame_progress();
-    let challenger_frames = challenger.frame_progress();
-    if primary_frames == 0 {
-        return challenger_frames > 0;
-    }
-    if challenger.is_healthy() && !primary.is_healthy() {
-        return true;
-    }
-    primary.has_representative_span()
-        && challenger.has_representative_span()
-        && challenger_frames >= primary_frames.saturating_add(2)
-        && challenger.fps() >= primary.fps() + GAMESCOPE_STARTUP_MATERIAL_FPS_GAIN
+async fn reap_encoded_source(source: EncodedSource) {
+    reap_encoded_source_with_timeout(source, SOURCE_REAP_GRACE_TIMEOUT).await;
 }
 
-async fn reap_encoded_source(source: EncodedSource) {
-    let EncodedSource { task, .. } = source;
-    SourceTaskGuard::new(task).abort_and_wait().await;
+async fn reap_encoded_source_with_timeout(source: EncodedSource, grace_timeout: Duration) {
+    let EncodedSource {
+        frames,
+        current_gop,
+        task,
+        pointer_surface_dimensions: _,
+    } = source;
+    // Closing both bounded outputs gives the capture task a chance to kill and
+    // wait for its GStreamer child itself. Abort is only the bounded fallback.
+    drop(frames);
+    drop(current_gop);
+    SourceTaskGuard::new(task)
+        .wait_or_abort(grace_timeout)
+        .await;
 }
 
 async fn select_gamescope_startup_source(
     config: HostConfig,
     session_clock: SessionClock,
     mut primary: EncodedSource,
-) -> EncodedSource {
+) -> Result<EncodedSource> {
     let primary_sample =
         sample_startup_cadence(&mut primary.frames, GAMESCOPE_STARTUP_SAMPLE_WINDOW).await;
     info!(
@@ -380,33 +388,37 @@ async fn select_gamescope_startup_source(
         receiver_open = primary_sample.receiver_open,
         "sampled primary Gamescope capture startup"
     );
-    if primary_sample.is_healthy() {
-        return primary;
+    if !startup_source_needs_restart(primary_sample) {
+        return Ok(primary);
     }
 
-    let Ok(mut challenger) = spawn_gamescope_pipewire_after_static_preflight(config, session_clock)
+    // Gamescope's PipeWire export does not reliably fan out full cadence to
+    // two simultaneous consumers. Reap an unhealthy startup pipeline before
+    // opening its replacement; overlapping them can divide vblank deliveries
+    // and permanently strand the selected source at half rate.
+    reap_encoded_source(primary).await;
+    let mut replacement = spawn_gamescope_pipewire_after_static_preflight(config, session_clock)
         .await
-        .inspect_err(|error| warn!(%error, "Gamescope startup challenger was unavailable"))
-    else {
-        return primary;
-    };
-    let challenger_sample =
-        sample_startup_cadence(&mut challenger.frames, GAMESCOPE_STARTUP_SAMPLE_WINDOW).await;
-    let use_challenger = prefer_startup_challenger(primary_sample, challenger_sample);
+        .context("restarting unhealthy Gamescope capture pipeline")?;
+    let replacement_sample =
+        sample_startup_cadence(&mut replacement.frames, GAMESCOPE_STARTUP_SAMPLE_WINDOW).await;
     info!(
-        frames = challenger_sample.frame_progress(),
-        fps = challenger_sample.fps(),
-        receiver_open = challenger_sample.receiver_open,
-        selected = use_challenger,
-        "sampled bounded Gamescope capture startup challenger"
+        frames = replacement_sample.frame_progress(),
+        fps = replacement_sample.fps(),
+        receiver_open = replacement_sample.receiver_open,
+        "sampled sequential Gamescope capture startup replacement"
     );
-    if use_challenger {
-        reap_encoded_source(primary).await;
-        challenger
-    } else {
-        reap_encoded_source(challenger).await;
-        primary
+    if !replacement_sample.is_healthy() {
+        let frames = replacement_sample.frame_progress();
+        let fps = replacement_sample.fps();
+        let receiver_open = replacement_sample.receiver_open;
+        reap_encoded_source(replacement).await;
+        bail!(
+            "replacement Gamescope capture pipeline remained unhealthy: \
+             frames={frames}, fps={fps:.2}, receiver_open={receiver_open}"
+        );
     }
+    Ok(replacement)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -762,11 +774,11 @@ async fn serve_media(
                 lease.session_clock,
             )
             .await?;
-            Ok(select_gamescope_startup_source(config.clone(), lease.session_clock, primary).await)
+            select_gamescope_startup_source(config.clone(), lease.session_clock, primary).await
         }
     };
     let EncodedSource {
-        frames: _frame_receiver,
+        frames: frame_receiver,
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
@@ -875,7 +887,9 @@ async fn serve_media(
     }
     .await;
 
-    source_task.abort_and_wait().await;
+    drop(current_gop_receiver);
+    drop(frame_receiver);
+    source_task.wait_or_abort(SOURCE_REAP_GRACE_TIMEOUT).await;
     drop(lease);
     info!(%remote, "media client released");
     session_result
@@ -915,11 +929,11 @@ async fn serve_media_v2(
                 lease.session_clock,
             )
             .await?;
-            Ok(select_gamescope_startup_source(config.clone(), lease.session_clock, primary).await)
+            select_gamescope_startup_source(config.clone(), lease.session_clock, primary).await
         }
     };
     let EncodedSource {
-        frames: _frame_receiver,
+        frames: frame_receiver,
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
@@ -949,7 +963,9 @@ async fn serve_media_v2(
     let session_result =
         run_media_v2_session(&connection, &config, &mut current_gop_receiver, remote).await;
 
-    source_task.abort_and_wait().await;
+    drop(current_gop_receiver);
+    drop(frame_receiver);
+    source_task.wait_or_abort(SOURCE_REAP_GRACE_TIMEOUT).await;
     drop(lease);
     info!(%remote, "media v2 client released");
     session_result
@@ -1706,48 +1722,22 @@ mod tests {
     }
 
     #[test]
-    fn startup_challenger_requires_materially_healthier_progress() {
+    fn startup_restart_requires_sustained_healthy_progress() {
         let slow = startup_sample(12.0, 6, true);
         let healthy = startup_sample(60.0, 8, true);
-        assert!(prefer_startup_challenger(slow, healthy));
-
-        assert!(!prefer_startup_challenger(
-            startup_sample(12.0, 6, true),
-            startup_sample(12.0, 6, true)
-        ));
-        assert!(!prefer_startup_challenger(
-            startup_sample(0.0, 0, true),
-            startup_sample(0.0, 0, true)
-        ));
-        assert!(prefer_startup_challenger(
-            startup_sample(0.0, 0, true),
-            startup_sample(0.0, 1, true)
-        ));
-        assert!(prefer_startup_challenger(
-            startup_sample(0.0, 0, false),
-            startup_sample(12.0, 6, true)
-        ));
-        assert!(!prefer_startup_challenger(
-            startup_sample(12.0, 6, true),
-            startup_sample(60.0, 8, false)
-        ));
+        assert!(startup_source_needs_restart(slow));
+        assert!(!startup_source_needs_restart(healthy));
+        assert!(startup_source_needs_restart(startup_sample(60.0, 8, false)));
+        assert!(startup_source_needs_restart(startup_sample(0.0, 0, true)));
     }
 
     #[test]
-    fn startup_bursts_are_not_sustained_health_or_material_gain() {
+    fn startup_bursts_are_not_sustained_health() {
         let burst = startup_sample(10_000.0, 8, true);
         assert!(burst.fps() > GAMESCOPE_STARTUP_HEALTHY_MIN_FPS);
         assert!(!burst.has_representative_span());
         assert!(!burst.is_healthy());
-
-        assert!(!prefer_startup_challenger(
-            startup_sample(12.0, 6, true),
-            burst
-        ));
-        assert!(prefer_startup_challenger(
-            startup_sample(0.0, 0, true),
-            burst
-        ));
+        assert!(startup_source_needs_restart(burst));
     }
 
     #[tokio::test]
@@ -1776,7 +1766,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reaping_unselected_source_always_terminates_its_task() {
+    async fn reaping_source_closes_outputs_before_waiting_for_task_cleanup() {
+        let (frame_sender, frame_receiver) = tokio::sync::watch::channel(None);
+        let (gop_sender, gop_receiver) = tokio::sync::watch::channel(None);
+        let (reaped_tx, reaped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            frame_sender.closed().await;
+            gop_sender.closed().await;
+            let _ = reaped_tx.send(());
+            Ok(())
+        });
+        let source = EncodedSource {
+            frames: frame_receiver,
+            current_gop: gop_receiver,
+            task,
+            pointer_surface_dimensions: None,
+        };
+
+        reap_encoded_source_with_timeout(source, Duration::from_millis(100)).await;
+        reaped_rx
+            .await
+            .expect("source task did not observe both closed outputs");
+    }
+
+    #[tokio::test]
+    async fn reaping_stalled_source_aborts_after_bounded_grace() {
         let (_frame_sender, frame_receiver) = tokio::sync::watch::channel(None);
         let (_gop_sender, gop_receiver) = tokio::sync::watch::channel(None);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -1794,10 +1808,10 @@ mod tests {
         };
 
         started_rx.await.unwrap();
-        reap_encoded_source(source).await;
+        reap_encoded_source_with_timeout(source, Duration::from_millis(10)).await;
         tokio::time::timeout(Duration::from_millis(100), reaped_rx)
             .await
-            .expect("unselected source task was not reaped")
+            .expect("stalled source task was not aborted and reaped")
             .unwrap();
     }
 

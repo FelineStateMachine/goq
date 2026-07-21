@@ -31,21 +31,10 @@ if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; 
 else
   echo 'linux_cross_build=skipped (cargo-zigbuild and zig are both required)'
 fi
-node --check src/main.js
-node --check src/audio-envelope.mjs
-node --check src/audio-ring.mjs
-node --check src/audio-worklet.js
-node --check src/controller-state.mjs
-node --check src/frame-envelope.mjs
-node --check src/input-state.mjs
-node --check src/stream-metrics.mjs
-node --test \
-  src/audio-envelope.test.mjs \
-  src/audio-ring.test.mjs \
-  src/controller-state.test.mjs \
-  src/frame-envelope.test.mjs \
-  src/input-state.test.mjs \
-  src/stream-metrics.test.mjs
+while IFS= read -r frontend_source; do
+  node --check "$frontend_source"
+done < <(find src -maxdepth 1 -type f \( -name '*.js' -o -name '*.mjs' \) -print | sort)
+node --test src/*.test.mjs
 
 if command -v shellcheck >/dev/null 2>&1; then
   find scripts -type f -name '*.sh' -exec shellcheck {} +
@@ -53,6 +42,9 @@ else
   echo 'shellcheck is required for the demo preflight' >&2
   exit 1
 fi
+while IFS= read -r script_test; do
+  "$script_test"
+done < <(find scripts/tests -maxdepth 1 -type f -name '*.sh' -perm -u+x -print | sort)
 
 host_dependencies="$(cargo tree --locked -p sigil-host --edges normal)"
 if grep -Eiq '(^|[[:space:]├└│─])(tauri|wry|webkit)([[:space:]-]|$)' <<<"$host_dependencies"; then

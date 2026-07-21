@@ -4,31 +4,38 @@ set -euo pipefail
 
 script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
 repo_dir="$(CDPATH='' cd -- "$script_dir/.." && pwd -P)"
-host_binary="$repo_dir/target/x86_64-unknown-linux-gnu/release/sigil-host"
-probe_binary="$repo_dir/target/x86_64-unknown-linux-gnu/release/sigil-probe"
+host_binary=""
+probe_binary=""
 output_path=""
 allow_dirty=false
 allow_unsigned=false
 minisign_secret_key=""
+linux_target="x86_64-unknown-linux-gnu.2.17"
+linux_output_target="x86_64-unknown-linux-gnu"
 
 usage() {
   cat <<'EOF'
 Usage: scripts/package-bazzite-release.sh --output /absolute/path/package.tar.gz [options]
 
-Create an allowlisted, deterministic Bazzite host runtime package from the
-prebuilt generic Linux release binaries. The package includes atomic install,
+Create an allowlisted, deterministic Bazzite host runtime package. Product mode
+exports the clean source HEAD and builds both generic Linux release binaries in
+an isolated Cargo target directory. The package includes atomic install,
 upgrade/rollback support, the systemd user unit, PipeWire sink, staged udev
 rule, complete checksums, and build provenance. It never includes the source
 tree, host identity, hardware configuration, environment files, or evidence.
 
 Options:
   --output PATH          New .tar.gz bundle path (required; must not exist)
-  --host-binary PATH     Generic Linux sigil-host (default: target cross release)
-  --probe-binary PATH    Generic Linux sigil-probe (default: target cross release)
+  --host-binary PATH     Development-only prebuilt generic Linux sigil-host
+  --probe-binary PATH    Development-only prebuilt generic Linux sigil-probe
   --minisign-key PATH    Create detached PACKAGE.minisig with this secret key
   --allow-dirty          Permit development packaging from a dirty worktree
   --allow-unsigned       Permit a package without a detached publisher signature
   --help                 Show this help
+
+The two prebuilt-binary options are an all-or-none development escape hatch and
+require both --allow-dirty and --allow-unsigned. Product packages never accept
+caller-supplied binaries.
 EOF
 }
 
@@ -92,8 +99,17 @@ esac
 [[ ! -e "$output_path" ]] || die "output already exists: $output_path"
 [[ ! -e "$output_path.sha256" ]] || die "digest output already exists: $output_path.sha256"
 [[ ! -e "$output_path.minisig" ]] || die "signature output already exists: $output_path.minisig"
-[[ -f "$host_binary" && -x "$host_binary" ]] || die "host binary is not executable: $host_binary"
-[[ -f "$probe_binary" && -x "$probe_binary" ]] || die "probe binary is not executable: $probe_binary"
+
+caller_supplied_binaries=false
+if [[ -n "$host_binary" || -n "$probe_binary" ]]; then
+  [[ -n "$host_binary" && -n "$probe_binary" ]] \
+    || die "--host-binary and --probe-binary must be supplied together"
+  if ! $allow_dirty || ! $allow_unsigned; then
+    die "caller-supplied binaries require both --allow-dirty and --allow-unsigned; product mode builds both binaries from clean HEAD"
+  fi
+  caller_supplied_binaries=true
+fi
+
 [[ -x "$script_dir/install-bazzite-package.sh" ]] || die "package installer is missing"
 [[ -x "$script_dir/rollback-bazzite-release.sh" ]] || die "rollback helper is missing"
 [[ -f "$script_dir/sigil-host.service" ]] || die "systemd user unit is missing"
@@ -136,6 +152,37 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
+if $caller_supplied_binaries; then
+  [[ -f "$host_binary" && -x "$host_binary" ]] \
+    || die "host binary is not executable: $host_binary"
+  [[ -f "$probe_binary" && -x "$probe_binary" ]] \
+    || die "probe binary is not executable: $probe_binary"
+  binary_provenance="caller-supplied-unverified"
+  binary_provenance_verified=false
+else
+  command -v cargo >/dev/null 2>&1 || die "cargo is required to build product binaries"
+  command -v cargo-zigbuild >/dev/null 2>&1 \
+    || die "cargo-zigbuild is required to build product binaries"
+
+  build_source="$temp_root/source"
+  build_target="$temp_root/cargo-target"
+  install -d -m 0700 "$build_source" "$build_target"
+  git -C "$repo_dir" archive --format=tar "$git_commit" | tar -xf - -C "$build_source"
+  (
+    cd "$build_source"
+    CARGO_TARGET_DIR="$build_target" cargo zigbuild --locked -p sigil-host --bins \
+      --target "$linux_target" --release
+  )
+  host_binary="$build_target/$linux_output_target/release/sigil-host"
+  probe_binary="$build_target/$linux_output_target/release/sigil-probe"
+  [[ -f "$host_binary" && -x "$host_binary" ]] \
+    || die "product build did not produce sigil-host"
+  [[ -f "$probe_binary" && -x "$probe_binary" ]] \
+    || die "product build did not produce sigil-probe"
+  binary_provenance="self-built-clean-head"
+  binary_provenance_verified=true
+fi
+
 payload="$temp_root/payload"
 release_tree="$payload/release"
 install -d -m 0700 "$payload" "$release_tree" "$release_tree/assets" "$release_tree/tools"
@@ -155,20 +202,32 @@ product_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_dir/src-tauri/C
 [[ -n "$product_version" ]] || die "could not read the product version"
 lock_sha256="$(sha256_file "$repo_dir/Cargo.lock")"
 toolchain_sha256="$(sha256_file "$repo_dir/rust-toolchain.toml")"
-zigbuild_version="$(cargo zigbuild --version 2>/dev/null | head -n 1 || true)"
+zigbuild_version="$(cargo-zigbuild --version 2>/dev/null | head -n 1 || true)"
 [[ -n "$zigbuild_version" ]] || zigbuild_version="unavailable"
 python3 - "$release_tree/release-manifest.json" "$product_version" "$git_commit" \
-  "$git_dirty" "$lock_sha256" "$toolchain_sha256" "$zigbuild_version" <<'PY'
+  "$git_dirty" "$lock_sha256" "$toolchain_sha256" "$zigbuild_version" \
+  "$binary_provenance" "$binary_provenance_verified" "$linux_target" <<'PY'
 import json
 import pathlib
 import sys
 
-path, version, commit, dirty, lock_sha, toolchain_sha, zigbuild = sys.argv[1:]
+(
+    path,
+    version,
+    commit,
+    dirty,
+    lock_sha,
+    toolchain_sha,
+    zigbuild,
+    binary_provenance,
+    binary_provenance_verified,
+    target,
+) = sys.argv[1:]
 manifest = {
     "format": 2,
     "product": "sigil-spark-host",
     "version": version,
-    "target": "x86_64-unknown-linux-gnu.2.17",
+    "target": target,
     "profile": "release",
     "features": ["default"],
     "demo_direct_node": False,
@@ -177,6 +236,8 @@ manifest = {
     "cargo_lock_sha256": lock_sha,
     "rust_toolchain_sha256": toolchain_sha,
     "cargo_zigbuild": zigbuild,
+    "binary_provenance": binary_provenance,
+    "binary_provenance_verified": binary_provenance_verified == "true",
 }
 pathlib.Path(path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 PY

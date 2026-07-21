@@ -221,9 +221,36 @@ export class BoundedCadenceWindow {
 }
 
 export class LatestFramePresenter {
-  constructor({ requestFrame, cancelFrame, draw, onPresent = () => {}, onDrop = () => {} }) {
+  constructor({
+    requestFrame,
+    cancelFrame,
+    setTimer,
+    cancelTimer,
+    now,
+    fallbackDelayMs = 25,
+    draw,
+    onPresent = () => {},
+    onDrop = () => {},
+  }) {
+    for (const [name, value] of Object.entries({
+      requestFrame,
+      cancelFrame,
+      setTimer,
+      cancelTimer,
+      now,
+      draw,
+    })) {
+      if (typeof value !== 'function') throw new TypeError(`${name} must be a function`);
+    }
+    if (!Number.isFinite(fallbackDelayMs) || fallbackDelayMs < 1 || fallbackDelayMs > 1000) {
+      throw new RangeError('fallbackDelayMs must be within 1..1000 ms');
+    }
     this.requestFrame = requestFrame;
     this.cancelFrame = cancelFrame;
+    this.setTimer = setTimer;
+    this.cancelTimer = cancelTimer;
+    this.now = now;
+    this.fallbackDelayMs = fallbackDelayMs;
     this.draw = draw;
     this.onPresent = onPresent;
     this.onDrop = onDrop;
@@ -234,7 +261,7 @@ export class LatestFramePresenter {
     // two-frame ceiling still bounds latency, and overload evicts the oldest
     // stale frame first.
     this.pending = [];
-    this.frameRequest = null;
+    this.activeSchedule = null;
   }
 
   enqueue(frame, metadata = null) {
@@ -249,25 +276,55 @@ export class LatestFramePresenter {
   }
 
   #schedule() {
-    if (this.frameRequest !== null || this.pending.length === 0) return;
-    this.frameRequest = this.requestFrame((nowMs) => {
-      this.frameRequest = null;
-      const pending = this.pending.shift();
-      if (!pending) return;
-      try {
-        this.draw(pending.frame);
-        this.onPresent(pending.metadata, nowMs);
-      } finally {
-        pending.frame.close();
-        this.#schedule();
-      }
+    if (this.activeSchedule !== null || this.pending.length === 0) return;
+    const schedule = {
+      settled: false,
+      frameHandle: null,
+      timerHandle: null,
+    };
+    this.activeSchedule = schedule;
+    const frameHandle = this.requestFrame((nowMs) => {
+      this.#presentScheduled(schedule, 'frame', nowMs);
     });
+    if (this.activeSchedule !== schedule || schedule.settled) return;
+    schedule.frameHandle = frameHandle;
+    const timerHandle = this.setTimer(() => {
+      this.#presentScheduled(schedule, 'timer', this.now());
+    }, this.fallbackDelayMs);
+    if (this.activeSchedule === schedule && !schedule.settled) {
+      schedule.timerHandle = timerHandle;
+    } else {
+      this.cancelTimer(timerHandle);
+    }
+  }
+
+  #presentScheduled(schedule, source, nowMs) {
+    if (this.activeSchedule !== schedule || schedule.settled) return;
+    schedule.settled = true;
+    this.activeSchedule = null;
+    if (source === 'frame') {
+      if (schedule.timerHandle !== null) this.cancelTimer(schedule.timerHandle);
+    } else if (schedule.frameHandle !== null) {
+      this.cancelFrame(schedule.frameHandle);
+    }
+    const pending = this.pending.shift();
+    if (!pending) return;
+    try {
+      this.draw(pending.frame);
+      this.onPresent(pending.metadata, nowMs);
+    } finally {
+      pending.frame.close();
+      this.#schedule();
+    }
   }
 
   clear() {
-    if (this.frameRequest !== null) {
-      this.cancelFrame(this.frameRequest);
-      this.frameRequest = null;
+    const schedule = this.activeSchedule;
+    this.activeSchedule = null;
+    if (schedule !== null) {
+      schedule.settled = true;
+      if (schedule.frameHandle !== null) this.cancelFrame(schedule.frameHandle);
+      if (schedule.timerHandle !== null) this.cancelTimer(schedule.timerHandle);
     }
     for (const pending of this.pending.splice(0)) pending.frame.close();
   }

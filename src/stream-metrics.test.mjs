@@ -181,16 +181,25 @@ test('latency percentiles are bounded, deterministic, and expire', () => {
 test('latest-frame presenter bounds jitter buffering at two and drops the oldest frame', () => {
   const callbacks = [];
   const cancelled = [];
+  const timerCallbacks = [];
+  const cancelledTimers = [];
   const drawn = [];
   const presented = [];
   const dropped = [];
   let nextHandle = 1;
+  let nextTimerHandle = 1;
   const presenter = new LatestFramePresenter({
     requestFrame: (callback) => {
       callbacks.push(callback);
       return nextHandle++;
     },
     cancelFrame: (handle) => cancelled.push(handle),
+    setTimer: (callback) => {
+      timerCallbacks.push(callback);
+      return nextTimerHandle++;
+    },
+    cancelTimer: (handle) => cancelledTimers.push(handle),
+    now: () => 999,
     draw: (frame) => drawn.push(frame.id),
     onPresent: (metadata) => presented.push(metadata),
     onDrop: (metadata) => dropped.push(metadata),
@@ -204,6 +213,7 @@ test('latest-frame presenter bounds jitter buffering at two and drops the oldest
   presenter.enqueue(second, 'second');
   presenter.enqueue(third, 'third');
   assert.equal(callbacks.length, 1);
+  assert.equal(timerCallbacks.length, 1);
   assert.equal(presenter.depth, 2);
   assert.equal(first.closed, 1);
   assert.deepEqual(dropped, ['first']);
@@ -213,6 +223,7 @@ test('latest-frame presenter bounds jitter buffering at two and drops the oldest
   assert.deepEqual(presented, ['second']);
   assert.equal(second.closed, 1);
   assert.equal(callbacks.length, 1);
+  assert.deepEqual(cancelledTimers, [1]);
   assert.equal(presenter.depth, 1);
 
   callbacks.shift()(140);
@@ -220,6 +231,7 @@ test('latest-frame presenter bounds jitter buffering at two and drops the oldest
   assert.deepEqual(presented, ['second', 'third']);
   assert.equal(third.closed, 1);
   assert.equal(presenter.depth, 0);
+  assert.deepEqual(cancelledTimers, [1, 2]);
 
   const fourth = frame(4);
   const fifth = frame(5);
@@ -227,6 +239,7 @@ test('latest-frame presenter bounds jitter buffering at two and drops the oldest
   presenter.enqueue(fifth);
   presenter.clear();
   assert.deepEqual(cancelled, [3]);
+  assert.deepEqual(cancelledTimers, [1, 2, 3]);
   assert.equal(fourth.closed, 1);
   assert.equal(fifth.closed, 1);
   assert.equal(presenter.depth, 0);
@@ -235,6 +248,7 @@ test('latest-frame presenter bounds jitter buffering at two and drops the oldest
 test('two-frame presenter smooths pair-bursty 60 fps input at display cadence', () => {
   let scheduledCallback = null;
   let nextHandle = 1;
+  let nextTimerHandle = 1;
   const presentedAt = [];
   const frames = [];
   let dropped = 0;
@@ -245,6 +259,9 @@ test('two-frame presenter smooths pair-bursty 60 fps input at display cadence', 
       return nextHandle++;
     },
     cancelFrame: () => { scheduledCallback = null; },
+    setTimer: () => nextTimerHandle++,
+    cancelTimer: () => {},
+    now: () => 0,
     draw: () => {},
     onPresent: (_metadata, nowMs) => presentedAt.push(nowMs),
     onDrop: () => dropped++,
@@ -279,4 +296,155 @@ test('two-frame presenter smooths pair-bursty 60 fps input at display cadence', 
     Math.abs((nowMs - presentedAt[index]) - displayIntervalMs) < 0.001
   )));
   assert.ok(frames.every((value) => value.closed === 1));
+});
+
+test('presenter watchdog drains one frame when requestAnimationFrame stalls', () => {
+  let frameCallback = null;
+  let timerCallback = null;
+  const cancelledFrames = [];
+  const drawn = [];
+  const presented = [];
+  const frame = { closed: 0, close() { this.closed++; } };
+  const presenter = new LatestFramePresenter({
+    requestFrame: (callback) => {
+      frameCallback = callback;
+      return 11;
+    },
+    cancelFrame: (handle) => cancelledFrames.push(handle),
+    setTimer: (callback, delayMs) => {
+      assert.equal(delayMs, 25);
+      timerCallback = callback;
+      return 22;
+    },
+    cancelTimer: () => assert.fail('winning watchdog must not cancel itself'),
+    now: () => 125,
+    draw: (value) => drawn.push(value),
+    onPresent: (metadata, nowMs) => presented.push({ metadata, nowMs }),
+  });
+
+  presenter.enqueue(frame, 'stalled');
+  timerCallback();
+
+  assert.deepEqual(cancelledFrames, [11]);
+  assert.deepEqual(drawn, [frame]);
+  assert.deepEqual(presented, [{ metadata: 'stalled', nowMs: 125 }]);
+  assert.equal(frame.closed, 1);
+  assert.equal(presenter.depth, 0);
+
+  frameCallback(126);
+  assert.equal(drawn.length, 1, 'a cancelled stale rAF must not present twice');
+  assert.equal(frame.closed, 1);
+});
+
+test('normal requestAnimationFrame presentation cancels its watchdog', () => {
+  let frameCallback = null;
+  let timerCallback = null;
+  const cancelledTimers = [];
+  const presented = [];
+  const frame = { closed: 0, close() { this.closed++; } };
+  const presenter = new LatestFramePresenter({
+    requestFrame: (callback) => {
+      frameCallback = callback;
+      return 1;
+    },
+    cancelFrame: () => assert.fail('winning rAF must not cancel itself'),
+    setTimer: (callback) => {
+      timerCallback = callback;
+      return 2;
+    },
+    cancelTimer: (handle) => cancelledTimers.push(handle),
+    now: () => 999,
+    draw: () => {},
+    onPresent: (metadata, nowMs) => presented.push({ metadata, nowMs }),
+  });
+
+  presenter.enqueue(frame, 'normal');
+  frameCallback(16);
+  assert.deepEqual(cancelledTimers, [2]);
+  assert.deepEqual(presented, [{ metadata: 'normal', nowMs: 16 }]);
+  assert.equal(frame.closed, 1);
+
+  timerCallback();
+  assert.equal(presented.length, 1, 'a cancelled stale timer must not present twice');
+});
+
+test('stale callbacks cannot consume a successor frame after a watchdog race', () => {
+  const frameCallbacks = [];
+  const timerCallbacks = [];
+  const drawn = [];
+  let nextFrameHandle = 1;
+  let nextTimerHandle = 10;
+  const frame = (id) => ({ id, closed: 0, close() { this.closed++; } });
+  const first = frame(1);
+  const second = frame(2);
+  const presenter = new LatestFramePresenter({
+    requestFrame: (callback) => {
+      frameCallbacks.push(callback);
+      return nextFrameHandle++;
+    },
+    cancelFrame: () => {},
+    setTimer: (callback) => {
+      timerCallbacks.push(callback);
+      return nextTimerHandle++;
+    },
+    cancelTimer: () => {},
+    now: () => 25,
+    draw: (value) => drawn.push(value.id),
+  });
+
+  presenter.enqueue(first);
+  presenter.enqueue(second);
+  timerCallbacks[0]();
+  assert.deepEqual(drawn, [1]);
+  assert.equal(frameCallbacks.length, 2);
+
+  frameCallbacks[0](26);
+  timerCallbacks[0]();
+  assert.deepEqual(drawn, [1]);
+  assert.equal(second.closed, 0);
+
+  frameCallbacks[1](32);
+  assert.deepEqual(drawn, [1, 2]);
+  assert.equal(first.closed, 1);
+  assert.equal(second.closed, 1);
+});
+
+test('clear cancels both schedulers and makes their callbacks harmless', () => {
+  let frameCallback = null;
+  let timerCallback = null;
+  const cancelledFrames = [];
+  const cancelledTimers = [];
+  const drawn = [];
+  const first = { closed: 0, close() { this.closed++; } };
+  const second = { closed: 0, close() { this.closed++; } };
+  const presenter = new LatestFramePresenter({
+    requestFrame: (callback) => {
+      frameCallback = callback;
+      return 7;
+    },
+    cancelFrame: (handle) => cancelledFrames.push(handle),
+    setTimer: (callback) => {
+      timerCallback = callback;
+      return 8;
+    },
+    cancelTimer: (handle) => cancelledTimers.push(handle),
+    now: () => 25,
+    draw: (frame) => drawn.push(frame),
+  });
+
+  presenter.enqueue(first);
+  presenter.enqueue(second);
+  presenter.clear();
+
+  assert.deepEqual(cancelledFrames, [7]);
+  assert.deepEqual(cancelledTimers, [8]);
+  assert.equal(first.closed, 1);
+  assert.equal(second.closed, 1);
+  assert.equal(presenter.depth, 0);
+
+  frameCallback(30);
+  timerCallback();
+  assert.deepEqual(drawn, []);
+  assert.equal(first.closed, 1);
+  assert.equal(second.closed, 1);
 });

@@ -460,14 +460,14 @@ The preferred host artifact is the deterministic, allowlisted runtime package.
 It contains the generic Linux host/probe binaries, installer and rollback tool,
 systemd/PipeWire/udev assets, license, complete checksums, and build provenance.
 It cannot include the worktree, credentials, identity, hardware configuration,
-or evidence. Product packaging fails closed when the worktree is dirty or no
+or evidence. Product packaging exports clean `HEAD`, builds both binaries with
+locked `cargo-zigbuild` in an isolated target directory, and never accepts
+caller-supplied binaries. It fails closed when the worktree is dirty or no
 Minisign secret key is supplied:
 
 ```bash
 cd /Users/dami/Developer/sigil-spark
 source ~/.cargo/env
-cargo zigbuild --locked -p sigil-host \
-  --target x86_64-unknown-linux-gnu.2.17 --release
 scripts/package-bazzite-release.sh \
   --output /tmp/sigil-spark-host.tar.gz \
   --minisign-key /absolute/path/to/release.key
@@ -505,7 +505,17 @@ or `host.toml`, changes `/etc`, restarts PipeWire, or starts/enables the service
 For a temporary dirty and unsigned development package only, replace the
 Minisign option with `--allow-dirty --allow-unsigned`. The manifest records that
 state and the package prints `publisher_signature=absent-development`; never
-publish that artifact.
+publish that artifact. Externally built host/probe binaries are accepted only
+as an all-or-none pair with both development flags, and their manifest records
+`binary_provenance=caller-supplied-unverified`:
+
+```bash
+scripts/package-bazzite-release.sh \
+  --output /tmp/sigil-spark-host-prebuilt-dev.tar.gz \
+  --allow-dirty --allow-unsigned \
+  --host-binary /absolute/path/to/sigil-host \
+  --probe-binary /absolute/path/to/sigil-probe
+```
 
 ## 8. Create the host identity and synthetic configuration
 
@@ -1207,9 +1217,20 @@ session that merely started the user manager:
 loginctl list-sessions
 sudo journalctl -b -o short-monotonic --no-pager | \
   grep -Ei 'gamescope|steam|sshd.*accepted|session.*sigil'
+set -o pipefail
+./scripts/bazzite-inventory.sh --cold-boot | \
+  tee "$HOME/bazzite-cold-boot.txt"
 ```
 
 The Gamescope session must predate the first accepted SSH login.
+`--cold-boot` is read-only and makes the gate machine-checkable. It exits zero
+only when no DRM connector is connected, the SDDM Gaming Mode session and
+required PipeWire nodes are active, the Sigil service is enabled and ready,
+and Gamescope plus Sigil both predate the first accepted SSH login. Exit status
+`1` means observed evidence failed a gate. Exit status `3` means the boot
+journal is unavailable, starts more than five minutes after boot, or otherwise
+cannot establish the first SSH ordering; do not treat that as a pass. Run it
+immediately on the first SSH login so journal rotation cannot erase the proof.
 
 If the stock session does not start or does not publish a node without a
 physical connector, stop at this gate. This is an expected discovery risk on

@@ -39,8 +39,10 @@ Steam and games.
 - The Bazzite path captures the exact Gamescope PipeWire node and uses AMD
   GstVA H.264 at the fixed 1280×800/60 first target.
 - The client delivers encoded frames to WebCodecs through a raw Tauri binary
-  channel. The handoff is capped at four frames, the decode queue at two, and
-  its transport/frontend/decoder drop counters are reported separately.
+  channel. The handoff is capped at four frames, the decode queue and
+  presentation queue at two, and a bounded watchdog recovers a suspended
+  webview animation-frame callback without presenting a frame twice. Its
+  transport/frontend/decoder drop counters are reported separately.
 - Media and input use separate Iroh connections; one active client is enforced.
 - Linux `uinput` supports bounded relative-mouse and keyboard injection plus a
   separate Xbox-style virtual gamepad, with strict device
@@ -94,7 +96,9 @@ Provision a dedicated AMD host with the
 [fresh Bazzite host runbook](docs/fresh-bazzite-host.md). The runbook also
 defines the temporary `slate` stand-in used for protocol and daemon extraction.
 Run `scripts/bazzite-inventory.sh` on a candidate host for a read-only report;
-add `--smoke` to exercise a bounded 1280×800/60 VA-API encode.
+add `--smoke` to exercise a bounded 1280×800/60 VA-API encode. On the first SSH
+login after a physically headless cold boot, use `--cold-boot` for a strict,
+read-only connector, session, service, PipeWire, and boot-order gate.
 
 Run the complete local demo gate before transferring a snapshot:
 
@@ -117,9 +121,12 @@ binaries, their dynamic libraries, and bounded startup commands validate. Host
 identity, hardware-specific configuration, and service activation remain
 separate gates in the Bazzite runbook.
 
-Create the Bazzite runtime package after the cross-compiled host and probe are
-built. Product packages require a clean worktree and detached Minisign
-signature; the explicit development flags are only for temporary testing:
+Create the Bazzite runtime package from a committed source revision. Product
+mode exports clean `HEAD` and builds the host and probe itself with locked
+`cargo-zigbuild` in an isolated target directory; it never accepts externally
+supplied binaries. Product packages require a clean worktree and detached
+Minisign signature; the explicit development flags are only for temporary
+testing:
 
 ```bash
 scripts/package-bazzite-release.sh \
@@ -130,13 +137,22 @@ scripts/package-bazzite-release.sh \
 scripts/package-bazzite-release.sh \
   --output /tmp/sigil-spark-host-dev.tar.gz \
   --allow-dirty --allow-unsigned
+
+# Temporary externally built binaries require both development flags:
+scripts/package-bazzite-release.sh \
+  --output /tmp/sigil-spark-host-prebuilt-dev.tar.gz \
+  --allow-dirty --allow-unsigned \
+  --host-binary /absolute/path/to/sigil-host \
+  --probe-binary /absolute/path/to/sigil-probe
 ```
 
 The package contains only the two Linux binaries, installer/rollback tools,
 service/audio/udev assets, license, checksums, and build provenance. It cannot
 contain the source tree, `.env` files, identities, host configuration, or test
 evidence. Its release ID is the SHA-256 of the complete installed-file checksum
-manifest. Identical inputs produce a byte-identical archive.
+manifest. Identical inputs produce a byte-identical archive. The manifest marks
+product binaries as built from clean `HEAD`; caller-supplied development
+binaries are explicitly marked as having unverified provenance.
 
 Verify the detached signature against the separately trusted public key before
 extracting, then run `payload/stage-this-release.sh` as the gaming user. Install

@@ -87,6 +87,7 @@ import {
   fitInitialStreamWindow,
   fitStreamSurface,
 } from './window-geometry.mjs';
+import { buildVideoDecoderConfig } from './video-decoder-config.mjs';
 
 let controlMode = false;
 let connected = false;
@@ -958,6 +959,10 @@ let lastVideoDrawCompletedAtMs = null;
 const framePresenter = new LatestFramePresenter({
   requestFrame: (callback) => requestAnimationFrame(callback),
   cancelFrame: (handle) => cancelAnimationFrame(handle),
+  setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
+  cancelTimer: (handle) => clearTimeout(handle),
+  now: () => performance.now(),
+  fallbackDelayMs: 25,
   draw: (frame) => {
     const startedAt = performance.now();
     ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
@@ -1066,13 +1071,12 @@ function initWebCodecsDecoder(width, height, desc, codecStr) {
       teardownDecoderPipeline();
     }
   });
-  videoDecoder.configure({
+  videoDecoder.configure(buildVideoDecoderConfig({
     codec: codecStr,
-    codedWidth: width,
-    codedHeight: height,
+    width,
+    height,
     description: desc,
-    optimizeForRealtimeUse: true,
-  });
+  }));
   decoderConfigured = true;
   waitingForDecoderKeyframe = false;
 }

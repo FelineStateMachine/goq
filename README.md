@@ -202,9 +202,9 @@ On Linux with NVIDIA:
 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
 ```
 
-The static `website/` directory is published through Cloudflare Pages after a
-merge to `main`. See the [Cloudflare Pages release setup](docs/cloudflare-pages.md)
-for the one-time project and GitHub environment configuration.
+The static `website/` directory is published as Cloudflare Worker static assets
+after a merge to `main`. See the [Cloudflare Worker release setup](docs/cloudflare-worker.md)
+for the one-time service and GitHub environment configuration.
 
 Portal is distributed as a compiled, signed desktop application; it is never
 installed through a shell pipe. Sigil uses a separate Bazzite machine bootstrap

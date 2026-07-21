@@ -830,6 +830,7 @@ async function connectHost() {
         control: result.control_available === true,
       };
       streamTransportMode = [
+        'grouped-v3',
         'independent-v2',
         'reliable-v1',
         'reliable-v0',
@@ -885,7 +886,6 @@ async function connectHost() {
         await teardownAudioPipeline(false);
         setAudioState('unavailable', result.audio_error || audioSupport.error || 'host audio unavailable');
       }
-      waitingForDecoderKeyframe = true;
       updatePanelVisibility();
       document.getElementById('node-id-text').textContent = result.host_node_id.substring(0, 16) + '...';
       document.getElementById('frame-canvas').style.display = 'block';
@@ -1263,8 +1263,12 @@ function enqueueVideoChunk(chunk, receivedAt, codecLabel, mediaPtsMicros = null)
 function initWebCodecsDecoder(width, height, desc, codecStr) {
   teardownDecoderPipeline();
   console.log('WebCodecs configure:', codecStr, 'w:', width, 'h:', height, 'desc:', desc.byteLength, 'bytes');
-  videoDecoder = new VideoDecoder({
+  const decoder = new VideoDecoder({
     output: (frame) => {
+      if (videoDecoder !== decoder) {
+        frame.close();
+        return;
+      }
       const now = performance.now();
       decoderOutputFrames++;
       decoderOutputRate.record(now);
@@ -1275,12 +1279,14 @@ function initWebCodecsDecoder(width, height, desc, codecStr) {
       framePresenter.enqueue(frame, timing);
     },
     error: (e) => {
+      if (videoDecoder !== decoder) return;
       console.error('VideoDecoder error:', e);
       enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_ERROR);
     }
   });
+  videoDecoder = decoder;
   try {
-    videoDecoder.configure(buildVideoDecoderConfig({
+    decoder.configure(buildVideoDecoderConfig({
       codec: codecStr,
       width,
       height,

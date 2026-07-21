@@ -1,10 +1,26 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
   DECODER_RECOVERY_REASONS,
   DecoderRecoveryState,
 } from './decoder-recovery.mjs';
+
+const main = await readFile(new URL('./main.js', import.meta.url), 'utf8');
+
+test('connect wiring uses the recovery state instead of removed legacy state', () => {
+  assert.doesNotMatch(main, /waitingForDecoderKeyframe/);
+  assert.match(main, /decoderRecovery\.reset\(\);/);
+});
+
+test('decoder callbacks cannot mutate a replacement decoder session', () => {
+  assert.match(
+    main,
+    /output: \(frame\) => \{\s*if \(videoDecoder !== decoder\) \{\s*frame\.close\(\);\s*return;/,
+  );
+  assert.match(main, /error: \(e\) => \{\s*if \(videoDecoder !== decoder\) return;/);
+});
 
 test('drops deltas until a recovery keyframe is successfully enqueued', () => {
   const recovery = new DecoderRecoveryState();

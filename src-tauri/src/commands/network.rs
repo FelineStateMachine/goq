@@ -909,7 +909,10 @@ impl MediaObjectReorderV3 {
             return Ok(Some(outcome));
         };
         if accept_index < self.next_accept_index {
-            return Ok(Some(outcome));
+            // A discontinuity barrier may advance beyond older in-flight
+            // reads. Their eventual timeout/reset outcomes belong to the
+            // superseded GOP and must not poison the recovered sequence.
+            return Ok(None);
         }
         if self.completed.insert(accept_index, outcome).is_some() {
             return Err(format!(
@@ -2934,6 +2937,19 @@ mod tests {
         MediaObjectV3::new(header, payload).unwrap()
     }
 
+    fn media_object_outcome_v3(
+        accept_index: u64,
+        group_id: u64,
+        object_id: u32,
+        sequence: u64,
+        flags: FrameFlags,
+    ) -> MediaObjectReadOutcomeV3 {
+        MediaObjectReadOutcomeV3::Object {
+            accept_index,
+            object: media_object_v3(group_id, object_id, sequence, flags),
+        }
+    }
+
     fn completed_object_index(outcome: &MediaObjectReadOutcome) -> Option<u64> {
         outcome.object_index()
     }
@@ -3126,6 +3142,53 @@ mod tests {
         assert_eq!(
             sequence.classify(&media_object_v3(10, 2, 12, FrameFlags::NONE)),
             MediaObjectSequenceDecisionV3::DropLate
+        );
+    }
+
+    #[test]
+    fn late_dropped_completion_after_v3_barrier_cannot_poison_recovered_group() {
+        let barrier = FrameFlags::KEYFRAME
+            .union(FrameFlags::CODEC_CONFIG)
+            .union(FrameFlags::DISCONTINUITY);
+        let mut reorder = MediaObjectReorderV3::new(1);
+        let mut sequence = MediaObjectSequenceV3::new();
+
+        let recovered = reorder
+            .push(media_object_outcome_v3(5, 20, 0, 20, barrier))
+            .unwrap()
+            .unwrap();
+        let MediaObjectReadOutcomeV3::Object { object, .. } = recovered else {
+            panic!("recovery barrier must remain an object");
+        };
+        assert_eq!(
+            sequence.classify(&object),
+            MediaObjectSequenceDecisionV3::Deliver {
+                discontinuity: true
+            }
+        );
+
+        assert!(
+            reorder
+                .push(MediaObjectReadOutcomeV3::Dropped {
+                    accept_index: 1,
+                    reason: KeyframeRequestReasonV3::DeliveryTimeout,
+                })
+                .unwrap()
+                .is_none()
+        );
+
+        let delta = reorder
+            .push(media_object_outcome_v3(6, 20, 1, 21, FrameFlags::NONE))
+            .unwrap()
+            .unwrap();
+        let MediaObjectReadOutcomeV3::Object { object, .. } = delta else {
+            panic!("new group delta must remain an object");
+        };
+        assert_eq!(
+            sequence.classify(&object),
+            MediaObjectSequenceDecisionV3::Deliver {
+                discontinuity: false
+            }
         );
     }
 

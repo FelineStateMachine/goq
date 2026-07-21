@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>goq.sh: one-to-one Steam streaming over iroh</title>
+  <meta name="description" content="goq.sh pairs Portal, a native client, with Sigil, a headless Gamescope host, for games over QUIC. One-to-one, low-latency Steam streaming over iroh. Your key is the address." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23ece3d2'/%3E%3Crect x='1' y='4' width='6' height='8' fill='%23b5623b'/%3E%3Crect x='3' y='7' width='2' height='2' fill='%23ece3d2'/%3E%3Crect x='7' y='7' width='8' height='2' fill='%23c98a3a'/%3E%3Crect x='10' y='9' width='2' height='2' fill='%236b7145'/%3E%3Crect x='13' y='9' width='2' height='3' fill='%236b7145'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <!--
+    goq.sh is the project and domain. Portal is the installed client;
+    sigil is the headless host CLI. "goq" is the games-over-QUIC
+    wordplay and repository name (github.com/FelineStateMachine/goq).
+    TODO(install-script): the curl one-liners below point at goq.sh but
+    those install scripts are NOT published yet. Publish them (client
+    app + host runtime package) before launch, then confirm the exact
+    commands here and in dither.js.
+  -->
+  <!-- ─── First screen: full-viewport dither with a floating panel ─── -->
+  <div class="screen">
+    <header class="topbar">
+      <a class="topbar-github" href="https://github.com/FelineStateMachine/goq" rel="noopener">source&nbsp;</a>
+      <nav class="topbar-nav">
+        <a href="#features">features</a>
+        <a href="#how">how</a>
+        <a href="#start">start</a>
+      </nav>
+    </header>
+
+    <section class="hero">
+      <canvas class="hero-canvas" aria-hidden="true"></canvas>
+      <div class="hero-panel">
+        <!-- pixel security key mark -->
+        <svg class="hero-key" viewBox="0 0 26 12" width="78" height="36" aria-hidden="true">
+          <rect x="0"  y="1" width="8"  height="10" fill="var(--terracotta)" />
+          <rect x="3"  y="5" width="2"  height="2"  fill="var(--paper)" />
+          <rect x="8"  y="5" width="18" height="2"  fill="var(--ochre)" />
+          <rect x="14" y="7" width="2"  height="3"  fill="var(--moss)" />
+          <rect x="19" y="7" width="2"  height="2"  fill="var(--moss)" />
+        </svg>
+        <pre class="hero-ascii" role="img" aria-label="goq.sh">░█▀▀░█▀█░█▀█░░░█▀▀░█░█
+░█░█░█░█░█▄█░░░▀▀█░█▀█
+░▀▀▀░▀▀▀░░░█░▀░▀▀▀░▀░▀</pre>
+        <p class="hero-tagline">Your key is the address. Plug in, tap, connect.</p>
+        <div class="install-group">
+          <div class="seg" role="radiogroup" aria-label="Install as">
+            <label class="seg-opt">
+              <input type="radio" name="install-target" value="client" checked />
+              <span>client</span>
+            </label>
+            <label class="seg-opt">
+              <input type="radio" name="install-target" value="host" />
+              <span>host</span>
+            </label>
+          </div>
+          <div class="install" data-copy="curl -fsSL https://goq.sh | sh">
+            <code class="install-cmd"><span class="install-prompt">$</span> <span class="install-text">curl -fsSL https://goq.sh | sh</span></code>
+            <button class="install-copy" type="button" aria-label="Copy install command">copy</button>
+          </div>
+        </div>
+        <p class="hero-note">Games over QUIC: one-to-one Steam streaming over iroh <br> Work in progress. Not a finished product.</p>
+      </div>
+    </section>
+  </div>
+
+  <main id="main">
+    <!-- ─── Features ─────────────────────────────────────────── -->
+    <section class="features" id="features">
+      <div class="section-rule" aria-hidden="true"></div>
+      <h2 class="section-title"><span aria-hidden="true">##</span> why goq</h2>
+      <ol class="feature-grid">
+        <li class="feature reveal">
+          <h3>Your key is the address</h3>
+          <p>The FIDO2 key's hmac-secret seeds the iroh identity. Host and client derive the same node ID from the same physical key. No pairing codes, no accounts.</p>
+        </li>
+        <li class="feature reveal">
+          <h3>Headless Sigil host</h3>
+          <p>A pure-Rust daemon on bare-metal Linux, no desktop, no display. Gamescope gives Steam its own private session; PipeWire feeds a hardware H.264 encoder.</p>
+        </li>
+        <li class="feature reveal">
+          <h3>Controller-first</h3>
+          <p>A virtual Xbox-style gamepad, keyboard, and relative mouse injected via uinput. D-pad PIN pad and a Back+Start escape chord, built for a couch.</p>
+        </li>
+        <li class="feature reveal">
+          <h3>Audio included</h3>
+          <p>PipeWire capture to Opus in bounded datagrams, played back through an AudioWorklet next to the WebCodecs picture.</p>
+        </li>
+        <li class="feature reveal">
+          <h3>Bounded everything</h3>
+          <p>Frame handoff capped at four, decode queue at two, every buffer bounded. Stale frames are dropped, not queued, so latency never drifts.</p>
+        </li>
+        <li class="feature reveal">
+          <h3>One host, one client</h3>
+          <p>A single active client, enforced, over an end-to-end encrypted iroh link, relay-assisted when a direct path isn't possible. No third-party streaming service.</p>
+        </li>
+      </ol>
+    </section>
+
+    <!-- ─── How it works ─────────────────────────────────────── -->
+    <section class="how" id="how">
+      <div class="section-rule" aria-hidden="true"></div>
+      <h2 class="section-title"><span aria-hidden="true">##</span> how it works</h2>
+
+      <div class="diagram">
+        <!-- host column -->
+        <div class="dg-node reveal">
+          <span class="dg-label">sigil · bare-metal linux</span>
+          <ol class="dg-steps">
+            <li>Steam and your game</li>
+            <li>headless Gamescope session</li>
+            <li>PipeWire video + audio capture</li>
+            <li>hardware H.264 + Opus encode</li>
+          </ol>
+          <span class="dg-foot-in">gamepad + kb/m injected via uinput</span>
+        </div>
+
+        <!-- channel: media out, input back -->
+        <div class="dg-channel" aria-hidden="true">
+          <div class="dg-rail dg-video">
+            <span class="dg-pill">media · iroh</span>
+            <span class="dg-head">▶</span>
+          </div>
+          <div class="dg-rail dg-input">
+            <span class="dg-pill">input · iroh</span>
+            <span class="dg-head">◀</span>
+          </div>
+        </div>
+
+        <!-- client column -->
+        <div class="dg-node reveal">
+          <span class="dg-label">portal · native app</span>
+          <ol class="dg-steps">
+            <li>native iroh endpoint</li>
+            <li>WebCodecs + AudioWorklet</li>
+            <li>picture and sound appear</li>
+            <li>controller, keyboard, mouse</li>
+          </ol>
+          <span class="dg-foot-in">any machine, near or far</span>
+        </div>
+      </div>
+
+      <ul class="dg-notes">
+        <li>Paired by your <strong>FIDO2 security key</strong>: same key, same address. No passwords, no accounts.</li>
+        <li><strong>One host, one client</strong>. Media and input ride separate end-to-end encrypted iroh connections.</li>
+        <li><strong>Every queue bounded</strong>. Stale frames are dropped, not queued, so it never drifts behind.</li>
+      </ul>
+    </section>
+
+    <!-- ─── Quick start ──────────────────────────────────────── -->
+    <section class="start" id="start">
+      <div class="section-rule" aria-hidden="true"></div>
+      <h2 class="section-title"><span aria-hidden="true">##</span> three taps to steam</h2>
+      <ol class="start-grid">
+        <li class="start-step reveal">
+          <span class="start-num" aria-hidden="true">01</span>
+          <h3>provision sigil</h3>
+          <p>A bare-metal Linux box. The runbook walks an AMD Bazzite machine from blank to streaming. The daemon runs headless; Gamescope is the display.</p>
+        </li>
+        <li class="start-step reveal">
+          <span class="start-num" aria-hidden="true">02</span>
+          <h3>open portal</h3>
+          <p>In Portal, tap your FIDO2 key and identity is minted on the token. A D-pad PIN pad keeps it couch-friendly.</p>
+        </li>
+        <li class="start-step reveal">
+          <span class="start-num" aria-hidden="true">03</span>
+          <h3>tap to play <kbd>back+start</kbd></h3>
+          <p>Tap the same key anywhere else: Steam appears, your controller just works. Hold Back+Start for a second to escape the session.</p>
+        </li>
+      </ol>
+      <p class="start-note">You'll need a FIDO2 key with hmac-secret support (YubiKey, Google Titan, …) and a Linux machine for Sigil. Portal builds run on Linux and macOS. <a class="footer-link" href="https://github.com/FelineStateMachine/goq" rel="noopener">Runbook and source →</a></p>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="section-rule" aria-hidden="true"></div>
+    <div class="footer-inner">
+      <ul class="stack-row" aria-label="Tech stack">
+        <li>rust</li>
+        <li>tauri v2</li>
+        <li>iroh</li>
+        <li>gamescope</li>
+        <li>pipewire</li>
+        <li>h.264 + opus</li>
+        <li>webcodecs</li>
+        <li>uinput</li>
+        <li>ctap-hid-fido2</li>
+        <li>no npm · no build step</li>
+      </ul>
+      <div class="footer-meta">
+        <span>MIT licensed</span>
+        <a class="footer-link" href="https://github.com/FelineStateMachine/goq" rel="noopener">Source</a>
+        <span class="footer-domain">goq.sh</span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="./dither.js"></script>
+</body>
+</html>

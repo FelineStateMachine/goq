@@ -5,12 +5,14 @@ on:
     paths:
       - website/**
       - scripts/verify-website.sh
+      - wrangler.jsonc
       - .github/workflows/website.yml
   push:
     branches: [main]
     paths:
       - website/**
       - scripts/verify-website.sh
+      - wrangler.jsonc
       - .github/workflows/website.yml
 
 permissions:
@@ -33,7 +35,7 @@ jobs:
         run: ./scripts/verify-website.sh
 
   deploy:
-    name: Cloudflare Pages
+    name: Cloudflare Worker
     if: github.event_name == 'push'
     needs: verify
     runs-on: ubuntu-24.04
@@ -50,10 +52,10 @@ jobs:
 
       - name: Deploy production site
         id: deploy
-        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: 4.112.0
-          command: pages deploy website --project-name=goq-sh --branch=main
+          command: deploy
           gitHubToken: ${{ secrets.GITHUB_TOKEN }}

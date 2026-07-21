@@ -43,7 +43,7 @@ Sigil host.
   AudioWorklet playback, controller-first navigation, input capture, A/V
   synchronization, window geometry, and client diagnostics.
 - `website/` is the static goq.sh site. A merge to `main` publishes it through
-  Cloudflare Pages after the static-site gate passes.
+  the `goq-sh` Cloudflare Worker after the static-site gate passes.
 
 ## Proven baseline
 

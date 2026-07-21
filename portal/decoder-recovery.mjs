@@ -54,8 +54,11 @@ export class DecoderRecoveryState {
   }
 
   /** Enter recovery, coalescing with an already active recovery episode. */
-  enter(reason) {
+  enter(reason, { requestKeyframe = true } = {}) {
     validReason(reason);
+    if (typeof requestKeyframe !== 'boolean') {
+      throw new TypeError('requestKeyframe must be a boolean');
+    }
     const entered = !this.#recovering;
     if (entered) {
       this.#recovering = true;
@@ -66,7 +69,7 @@ export class DecoderRecoveryState {
     }
 
     let requested = false;
-    if (!this.#requestIssued) {
+    if (requestKeyframe && !this.#requestIssued) {
       // Mark the request before invoking user code. Even if that code throws,
       // the same recovery episode must not create an unbounded retry loop.
       this.#requestIssued = true;

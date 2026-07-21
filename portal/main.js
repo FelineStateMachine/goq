@@ -1098,8 +1098,10 @@ const decoderRecovery = new DecoderRecoveryState({
   onKeyframeRequest: requestDecoderKeyframe,
 });
 
-function enterDecoderRecovery(reason, { restart = false } = {}) {
-  const result = restart ? decoderRecovery.restart(reason) : decoderRecovery.enter(reason);
+function enterDecoderRecovery(reason, { restart = false, requestKeyframe = true } = {}) {
+  const result = restart
+    ? decoderRecovery.restart(reason)
+    : decoderRecovery.enter(reason, { requestKeyframe });
   // Closing WebCodecs and clearing the latest-frame presenter is part of the
   // recovery boundary. Do it immediately rather than allowing already queued
   // frames from a poisoned GOP to continue reaching the canvas.
@@ -1507,7 +1509,11 @@ function processFramePayload(payload, binaryData = null) {
     const raw = binaryData ?? Uint8Array.from(atob(data), c => c.charCodeAt(0));
     const decoderBacklogged = videoDecoder?.decodeQueueSize >= MAX_DECODE_QUEUE_SIZE;
     if (discontinuity) {
-      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DISCONTINUITY);
+      // A delivered discontinuity keyframe is the recovery boundary we were
+      // waiting for, not evidence that another keyframe is missing.
+      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DISCONTINUITY, {
+        requestKeyframe: !keyframe,
+      });
     } else if (decoderBacklogged) {
       enterDecoderRecovery(DECODER_RECOVERY_REASONS.FRONTEND_BACKPRESSURE);
     }

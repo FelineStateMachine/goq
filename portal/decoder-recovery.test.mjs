@@ -22,6 +22,26 @@ test('decoder callbacks cannot mutate a replacement decoder session', () => {
   assert.match(main, /error: \(e\) => \{\s*if \(videoDecoder !== decoder\) return;/);
 });
 
+test('a delivered discontinuity keyframe resets without requesting its replacement', () => {
+  const requests = [];
+  const recovery = new DecoderRecoveryState({
+    initiallyRecovering: false,
+    onKeyframeRequest: (reason) => requests.push(reason),
+  });
+
+  assert.deepEqual(
+    recovery.enter(DECODER_RECOVERY_REASONS.DISCONTINUITY, { requestKeyframe: false }),
+    { entered: true, requested: false },
+  );
+  assert.equal(recovery.shouldDropFrame({ keyframe: true }), false);
+  assert.equal(recovery.confirmKeyframeEnqueued(true), true);
+  assert.deepEqual(requests, []);
+  assert.match(
+    main,
+    /enterDecoderRecovery\(DECODER_RECOVERY_REASONS\.DISCONTINUITY, \{\s*requestKeyframe: !keyframe,/,
+  );
+});
+
 test('drops deltas until a recovery keyframe is successfully enqueued', () => {
   const recovery = new DecoderRecoveryState();
 
@@ -134,6 +154,10 @@ test('session reset clears request coalescing without notifying an inactive host
 test('rejects malformed reasons and frame decisions', () => {
   const recovery = new DecoderRecoveryState();
   assert.throws(() => recovery.enter('loss'), /unsupported decoder recovery reason/);
+  assert.throws(
+    () => recovery.enter(DECODER_RECOVERY_REASONS.DISCONTINUITY, { requestKeyframe: 'no' }),
+    /requestKeyframe must be a boolean/,
+  );
   assert.throws(() => recovery.restart(null), /unsupported decoder recovery reason/);
   assert.throws(() => recovery.shouldDropFrame({ keyframe: 1 }), /keyframe must be a boolean/);
   assert.throws(() => recovery.confirmKeyframeEnqueued('yes'), /succeeded must be a boolean/);

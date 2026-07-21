@@ -741,16 +741,45 @@ a { color: inherit; }
   .start-grid { grid-template-columns: 1fr; }
 }
 
-/* ─── Scroll reveal (JS-gated: html.js only) ───────────────── */
-html.js .reveal {
-  opacity: 0;
-  transform: translateY(14px);
-  transition: opacity 0.55s ease, transform 0.55s ease;
-  transition-delay: var(--reveal-delay, 0s);
+/* ─── Scroll reveal: Bayer dither dissolve (JS-gated: html.js) ──
+       Elements materialize the way the hero field is drawn: pixels
+       arrive in ordered-dither (4x4 Bayer) sequence — sparse
+       checkerboard, then dense, then solid — instead of fading.
+       mask-image is discrete-animatable, so the keyframes step
+       through three threshold masks; browsers that don't animate
+       masks degrade to a fast pop-in via the opacity ramp. */
+html.js .reveal { opacity: 0; }
+html.js .reveal.in {
+  opacity: 1;
+  -webkit-mask-repeat: repeat;
+  mask-repeat: repeat;
+  -webkit-mask-size: 12px 12px;
+  mask-size: 12px 12px;
+  animation: dither-in 0.45s var(--reveal-delay, 0s) backwards;
 }
-html.js .reveal.in { opacity: 1; transform: none; }
+@keyframes dither-in {
+  0% {
+    opacity: 0;
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='1' height='1'/%3E%3Crect x='2' y='0' width='1' height='1'/%3E%3Crect x='0' y='2' width='1' height='1'/%3E%3Crect x='2' y='2' width='1' height='1'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='1' height='1'/%3E%3Crect x='2' y='0' width='1' height='1'/%3E%3Crect x='0' y='2' width='1' height='1'/%3E%3Crect x='2' y='2' width='1' height='1'/%3E%3C/svg%3E");
+  }
+  10% { opacity: 1; }
+  30% {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='1' height='1'/%3E%3Crect x='2' y='0' width='1' height='1'/%3E%3Crect x='0' y='2' width='1' height='1'/%3E%3Crect x='2' y='2' width='1' height='1'/%3E%3Crect x='1' y='1' width='1' height='1'/%3E%3Crect x='3' y='1' width='1' height='1'/%3E%3Crect x='1' y='3' width='1' height='1'/%3E%3Crect x='3' y='3' width='1' height='1'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='1' height='1'/%3E%3Crect x='2' y='0' width='1' height='1'/%3E%3Crect x='0' y='2' width='1' height='1'/%3E%3Crect x='2' y='2' width='1' height='1'/%3E%3Crect x='1' y='1' width='1' height='1'/%3E%3Crect x='3' y='1' width='1' height='1'/%3E%3Crect x='1' y='3' width='1' height='1'/%3E%3Crect x='3' y='3' width='1' height='1'/%3E%3C/svg%3E");
+  }
+  60% {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='4' height='1'/%3E%3Crect x='0' y='2' width='4' height='1'/%3E%3Crect x='1' y='1' width='1' height='1'/%3E%3Crect x='3' y='1' width='1' height='1'/%3E%3Crect x='1' y='3' width='1' height='1'/%3E%3Crect x='3' y='3' width='1' height='1'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='4' height='1'/%3E%3Crect x='0' y='2' width='4' height='1'/%3E%3Crect x='1' y='1' width='1' height='1'/%3E%3Crect x='3' y='1' width='1' height='1'/%3E%3Crect x='1' y='3' width='1' height='1'/%3E%3Crect x='3' y='3' width='1' height='1'/%3E%3C/svg%3E");
+  }
+  100% {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
-  html.js .reveal { opacity: 1; transform: none; transition: none; }
+  html.js .reveal { opacity: 1; }
+  html.js .reveal.in { animation: none; }
 }
 
 /* ─── Footer ───────────────────────────────────────────────── */

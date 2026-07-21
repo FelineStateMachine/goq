@@ -144,9 +144,9 @@
           The pointer dents the height field; the dent propagates as
           rings that get dithered into the same ramps as the terrain. */
     var waveA, waveB; // waveA = current heights, waveB = previous
-    var WAVE_DAMP = 0.975;
-    var WAVE_WARP = 14;   // wave gradient displaces the noise-sampling coords (refraction)
-    var WAVE_SHADE = 0.1; // faint crest/trough shading on top of the refraction
+    var WAVE_DAMP = 0.97;
+    var WAVE_WARP = 9;     // wave gradient displaces the noise-sampling coords (refraction)
+    var WAVE_SHADE = 0.06; // faint crest/trough shading on top of the refraction
     var lastCellX = -1, lastCellY = -1;
 
     // Soft 5x5 dent: a wider impulse makes longer-wavelength rings
@@ -184,32 +184,46 @@
       ];
     }
 
+    function trailTo(cx, cy) {
+      if (lastCellX >= 0) {
+        var dx = cx - lastCellX;
+        var dy = cy - lastCellY;
+        var steps = Math.min(48, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy))) || 1);
+        for (var s = 1; s <= steps; s++) {
+          splash(lastCellX + (dx * s) / steps, lastCellY + (dy * s) / steps, 0.22);
+        }
+      } else {
+        splash(cx, cy, 0.22);
+      }
+      lastCellX = cx;
+      lastCellY = cy;
+    }
+
     // Listen on the hero (not the canvas) so the trail continues
     // under the floating panel instead of dying at its edge.
     var hero = display.parentElement;
+    var lastClientX = -1, lastClientY = -1;
     hero.addEventListener("pointermove", function (e) {
       if (reduced.matches || !raf) return;
+      lastClientX = e.clientX;
+      lastClientY = e.clientY;
       var c = pointerCell(e);
-      if (lastCellX >= 0) {
-        var dx = c[0] - lastCellX;
-        var dy = c[1] - lastCellY;
-        var steps = Math.min(48, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy))) || 1);
-        for (var s = 1; s <= steps; s++) {
-          splash(lastCellX + (dx * s) / steps, lastCellY + (dy * s) / steps, 0.4);
-        }
-      } else {
-        splash(c[0], c[1], 0.4);
-      }
-      lastCellX = c[0];
-      lastCellY = c[1];
+      trailTo(c[0], c[1]);
     });
+    // Scrolling slides the field under a stationary cursor; lay the
+    // same trail along that relative motion so it acts like a move.
+    window.addEventListener("scroll", function () {
+      if (reduced.matches || !raf || lastClientX < 0) return;
+      var c = pointerCell({ clientX: lastClientX, clientY: lastClientY });
+      trailTo(c[0], c[1]);
+    }, { passive: true });
     hero.addEventListener("pointerdown", function (e) {
       if (reduced.matches || !raf) return;
       var c = pointerCell(e);
-      splash(c[0], c[1], 2);
+      splash(c[0], c[1], 1.2);
     });
-    hero.addEventListener("pointerleave", function () { lastCellX = -1; });
-    hero.addEventListener("pointercancel", function () { lastCellX = -1; });
+    hero.addEventListener("pointerleave", function () { lastCellX = -1; lastClientX = -1; });
+    hero.addEventListener("pointercancel", function () { lastCellX = -1; lastClientX = -1; });
 
     // Per-load random seed: shifts sampling into a different region of
     // the infinite noise field so the background doesn't start the same

@@ -84,6 +84,25 @@ a { color: inherit; }
 
 ::selection { background: var(--ochre); color: var(--ink); }
 
+/* ─── Selection policy: prose and the install command are content
+       and stay selectable; controls, nav chrome, and decorative
+       glyphs are not. The $ prompt is excluded so a hand-selected
+       command never carries it into a terminal paste. ──────────── */
+.skip,
+.topbar-github,
+.topbar-nav,
+.seg,
+.portal-download,
+.install-copy,
+.install-prompt,
+.section-title span,
+.start-num,
+.dg-channel,
+.hero-key {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
 /* ─── Top bar ──────────────────────────────────────────────── */
 .topbar {
   display: flex;
@@ -204,6 +223,78 @@ a { color: inherit; }
   gap: 10px;
   max-width: 100%;
 }
+.release-action {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+}
+.release-action[hidden] { display: none; }
+.portal-download {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 9px 18px;
+  border: 1px solid var(--hair-strong);
+  background: color-mix(in srgb, var(--paper-2) 82%, transparent);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-decoration: none;
+  text-transform: lowercase;
+  box-shadow: 4px 4px 0 var(--hair);
+  transition: background 0.12s, color 0.12s, box-shadow 0.12s, transform 0.12s;
+}
+/* pixel marker, same language as the hero-note square */
+.portal-download::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  background: var(--terracotta);
+}
+.portal-download:hover { background: var(--ink); color: var(--paper); }
+.portal-download:hover::before { background: var(--ochre); }
+.portal-download:active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 var(--hair);
+}
+.portal-download:focus-visible { outline: 2px solid var(--moss); outline-offset: 3px; }
+.portal-picker {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+/* combo without an artifact: dashed slot, no shadow — a pending space,
+   not a pressable thing */
+.portal-download.disabled {
+  background: transparent;
+  color: var(--ink-muted);
+  border: 1px dashed var(--hair-strong);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+.portal-download.disabled::before { background: var(--hair-strong); }
+.portal-download.disabled:hover {
+  background: transparent;
+  color: var(--ink-muted);
+}
+@media (prefers-reduced-motion: reduce) {
+  .portal-download:active { transform: none; }
+}
+.release-note {
+  color: var(--ink-muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.release-history { text-decoration: underline; text-underline-offset: 2px; }
+.release-history:hover { color: var(--ink); }
 /* platform segmented radio */
 .seg {
   display: inline-flex;
@@ -372,6 +463,53 @@ a { color: inherit; }
 }
 @media (max-width: 620px) {
   .feature-grid { grid-template-columns: 1fr; }
+}
+
+/* ─── Promoted hardening roadmap ──────────────────────────── */
+.roadmap { padding: clamp(56px, 8vw, 96px) var(--edge); }
+.roadmap-intro {
+  max-width: var(--maxw);
+  margin: 0 auto clamp(24px, 3vw, 34px);
+  color: var(--ink-muted);
+  font-size: 15px;
+}
+.roadmap-grid {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1px;
+  border: 1px solid var(--hair);
+  background: var(--hair);
+}
+.roadmap-item {
+  min-height: 210px;
+  padding: clamp(22px, 3vw, 34px);
+  background: var(--paper-2);
+}
+.roadmap-status {
+  display: block;
+  margin-bottom: 18px;
+  color: var(--terracotta);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.roadmap-item h3 {
+  margin-bottom: 10px;
+  font-family: var(--mono);
+  font-size: 17px;
+  text-transform: lowercase;
+}
+.roadmap-item h3 a { text-decoration-thickness: 1px; text-underline-offset: 4px; }
+.roadmap-item h3 a:hover { color: var(--terracotta); }
+.roadmap-item h3 a:focus-visible { outline: 2px solid var(--moss); outline-offset: 4px; }
+.roadmap-item p { color: var(--ink-muted); font-size: 14.5px; line-height: 1.55; }
+@media (max-width: 720px) {
+  .roadmap-grid { grid-template-columns: 1fr; }
+  .roadmap-item { min-height: 0; }
 }
 
 /* ─── How it works: one-stop diagram ───────────────────────── */
@@ -603,16 +741,45 @@ a { color: inherit; }
   .start-grid { grid-template-columns: 1fr; }
 }
 
-/* ─── Scroll reveal (JS-gated: html.js only) ───────────────── */
-html.js .reveal {
-  opacity: 0;
-  transform: translateY(14px);
-  transition: opacity 0.55s ease, transform 0.55s ease;
-  transition-delay: var(--reveal-delay, 0s);
+/* ─── Scroll reveal: Bayer dither dissolve (JS-gated: html.js) ──
+       Elements materialize the way the hero field is drawn: pixels
+       arrive in ordered-dither (4x4 Bayer) sequence — sparse
+       checkerboard, then dense, then solid — instead of fading.
+       mask-image is discrete-animatable, so the keyframes step
+       through three threshold masks; browsers that don't animate
+       masks degrade to a fast pop-in via the opacity ramp. */
+html.js .reveal { opacity: 0; }
+html.js .reveal.in {
+  opacity: 1;
+  -webkit-mask-repeat: repeat;
+  mask-repeat: repeat;
+  -webkit-mask-size: 12px 12px;
+  mask-size: 12px 12px;
+  animation: dither-in 0.45s var(--reveal-delay, 0s) backwards;
 }
-html.js .reveal.in { opacity: 1; transform: none; }
+@keyframes dither-in {
+  0% {
+    opacity: 0;
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='1' height='1'/%3E%3Crect x='2' y='0' width='1' height='1'/%3E%3Crect x='0' y='2' width='1' height='1'/%3E%3Crect x='2' y='2' width='1' height='1'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='1' height='1'/%3E%3Crect x='2' y='0' width='1' height='1'/%3E%3Crect x='0' y='2' width='1' height='1'/%3E%3Crect x='2' y='2' width='1' height='1'/%3E%3C/svg%3E");
+  }
+  10% { opacity: 1; }
+  30% {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='1' height='1'/%3E%3Crect x='2' y='0' width='1' height='1'/%3E%3Crect x='0' y='2' width='1' height='1'/%3E%3Crect x='2' y='2' width='1' height='1'/%3E%3Crect x='1' y='1' width='1' height='1'/%3E%3Crect x='3' y='1' width='1' height='1'/%3E%3Crect x='1' y='3' width='1' height='1'/%3E%3Crect x='3' y='3' width='1' height='1'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='1' height='1'/%3E%3Crect x='2' y='0' width='1' height='1'/%3E%3Crect x='0' y='2' width='1' height='1'/%3E%3Crect x='2' y='2' width='1' height='1'/%3E%3Crect x='1' y='1' width='1' height='1'/%3E%3Crect x='3' y='1' width='1' height='1'/%3E%3Crect x='1' y='3' width='1' height='1'/%3E%3Crect x='3' y='3' width='1' height='1'/%3E%3C/svg%3E");
+  }
+  60% {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='4' height='1'/%3E%3Crect x='0' y='2' width='4' height='1'/%3E%3Crect x='1' y='1' width='1' height='1'/%3E%3Crect x='3' y='1' width='1' height='1'/%3E%3Crect x='1' y='3' width='1' height='1'/%3E%3Crect x='3' y='3' width='1' height='1'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'%3E%3Crect x='0' y='0' width='4' height='1'/%3E%3Crect x='0' y='2' width='4' height='1'/%3E%3Crect x='1' y='1' width='1' height='1'/%3E%3Crect x='3' y='1' width='1' height='1'/%3E%3Crect x='1' y='3' width='1' height='1'/%3E%3Crect x='3' y='3' width='1' height='1'/%3E%3C/svg%3E");
+  }
+  100% {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
-  html.js .reveal { opacity: 1; transform: none; transition: none; }
+  html.js .reveal { opacity: 1; }
+  html.js .reveal.in { animation: none; }
 }
 
 /* ─── Footer ───────────────────────────────────────────────── */

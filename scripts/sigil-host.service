@@ -1,0 +1,28 @@
+[Unit]
+Description=Sigil streaming host
+Wants=pipewire.socket pipewire-pulse.socket
+After=pipewire.socket pipewire-pulse.socket
+ConditionPathExists=%h/.config/sigil-spark/host.toml
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Keep the compatibility filename during the legacy rollback window. The file
+# is byte-identical to the public `sigil` CLI, whose Clap command name remains
+# `sigil`; this path lets an older rollback helper validate a newer release.
+ExecStart=%h/.local/libexec/sigil-spark/current/sigil-host serve --config %h/.config/sigil-spark/host.toml
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=10
+KillSignal=SIGINT
+UMask=0077
+CPUQuota=400%
+MemoryHigh=1536M
+MemoryMax=2G
+TasksMax=256
+LimitNOFILE=8192
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=default.target

@@ -1,12 +1,16 @@
 [package]
-name = "sigil"
+name = "portal"
 version = "0.1.0"
-description = "FIDO2-secured remote desktop via Iroh"
+description = "Portal client for one-to-one Gamescope streaming over iroh"
 authors = ["Dami"]
 license = "MIT"
-repository = "https://github.com/FelineStateMachine/sigil"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
+
+[features]
+# Produces an optimized, explicitly insecure demo build while keeping ordinary
+# release builds fail-closed around --dev-connect.
+demo-direct-node = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -18,13 +22,12 @@ log = "0.4"
 tauri = { version = "2", features = [] }
 tauri-plugin-log = "2"
 ctap-hid-fido2 = "3.5"
+getrandom = "0.4"
 iroh = "1.0"
 anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time", "process"] }
-xcap = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 base64 = "0.22"
-enigo = { version = "0.2", features = ["serde"] }
 sha2 = "0.10"
-keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 openh264 = "0.7"
+sigil-protocol = { path = "../crates/sigil-protocol" }

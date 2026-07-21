@@ -1,3 +1,8 @@
 [workspace]
-members = ["src-tauri"]
+members = ["crates/sigil-host", "crates/sigil-protocol", "src-tauri"]
 resolver = "2"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

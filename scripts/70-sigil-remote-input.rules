@@ -1,0 +1,5 @@
+# Sigil creates bounded, disjoint keyboard and relative-pointer devices after
+# Gamescope starts. Run before the stock seat/uaccess pass so logind grants the
+# active Gamescope session access as soon as either device appears.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Sigil Spark Virtual Pointer", GROUP="sigil-uinput", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Sigil Spark Virtual Keyboard", GROUP="sigil-uinput", MODE="0660", TAG+="uaccess"

@@ -1,0 +1,11 @@
+/*
+  Content-Security-Policy: default-src 'self'; base-uri 'none'; connect-src 'none'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'; upgrade-insecure-requests
+  Permissions-Policy: camera=(), geolocation=(), microphone=()
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+
+/install-sigil
+  Cache-Control: public, max-age=300, must-revalidate
+  Content-Disposition: inline; filename="install-sigil"
+  Content-Type: text/plain; charset=utf-8

@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+readonly repository="FelineStateMachine/goq"
+readonly publisher_key="unconfigured"
+readonly release_tag="unconfigured"
+
+die() {
+  printf 'Sigil setup failed: %s\n' "$*" >&2
+  exit 1
+}
+
+if [[ "$publisher_key" == unconfigured || "$release_tag" == unconfigured ]]; then
+  die "the signed Sigil release channel is not open yet"
+fi
+
+[[ "$(uname -s)" == Linux ]] || die "Sigil requires Linux"
+[[ "$(uname -m)" == x86_64 ]] || die "Sigil currently requires x86_64"
+[[ "$(id -u)" -ne 0 ]] || die "run this command as the dedicated gaming user, not root"
+grep -Eq '^ID="?bazzite"?$' /etc/os-release || die "Sigil currently supports Bazzite"
+
+for command_name in awk curl find grep install minisign mktemp rm sha256sum tar tr wc; do
+  command -v "$command_name" >/dev/null 2>&1 \
+    || die "$command_name is required"
+done
+
+[[ "$release_tag" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || die "the release tag is malformed"
+
+asset_name="sigil-$release_tag-bazzite-x86_64.tar.gz"
+asset_base="https://github.com/$repository/releases/download/$release_tag/$asset_name"
+temp_parent="${TMPDIR:-/tmp}"
+temp_parent="${temp_parent%/}"
+[[ "$temp_parent" == /* && -d "$temp_parent" && ! -L "$temp_parent" ]] \
+  || die "the temporary directory is unsafe"
+temp_root="$(mktemp -d "$temp_parent/goq-sigil-install.XXXXXX")"
+archive_path="$temp_root/$asset_name"
+checksum_path="$archive_path.sha256"
+signature_path="$archive_path.minisig"
+unpack_path="$temp_root/unpack"
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  case "$temp_root" in
+    "$temp_parent"/goq-sigil-install.??????) rm -rf -- "$temp_root" ;;
+  esac
+  exit "$status"
+}
+trap cleanup EXIT INT TERM HUP
+
+for suffix in '' .sha256 .minisig; do
+  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+    --retry 3 --retry-all-errors --output "$archive_path$suffix" "$asset_base$suffix"
+done
+
+minisign -Vm "$archive_path" -x "$signature_path" -P "$publisher_key" \
+  || die "the publisher signature is invalid"
+
+[[ "$(wc -l <"$checksum_path" | tr -d ' ')" == 1 ]] \
+  || die "the release checksum file is malformed"
+expected_hash="$(awk 'NF == 2 { print $1 }' "$checksum_path")"
+expected_name="$(awk 'NF == 2 { print $2 }' "$checksum_path")"
+[[ "$expected_hash" =~ ^[0-9a-f]{64}$ && "$expected_name" == "$asset_name" ]] \
+  || die "the release checksum declaration is malformed"
+actual_hash="$(sha256sum "$archive_path" | awk '{ print $1 }')"
+[[ "$actual_hash" == "$expected_hash" ]] || die "the release checksum does not match"
+
+archive_entries="$(tar --list --gzip --file "$archive_path")" \
+  || die "the signed release archive is unreadable"
+[[ -n "$archive_entries" ]] || die "the signed release archive is empty"
+while IFS= read -r archive_entry; do
+  case "$archive_entry" in
+    payload|payload/|payload/*) ;;
+    *) die "the signed release archive escapes its payload root" ;;
+  esac
+  case "/$archive_entry/" in
+    */../*|*/./*) die "the signed release archive contains an unsafe path" ;;
+  esac
+done <<<"$archive_entries"
+if ! LC_ALL=C tar --list --verbose --gzip --file "$archive_path" \
+  | awk '{ type = substr($1, 1, 1); if (type != "-" && type != "d") exit 1 }'
+then
+  die "the signed release archive contains a special file or link"
+fi
+
+install -d -m 0700 "$unpack_path"
+tar --extract --gzip --file "$archive_path" --directory "$unpack_path" \
+  --no-same-owner --no-same-permissions
+payload_path="$unpack_path/payload"
+[[ -d "$payload_path" && ! -L "$payload_path" ]] || die "the package payload is missing"
+[[ -x "$payload_path/stage-this-release.sh" \
+  && ! -L "$payload_path/stage-this-release.sh" ]] || die "the package installer is missing"
+[[ -z "$(find "$payload_path" -type l -print -quit)" ]] \
+  || die "the package payload contains a symbolic link"
+
+"$payload_path/stage-this-release.sh"
+printf '%s\n' \
+  "Sigil runtime $release_tag is installed." \
+  "Continue with the hardware and identity gates in the fresh Bazzite runbook." \
+  "The installer did not start or restart the active Sigil service."

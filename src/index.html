@@ -3,231 +3,193 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>sigil</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Inconsolata:wght@400;500;600&display=swap" rel="stylesheet" />
+  <title>Portal</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
-  <!-- Tap key overlay -->
   <div class="overlay-screen hidden" id="tap-overlay" style="z-index: 200;">
     <div class="overlay-content">
+      <div class="flow-steps" aria-hidden="true">
+        <span class="flow-step">01 pin</span>
+        <span class="flow-step active">02 tap</span>
+        <span class="flow-step">03 play</span>
+      </div>
+      <svg class="pixel-key" viewBox="0 0 26 12" width="78" height="36" aria-hidden="true">
+        <rect x="0"  y="1" width="8"  height="10" fill="var(--terracotta)" />
+        <rect x="3"  y="5" width="2"  height="2"  fill="var(--paper)" />
+        <rect x="8"  y="5" width="18" height="2"  fill="var(--ochre)" />
+        <rect x="14" y="7" width="2"  height="3"  fill="var(--moss)" />
+        <rect x="19" y="7" width="2"  height="2"  fill="var(--moss)" />
+      </svg>
       <h1 id="tap-overlay-title">tap key</h1>
       <p id="tap-overlay-desc">Touch the sensor on your key when it blinks.</p>
       <div class="overlay-status pending" id="tap-status">waiting...</div>
     </div>
   </div>
 
-  <!-- Intro screen -->
+  <div class="overlay-screen hidden" id="pin-pad-overlay" role="dialog" aria-modal="true" aria-labelledby="pin-pad-title">
+    <div class="overlay-content pin-pad-content">
+      <h1 id="pin-pad-title">enter pin</h1>
+      <div class="pin-pad-display" id="pin-pad-display" aria-live="polite">empty</div>
+      <p class="controller-hint">D-pad / left stick to move · A select · B close</p>
+      <div class="pin-pad-grid">
+        <button class="pin-pad-key" data-controller-focus data-pin-digit="1" onclick="pinPadDigit('1')">1</button>
+        <button class="pin-pad-key" data-controller-focus data-pin-digit="2" onclick="pinPadDigit('2')">2</button>
+        <button class="pin-pad-key" data-controller-focus data-pin-digit="3" onclick="pinPadDigit('3')">3</button>
+        <button class="pin-pad-key" data-controller-focus data-pin-digit="4" onclick="pinPadDigit('4')">4</button>
+        <button class="pin-pad-key" data-controller-focus data-pin-digit="5" onclick="pinPadDigit('5')">5</button>
+        <button class="pin-pad-key" data-controller-focus data-pin-digit="6" onclick="pinPadDigit('6')">6</button>
+        <button class="pin-pad-key" data-controller-focus data-pin-digit="7" onclick="pinPadDigit('7')">7</button>
+        <button class="pin-pad-key" data-controller-focus data-pin-digit="8" onclick="pinPadDigit('8')">8</button>
+        <button class="pin-pad-key" data-controller-focus data-pin-digit="9" onclick="pinPadDigit('9')">9</button>
+        <button class="pin-pad-key pin-pad-action" data-controller-focus onclick="pinPadBackspace()" aria-label="Backspace">del</button>
+        <button class="pin-pad-key" data-controller-focus data-pin-digit="0" onclick="pinPadDigit('0')">0</button>
+        <button class="pin-pad-key pin-pad-action" data-controller-focus onclick="closePinPad()">done</button>
+      </div>
+      <button class="overlay-btn pin-pad-clear" data-controller-focus onclick="pinPadClear()">clear</button>
+    </div>
+  </div>
+
   <div class="overlay-screen hidden" id="intro">
     <div class="overlay-content">
-      <h1>sigil</h1>
-      <p id="intro-desc">type pin</p>
-
-      <!-- Unregistered: register or connect -->
-      <div id="intro-unregistered">
-        <div class="overlay-form">
-          <input class="overlay-input" id="intro-pin-unreg" type="password" placeholder="PIN" autocomplete="off" />
-        </div>
-        <div style="display: flex; gap: 16px; justify-content: center; margin-top: 12px;">
-          <button class="overlay-btn" onclick="introRegister()">register</button>
-          <button class="overlay-btn" onclick="introConnectUnreg()">connect</button>
-        </div>
-        <div class="overlay-status" id="intro-status-unreg"></div>
+      <div class="flow-steps" aria-hidden="true">
+        <span class="flow-step active">01 pin</span>
+        <span class="flow-step">02 tap</span>
+        <span class="flow-step">03 play</span>
       </div>
-
-      <!-- Registered: host or connect -->
-      <div id="intro-registered" style="display: none;">
-        <div style="display: flex; gap: 16px; justify-content: center; margin-bottom: 16px;">
-          <button class="overlay-btn" onclick="introHost()">host</button>
-        </div>
-        <div class="overlay-form">
-          <input class="overlay-input" id="intro-pin-reg" type="password" placeholder="PIN" autocomplete="off" />
-        </div>
-        <div style="display: flex; gap: 16px; justify-content: center; margin-top: 12px;">
-          <button class="overlay-btn" onclick="introConnectReg()">connect</button>
-        </div>
-        <div class="overlay-status" id="intro-status-reg"></div>
+      <h1>portal</h1>
+      <p id="intro-desc">enter the host security-key pin</p>
+      <div class="dev-warning hidden" id="dev-connect-warning" role="alert">
+        DEVELOPMENT DIRECT NODE<br />PASSKEY LOOKUP BYPASSED · NOT CLIENT AUTHORIZATION
       </div>
+      <div class="overlay-form" id="intro-pin-form">
+        <input class="overlay-input" id="intro-pin" data-controller-focus data-pin-target="intro-pin" type="password" inputmode="numeric" maxlength="64" placeholder="PIN" autocomplete="off" />
+        <button class="overlay-btn controller-pin-btn" id="controller-pin-intro" data-controller-focus onclick="openPinPad('intro-pin', this)">D-pad PIN</button>
+      </div>
+      <div class="overlay-actions">
+        <button class="overlay-btn primary" id="intro-connect" data-controller-focus onclick="introConnect()">connect</button>
+      </div>
+      <div class="overlay-status" id="intro-status"></div>
+      <p class="controller-hint" id="intro-controller-hint">Controller optional · keyboard and mouse remain available</p>
     </div>
   </div>
 
-  <!-- Config screen (post-registration, pre-host) -->
-  <div class="overlay-screen hidden" id="config-overlay">
-    <div class="overlay-content" style="width: 360px;">
-      <h1>configure host</h1>
-      <p>encoder settings before hosting.</p>
-      <div class="config-rows">
-        <div class="config-row">
-          <span class="config-row-label">codec</span>
-          <select id="cfg-codec" class="config-select">
-            <option value="h264">h.264</option>
-            <option value="h265">h.265</option>
-            <option value="av1">av1</option>
-          </select>
-        </div>
-        <div class="config-row">
-          <span class="config-row-label">backend</span>
-          <select id="cfg-backend" class="config-select">
-            <option value="auto">auto</option>
-            <option value="nvenc">nvenc</option>
-            <option value="vaapi">vaapi</option>
-            <option value="qsv">qsv</option>
-            <option value="amf">amf</option>
-            <option value="videotoolbox">videotoolbox</option>
-            <option value="software">software</option>
-          </select>
-        </div>
-        <div class="config-row">
-          <span class="config-row-label">bitrate</span>
-          <input id="cfg-bitrate" class="config-input" type="text" value="8M" />
-        </div>
-        <div class="config-row">
-          <span class="config-row-label">framerate</span>
-          <input id="cfg-framerate" class="config-input" type="number" value="30" min="1" max="60" />
-        </div>
-        <div class="config-row">
-          <span class="config-row-label">gop</span>
-          <input id="cfg-gop" class="config-input" type="number" value="30" min="1" max="120" />
-        </div>
-        <div class="config-row">
-          <span class="config-row-label">available</span>
-          <span class="config-row-value" id="cfg-available">—</span>
-        </div>
-      </div>
-      <div style="display: flex; gap: 16px; justify-content: center; margin-top: 20px;">
-        <button class="overlay-btn" onclick="configBack()">back</button>
-        <button class="overlay-btn" onclick="configHost()">host</button>
-      </div>
-      <div class="overlay-status" id="config-status"></div>
-    </div>
-  </div>
-
-  <!-- Top bar -->
   <div class="topbar">
-    <span class="brand">sigil</span>
+    <span class="brand">portal</span>
+    <span class="dev-badge hidden" id="dev-connect-badge" title="Skips passkey identity lookup. This is not client authorization.">dev direct-node · not auth</span>
     <span class="sep">·</span>
     <div class="status-line" id="status-line">
       <span class="dot" id="status-dot"></span>
       <span id="status-text">idle</span>
     </div>
     <div class="topbar-right">
+      <span class="controller-status" id="controller-status">controller: none</span>
       <span class="node-id" id="node-id-text"></span>
-      <button class="link-btn" onclick="togglePanel()">info</button>
+      <button class="link-btn" data-controller-focus onclick="togglePanel(true)">info</button>
     </div>
   </div>
 
-  <!-- Main area -->
-  <div class="main">
+  <main class="main">
     <canvas id="frame-canvas"></canvas>
+    <svg id="remote-pointer" class="remote-pointer" viewBox="0 0 24 32" aria-hidden="true">
+      <path d="M2 1.5v25l6.2-6.1 4.2 9.7 4.4-1.9-4.2-9.5h8.8z" />
+    </svg>
     <div class="placeholder" id="placeholder">no stream</div>
-    <div class="host-info hidden" id="host-info">
-      <div class="label">hosting</div>
-      <div class="value" id="host-node-id"></div>
-      <div class="label">connections</div>
-      <div class="conn-count" id="host-conn-count">0</div>
-    </div>
-    <div class="stats" id="stats"></div>
-    <div class="control-bar" id="control-bar">
-      <div class="control-toggle" id="control-toggle" onclick="toggleControl()">
-        take control
-      </div>
-    </div>
-  </div>
+  </main>
 
-  <!-- Bottom bar -->
   <div class="bottombar">
-    <span class="action primary" id="action-main" onclick="mainAction()">host</span>
-    <span class="sep hidden" id="sep-disconnect-main">·</span>
-    <span class="action danger hidden" id="action-disconnect" onclick="disconnect()">disconnect</span>
-    <span class="sep hidden" id="sep-disconnect">·</span>
-    <span class="action" id="action-unreg" onclick="unregister()">unregister</span>
-    <span class="action danger hidden" id="action-unreg-confirm" onclick="unregisterConfirm()">yes</span>
-    <span class="action hidden" id="action-unreg-cancel" onclick="unregisterCancel()">no</span>
-    <div class="spacer"></div>
-    <span class="pin-label" id="pin-label">pin</span>
-    <input class="pin-input" id="pin-input" type="password" placeholder="····" autocomplete="off" />
-    <span class="sep">·</span>
-    <span class="action primary" id="action-connect" onclick="connectHost()">connect</span>
+    <div class="bottombar-start">
+      <button class="action danger hidden" id="action-disconnect" data-controller-focus onclick="disconnect()">disconnect</button>
+    </div>
+    <div class="control-bar" id="control-bar">
+      <button class="control-toggle" id="control-toggle" data-controller-focus onclick="toggleControl()">
+        view only · input unavailable
+      </button>
+      <button type="button" class="control-toggle disabled" id="audio-toggle" data-controller-focus onclick="toggleAudioMute()" aria-disabled="true" aria-label="Audio unavailable. Not connected" title="Audio unavailable: not connected">
+        🔇
+      </button>
+    </div>
+    <div class="bottombar-end">
+      <span class="pin-label" id="pin-label">pin</span>
+      <input class="pin-input" id="pin-input" data-controller-focus data-pin-target="pin-input" type="password" inputmode="numeric" maxlength="64" placeholder="····" autocomplete="off" />
+      <button class="action" id="controller-pin-main" data-controller-focus onclick="openPinPad('pin-input', this)">D-pad PIN</button>
+      <span class="sep">·</span>
+      <button class="action primary" id="action-connect" data-controller-focus onclick="connectHost()">connect</button>
+    </div>
   </div>
 
-  <!-- Side panel -->
-  <div class="panel-overlay" id="panel-overlay" onclick="togglePanel()"></div>
-  <div class="panel" id="panel">
+  <div class="panel-overlay" id="panel-overlay" onclick="togglePanel(false)"></div>
+  <aside class="panel" id="panel" aria-label="Connection information">
     <div class="panel-header">
-      <h2>device</h2>
-      <button class="link-btn" onclick="togglePanel()">close</button>
+      <h2>client</h2>
+      <button class="link-btn" id="panel-close" data-controller-focus onclick="togglePanel(false)">close</button>
     </div>
     <div class="panel-body">
       <div class="panel-section">
-        <h3># security key</h3>
+        <h3><span class="hash" aria-hidden="true">#</span> security key</h3>
         <div class="info-row"><span class="info-label">status</span><span class="info-value" id="fido-status">—</span></div>
         <div class="info-row"><span class="info-label">product</span><span class="info-value" id="fido-product">—</span></div>
         <div class="info-row"><span class="info-label">vid:pid</span><span class="info-value" id="fido-vidpid">—</span></div>
         <div class="info-row"><span class="info-label">ctap</span><span class="info-value" id="fido-versions">—</span></div>
         <div class="info-row"><span class="info-label">extensions</span><span class="info-value" id="fido-extensions">—</span></div>
         <div class="info-row"><span class="info-label">pin retries</span><span class="info-value" id="fido-pin">—</span></div>
-        <button class="link-btn" style="margin-top: 8px;" onclick="scanFido()">rescan</button>
+        <button class="link-btn panel-action" data-controller-focus onclick="scanFido()">rescan</button>
       </div>
-      <div class="panel-section" id="encoder-section">
-        <h3># encoder</h3>
-        <div class="info-row">
-          <span class="info-label">codec</span>
-          <select id="enc-codec" class="config-select">
-            <option value="h264">h.264</option>
-            <option value="h265">h.265</option>
-            <option value="av1">av1</option>
-          </select>
-        </div>
-        <div class="info-row">
-          <span class="info-label">backend</span>
-          <select id="enc-backend" class="config-select">
-            <option value="auto">auto</option>
-            <option value="nvenc">nvenc</option>
-            <option value="vaapi">vaapi</option>
-            <option value="qsv">qsv</option>
-            <option value="amf">amf</option>
-            <option value="videotoolbox">videotoolbox</option>
-            <option value="software">software</option>
-          </select>
-        </div>
-        <div class="info-row">
-          <span class="info-label">bitrate</span>
-          <input id="enc-bitrate" class="config-input" type="text" value="8M" />
-        </div>
-        <div class="info-row">
-          <span class="info-label">framerate</span>
-          <input id="enc-framerate" class="config-input" type="number" value="30" min="1" max="60" />
-        </div>
-        <div class="info-row">
-          <span class="info-label">gop</span>
-          <input id="enc-gop" class="config-input" type="number" value="30" min="1" max="120" />
-        </div>
-        <div class="info-row"><span class="info-label">available</span><span class="info-value" id="enc-available">—</span></div>
-        <button class="link-btn" style="margin-top: 8px;" onclick="saveEncoderConfig()">apply</button>
-      </div>
-      <div class="panel-section" id="host-perf-section">
-        <h3># host performance</h3>
-        <div class="info-row"><span class="info-label">frame time</span><span class="info-value" id="perf-encode">— ms</span></div>
-        <div class="info-row"><span class="info-label">encoder</span><span class="info-value" id="perf-capture">—</span></div>
-        <div class="info-row"><span class="info-label">frame size</span><span class="info-value" id="perf-size">— KB</span></div>
-        <div class="info-row"><span class="info-label">fps</span><span class="info-value" id="perf-fps">—</span></div>
-        <canvas id="encode-spark" width="260" height="48" style="width:100%;height:48px;margin-top:8px;display:block;"></canvas>
-      </div>
-      <div class="panel-section" id="stream-section" style="display:none;">
-        <h3># stream</h3>
+      <div class="panel-section" id="stream-section">
+        <h3><span class="hash" aria-hidden="true">#</span> stream</h3>
         <div class="info-row"><span class="info-label">codec</span><span class="info-value" id="stream-codec">—</span></div>
-        <div class="info-row"><span class="info-label">dropped</span><span class="info-value" id="stream-dropped">0</span></div>
+        <div class="info-row"><span class="info-label">transport</span><span class="info-value" id="stream-transport">—</span></div>
+        <div class="info-row"><span class="info-label">path</span><span class="info-value" id="stream-path">—</span></div>
+        <div class="info-row"><span class="info-label">RTT</span><span class="info-value" id="stream-rtt">— ms</span></div>
+        <div class="info-row"><span class="info-label">control</span><span class="info-value" id="stream-control">—</span></div>
+        <div class="info-row"><span class="info-label">audio</span><span class="info-value" id="stream-audio-state">unavailable</span></div>
+        <div class="info-row"><span class="info-label">audio webview received</span><span class="info-value" id="stream-audio-webview-received-packets">0 packets</span></div>
+        <div class="info-row"><span class="info-label">audio transport missing</span><span class="info-value" id="stream-audio-transport-missing-packets">0 packets</span></div>
+        <div class="info-row"><span class="info-label">audio IPC dropped</span><span class="info-value" id="stream-audio-ipc-dropped-packets">0 packets</span></div>
+        <div class="info-row"><span class="info-label">audio decoder dropped</span><span class="info-value" id="stream-audio-decoder-dropped-packets">0 packets</span></div>
+        <div class="info-row"><span class="info-label">audio PCM handoff dropped</span><span class="info-value" id="stream-audio-pcm-handoff-dropped-blocks">0 blocks</span></div>
+        <div class="info-row"><span class="info-label">audio ring overflow</span><span class="info-value" id="stream-audio-ring-overflow-ms">0.0 ms</span></div>
+        <div class="info-row"><span class="info-label">audio ring recovery discarded</span><span class="info-value" id="stream-audio-ring-recovery-discarded-ms">0.0 ms</span></div>
+        <div class="info-row"><span class="info-label">audio ring buffer</span><span class="info-value" id="stream-audio-ring-buffer-ms">0.0 ms</span></div>
+        <div class="info-row"><span class="info-label">audio underruns</span><span class="info-value" id="stream-audio-underruns">0 events / 0.0 ms</span></div>
+        <div class="info-row"><span class="info-label">audio output silence</span><span class="info-value" id="stream-audio-silence-ms">0.0 ms</span></div>
+        <div class="info-row"><span class="info-label">transport fps</span><span class="info-value" id="stream-transport-fps">0.0</span></div>
+        <div class="info-row"><span class="info-label">IPC send fps</span><span class="info-value" id="stream-ipc-send-fps">0.0</span></div>
+        <div class="info-row metric-stack"><span class="info-label">transport interval p50/p95/max</span><span class="info-value" id="stream-transport-interval">—</span></div>
+        <div class="info-row metric-stack"><span class="info-label">IPC send duration p50/p95/max</span><span class="info-value" id="stream-ipc-send-duration">—</span></div>
+        <div class="info-row"><span class="info-label">Rust timing window/cap</span><span class="info-value" id="stream-rust-timing-window">—</span></div>
+        <div class="info-row metric-stack"><span class="info-label">IPC frame queue</span><span class="info-value" id="stream-frontend-queue">—</span></div>
+        <div class="info-row metric-stack"><span class="info-label">IPC resync</span><span class="info-value" id="stream-frontend-resync">—</span></div>
+        <div class="info-row"><span class="info-label">webview fps</span><span class="info-value" id="stream-frontend-fps">0.0</span></div>
+        <div class="info-row"><span class="info-label">decode fps</span><span class="info-value" id="stream-decode-fps">0.0</span></div>
+        <div class="info-row"><span class="info-label">decoder output fps</span><span class="info-value" id="stream-decoder-output-fps">0.0</span></div>
+        <div class="info-row"><span class="info-label">present fps</span><span class="info-value" id="stream-present-fps">0.0</span></div>
+        <div class="info-row metric-stack"><span class="info-label">A−V skew p50/p95/max absolute</span><span class="info-value" id="stream-av-skew">—</span></div>
+        <div class="info-row"><span class="info-label">decode queue</span><span class="info-value" id="stream-decode-queue">0</span></div>
+        <div class="info-row"><span class="info-label">present queue</span><span class="info-value" id="stream-present-queue">0</span></div>
+        <div class="info-row"><span class="info-label">decode p50 / p95</span><span class="info-value" id="stream-decode-latency">—</span></div>
+        <div class="info-row"><span class="info-label">client present p50 / p95</span><span class="info-value" id="stream-present-latency">—</span></div>
+        <div class="info-row"><span class="info-label">draw p50/p95/p99/max</span><span class="info-value" id="stream-draw-latency">—</span></div>
+        <div class="info-row metric-stack"><span class="info-label">delivery interval p50/p95/p99/max</span><span class="info-value" id="stream-delivery-cadence">—</span></div>
+        <div class="info-row metric-stack"><span class="info-label">decoder input interval p50/p95/p99/max</span><span class="info-value" id="stream-decoder-input-cadence">—</span></div>
+        <div class="info-row metric-stack"><span class="info-label">decoder output interval p50/p95/p99/max</span><span class="info-value" id="stream-decoder-output-cadence">—</span></div>
+        <div class="info-row metric-stack"><span class="info-label">present interval p50/p95/p99/max</span><span class="info-value" id="stream-present-cadence">—</span></div>
+        <div class="info-row"><span class="info-label">total discarded</span><span class="info-value" id="stream-dropped">0 frames</span></div>
+        <div class="info-row"><span class="info-label">transport sequence gap</span><span class="info-value" id="stream-transport-dropped">0 frames</span></div>
+        <div class="info-row"><span class="info-label">transport object discarded</span><span class="info-value" id="stream-transport-object-dropped">—</span></div>
+        <div class="info-row"><span class="info-label">late object discarded</span><span class="info-value" id="stream-transport-late-object-dropped">—</span></div>
+        <div class="info-row"><span class="info-label">IPC discarded</span><span class="info-value" id="stream-frontend-dropped">0 frames</span></div>
+        <div class="info-row"><span class="info-label">IPC queue discarded</span><span class="info-value" id="stream-frontend-queue-dropped">—</span></div>
+        <div class="info-row"><span class="info-label">IPC resync discarded</span><span class="info-value" id="stream-frontend-resync-dropped">—</span></div>
+        <div class="info-row"><span class="info-label">decoder discarded</span><span class="info-value" id="stream-decoder-dropped">0 frames</span></div>
+        <div class="info-row"><span class="info-label">presenter overwrite</span><span class="info-value" id="stream-present-dropped">0 frames</span></div>
         <div class="info-row"><span class="info-label">received</span><span class="info-value" id="stream-received">0</span></div>
-      </div>
-      <div class="panel-section">
-        <h3># registration</h3>
-        <div class="info-row"><span class="info-label">status</span><span class="info-value" id="reg-status">—</span></div>
-        <div class="info-row"><span class="info-label">node id</span><span class="info-value" id="reg-node-id">—</span></div>
+        <div class="info-row"><span class="info-label">decoder input</span><span class="info-value" id="stream-decoder-input">0</span></div>
+        <div class="info-row"><span class="info-label">decoder output</span><span class="info-value" id="stream-decoder-output">0</span></div>
+        <div class="info-row"><span class="info-label">presented</span><span class="info-value" id="stream-presented">0</span></div>
       </div>
     </div>
-  </div>
+  </aside>
 
   <script type="module" src="./main.js"></script>
 </body>

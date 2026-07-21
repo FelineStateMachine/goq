@@ -2,9 +2,6 @@
 **/target/
 **/*.rs.bk
 
-# Tauri
-src-tauri/target/
-
 # Node (if added later)
 node_modules/
 
@@ -20,9 +17,6 @@ Thumbs.db
 # Env
 .env
 .env.local
-
-# Spike artifacts (optional — keep code, ignore binary outputs)
-spikes/**/target/
 
 # Temp
 /tmp/

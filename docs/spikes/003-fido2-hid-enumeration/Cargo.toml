@@ -1,8 +1,0 @@
-[package]
-name = "keyhome-fido2-hid-enumeration-spike"
-version = "0.1.0"
-edition = "2024"
-publish = false
-
-[dependencies]
-ctap-hid-fido2 = "3.5"

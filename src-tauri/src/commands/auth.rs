@@ -1,54 +1,15 @@
+use super::state::{RPID, SALT_MESSAGE};
 use anyhow::Context as _;
 use ctap_hid_fido2::fidokey::{
-    GetAssertionArgsBuilder, MakeCredentialArgsBuilder,
-    get_assertion::Extension as Gext,
-    get_assertion::get_assertion_params::Assertion,
-    make_credential::Extension as Mext,
+    GetAssertionArgsBuilder, MakeCredentialArgsBuilder, get_assertion::Extension as Gext,
+    get_assertion::get_assertion_params::Assertion, make_credential::Extension as Mext,
 };
 use ctap_hid_fido2::public_key_credential_user_entity::PublicKeyCredentialUserEntity;
-use ctap_hid_fido2::{verifier, Cfg, FidoKeyHidFactory};
+use ctap_hid_fido2::{Cfg, FidoKeyHidFactory, verifier};
 use iroh::SecretKey;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use super::state::{KEYRING_ENTRY, KEYRING_SERVICE, RPID, SALT_MESSAGE};
-
-// ─── Keyring Persistence ─────────────────────────────────────────────────────
-
-pub fn store_identity_in_keyring(secret: &[u8; 32]) -> anyhow::Result<()> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY)
-        .context("Failed to create keyring entry")?;
-    entry
-        .set_secret(secret)
-        .context("Failed to store identity in keyring")
-}
-
-pub fn load_identity_from_keyring() -> anyhow::Result<Option<[u8; 32]>> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY)
-        .context("Failed to create keyring entry")?;
-    match entry.get_secret() {
-        Ok(bytes) => {
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                Ok(Some(arr))
-            } else {
-                anyhow::bail!("Keyring entry has wrong length: {}", bytes.len())
-            }
-        }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => anyhow::bail!("Failed to read keyring: {:?}", e),
-    }
-}
-
-pub fn clear_identity_from_keyring() -> anyhow::Result<()> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY)
-        .context("Failed to create keyring entry")?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => anyhow::bail!("Failed to clear keyring: {:?}", e),
-    }
-}
 
 // ─── FIDO2 HMAC-Secret Derivation ────────────────────────────────────────────
 
@@ -73,17 +34,13 @@ pub fn derive_secret_from_key(pin: &str) -> anyhow::Result<[u8; 32]> {
         .extensions(&[Gext::HmacSecret(Some(salt))])
         .build();
 
-    match device.get_assertion_with_args(&get_args) {
-        Ok(assertions) => return extract_hmac_secret(&assertions),
-        Err(_) => {}
+    if let Ok(assertions) = device.get_assertion_with_args(&get_args) {
+        return extract_hmac_secret(&assertions);
     }
 
     // No resident key — create one
-    let user_entity = PublicKeyCredentialUserEntity::new(
-        Some(b"sigil-user"),
-        Some("sigil"),
-        Some("Sigil"),
-    );
+    let user_entity =
+        PublicKeyCredentialUserEntity::new(Some(b"sigil-user"), Some("sigil"), Some("Sigil"));
 
     let challenge = verifier::create_challenge();
     let make_args = MakeCredentialArgsBuilder::new(RPID, &challenge)
@@ -135,7 +92,7 @@ pub fn derive_iroh_secret_from_key(pin: &str) -> anyhow::Result<SecretKey> {
 
 // ─── FIDO2 Tauri Commands ─────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 pub struct FidoDeviceInfo {
     pub found: bool,
     pub vid: u16,
@@ -149,28 +106,14 @@ pub struct FidoDeviceInfo {
     pub error: Option<String>,
 }
 
-impl Default for FidoDeviceInfo {
-    fn default() -> Self {
-        Self {
-            found: false,
-            vid: 0,
-            pid: 0,
-            product: String::new(),
-            versions: vec![],
-            extensions: vec![],
-            options: vec![],
-            max_msg_size: 0,
-            pin_retries: 0,
-            error: None,
-        }
-    }
-}
-
 #[tauri::command]
 pub fn fido_device_info() -> FidoDeviceInfo {
     let devices = ctap_hid_fido2::get_fidokey_devices();
     if devices.is_empty() {
-        return FidoDeviceInfo { found: false, ..Default::default() };
+        return FidoDeviceInfo {
+            found: false,
+            ..Default::default()
+        };
     }
 
     let dev = &devices[0];
@@ -189,7 +132,12 @@ pub fn fido_device_info() -> FidoDeviceInfo {
     match FidoKeyHidFactory::create(&cfg) {
         Ok(device) => {
             let (versions, extensions, options, max_msg_size) = match device.get_info() {
-                Ok(i) => (i.versions.clone(), i.extensions.clone(), i.options.clone(), i.max_msg_size as u32),
+                Ok(i) => (
+                    i.versions.clone(),
+                    i.extensions.clone(),
+                    i.options.clone(),
+                    i.max_msg_size as u32,
+                ),
                 Err(_) => (vec![], vec![], vec![], 0),
             };
             let pin_retries = device.get_pin_retries().unwrap_or(0);
@@ -231,8 +179,14 @@ pub fn fido_pin_retries() -> PinRetries {
     let cfg = Cfg::init();
     match FidoKeyHidFactory::create(&cfg) {
         Ok(device) => match device.get_pin_retries() {
-            Ok(n) => PinRetries { retries: n as u32, error: None },
-            Err(e) => PinRetries { retries: 0, error: Some(format!("{:?}", e)) },
+            Ok(n) => PinRetries {
+                retries: n as u32,
+                error: None,
+            },
+            Err(e) => PinRetries {
+                retries: 0,
+                error: Some(format!("{:?}", e)),
+            },
         },
         Err(e) => PinRetries {
             retries: 0,
@@ -259,60 +213,17 @@ pub async fn key_derive_identity(pin: String) -> KeyIdentity {
             node_id: String::new(),
             error: Some("Security key timed out (30s). Check that your key is connected.".into()),
         },
-        Ok(Err(e)) => KeyIdentity { node_id: String::new(), error: Some(format!("Task error: {}", e)) },
-        Ok(Ok(Err(e))) => KeyIdentity { node_id: String::new(), error: Some(format!("{:?}", e)) },
-        Ok(Ok(Ok(secret))) => KeyIdentity { node_id: secret.public().to_string(), error: None },
-    }
-}
-
-// ─── Registration Commands ────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-pub struct RegistrationStatus {
-    pub registered: bool,
-    pub node_id: Option<String>,
-    pub error: Option<String>,
-}
-
-#[tauri::command]
-pub fn host_registration_status() -> RegistrationStatus {
-    match load_identity_from_keyring() {
-        Ok(Some(bytes)) => {
-            let secret = SecretKey::from_bytes(&bytes);
-            RegistrationStatus {
-                registered: true,
-                node_id: Some(secret.public().to_string()),
-                error: None,
-            }
-        }
-        Ok(None) => RegistrationStatus { registered: false, node_id: None, error: None },
-        Err(e) => RegistrationStatus {
-            registered: false,
-            node_id: None,
+        Ok(Err(e)) => KeyIdentity {
+            node_id: String::new(),
+            error: Some(format!("Task error: {}", e)),
+        },
+        Ok(Ok(Err(e))) => KeyIdentity {
+            node_id: String::new(),
             error: Some(format!("{:?}", e)),
         },
+        Ok(Ok(Ok(secret))) => KeyIdentity {
+            node_id: secret.public().to_string(),
+            error: None,
+        },
     }
-}
-
-#[tauri::command]
-pub async fn key_register_host(pin: String) -> Result<RegistrationStatus, String> {
-    let secret = tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || derive_secret_from_key(&pin)),
-    )
-    .await
-    .map_err(|_| "Security key timed out (30s). Make sure your key is connected.".to_string())?
-    .map_err(|e| format!("Task failed: {}", e))?
-    .map_err(|e| format!("FIDO2 error: {:?}", e))?;
-
-    let node_id = SecretKey::from_bytes(&secret).public().to_string();
-    store_identity_in_keyring(&secret).map_err(|e| format!("Keyring store failed: {:?}", e))?;
-
-    Ok(RegistrationStatus { registered: true, node_id: Some(node_id), error: None })
-}
-
-#[tauri::command]
-pub fn host_unregister() -> Result<bool, String> {
-    clear_identity_from_keyring().map_err(|e| format!("Keyring clear failed: {:?}", e))?;
-    Ok(true)
 }

@@ -6,30 +6,40 @@ mod commands;
 use commands::AppState;
 
 fn main() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::default().build())
-        .manage(AppState::default())
+    let state = match AppState::from_args(std::env::args_os()) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("sigil-spark: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    let run_result = tauri::Builder::default()
+        // Packet-level transport logs are catastrophically expensive in an
+        // interactive media client. Keep actionable warnings and errors
+        // without formatting every QUIC packet on the UI-critical machine.
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Warn)
+                .build(),
+        )
+        .manage(state)
         .setup(|app| {
             use tauri::Manager;
 
-            // Load persisted encoder config before the window reads it
-            if let Ok(data_dir) = app.path().app_data_dir() {
-                let path = data_dir.join("encoder_config.json");
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if let Ok(config) =
-                        serde_json::from_str::<commands::EncoderConfig>(&contents)
+            // The Tauri application is the installed client. Hosting is owned
+            // exclusively by the separate, headless `sigil-host` daemon.
+            if let Some(window) = app.get_webview_window("main") {
+                let focus_window = window.clone();
+                window.on_window_event(move |event| {
+                    if matches!(event, tauri::WindowEvent::Focused(true))
+                        && let Err(error) =
+                            commands::state::reassert_client_cursor_grab(&focus_window)
                     {
-                        let state = app.state::<commands::AppState>();
-                        *state.encoder_config.lock().unwrap() = config;
+                        log::warn!("could not restore cursor grab after focus changed: {error}");
                     }
-                }
-            }
-
-            // Daemon mode runs headless; only show the window for interactive use
-            if !app.state::<commands::AppState>().daemon {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                }
+                });
+                let _ = window.show();
             }
 
             Ok(())
@@ -38,22 +48,18 @@ fn main() {
             commands::auth::fido_device_info,
             commands::auth::fido_pin_retries,
             commands::auth::key_derive_identity,
-            commands::state::is_daemon_mode,
+            commands::state::development_connection_mode,
+            commands::state::set_client_cursor_grab,
             commands::state::set_webcodecs_available,
             commands::state::is_webcodecs_available,
-            commands::streaming::get_encoder_config,
-            commands::streaming::set_encoder_config,
-            commands::streaming::detect_available_encoders,
-            commands::auth::host_registration_status,
-            commands::auth::key_register_host,
-            commands::auth::host_unregister,
-            commands::network::iroh_host_start,
-            commands::network::iroh_host_stop,
-            commands::network::iroh_host_status,
             commands::network::iroh_client_connect,
             commands::network::iroh_client_disconnect,
+            commands::network::iroh_client_ack_frame,
+            commands::network::iroh_client_ack_audio,
+            commands::network::iroh_client_stop_audio,
             commands::network::iroh_client_send_input,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+    commands::state::restore_client_cursor();
+    run_result.expect("error while running tauri application");
 }

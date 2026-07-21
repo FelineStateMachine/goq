@@ -1,15 +1,15 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Sigil",
+  "productName": "Sigil Spark",
   "version": "0.1.0",
-  "identifier": "com.sigil.app",
+  "identifier": "com.sigil.spark",
   "build": {
     "frontendDist": "../src"
   },
   "app": {
     "windows": [
       {
-        "title": "Sigil",
+        "title": "Sigil Spark",
         "width": 1024,
         "height": 768,
         "resizable": true,

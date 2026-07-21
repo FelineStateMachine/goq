@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
@@ -21,6 +24,10 @@ struct Args {
     frames: u32,
     #[arg(long, default_value_t = 15)]
     timeout_seconds: u64,
+    /// Fail unless accepted media frames sustain at least this first-to-last
+    /// cadence. Intended for live appliance performance gates.
+    #[arg(long, value_parser = parse_minimum_fps)]
+    minimum_fps: Option<f64>,
     #[arg(long, default_value = "1280x800", value_parser = parse_size)]
     expect_size: (u16, u16),
     /// Exercise the reliable ordered v1 media stream instead of independent
@@ -66,9 +73,83 @@ enum MediaObjectOutcome {
     Malformed { index: u64, error: ProtocolError },
 }
 
+impl MediaObjectOutcome {
+    fn index(&self) -> u64 {
+        match self {
+            Self::Frame { index, .. } | Self::Dropped { index } | Self::Malformed { index, .. } => {
+                *index
+            }
+        }
+    }
+
+    fn is_fast_forward_barrier(&self) -> bool {
+        let Self::Frame { frame, .. } = self else {
+            return false;
+        };
+        frame.header.flags.contains(FrameFlags::KEYFRAME)
+            && frame.header.flags.contains(FrameFlags::CODEC_CONFIG)
+            && frame.header.flags.contains(FrameFlags::DISCONTINUITY)
+    }
+}
+
+#[derive(Debug)]
+struct MediaObjectReorder {
+    next_index: u64,
+    completed: BTreeMap<u64, MediaObjectOutcome>,
+}
+
+impl MediaObjectReorder {
+    fn new(first_index: u64) -> Self {
+        Self {
+            next_index: first_index,
+            completed: BTreeMap::new(),
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.completed.len()
+    }
+
+    fn push(&mut self, outcome: MediaObjectOutcome) -> Result<Option<MediaObjectOutcome>> {
+        if matches!(outcome, MediaObjectOutcome::Malformed { .. }) {
+            // Malformed objects remain terminal as soon as their read completes.
+            return Ok(Some(outcome));
+        }
+        let index = outcome.index();
+        if index < self.next_index {
+            return Ok(Some(outcome));
+        }
+        if outcome.is_fast_forward_barrier() {
+            self.completed
+                .retain(|completed_index, _| *completed_index > index);
+            self.next_index = index
+                .checked_add(1)
+                .context("media object reorder overflowed")?;
+            return Ok(Some(outcome));
+        }
+        ensure!(
+            self.completed.insert(index, outcome).is_none(),
+            "media object {index} completed more than once"
+        );
+        self.take_next()
+    }
+
+    fn take_next(&mut self) -> Result<Option<MediaObjectOutcome>> {
+        let Some(outcome) = self.completed.remove(&self.next_index) else {
+            return Ok(None);
+        };
+        self.next_index = self
+            .next_index
+            .checked_add(1)
+            .context("media object reorder overflowed")?;
+        Ok(Some(outcome))
+    }
+}
+
 struct MediaObjectReceiver {
     connection: iroh::endpoint::Connection,
     reads: tokio::task::JoinSet<MediaObjectOutcome>,
+    reorder: MediaObjectReorder,
     next_index: u64,
     accepting: bool,
     read_timeout: Duration,
@@ -79,6 +160,7 @@ impl MediaObjectReceiver {
         Self {
             connection,
             reads: tokio::task::JoinSet::new(),
+            reorder: MediaObjectReorder::new(0),
             next_index: 0,
             accepting: true,
             read_timeout,
@@ -87,13 +169,22 @@ impl MediaObjectReceiver {
 
     async fn next(&mut self) -> Result<Option<MediaObjectOutcome>> {
         loop {
+            if let Some(completed) = self.reorder.take_next()? {
+                return Ok(Some(completed));
+            }
             if !self.accepting && self.reads.is_empty() {
+                ensure!(
+                    self.reorder.pending_len() == 0,
+                    "media connection closed with an incomplete object order"
+                );
                 return Ok(None);
             }
 
             tokio::select! {
                 accepted = self.connection.accept_uni(),
-                    if self.accepting && self.reads.len() < MEDIA_OBJECT_CAPACITY => {
+                    if self.accepting
+                        && self.reads.len() + self.reorder.pending_len()
+                            < MEDIA_OBJECT_CAPACITY => {
                     match accepted {
                         Ok(mut stream) => {
                             let index = self.next_index;
@@ -115,11 +206,15 @@ impl MediaObjectReceiver {
                     }
                 }
                 completed = self.reads.join_next(), if !self.reads.is_empty() => {
-                    return match completed.expect("guarded by non-empty media object task set") {
-                        Ok(outcome) => Ok(Some(outcome)),
+                    match completed.expect("guarded by non-empty media object task set") {
+                        Ok(outcome) => {
+                            if let Some(completed) = self.reorder.push(outcome)? {
+                                return Ok(Some(completed));
+                            }
+                        }
                         Err(error) if error.is_cancelled() => continue,
-                        Err(error) => Err(error).context("media object read task failed"),
-                    };
+                        Err(error) => return Err(error).context("media object read task failed"),
+                    }
                 }
             }
         }
@@ -360,6 +455,8 @@ async fn main() -> Result<()> {
     let mut media_objects_late = 0_u64;
     let mut last_sequence: Option<u64> = None;
     let mut dimensions = None;
+    let mut first_accepted_at = None;
+    let mut last_accepted_at = None;
     let mut object_receiver = (media_transport == MediaTransport::IndependentV2).then(|| {
         MediaObjectReceiver::new(
             media_connection.clone(),
@@ -419,6 +516,10 @@ async fn main() -> Result<()> {
             },
         };
 
+        let accepted_at = Instant::now();
+        first_accepted_at.get_or_insert(accepted_at);
+        last_accepted_at = Some(accepted_at);
+
         if received == 0 {
             ensure!(
                 frame.header.flags.contains(FrameFlags::KEYFRAME)
@@ -456,6 +557,21 @@ async fn main() -> Result<()> {
     );
     ensure!(keyframes > 0, "probe received no H.264 keyframe");
     ensure!(gaps == 0, "probe observed {gaps} media sequence gaps");
+    let accepted_span = first_accepted_at
+        .zip(last_accepted_at)
+        .map_or(Duration::ZERO, |(first, last)| {
+            last.saturating_duration_since(first)
+        });
+    let accepted_fps = accepted_frame_rate(received, accepted_span);
+    if let Some(minimum_fps) = args.minimum_fps {
+        let accepted_fps = accepted_fps.context(
+            "--minimum-fps requires at least two accepted frames with measurable elapsed time",
+        )?;
+        ensure!(
+            accepted_fps >= minimum_fps,
+            "probe sustained only {accepted_fps:.3} accepted fps; required at least {minimum_fps:.3} fps"
+        );
+    }
     let (path_mode, path_rtt_ms) = selected_path_diagnostics(&media_connection);
     input_send.finish().context("finishing input stream")?;
     if let Some(mut media_send) = media_send {
@@ -481,6 +597,10 @@ async fn main() -> Result<()> {
     println!("media_objects_dropped={media_objects_dropped}");
     println!("media_objects_late={media_objects_late}");
     println!("transport={}", media_transport.label());
+    match accepted_fps {
+        Some(fps) => println!("accepted_fps={fps:.3}"),
+        None => println!("accepted_fps=unknown"),
+    }
     println!("input_ack_micros={input_ack_micros}");
     println!(
         "pointer_smoke={}",
@@ -534,6 +654,13 @@ fn sequence_gap(previous: u64, current: u64) -> Result<u64> {
     Ok(current - expected)
 }
 
+fn accepted_frame_rate(frame_count: u32, elapsed: Duration) -> Option<f64> {
+    if frame_count < 2 || elapsed.is_zero() {
+        return None;
+    }
+    Some(f64::from(frame_count - 1) / elapsed.as_secs_f64())
+}
+
 fn selected_path_diagnostics(
     connection: &iroh::endpoint::Connection,
 ) -> (&'static str, Option<f64>) {
@@ -561,6 +688,16 @@ fn parse_size(value: &str) -> std::result::Result<(u16, u16), String> {
         return Err("dimensions must be non-zero".to_owned());
     }
     Ok((width, height))
+}
+
+fn parse_minimum_fps(value: &str) -> std::result::Result<f64, String> {
+    let minimum_fps = value
+        .parse::<f64>()
+        .map_err(|_| "minimum fps must be a number".to_owned())?;
+    if !minimum_fps.is_finite() || minimum_fps <= 0.0 || minimum_fps > 240.0 {
+        return Err("minimum fps must be finite and within (0, 240]".to_owned());
+    }
+    Ok(minimum_fps)
 }
 
 async fn negotiate(
@@ -681,6 +818,84 @@ mod tests {
             payload,
         )
         .unwrap()
+    }
+
+    fn media_outcome(index: u64, sequence: u64, flags: FrameFlags) -> MediaObjectOutcome {
+        MediaObjectOutcome::Frame {
+            index,
+            frame: media_frame(sequence, flags),
+        }
+    }
+
+    #[test]
+    fn media_object_reorder_restores_accept_order_before_sequence_checks() {
+        let keyframe = FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG);
+        let mut reorder = MediaObjectReorder::new(0);
+
+        assert!(
+            reorder
+                .push(media_outcome(1, 11, FrameFlags::NONE))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reorder.pending_len(), 1);
+        assert_eq!(
+            reorder
+                .push(media_outcome(0, 10, keyframe))
+                .unwrap()
+                .unwrap()
+                .index(),
+            0
+        );
+        assert_eq!(reorder.take_next().unwrap().unwrap().index(), 1);
+        assert_eq!(reorder.pending_len(), 0);
+    }
+
+    #[test]
+    fn discontinuity_keyframe_is_an_explicit_latest_frame_barrier() {
+        let barrier = FrameFlags::KEYFRAME
+            .union(FrameFlags::CODEC_CONFIG)
+            .union(FrameFlags::DISCONTINUITY);
+        let mut reorder = MediaObjectReorder::new(0);
+
+        assert!(
+            reorder
+                .push(media_outcome(1, 11, FrameFlags::NONE))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reorder
+                .push(media_outcome(2, 20, barrier))
+                .unwrap()
+                .unwrap()
+                .index(),
+            2
+        );
+        assert_eq!(reorder.pending_len(), 0);
+        assert_eq!(
+            reorder
+                .push(media_outcome(0, 10, FrameFlags::NONE))
+                .unwrap()
+                .unwrap()
+                .index(),
+            0
+        );
+    }
+
+    #[test]
+    fn minimum_fps_parser_and_first_to_last_evaluation_are_bounded() {
+        assert_eq!(parse_minimum_fps("55").unwrap(), 55.0);
+        assert_eq!(parse_minimum_fps("240").unwrap(), 240.0);
+        for invalid in ["0", "-1", "240.1", "NaN", "inf", "not-a-number"] {
+            assert!(parse_minimum_fps(invalid).is_err(), "{invalid}");
+        }
+
+        assert_eq!(accepted_frame_rate(56, Duration::from_secs(1)), Some(55.0));
+        assert_eq!(accepted_frame_rate(1, Duration::from_secs(1)), None);
+        assert_eq!(accepted_frame_rate(2, Duration::ZERO), None);
+        assert!(accepted_frame_rate(56, Duration::from_secs(1)).unwrap() >= 55.0);
+        assert!(accepted_frame_rate(55, Duration::from_secs(1)).unwrap() < 55.0);
     }
 
     #[test]

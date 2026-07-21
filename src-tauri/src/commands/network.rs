@@ -679,9 +679,87 @@ enum MediaObjectReadOutcome {
     Malformed(String),
 }
 
+impl MediaObjectReadOutcome {
+    fn object_index(&self) -> Option<u64> {
+        match self {
+            Self::Frame { object_index, .. } | Self::Dropped { object_index } => {
+                Some(*object_index)
+            }
+            Self::Malformed(_) => None,
+        }
+    }
+
+    fn is_fast_forward_barrier(&self) -> bool {
+        let Self::Frame { frame, .. } = self else {
+            return false;
+        };
+        frame.header.flags.contains(FrameFlags::KEYFRAME)
+            && frame.header.flags.contains(FrameFlags::CODEC_CONFIG)
+            && frame.header.flags.contains(FrameFlags::DISCONTINUITY)
+    }
+}
+
+#[derive(Debug)]
+struct MediaObjectReorder {
+    next_object_index: u64,
+    completed: BTreeMap<u64, MediaObjectReadOutcome>,
+}
+
+impl MediaObjectReorder {
+    fn new(first_object_index: u64) -> Self {
+        Self {
+            next_object_index: first_object_index,
+            completed: BTreeMap::new(),
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.completed.len()
+    }
+
+    fn push(
+        &mut self,
+        outcome: MediaObjectReadOutcome,
+    ) -> Result<Option<MediaObjectReadOutcome>, String> {
+        let Some(object_index) = outcome.object_index() else {
+            // Malformed objects remain terminal as soon as their read completes.
+            return Ok(Some(outcome));
+        };
+        if object_index < self.next_object_index {
+            return Ok(Some(outcome));
+        }
+        if outcome.is_fast_forward_barrier() {
+            self.completed
+                .retain(|completed_index, _| *completed_index > object_index);
+            self.next_object_index = object_index
+                .checked_add(1)
+                .ok_or_else(|| "Media object reorder index overflowed".to_string())?;
+            return Ok(Some(outcome));
+        }
+        if self.completed.insert(object_index, outcome).is_some() {
+            return Err(format!(
+                "Media object {object_index} completed more than once"
+            ));
+        }
+        self.take_next()
+    }
+
+    fn take_next(&mut self) -> Result<Option<MediaObjectReadOutcome>, String> {
+        let Some(outcome) = self.completed.remove(&self.next_object_index) else {
+            return Ok(None);
+        };
+        self.next_object_index = self
+            .next_object_index
+            .checked_add(1)
+            .ok_or_else(|| "Media object reorder index overflowed".to_string())?;
+        Ok(Some(outcome))
+    }
+}
+
 struct MediaObjectReceiver {
     connection: iroh::endpoint::Connection,
     reads: tokio::task::JoinSet<MediaObjectReadOutcome>,
+    reorder: MediaObjectReorder,
     next_object_index: u64,
     connection_closed: bool,
 }
@@ -691,6 +769,7 @@ impl MediaObjectReceiver {
         Self {
             connection,
             reads: tokio::task::JoinSet::new(),
+            reorder: MediaObjectReorder::new(1),
             next_object_index: 0,
             connection_closed: false,
         }
@@ -698,7 +777,13 @@ impl MediaObjectReceiver {
 
     async fn next(&mut self) -> Result<Option<MediaObjectReadOutcome>, String> {
         loop {
+            if let Some(completed) = self.reorder.take_next()? {
+                return Ok(Some(completed));
+            }
             if self.connection_closed && self.reads.is_empty() {
+                if self.reorder.pending_len() != 0 {
+                    return Err("Media connection closed with an incomplete object order".into());
+                }
                 return Ok(None);
             }
 
@@ -708,10 +793,13 @@ impl MediaObjectReceiver {
                     let completed = completed
                         .ok_or_else(|| "Media object reader ended unexpectedly".to_string())?
                         .map_err(|error| format!("Media object reader task failed: {error}"))?;
-                    return Ok(Some(completed));
+                    if let Some(completed) = self.reorder.push(completed)? {
+                        return Ok(Some(completed));
+                    }
                 }
                 accepted = self.connection.accept_uni(), if !self.connection_closed
-                    && self.reads.len() < CLIENT_MEDIA_OBJECT_CAPACITY => {
+                    && self.reads.len() + self.reorder.pending_len()
+                        < CLIENT_MEDIA_OBJECT_CAPACITY => {
                     let mut stream = match accepted {
                         Ok(stream) => stream,
                         Err(_) => {
@@ -2271,6 +2359,93 @@ mod tests {
         )
         .unwrap();
         MediaFrame::new(header, payload).unwrap()
+    }
+
+    fn media_object_outcome(
+        object_index: u64,
+        sequence: u64,
+        flags: FrameFlags,
+    ) -> MediaObjectReadOutcome {
+        MediaObjectReadOutcome::Frame {
+            object_index,
+            frame: media_object_frame(sequence, flags),
+        }
+    }
+
+    fn completed_object_index(outcome: &MediaObjectReadOutcome) -> Option<u64> {
+        outcome.object_index()
+    }
+
+    #[test]
+    fn media_object_reorder_restores_accept_order_without_false_resync() {
+        let keyframe = FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG);
+        let mut reorder = MediaObjectReorder::new(1);
+
+        assert!(
+            reorder
+                .push(media_object_outcome(2, 11, FrameFlags::NONE))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reorder.pending_len(), 1);
+        let first = reorder
+            .push(media_object_outcome(1, 10, keyframe))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed_object_index(&first), Some(1));
+        assert_eq!(
+            completed_object_index(&reorder.take_next().unwrap().unwrap()),
+            Some(2)
+        );
+        assert_eq!(reorder.pending_len(), 0);
+    }
+
+    #[test]
+    fn explicit_discontinuity_keyframe_fast_forwards_bounded_reorder() {
+        let barrier = FrameFlags::KEYFRAME
+            .union(FrameFlags::CODEC_CONFIG)
+            .union(FrameFlags::DISCONTINUITY);
+        let mut reorder = MediaObjectReorder::new(1);
+
+        assert!(
+            reorder
+                .push(media_object_outcome(2, 11, FrameFlags::NONE))
+                .unwrap()
+                .is_none()
+        );
+        let recovered = reorder
+            .push(media_object_outcome(3, 20, barrier))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed_object_index(&recovered), Some(3));
+        assert_eq!(reorder.pending_len(), 0);
+        assert_eq!(
+            completed_object_index(
+                &reorder
+                    .push(media_object_outcome(1, 10, FrameFlags::NONE))
+                    .unwrap()
+                    .unwrap()
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn malformed_media_object_bypasses_reorder_and_remains_terminal() {
+        let mut reorder = MediaObjectReorder::new(1);
+        assert!(
+            reorder
+                .push(media_object_outcome(2, 11, FrameFlags::NONE))
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            reorder
+                .push(MediaObjectReadOutcome::Malformed("bad object".into()))
+                .unwrap(),
+            Some(MediaObjectReadOutcome::Malformed(_))
+        ));
+        assert_eq!(reorder.pending_len(), 1);
     }
 
     #[test]

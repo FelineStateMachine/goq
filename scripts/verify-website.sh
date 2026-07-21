@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_dir="$(CDPATH='' cd -- "$script_dir/.." && pwd -P)"
+site_dir="$repo_dir/website"
+
+for command_name in find grep node; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    printf 'required command is missing: %s\n' "$command_name" >&2
+    exit 1
+  fi
+done
+
+for required_file in index.html styles.css dither.js _headers; do
+  if [[ ! -f "$site_dir/$required_file" ]]; then
+    printf 'website asset is missing: %s\n' "$required_file" >&2
+    exit 1
+  fi
+done
+
+if find "$site_dir" -type l -print -quit | grep -q .; then
+  echo 'website output must not contain symbolic links' >&2
+  exit 1
+fi
+
+node --check "$site_dir/dither.js"
+grep -Fq 'href="./styles.css"' "$site_dir/index.html"
+grep -Fq 'src="./dither.js"' "$site_dir/index.html"
+grep -Fq 'Content-Security-Policy:' "$site_dir/_headers"
+
+echo 'website_static_gate=ok'

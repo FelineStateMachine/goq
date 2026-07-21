@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The test sources production helpers dynamically, so ShellCheck cannot see
 # their references to the fixture overrides and shared state variables.
-# shellcheck disable=SC2034,SC2329
+# SC2317 is the equivalent diagnostic emitted by the ShellCheck release used
+# on GitHub's Ubuntu runner for these indirectly invoked fixture functions.
+# shellcheck disable=SC2034,SC2317,SC2329
 
 set -euo pipefail
 

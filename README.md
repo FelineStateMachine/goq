@@ -197,6 +197,10 @@ On Linux with NVIDIA:
 WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo tauri dev
 ```
 
+The static `website/` directory is published through Cloudflare Pages after a
+merge to `main`. See the [Cloudflare Pages release setup](docs/cloudflare-pages.md)
+for the one-time project and GitHub environment configuration.
+
 ## License
 
 MIT

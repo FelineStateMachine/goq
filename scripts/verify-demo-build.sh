@@ -10,7 +10,7 @@ if [[ -f "$HOME/.cargo/env" ]]; then
   source "$HOME/.cargo/env"
 fi
 
-for command_name in cargo rustc node git; do
+for command_name in cargo rustc node git ffmpeg shellcheck; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     printf 'required command is missing: %s\n' "$command_name" >&2
     exit 1
@@ -36,12 +36,7 @@ while IFS= read -r frontend_source; do
 done < <(find src -maxdepth 1 -type f \( -name '*.js' -o -name '*.mjs' \) -print | sort)
 node --test src/*.test.mjs
 
-if command -v shellcheck >/dev/null 2>&1; then
-  find scripts -type f -name '*.sh' -exec shellcheck {} +
-else
-  echo 'shellcheck is required for the demo preflight' >&2
-  exit 1
-fi
+find scripts -type f -name '*.sh' -exec shellcheck {} +
 while IFS= read -r script_test; do
   "$script_test"
 done < <(find scripts/tests -maxdepth 1 -type f -name '*.sh' -perm -u+x -print | sort)

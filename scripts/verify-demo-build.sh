@@ -33,8 +33,8 @@ else
 fi
 while IFS= read -r frontend_source; do
   node --check "$frontend_source"
-done < <(find src -maxdepth 1 -type f \( -name '*.js' -o -name '*.mjs' \) -print | sort)
-node --test src/*.test.mjs
+done < <(find portal -maxdepth 1 -type f \( -name '*.js' -o -name '*.mjs' \) -print | sort)
+node --test portal/*.test.mjs
 
 find scripts -type f -name '*.sh' -exec shellcheck {} +
 while IFS= read -r script_test; do

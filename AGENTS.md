@@ -39,7 +39,7 @@ Sigil host.
     binary Tauri channels, input transport, and diagnostics.
   - `commands/auth.rs` owns FIDO2 `hmac-secret` derivation.
   - `commands/state.rs` owns launch options and process-wide bounded state.
-- `src/main.js` and the focused `src/*.mjs` modules own WebCodecs decode,
+- `portal/main.js` and the focused `portal/*.mjs` modules own WebCodecs decode,
   AudioWorklet playback, controller-first navigation, input capture, A/V
   synchronization, window geometry, and client diagnostics.
 - `website/` is the static goq.sh site. A merge to `main` publishes it through

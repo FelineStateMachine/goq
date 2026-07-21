@@ -95,7 +95,9 @@ Sigil host.
   configuration and must not silently start, restart, or enable the service.
 - Portal is a compiled desktop download, never a shell install. The first
   public target is macOS arm64 and requires Developer ID signing, hardened
-  runtime, notarization, stapling, and strict Gatekeeper verification. Do not
+  runtime, notarization, stapling, and strict Gatekeeper verification. Its
+  TeamIdentifier must equal `release/portal-apple-team-id.txt`, and every
+  Portal asset must carry protected exact-tag GitHub build provenance. Do not
   advertise an unavailable platform/architecture as a download.
 - The Minisign secret, Apple certificate, notarization credentials, host
   identity, and FIDO-derived secrets must never enter the repository, release
@@ -125,8 +127,8 @@ Sigil host.
 - Issue #4: configure the offline Minisign trust root, publish the signed Sigil
   asset set, and prove clean install plus upgrade/rollback from the public
   command.
-- Issue #5: publish the signed/notarized macOS arm64 Portal DMG, digest, and
-  manifest.
+- Issue #5: configure the committed Apple TeamIdentifier pin, then publish the
+  signed/notarized/attested macOS arm64 Portal DMG, digest, and manifest.
 - Issue #6: prove physically headless cold boot, physical client controller
   gameplay, mouse buttons consumed by Gamescope/an actual game, sustained A/V
   and resource percentiles without latency growth, difficult-NAT relay

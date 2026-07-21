@@ -7,6 +7,7 @@ EVIDENCE_SCHEMA='goq-public-alpha-evidence-v2'
 MAX_SOURCE_BYTES=$((1024 * 1024))
 DEFAULT_MAX_AGE_SECONDS=$((7 * 24 * 60 * 60))
 FUTURE_SKEW_SECONDS=300
+GITHUB_REPOSITORY='FelineStateMachine/goq'
 required_kinds=(cold-boot controller mouse soak network-direct network-relay reconnect second-client)
 all_kinds=("${required_kinds[@]}" loopback-preflight)
 script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -15,6 +16,7 @@ sigil_release_verifier="$script_dir/verify-sigil-release.sh"
 portal_release_verifier="$script_dir/verify-portal-release.py"
 portal_signature_verifier="$script_dir/verify-macos-portal-signature.sh"
 sigil_public_key="$repo_dir/release/sigil-minisign.pub"
+portal_apple_team_id_file="$repo_dir/release/portal-apple-team-id.txt"
 
 usage() {
   cat <<'EOF'
@@ -115,6 +117,150 @@ verified_portal_dmg=''
 verified_portal_checksum=''
 verified_portal_manifest=''
 
+github_api() {
+  local endpoint="$1"
+  command -v gh > /dev/null 2>&1 || die "GitHub CLI (gh) is required to verify published release assets"
+  GH_PROMPT_DISABLED=1 gh api "$endpoint" \
+    || die "GitHub API request failed for $endpoint"
+}
+
+git_object_from_json() {
+  PYTHONDONTWRITEBYTECODE=1 python3 -c '
+import json
+import re
+import sys
+
+try:
+    obj = json.load(sys.stdin)["object"]
+    kind = obj["type"]
+    sha = obj["sha"]
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+if kind not in {"commit", "tag"} or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+    raise SystemExit(1)
+print(f"{kind}\t{sha}")
+'
+}
+
+resolve_published_tag_commit() {
+  local release_tag="$1"
+  local response
+  local parsed
+  local object_type
+  local object_sha
+  local depth=0
+
+  response="$(github_api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag")"
+  parsed="$(printf '%s' "$response" | git_object_from_json)" \
+    || die "GitHub tag ref is malformed for $release_tag"
+  IFS=$'\t' read -r object_type object_sha <<< "$parsed"
+  while [[ "$object_type" == tag ]]; do
+    ((depth += 1))
+    (( depth <= 8 )) || die "GitHub annotated tag chain is too deep for $release_tag"
+    response="$(github_api "/repos/$GITHUB_REPOSITORY/git/tags/$object_sha")"
+    parsed="$(printf '%s' "$response" | git_object_from_json)" \
+      || die "GitHub annotated tag object is malformed for $release_tag"
+    IFS=$'\t' read -r object_type object_sha <<< "$parsed"
+  done
+  [[ "$object_type" == commit ]] || die "GitHub tag does not resolve to a commit: $release_tag"
+  printf '%s\n' "$object_sha"
+}
+
+verify_published_release() {
+  local release_tag="$1"
+  local expected_commit="$2"
+  local archive="$3"
+  local portal_dmg="$4"
+  local portal_checksum="$5"
+  local portal_manifest="$6"
+  local remote_commit
+  local release_json
+
+  remote_commit="$(resolve_published_tag_commit "$release_tag")"
+  require_equal "$remote_commit" "$expected_commit" "published GitHub tag commit"
+  release_json="$(github_api "/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag")"
+  PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$GITHUB_REPOSITORY" "$release_tag" \
+    "$archive" "$archive.sha256" "$archive.minisig" \
+    "$portal_dmg" "$portal_checksum" "$portal_manifest" \
+    3<<< "$release_json" <<'PY' \
+    || die "supplied assets do not match the published GitHub prerelease"
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+
+repository = sys.argv[1]
+release_tag = sys.argv[2]
+paths = [pathlib.Path(value) for value in sys.argv[3:]]
+try:
+    with os.fdopen(3) as release_stream:
+        release = json.load(release_stream)
+except (TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+if release.get("tag_name") != release_tag:
+    raise SystemExit(1)
+if release.get("draft") is not False or release.get("prerelease") is not True:
+    raise SystemExit(1)
+if not isinstance(release.get("id"), int) or release["id"] <= 0:
+    raise SystemExit(1)
+if not isinstance(release.get("published_at"), str) or not release["published_at"]:
+    raise SystemExit(1)
+if release.get("html_url") != f"https://github.com/{repository}/releases/tag/{release_tag}":
+    raise SystemExit(1)
+
+assets = release.get("assets")
+if not isinstance(assets, list) or len(assets) != len(paths):
+    raise SystemExit(1)
+by_name = {}
+for asset in assets:
+    if not isinstance(asset, dict) or not isinstance(asset.get("name"), str):
+        raise SystemExit(1)
+    if asset["name"] in by_name:
+        raise SystemExit(1)
+    by_name[asset["name"]] = asset
+
+expected_names = {path.name for path in paths}
+if len(expected_names) != len(paths) or set(by_name) != expected_names:
+    raise SystemExit(1)
+for path in paths:
+    asset = by_name[path.name]
+    digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    if asset.get("state") != "uploaded" or asset.get("digest") != digest:
+        raise SystemExit(1)
+    if asset.get("size") != path.stat().st_size:
+        raise SystemExit(1)
+    if not isinstance(asset.get("id"), int) or asset["id"] <= 0:
+        raise SystemExit(1)
+    api_url = asset.get("url")
+    if not isinstance(api_url, str) or not re.fullmatch(
+        rf"https://api\.github\.com/repos/{re.escape(repository)}/releases/assets/[1-9][0-9]*",
+        api_url,
+    ):
+        raise SystemExit(1)
+PY
+}
+
+verify_portal_attestations() {
+  local release_tag="$1"
+  local expected_commit="$2"
+  shift 2
+  local asset
+
+  for asset in "$@"; do
+    GH_PROMPT_DISABLED=1 gh attestation verify "$asset" \
+      --repo "$GITHUB_REPOSITORY" \
+      --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/portal-release.yml" \
+      --source-ref "refs/tags/$release_tag" \
+      --source-digest "$expected_commit" \
+      --deny-self-hosted-runners > /dev/null \
+      || die "Portal GitHub build-provenance attestation verification failed: $(basename -- "$asset")"
+  done
+}
+
 verify_release_inputs() {
   local release_tag="$1"
   local archive="$2"
@@ -124,6 +270,7 @@ verify_release_inputs() {
   local head
   local worktree_status
   local expected_names
+  local portal_apple_team_id
 
   require_release_tag "$release_tag"
   require_absolute_path "$archive"
@@ -138,6 +285,7 @@ verify_release_inputs() {
   require_safe_regular_file "$portal_release_verifier"
   require_safe_regular_file "$portal_signature_verifier"
   require_safe_regular_file "$sigil_public_key"
+  require_safe_regular_file "$portal_apple_team_id_file"
 
   verified_commit="$(git -C "$repo_dir" rev-parse --verify "refs/tags/$release_tag^{commit}" 2>/dev/null)" \
     || die "release tag does not resolve through refs/tags/$release_tag"
@@ -197,11 +345,32 @@ PY
     --asset-dir "$portal_assets" > /dev/null \
     || die "Portal release asset verification failed"
 
+  portal_apple_team_id="$(awk 'NF { count += 1; value = $0 } END { if (count != 1) exit 1; print value }' \
+    "$portal_apple_team_id_file")" \
+    || die "committed Portal Apple TeamIdentifier pin must contain exactly one non-empty line"
+  [[ "$portal_apple_team_id" =~ ^[A-Z0-9]{10}$ ]] \
+    || die "committed Portal Apple TeamIdentifier pin is invalid"
+
   [[ "$(uname -s)" == Darwin ]] || die "hardware UAT release verification must run on macOS"
   bash "$portal_signature_verifier" \
     --dmg "$verified_portal_dmg" \
-    --expected-version "$version" > /dev/null \
+    --expected-version "$version" \
+    --expected-team-id "$portal_apple_team_id" > /dev/null \
     || die "Portal macOS signature verification failed"
+
+  verify_published_release \
+    "$release_tag" \
+    "$verified_commit" \
+    "$archive" \
+    "$verified_portal_dmg" \
+    "$verified_portal_checksum" \
+    "$verified_portal_manifest"
+  verify_portal_attestations \
+    "$release_tag" \
+    "$verified_commit" \
+    "$verified_portal_dmg" \
+    "$verified_portal_checksum" \
+    "$verified_portal_manifest"
 }
 
 manifest_get() {

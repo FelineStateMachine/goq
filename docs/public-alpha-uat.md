@@ -10,6 +10,9 @@ Use the actual release candidates from a clean checkout of the exact tag. `HEAD`
 a branch name, a locally rebuilt binary, a different DMG, or a moving ref is not
 accepted even if its source is equivalent. Initialization and verification must
 run on macOS because the Portal DMG is assessed with the platform security tools.
+They also require an authenticated GitHub CLI with network access to the public
+`FelineStateMachine/goq` repository; downloaded or mirrored files cannot be used
+as an offline substitute for the published release identity checks.
 
 ## 1. Initialize the bundle
 
@@ -36,6 +39,12 @@ evidence freshness window. The default window is seven days;
 Before creating the bundle the harness performs all of these fail-closed checks:
 
 - `refs/tags/vVERSION` resolves exactly to the clean checkout's `HEAD`.
+- GitHub's `FelineStateMachine/goq` tag ref resolves to that same 40-character
+  commit, including through an annotated-tag chain, and the release carrying
+  that exact tag is published, non-draft, and marked as a prerelease.
+- The published release contains exactly the expected six Sigil and Portal
+  filenames. Every supplied file's size and SHA-256 must equal GitHub's uploaded
+  asset metadata; a locally valid or identically named substitution is rejected.
 - `scripts/verify-sigil-release.sh` validates the archive, checksum, detached
   Minisign signature, source commit, and product contents against the reviewed
   repository key at `release/sigil-minisign.pub`.
@@ -45,14 +54,19 @@ Before creating the bundle the harness performs all of these fail-closed checks:
   `.dmg.sha256`, and `Portal-VERSION-arm64.json`.
 - `scripts/verify-portal-release.py assets` validates those three assets against
   the same clean exact tag.
+- `gh attestation verify` validates all three Portal files against the exact
+  `FelineStateMachine/goq/.github/workflows/portal-release.yml` signer workflow,
+  `refs/tags/vVERSION`, tagged source commit, and GitHub-hosted runner boundary.
 - `scripts/verify-macos-portal-signature.sh` validates the DMG, Developer ID
   signature, hardened runtime, notarization ticket, staple, Gatekeeper result,
-  bundle identity/version, arm64-only executable, and containment boundary.
+  bundle identity/version, arm64-only executable, containment boundary, and the
+  exact Apple TeamIdentifier pinned in `release/portal-apple-team-id.txt`.
 
 If the reviewed Sigil key is still the `unconfigured` sentinel, Minisign or
-macOS verification tools are unavailable, the macOS verifier is absent, or any
-verification cannot run, initialization fails. There is no candidate or test
-bypass in the UAT command.
+macOS verification tools are unavailable, the Apple TeamIdentifier pin is
+invalid, the GitHub API or attestations cannot be verified, the macOS verifier
+is absent, or any verification cannot run, initialization fails. There is no
+candidate, offline, or test bypass in the UAT command.
 
 The bundle format is intentionally append-only at the command boundary. To
 replace a mistaken record, initialize a new bundle. Do not edit the manifest or
@@ -286,7 +300,8 @@ The harness ingests the output by value and never mutates the Bazzite host.
 
 Verification requires the exact same signed asset sets and tested Sigil
 executable again. It reruns every release, Minisign, and macOS platform check;
-stored hashes alone are not sufficient:
+it also reruns the live GitHub release/tag/digest and Portal provenance checks.
+Stored hashes alone are not sufficient:
 
 ```bash
 ./scripts/public-alpha-uat.sh verify \
@@ -299,7 +314,8 @@ stored hashes alone are not sufficient:
 Success prints `public_alpha_uat=pass` plus the release tag, commit, artifact hashes, and
 required gate count. Verification rejects missing records, expired timestamps,
 changed tags, wrong artifacts, modified normalized evidence, unsafe modes,
-symlinks, and unexpected bundle files.
+symlinks, unpublished or non-prerelease releases, mismatched remote asset
+digests, invalid Portal attestations, and unexpected bundle files.
 
 That output means the supplied bundle satisfies the machine-checkable contract.
 It is not evidence that an exercise occurred unless the inputs came from the

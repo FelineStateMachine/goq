@@ -212,8 +212,10 @@ service interruption is intended.
 The macOS Portal build currently produces an arm64 DMG for development. A public
 Portal release additionally requires Developer ID signing with hardened
 runtime, notarization, stapling, and strict Gatekeeper verification; ad-hoc
-development signatures are not a distributable package. With Apple credentials
-configured as described by the official
+development signatures are not a distributable package. Before tagging, the
+public TeamIdentifier in `release/portal-apple-team-id.txt` must match the
+protected certificate, and the tag-ref workflow attests every published Portal
+asset. With Apple credentials configured as described by the official
 [Tauri macOS signing guide](https://v2.tauri.app/distribute/sign/macos/), run:
 
 ```bash

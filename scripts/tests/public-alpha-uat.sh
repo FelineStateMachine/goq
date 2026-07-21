@@ -33,12 +33,40 @@ mkdir -m 700 "$fixture_bin"
 printf '%s\n' '#!/usr/bin/env bash' 'if [[ "${1:-}" == -s ]]; then printf "Darwin\n"; else exec /usr/bin/uname "$@"; fi' \
   > "$fixture_bin/uname"
 chmod 755 "$fixture_bin/uname"
+# The generated GitHub CLI fixture exposes only the exact API and attestation
+# operations used by the production harness.
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if [[ "${1:-}" == api && $# == 2 ]]; then' \
+  '  case "$2" in' \
+  '    /repos/FelineStateMachine/goq/releases/tags/*) cat "$UAT_GITHUB_RELEASE_JSON" ;;' \
+  '    /repos/FelineStateMachine/goq/git/ref/tags/*) cat "$UAT_GITHUB_REF_JSON" ;;' \
+  '    *) exit 1 ;;' \
+  '  esac' \
+  'elif [[ "${1:-}" == attestation && "${2:-}" == verify ]]; then' \
+  '  if [[ -e "$UAT_ATTESTATION_LOG.fail" ]]; then exit 1; fi' \
+  '  [[ -f "$3" ]]' \
+  '  [[ " $* " == *" --repo FelineStateMachine/goq "* ]]' \
+  '  [[ " $* " == *" --signer-workflow FelineStateMachine/goq/.github/workflows/portal-release.yml "* ]]' \
+  '  [[ " $* " == *" --source-ref refs/tags/v1.2.3 "* ]]' \
+  '  [[ " $* " == *" --source-digest $UAT_GITHUB_COMMIT "* ]]' \
+  '  [[ " $* " == *" --deny-self-hosted-runners "* ]]' \
+  '  printf "%s\n" "$3" >> "$UAT_ATTESTATION_LOG"' \
+  'else' \
+  '  exit 1' \
+  'fi' \
+  > "$fixture_bin/gh"
+chmod 755 "$fixture_bin/gh"
 export PATH="$fixture_bin:$PATH"
 cp "$production_harness" "$fixture_repo/scripts/public-alpha-uat.sh"
 chmod 755 "$fixture_repo/scripts/public-alpha-uat.sh"
 printf '%s\n' 'untrusted comment: fixture key' 'RWRmaXh0dXJlUHVibGljS2V5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=' \
   > "$fixture_repo/release/sigil-minisign.pub"
+printf '%s\n' 'ABC123DEF4' > "$fixture_repo/release/portal-apple-team-id.txt"
 chmod 644 "$fixture_repo/release/sigil-minisign.pub"
+chmod 644 "$fixture_repo/release/portal-apple-team-id.txt"
 
 # The single-quoted fixture lines intentionally defer expansion to the generated verifier.
 # shellcheck disable=SC2016
@@ -89,6 +117,7 @@ printf '%s\n' \
   '[[ "$1" == --dmg && "$3" == --expected-version && "$4" == 1.2.3 ]]' \
   '[[ "$(<"$2")" == "verified portal dmg fixture" ]]' \
   'if [[ -n "${UAT_SIGNATURE_MARKER:-}" ]]; then printf invoked > "$UAT_SIGNATURE_MARKER"; fi' \
+  '[[ "$5" == --expected-team-id && "$6" == ABC123DEF4 ]]' \
   'printf "portal_signature_verification=ok\\n"' \
   > "$fixture_repo/scripts/verify-macos-portal-signature.sh"
 chmod 755 "$fixture_repo/scripts/verify-macos-portal-signature.sh"
@@ -123,6 +152,63 @@ git -C "$fixture_repo" config user.email 'uat-fixture@example.invalid'
 git -C "$fixture_repo" add scripts release
 git -C "$fixture_repo" commit -qm 'fixture release verifiers'
 git -C "$fixture_repo" tag "$release_tag"
+
+export UAT_GITHUB_COMMIT
+UAT_GITHUB_COMMIT="$(git -C "$fixture_repo" rev-parse "$release_tag^{commit}")"
+export UAT_GITHUB_RELEASE_JSON="$temporary_root/github-release.json"
+export UAT_GITHUB_REF_JSON="$temporary_root/github-ref.json"
+export UAT_ATTESTATION_LOG="$temporary_root/github-attestations.log"
+
+write_remote_ref_fixture() {
+  local commit="${1:-$UAT_GITHUB_COMMIT}"
+  printf '{"object":{"type":"commit","sha":"%s"}}\n' "$commit" > "$UAT_GITHUB_REF_JSON"
+}
+
+write_remote_release_fixture() {
+  local draft="${1:-false}"
+  local prerelease="${2:-true}"
+  local tag="${3:-$release_tag}"
+  PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$UAT_GITHUB_RELEASE_JSON" "$draft" "$prerelease" "$tag" \
+    "$sigil_archive" "$sigil_archive.sha256" "$sigil_archive.minisig" \
+    "$portal_assets/Portal-1.2.3-arm64.dmg" \
+    "$portal_assets/Portal-1.2.3-arm64.dmg.sha256" \
+    "$portal_assets/Portal-1.2.3-arm64.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+output = pathlib.Path(sys.argv[1])
+draft = sys.argv[2] == "true"
+prerelease = sys.argv[3] == "true"
+tag = sys.argv[4]
+paths = [pathlib.Path(value) for value in sys.argv[5:]]
+assets = []
+for index, path in enumerate(paths, start=101):
+    content = path.read_bytes()
+    assets.append({
+        "id": index,
+        "name": path.name,
+        "state": "uploaded",
+        "size": len(content),
+        "digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+        "url": f"https://api.github.com/repos/FelineStateMachine/goq/releases/assets/{index}",
+    })
+output.write_text(json.dumps({
+    "id": 42,
+    "tag_name": tag,
+    "draft": draft,
+    "prerelease": prerelease,
+    "published_at": "2026-07-21T12:00:00Z",
+    "html_url": f"https://github.com/FelineStateMachine/goq/releases/tag/{tag}",
+    "assets": assets,
+}))
+PY
+}
+
+write_remote_ref_fixture
+write_remote_release_fixture
 
 harness="$fixture_repo/scripts/public-alpha-uat.sh"
 signature_marker="$temporary_root/signature-verifier-invoked"
@@ -249,6 +335,8 @@ verify_bundle() {
 
 complete_bundle="$(new_bundle complete)"
 [[ -f "$signature_marker" ]] || { printf 'macOS signature verifier was not invoked\n' >&2; exit 1; }
+[[ "$(wc -l < "$UAT_ATTESTATION_LOG" | tr -d ' ')" == 3 ]] \
+  || { printf 'all three Portal attestations were not verified\n' >&2; exit 1; }
 record_all_required "$complete_bundle"
 loopback_source="$temporary_root/loopback.evidence"
 write_fixture "$complete_bundle" loopback-preflight "$loopback_source"
@@ -256,6 +344,39 @@ write_fixture "$complete_bundle" loopback-preflight "$loopback_source"
   --file "$loopback_source" > /dev/null
 verify_bundle "$complete_bundle" | grep '^public_alpha_uat=pass$' > /dev/null
 pass 'complete bundle verifies only after all release verifiers run'
+
+write_remote_ref_fixture 0000000000000000000000000000000000000000
+expect_failure 'a published tag resolving to a different commit is rejected' \
+  "$harness" init --evidence-dir "$temporary_root/wrong-remote-commit" \
+    --release-tag "$release_tag" --sigil-archive "$sigil_archive" \
+    --sigil-bin "$sigil_bin" --portal-assets "$portal_assets"
+write_remote_ref_fixture
+
+write_remote_release_fixture false true v1.2.4
+expect_failure 'a GitHub release carrying a different tag is rejected' \
+  "$harness" init --evidence-dir "$temporary_root/wrong-remote-tag" \
+    --release-tag "$release_tag" --sigil-archive "$sigil_archive" \
+    --sigil-bin "$sigil_bin" --portal-assets "$portal_assets"
+write_remote_release_fixture
+
+touch "$UAT_ATTESTATION_LOG.fail"
+expect_failure 'missing or invalid Portal build provenance is rejected' \
+  "$harness" init --evidence-dir "$temporary_root/attestation-failure" \
+    --release-tag "$release_tag" --sigil-archive "$sigil_archive" \
+    --sigil-bin "$sigil_bin" --portal-assets "$portal_assets"
+rm "$UAT_ATTESTATION_LOG.fail"
+
+write_remote_release_fixture true true
+expect_failure 'a draft GitHub release is rejected' \
+  "$harness" init --evidence-dir "$temporary_root/remote-draft" \
+    --release-tag "$release_tag" --sigil-archive "$sigil_archive" \
+    --sigil-bin "$sigil_bin" --portal-assets "$portal_assets"
+write_remote_release_fixture false false
+expect_failure 'a published non-prerelease GitHub release is rejected' \
+  "$harness" init --evidence-dir "$temporary_root/remote-not-prerelease" \
+    --release-tag "$release_tag" --sigil-archive "$sigil_archive" \
+    --sigil-bin "$sigil_bin" --portal-assets "$portal_assets"
+write_remote_release_fixture
 
 expect_failure 'verify rejects an executable different from the signed Sigil payload' \
   "$harness" verify --evidence-dir "$complete_bundle" --sigil-archive "$sigil_archive" \
@@ -299,6 +420,23 @@ expect_failure 'a different Sigil executable is rejected against the archive pay
     --release-tag "$release_tag" --sigil-archive "$sigil_archive" \
     --sigil-bin "$wrong_sigil_bin" --portal-assets "$portal_assets"
 
+substituted_sigil_dir="$temporary_root/substituted-sigil"
+mkdir -m 700 "$substituted_sigil_dir"
+substituted_sigil_archive="$substituted_sigil_dir/$(basename -- "$sigil_archive")"
+tar -czf "$substituted_sigil_archive" -C "$payload_root" payload
+printf '%s\n' 'fixture checksum' > "$substituted_sigil_archive.sha256"
+printf '%s\n' 'fixture-signature' > "$substituted_sigil_archive.minisig"
+chmod 600 "$substituted_sigil_archive" "$substituted_sigil_archive.sha256" \
+  "$substituted_sigil_archive.minisig"
+if [[ "$(shasum -a 256 "$substituted_sigil_archive" | awk '{print $1}')" == \
+      "$(shasum -a 256 "$sigil_archive" | awk '{print $1}')" ]]; then
+  printf '\n' >> "$substituted_sigil_archive.sha256"
+fi
+expect_failure 'a locally valid substituted Sigil asset set is rejected by published digests' \
+  "$harness" init --evidence-dir "$temporary_root/substituted-sigil-bundle" \
+    --release-tag "$release_tag" --sigil-archive "$substituted_sigil_archive" \
+    --sigil-bin "$sigil_bin" --portal-assets "$portal_assets"
+
 arbitrary_portal="$temporary_root/arbitrary-portal"
 mkdir -m 700 "$arbitrary_portal"
 printf '%s\n' 'arbitrary DMG' > "$arbitrary_portal/Portal-1.2.3-arm64.dmg"
@@ -313,6 +451,16 @@ expect_failure 'arbitrary Portal files are rejected by release policy verificati
 expect_failure 'verify reruns Portal release and platform verification' \
   "$harness" verify --evidence-dir "$complete_bundle" --sigil-archive "$sigil_archive" \
     --sigil-bin "$sigil_bin" --portal-assets "$arbitrary_portal"
+
+substituted_portal="$temporary_root/substituted-portal"
+mkdir -m 700 "$substituted_portal"
+cp "$portal_assets"/* "$substituted_portal/"
+printf '%s\n' '{"substituted":true}' > "$substituted_portal/Portal-1.2.3-arm64.json"
+chmod 600 "$substituted_portal"/*
+expect_failure 'a locally valid substituted Portal asset set is rejected by published digests' \
+  "$harness" init --evidence-dir "$temporary_root/substituted-portal-bundle" \
+    --release-tag "$release_tag" --sigil-archive "$sigil_archive" \
+    --sigil-bin "$sigil_bin" --portal-assets "$substituted_portal"
 
 missing_bundle="$(new_bundle missing)"
 expect_failure 'missing hardware gates fail closed' verify_bundle "$missing_bundle"

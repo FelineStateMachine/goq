@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2329
+# The fixture overrides commands that are reached indirectly through sourced
+# inventory functions. ShellCheck reports that pattern as SC2317 before 0.10
+# and SC2329 in newer releases.
+# shellcheck disable=SC2317,SC2329
 
 set -euo pipefail
 

@@ -60,20 +60,25 @@ Steam and games.
   rollback, and package-owned user assets that follow the active release.
 
 The software JPEG client decode fallback and legacy wire compatibility remain.
-Media still uses reliable QUIC rather than drop-aware Iroh/MoQ. A dedicated
-persistent PipeWire sink, bounded Opus datagrams, WebCodecs decode, and
-AudioWorklet playback are implemented; longer-run audio/video synchronization
-measurement remains. Client authorization still needs
-short-lived capability tickets; the debug direct-node bypass is routing, not
-authentication.
+Media v2 now uses bounded independent QUIC object streams with prioritized
+keyframes, dependent-object cancellation, and discontinuity recovery; full MoQ
+group/control semantics remain promoted hardening work. A dedicated persistent
+PipeWire sink, bounded Opus datagrams, WebCodecs decode, and AudioWorklet
+playback are implemented; longer-run audio/video synchronization measurement
+remains. Client authorization still needs short-lived capability enrollment;
+the debug direct-node bypass is routing, not authentication.
 
 ## Immediate milestones
 
 1. **Done:** split Sigil into a pure Rust host binary; keep Portal client-only.
-2. **Hardware-proven:** capture the Gamescope PipeWire node without an XDG portal or physical display; cold-boot service proof remains.
+2. **Hardware-proven on the attached-display GPD host:** capture the exact
+   Gamescope PipeWire node without an XDG portal. Physically headless cold boot
+   and service startup remain public-alpha acceptance gates.
 3. **Hardware-proven:** encode H.264 at 1280x800/60 with bounded buffers and no B-frames.
 4. **Done:** replace base64 WebCodecs delivery with a bounded binary Tauri channel.
-5. Replace FIFO frame delivery with drop-aware iroh/MoQ media delivery.
+5. **Incremental object transport done:** bounded independent QUIC media
+   objects cancel stale dependent frames and recover at discontinuity
+   keyframes. Full Iroh/MoQ group/control semantics remain tracked in issue #7.
 6. **Host hardware-proven; physical client controller pending:** the virtual
    Xbox-style controller negotiated over Iroh and produced the expected
    button, stick, trigger, D-pad, and neutral-release events on the Bazzite

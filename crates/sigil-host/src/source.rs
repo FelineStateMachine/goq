@@ -560,10 +560,12 @@ fn gamescope_pipeline_args(config: &HostConfig, target_object: &str) -> Result<V
         "!".to_owned(),
         "fdsink".to_owned(),
         "fd=1".to_owned(),
-        // Gamescope advertises a variable PipeWire rate and can deliver on
-        // every display vblank. Keep the terminal sink clocked so negotiated
-        // 60 fps timestamps cannot be written to the daemon in a 144 Hz burst.
-        "sync=true".to_owned(),
+        // Gamescope's PipeWire timestamps can advance in larger jumps than
+        // the negotiated frame duration. Clocking this terminal sink makes it
+        // wait on those producer timestamps while the one-frame leaky queue
+        // drops fresh motion. Videorate already caps the live stream at the
+        // configured maximum, so drain encoded access units immediately.
+        "sync=false".to_owned(),
     ]);
     Ok(args.into_iter().map(OsString::from).collect())
 }
@@ -1269,7 +1271,7 @@ mod tests {
         assert!(args.ends_with(&[
             "fdsink".to_owned(),
             "fd=1".to_owned(),
-            "sync=true".to_owned()
+            "sync=false".to_owned()
         ]));
         let videorate = args.iter().position(|arg| arg == "videorate").unwrap();
         let queue = args.iter().position(|arg| arg == "queue").unwrap();

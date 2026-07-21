@@ -42,8 +42,8 @@ const MAX_PENDING_HANDSHAKES: usize = 4;
 const MAX_MEDIA_REPLAY_AGE_FRAME_PERIODS: u64 = 2;
 const GAMESCOPE_STARTUP_SAMPLE_WINDOW: Duration = Duration::from_millis(500);
 const GAMESCOPE_STARTUP_MIN_OBSERVATION_SPAN: Duration = Duration::from_millis(100);
-const GAMESCOPE_STARTUP_HEALTHY_MIN_FRAMES: u64 = 8;
-const GAMESCOPE_STARTUP_HEALTHY_MIN_FPS: f64 = 45.0;
+const GAMESCOPE_STARTUP_TARGET_MIN_FRAMES: u64 = 8;
+const GAMESCOPE_STARTUP_TARGET_MIN_FPS: f64 = 45.0;
 const SOURCE_REAP_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
@@ -270,6 +270,7 @@ struct StartupCadenceSample {
     first_observed_at: Option<Instant>,
     last_observed_at: Option<Instant>,
     receiver_open: bool,
+    decodable_gop_ready: bool,
 }
 
 impl StartupCadenceSample {
@@ -314,20 +315,25 @@ impl StartupCadenceSample {
         self.observation_span() >= GAMESCOPE_STARTUP_MIN_OBSERVATION_SPAN
     }
 
-    fn is_healthy(self) -> bool {
+    fn is_usable(self) -> bool {
+        self.receiver_open && self.frame_progress() > 0 && self.decodable_gop_ready
+    }
+
+    fn meets_target_cadence(self) -> bool {
         self.receiver_open
             && self.has_representative_span()
-            && self.frame_progress() >= GAMESCOPE_STARTUP_HEALTHY_MIN_FRAMES
-            && self.fps() >= GAMESCOPE_STARTUP_HEALTHY_MIN_FPS
+            && self.frame_progress() >= GAMESCOPE_STARTUP_TARGET_MIN_FRAMES
+            && self.fps() >= GAMESCOPE_STARTUP_TARGET_MIN_FPS
     }
 }
 
 fn startup_source_needs_restart(sample: StartupCadenceSample) -> bool {
-    !sample.is_healthy()
+    !sample.is_usable()
 }
 
 async fn sample_startup_cadence(
     receiver: &mut tokio::sync::watch::Receiver<Option<EncodedFrame>>,
+    current_gop: &tokio::sync::watch::Receiver<Option<EncodedGop>>,
     window: Duration,
 ) -> StartupCadenceSample {
     let mut sample = StartupCadenceSample {
@@ -337,13 +343,15 @@ async fn sample_startup_cadence(
     if let Some(frame) = receiver.borrow_and_update().as_ref() {
         sample.observe(frame);
     }
+    sample.decodable_gop_ready = current_gop.borrow().is_some();
     let deadline = tokio::time::Instant::now() + window;
-    while !sample.is_healthy() {
+    while !sample.is_usable() || !sample.has_representative_span() {
         match tokio::time::timeout_at(deadline, receiver.changed()).await {
             Ok(Ok(())) => {
                 if let Some(frame) = receiver.borrow_and_update().as_ref() {
                     sample.observe(frame);
                 }
+                sample.decodable_gop_ready = current_gop.borrow().is_some();
             }
             Ok(Err(_)) => {
                 sample.receiver_open = false;
@@ -380,12 +388,18 @@ async fn select_gamescope_startup_source(
     session_clock: SessionClock,
     mut primary: EncodedSource,
 ) -> Result<EncodedSource> {
-    let primary_sample =
-        sample_startup_cadence(&mut primary.frames, GAMESCOPE_STARTUP_SAMPLE_WINDOW).await;
+    let primary_sample = sample_startup_cadence(
+        &mut primary.frames,
+        &primary.current_gop,
+        GAMESCOPE_STARTUP_SAMPLE_WINDOW,
+    )
+    .await;
     info!(
         frames = primary_sample.frame_progress(),
         fps = primary_sample.fps(),
         receiver_open = primary_sample.receiver_open,
+        decodable_gop_ready = primary_sample.decodable_gop_ready,
+        target_cadence = primary_sample.meets_target_cadence(),
         "sampled primary Gamescope capture startup"
     );
     if !startup_source_needs_restart(primary_sample) {
@@ -400,22 +414,30 @@ async fn select_gamescope_startup_source(
     let mut replacement = spawn_gamescope_pipewire_after_static_preflight(config, session_clock)
         .await
         .context("restarting unhealthy Gamescope capture pipeline")?;
-    let replacement_sample =
-        sample_startup_cadence(&mut replacement.frames, GAMESCOPE_STARTUP_SAMPLE_WINDOW).await;
+    let replacement_sample = sample_startup_cadence(
+        &mut replacement.frames,
+        &replacement.current_gop,
+        GAMESCOPE_STARTUP_SAMPLE_WINDOW,
+    )
+    .await;
     info!(
         frames = replacement_sample.frame_progress(),
         fps = replacement_sample.fps(),
         receiver_open = replacement_sample.receiver_open,
+        decodable_gop_ready = replacement_sample.decodable_gop_ready,
+        target_cadence = replacement_sample.meets_target_cadence(),
         "sampled sequential Gamescope capture startup replacement"
     );
-    if !replacement_sample.is_healthy() {
+    if !replacement_sample.is_usable() {
         let frames = replacement_sample.frame_progress();
         let fps = replacement_sample.fps();
         let receiver_open = replacement_sample.receiver_open;
+        let decodable_gop_ready = replacement_sample.decodable_gop_ready;
         reap_encoded_source(replacement).await;
         bail!(
             "replacement Gamescope capture pipeline remained unhealthy: \
-             frames={frames}, fps={fps:.2}, receiver_open={receiver_open}"
+             frames={frames}, fps={fps:.2}, receiver_open={receiver_open}, \
+             decodable_gop_ready={decodable_gop_ready}"
         );
     }
     Ok(replacement)
@@ -1718,26 +1740,32 @@ mod tests {
             first_observed_at: Some(first),
             last_observed_at: Some(first + span),
             receiver_open,
+            decodable_gop_ready: true,
         }
     }
 
     #[test]
-    fn startup_restart_requires_sustained_healthy_progress() {
+    fn startup_restart_requires_a_live_decodable_source_not_target_cadence() {
         let slow = startup_sample(12.0, 6, true);
-        let healthy = startup_sample(60.0, 8, true);
-        assert!(startup_source_needs_restart(slow));
-        assert!(!startup_source_needs_restart(healthy));
+        let target = startup_sample(60.0, 8, true);
+        assert!(!startup_source_needs_restart(slow));
+        assert!(!slow.meets_target_cadence());
+        assert!(!startup_source_needs_restart(target));
+        assert!(target.meets_target_cadence());
         assert!(startup_source_needs_restart(startup_sample(60.0, 8, false)));
         assert!(startup_source_needs_restart(startup_sample(0.0, 0, true)));
+        let mut undecodable = startup_sample(60.0, 8, true);
+        undecodable.decodable_gop_ready = false;
+        assert!(startup_source_needs_restart(undecodable));
     }
 
     #[test]
     fn startup_bursts_are_not_sustained_health() {
         let burst = startup_sample(10_000.0, 8, true);
-        assert!(burst.fps() > GAMESCOPE_STARTUP_HEALTHY_MIN_FPS);
+        assert!(burst.fps() > GAMESCOPE_STARTUP_TARGET_MIN_FPS);
         assert!(!burst.has_representative_span());
-        assert!(!burst.is_healthy());
-        assert!(startup_source_needs_restart(burst));
+        assert!(!burst.meets_target_cadence());
+        assert!(!startup_source_needs_restart(burst));
     }
 
     #[tokio::test]
@@ -1758,7 +1786,8 @@ mod tests {
             payload_bytes: 3,
         }));
 
-        let sample = sample_startup_cadence(&mut frame_receiver, Duration::ZERO).await;
+        let sample =
+            sample_startup_cadence(&mut frame_receiver, &gop_receiver, Duration::ZERO).await;
         assert_eq!(sample.frame_progress(), 1);
         let current_gop = gop_receiver.borrow().clone().unwrap();
         assert_eq!(current_gop.frames.len(), 1);

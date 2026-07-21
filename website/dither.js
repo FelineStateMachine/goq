@@ -368,10 +368,9 @@
     });
   });
 
-  /* ── Portal platform matrix. One map is the single source of truth:
-        flip a null to an entry when an artifact passes the signing gate.
-        Combos without an artifact grey out the download button — the
-        matrix is shown, but nothing unavailable is advertised as a link. */
+  /* ── Portal platform matrix. Availability comes only from the reviewed
+        static manifest. Invalid or unavailable manifests leave every entry
+        null, so no development or unsigned fallback can become a link. */
   var PORTAL_BUILDS = {
     "macos-arm": null,
     "macos-x86": null,
@@ -381,6 +380,39 @@
     "windows-x86": null,
   };
   var ARCH_NAMES = { arm: "arm64", x86: "x86_64" };
+  var portalManifestStatus = "loading";
+  var portalManifestReason = "checking the signed release manifest";
+
+  function portalBuildFromManifest(manifest) {
+    if (!manifest || manifest.format !== 1 || manifest.product !== "portal-client" ||
+        !manifest.builds || typeof manifest.builds["macos-arm64"] !== "object") {
+      throw new Error("invalid Portal release manifest");
+    }
+    var build = manifest.builds["macos-arm64"];
+    if (build.available !== true) {
+      if (build.available !== false || typeof build.reason !== "string" || !build.reason.trim()) {
+        throw new Error("invalid unavailable Portal release entry");
+      }
+      portalManifestReason = build.reason.trim();
+      return null;
+    }
+    var version = build.version;
+    var tag = build.release_tag;
+    var asset = build.asset;
+    var expectedAsset = "Portal-" + version + "-arm64.dmg";
+    var expectedBase = "https://github.com/FelineStateMachine/goq/releases/download/" + tag + "/";
+    if (typeof version !== "string" || tag !== "v" + version ||
+        build.platform !== "macos" || build.architecture !== "arm64" ||
+        asset !== expectedAsset || build.download_url !== expectedBase + expectedAsset ||
+        build.verification !== "developer-id+hardened-runtime+notarized+stapled+gatekeeper") {
+      throw new Error("invalid available Portal release entry");
+    }
+    return {
+      href: build.download_url,
+      label: "download Portal " + version + " · macOS arm64",
+      note: "Portal " + version + " · macOS arm64 · signed, notarized, and Gatekeeper verified",
+    };
+  }
 
   function pickedPortalValue(name) {
     var el = document.querySelector('input[name="' + name + '"]:checked');
@@ -405,9 +437,39 @@
       button.setAttribute("aria-disabled", "true");
       button.removeAttribute("href"); // href-less anchor: unfocusable, unclickable
       button.textContent = "no " + os + " " + ARCH_NAMES[arch] + " build yet";
-      note.textContent = "portal for " + os + "/" + ARCH_NAMES[arch] +
-        " is not released yet · macos arm64 comes first";
+      if (os === "macos" && arch === "arm" && portalManifestStatus !== "loaded") {
+        note.textContent = portalManifestReason + " · no download offered";
+      } else if (os === "macos" && arch === "arm" && portalManifestReason) {
+        note.textContent = portalManifestReason;
+      } else {
+        note.textContent = "portal for " + os + "/" + ARCH_NAMES[arch] +
+          " is not released yet · macos arm64 comes first";
+      }
     }
+  }
+
+  function loadPortalReleaseManifest() {
+    if (typeof window.fetch !== "function") {
+      portalManifestStatus = "failed";
+      portalManifestReason = "signed release manifest could not be loaded";
+      updatePortalDownload();
+      return;
+    }
+    window.fetch("./portal-release.json", {
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    }).then(function (response) {
+      if (!response.ok) throw new Error("Portal release manifest request failed");
+      return response.json();
+    }).then(function (manifest) {
+      PORTAL_BUILDS["macos-arm"] = portalBuildFromManifest(manifest);
+      portalManifestStatus = "loaded";
+    }).catch(function () {
+      PORTAL_BUILDS["macos-arm"] = null;
+      portalManifestStatus = "failed";
+      portalManifestReason = "signed release manifest is unavailable or invalid";
+    }).then(updatePortalDownload);
   }
 
   document.querySelectorAll('input[name="portal-os"], input[name="portal-arch"]').forEach(function (radio) {
@@ -436,6 +498,7 @@
       if (archRadio) archRadio.checked = true;
     }
     updatePortalDownload();
+    loadPortalReleaseManifest();
   })();
 
   /* ── Copy-to-clipboard for the install command(s). ── */

@@ -137,10 +137,12 @@ impl MediaObjectHeaderV3 {
                 reason: "object zero must be a keyframe carrying codec configuration",
             });
         }
-        if self.object_id != 0 && (keyframe || codec_config) {
+        if self.object_id != 0
+            && (keyframe || codec_config || self.flags.contains(FrameFlags::DISCONTINUITY))
+        {
             return Err(ProtocolError::InvalidMessage {
                 message_type: "v3 media object header",
-                reason: "nonzero objects must not carry a keyframe or codec configuration",
+                reason: "nonzero objects must not carry recovery-boundary flags",
             });
         }
         Ok(())
@@ -566,6 +568,22 @@ mod tests {
         assert!(MediaObjectHeaderV3::h264(1280, 800, 1, 0, keyframe, 256, 1, 1, 1, 1, 16).is_err());
         assert!(
             MediaObjectHeaderV3::h264(1280, 800, 1, 0, FrameFlags::NONE, 1, 1, 2, 2, 2, 16).is_ok()
+        );
+        assert!(
+            MediaObjectHeaderV3::h264(
+                1280,
+                800,
+                1,
+                0,
+                FrameFlags::DISCONTINUITY,
+                1,
+                1,
+                2,
+                2,
+                2,
+                16,
+            )
+            .is_err()
         );
         assert!(
             MediaObjectHeaderV3::h264(1280, 800, 1, 0, FrameFlags::NONE, 1, 1, 2, 2, 2, 15)

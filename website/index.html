@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>goq.sh: one-to-one Steam streaming over iroh</title>
-  <meta name="description" content="goq.sh pairs Portal, a native client, with Sigil, a headless Gamescope host, for games over QUIC. One-to-one, low-latency Steam streaming over iroh. Your key is the address." />
+  <title>goq.sh: one-to-one SteamOS streaming over iroh</title>
+  <meta name="description" content="goq.sh pairs Portal, a native client, with Sigil, a headless Gamescope host, for games over QUIC. One-to-one, low-latency SteamOS streaming over iroh. Your key is the address." />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024' shape-rendering='crispEdges'%3E%3Crect x='100' y='100' width='824' height='824' rx='185' fill='%23ece3d2'/%3E%3Cg transform='translate(224,356) scale(44)' fill='%232b2119' fill-opacity='0.18'%3E%3Crect width='6' height='8'/%3E%3Crect x='6' y='3' width='8' height='2'/%3E%3Crect x='9' y='5' width='2' height='2'/%3E%3Crect x='12' y='5' width='2' height='3'/%3E%3C/g%3E%3Cg transform='translate(204,336) scale(44)'%3E%3Crect width='6' height='8' fill='%23b5623b'/%3E%3Crect x='2' y='3' width='2' height='2' fill='%23ece3d2'/%3E%3Crect x='6' y='3' width='8' height='2' fill='%23c98a3a'/%3E%3Crect x='9' y='5' width='2' height='2' fill='%236b7145'/%3E%3Crect x='12' y='5' width='2' height='3' fill='%236b7145'/%3E%3C/g%3E%3C/svg%3E" />
   <link rel="stylesheet" href="./styles.css" />
 </head>
@@ -62,7 +62,7 @@
             <button class="install-copy" type="button" aria-label="Copy install command">copy</button>
           </div>
         </div>
-        <p class="hero-note">Games over QUIC: one-to-one Steam streaming over iroh <br> Work in progress. Not a finished product.</p>
+        <p class="hero-note">Games over QUIC: one-to-one SteamOS streaming over iroh <br> Work in progress. Not a finished product.</p>
       </div>
     </section>
   </div>
@@ -79,7 +79,7 @@
         </li>
         <li class="feature reveal">
           <h3>Headless Sigil host</h3>
-          <p>A pure-Rust daemon on bare-metal Linux, no desktop, no display. Gamescope gives Steam its own private session; PipeWire feeds a hardware H.264 encoder.</p>
+          <p>A pure-Rust daemon on bare-metal Linux, no desktop, no display. Gamescope runs a private SteamOS session; PipeWire feeds a hardware H.264 encoder.</p>
         </li>
         <li class="feature reveal">
           <h3>Controller-first</h3>
@@ -168,7 +168,7 @@
         <li class="start-step reveal">
           <span class="start-num" aria-hidden="true">03</span>
           <h3>tap to play <kbd>back+start</kbd></h3>
-          <p>Tap the same key anywhere else: Steam appears, your controller just works. Hold Back+Start for a second to escape the session.</p>
+          <p>Tap the same key anywhere else: SteamOS appears, your controller just works. Hold Back+Start for a second to escape the session.</p>
         </li>
       </ol>
       <p class="start-note">You'll need a FIDO2 key with hmac-secret support (YubiKey, Google Titan, …) and a Linux machine for Sigil. Portal builds run on Linux and macOS. <a class="footer-link" href="https://github.com/FelineStateMachine/goq" rel="noopener">Runbook and source →</a></p>

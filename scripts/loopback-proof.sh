@@ -13,9 +13,11 @@ probe_timeout_seconds=15
 command_timeout_seconds=45
 readiness_timeout_seconds=30
 host_runtime_seconds=120
-media_transport="independent-v2"
-media_accept_log="media v2 client accepted"
-media_release_log="media v2 client released"
+media_transport="grouped-v3"
+media_accept_log="media v3 client accepted"
+media_release_log="media v3 client released"
+keyframe_recovery="ok"
+media_v2=false
 media_v1=false
 
 usage() {
@@ -32,8 +34,10 @@ Options:
   --reconnect-cycles COUNT      Fresh sessions after the primary (default: 3)
   --reconnect-frames COUNT      Frames per reconnect session (default: 30)
   --probe-timeout-seconds SEC   Probe per-operation timeout (default: 15)
+  --media-v2                    Exercise independent media v2 compatibility
+                                instead of grouped media v3
   --media-v1                    Exercise ordered media v1 compatibility
-                                instead of independent media v2
+                                instead of grouped media v3
   --help                        Show this help
 EOF
 }
@@ -82,10 +86,21 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --media-v1)
+      [[ "$media_v2" == false ]] || die "--media-v1 and --media-v2 cannot be combined"
       media_transport="reliable-v1"
       media_accept_log="media client accepted"
       media_release_log="media client released"
+      keyframe_recovery="not-requested"
       media_v1=true
+      shift
+      ;;
+    --media-v2)
+      [[ "$media_v1" == false ]] || die "--media-v1 and --media-v2 cannot be combined"
+      media_transport="independent-v2"
+      media_accept_log="media v2 client accepted"
+      media_release_log="media v2 client released"
+      keyframe_recovery="not-requested"
+      media_v2=true
       shift
       ;;
     --help|-h)
@@ -111,6 +126,12 @@ require_positive_integer "--primary-frames" "$primary_frames"
 require_positive_integer "--reconnect-cycles" "$reconnect_cycles"
 require_positive_integer "--reconnect-frames" "$reconnect_frames"
 require_positive_integer "--probe-timeout-seconds" "$probe_timeout_seconds"
+if [[ "$media_v1" == false && "$media_v2" == false ]]; then
+  [[ "$primary_frames" -ge 4 ]] \
+    || die "--primary-frames must be at least 4 for grouped v3 keyframe recovery"
+  [[ "$reconnect_frames" -ge 4 ]] \
+    || die "--reconnect-frames must be at least 4 for grouped v3 keyframe recovery"
+fi
 
 # A fresh Iroh endpoint performs relay discovery and path establishment on
 # every reconnect. Keep the default three-cycle proof fast, but scale the host
@@ -312,6 +333,7 @@ validate_probe_log() {
   grep -Fxq 'dimensions=1280x800' "$log_path" || return 1
   grep -Fxq 'sequence_gaps=0' "$log_path" || return 1
   grep -Fxq "transport=${media_transport}" "$log_path" || return 1
+  grep -Fxq "keyframe_recovery=${keyframe_recovery}" "$log_path" || return 1
   awk -F= '$1 == "media_objects_dropped" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
     "$log_path" || return 1
   awk -F= '$1 == "media_objects_late" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
@@ -325,8 +347,18 @@ validate_probe_log() {
 run_probe() {
   if [[ "$media_v1" == true ]]; then
     "$probe_bin" --media-v1 "$@"
+  elif [[ "$media_v2" == true ]]; then
+    "$probe_bin" --media-v2 "$@"
   else
     "$probe_bin" "$@"
+  fi
+}
+
+run_proof_probe() {
+  if [[ "$media_v1" == false && "$media_v2" == false ]]; then
+    run_probe --keyframe-smoke "$@"
+  else
+    run_probe "$@"
   fi
 }
 
@@ -370,7 +402,7 @@ wait_for_log_line "$host_log" 'status=ready' "$host_pid" 'sigil' || die "host di
 host_node_id="$(sed -n 's/^node_id=//p' "$host_log" | tail -n 1)"
 [[ "$host_node_id" == "$node_id" ]] || die "ready host node ID does not match its identity"
 
-run_probe \
+run_proof_probe \
   --node-id "$node_id" \
   --frames "$primary_frames" \
   --timeout-seconds "$probe_timeout_seconds" \
@@ -427,7 +459,7 @@ cycle=1
 while [[ "$cycle" -le "$reconnect_cycles" ]]; do
   reconnect_log="$tmp_root/reconnect-${cycle}.log"
   if ! run_bounded "$command_timeout_seconds" "$reconnect_log" \
-    run_probe --node-id "$node_id" --frames "$reconnect_frames" \
+    run_proof_probe --node-id "$node_id" --frames "$reconnect_frames" \
     --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800; then
     sed -n '1,240p' "$reconnect_log" >&2 || true
     die "reconnect cycle $cycle failed"
@@ -467,7 +499,7 @@ printf 'probe_binary=%s\n' "$probe_bin"
 printf 'probe_sha256=%s\n' "$(sha256_file "$probe_bin")"
 printf 'node_id=%s\n' "$node_id"
 printf 'primary_frames=%s\n' "$primary_frames"
-grep -E '^(transport|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
+grep -E '^(transport|keyframe_recovery|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
 printf 'active_client_rejection=ok\n'
 printf 'reconnect_cycles=%s\n' "$reconnect_cycles"
 printf 'cleanup=ok\n'

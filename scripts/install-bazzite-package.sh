@@ -186,7 +186,11 @@ if [[ -e "$current_link" || -L "$current_link" ]]; then
   [[ -L "$current_link" ]] || die "current activation is not a symlink"
   current_path="$(readlink -f "$current_link")"
   [[ -n "$current_path" && -d "$current_path" ]] || die "current activation is dangling"
-  [[ "$(dirname -- "$current_path")" == "$releases_root" ]] || die "current activation escapes the release root"
+  # Fedora Atomic/Bazzite exposes /home through /var/home. Compare canonical
+  # paths on both sides so a managed activation remains valid regardless of
+  # which equivalent spelling systemd or the login session used for $HOME.
+  [[ "$(dirname -- "$current_path")" == "$(readlink -f "$releases_root")" ]] \
+    || die "current activation escapes the release root"
   current_release_id="$(basename -- "$current_path")"
 fi
 if [[ -e "$previous_link" || -L "$previous_link" ]]; then

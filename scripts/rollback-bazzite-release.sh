@@ -68,7 +68,10 @@ resolve_activation() {
   [[ -L "$link" ]] || die "$label activation is missing or is not a symlink"
   resolved="$(readlink -f "$link")"
   [[ -n "$resolved" && -d "$resolved" ]] || die "$label activation is dangling"
-  [[ "$(dirname -- "$resolved")" == "$releases_root" ]] || die "$label activation escapes the release root"
+  # Fedora Atomic/Bazzite exposes /home through /var/home. Compare canonical
+  # paths on both sides so the managed symlink does not appear to escape.
+  [[ "$(dirname -- "$resolved")" == "$(readlink -f "$releases_root")" ]] \
+    || die "$label activation escapes the release root"
   basename -- "$resolved"
 }
 

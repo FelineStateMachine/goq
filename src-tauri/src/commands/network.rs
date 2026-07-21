@@ -10,11 +10,13 @@ use openh264::{formats::YUVSource, nal_units};
 use serde::Serialize;
 use sigil_protocol::{
     AUDIO_ALPN_V1, AudioFlags, AudioPacket, AudioPacketHeader, Capability, ClientHello, FrameFlags,
-    INPUT_ALPN_V1, InputEvent, InvitationGrants, MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION,
-    MAX_VIDEO_PIXELS, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MediaCodec, MediaFrame, PointerPosition,
+    INPUT_ALPN_V1, InputEvent, InvitationGrants, KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3,
+    MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS, MEDIA_ALPN_V1, MEDIA_ALPN_V2,
+    MEDIA_ALPN_V3, MediaCodec, MediaControlRequestV3, MediaFrame, MediaObjectV3, PointerPosition,
     PointerSurfaceDimensions, ProtocolError, RELATIVE_POINTER_DELTA_MAX,
     RELATIVE_POINTER_DELTA_MIN, read_host_hello, read_input_ack, read_media_frame,
-    read_media_object, write_client_hello, write_input_event,
+    read_media_object, read_media_object_v3, write_client_hello, write_input_event,
+    write_media_control_request_v3,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Cursor;
@@ -656,6 +658,7 @@ enum MediaTransport {
     LegacyV0,
     ReliableStreamV1,
     IndependentObjectsV2,
+    GroupedObjectsV3,
 }
 
 impl MediaTransport {
@@ -664,6 +667,7 @@ impl MediaTransport {
             Self::LegacyV0 => "reliable-v0",
             Self::ReliableStreamV1 => "reliable-v1",
             Self::IndependentObjectsV2 => "independent-v2",
+            Self::GroupedObjectsV3 => "grouped-v3",
         }
     }
 }
@@ -845,6 +849,186 @@ impl Drop for MediaObjectReceiver {
     }
 }
 
+#[derive(Debug)]
+enum MediaObjectReadOutcomeV3 {
+    Object {
+        accept_index: u64,
+        object: MediaObjectV3,
+    },
+    Dropped {
+        accept_index: u64,
+        reason: KeyframeRequestReasonV3,
+    },
+    Malformed(String),
+}
+
+impl MediaObjectReadOutcomeV3 {
+    fn accept_index(&self) -> Option<u64> {
+        match self {
+            Self::Object { accept_index, .. } | Self::Dropped { accept_index, .. } => {
+                Some(*accept_index)
+            }
+            Self::Malformed(_) => None,
+        }
+    }
+
+    fn is_fast_forward_barrier(&self) -> bool {
+        let Self::Object { object, .. } = self else {
+            return false;
+        };
+        object.header.object_id == 0
+            && object.header.flags.contains(FrameFlags::KEYFRAME)
+            && object.header.flags.contains(FrameFlags::CODEC_CONFIG)
+            && object.header.flags.contains(FrameFlags::DISCONTINUITY)
+    }
+}
+
+#[derive(Debug)]
+struct MediaObjectReorderV3 {
+    next_accept_index: u64,
+    completed: BTreeMap<u64, MediaObjectReadOutcomeV3>,
+}
+
+impl MediaObjectReorderV3 {
+    fn new(first_accept_index: u64) -> Self {
+        Self {
+            next_accept_index: first_accept_index,
+            completed: BTreeMap::new(),
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.completed.len()
+    }
+
+    fn push(
+        &mut self,
+        outcome: MediaObjectReadOutcomeV3,
+    ) -> Result<Option<MediaObjectReadOutcomeV3>, String> {
+        let Some(accept_index) = outcome.accept_index() else {
+            return Ok(Some(outcome));
+        };
+        if accept_index < self.next_accept_index {
+            return Ok(Some(outcome));
+        }
+        if self.completed.insert(accept_index, outcome).is_some() {
+            return Err(format!(
+                "Duplicate media v3 accept index {accept_index} completed"
+            ));
+        }
+        if self
+            .completed
+            .get(&accept_index)
+            .is_some_and(MediaObjectReadOutcomeV3::is_fast_forward_barrier)
+        {
+            self.completed.retain(|index, _| *index >= accept_index);
+            self.next_accept_index = accept_index;
+        }
+        self.take_next()
+    }
+
+    fn take_next(&mut self) -> Result<Option<MediaObjectReadOutcomeV3>, String> {
+        let Some(outcome) = self.completed.remove(&self.next_accept_index) else {
+            return Ok(None);
+        };
+        self.next_accept_index = self
+            .next_accept_index
+            .checked_add(1)
+            .ok_or_else(|| "Media v3 accept index overflowed".to_string())?;
+        Ok(Some(outcome))
+    }
+}
+
+struct MediaObjectReceiverV3 {
+    connection: iroh::endpoint::Connection,
+    reads: tokio::task::JoinSet<MediaObjectReadOutcomeV3>,
+    reorder: MediaObjectReorderV3,
+    next_accept_index: u64,
+    connection_closed: bool,
+}
+
+impl MediaObjectReceiverV3 {
+    fn new(connection: iroh::endpoint::Connection) -> Self {
+        Self {
+            connection,
+            reads: tokio::task::JoinSet::new(),
+            reorder: MediaObjectReorderV3::new(1),
+            next_accept_index: 0,
+            connection_closed: false,
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<MediaObjectReadOutcomeV3>, String> {
+        loop {
+            if let Some(completed) = self.reorder.take_next()? {
+                return Ok(Some(completed));
+            }
+            if self.connection_closed && self.reads.is_empty() {
+                if self.reorder.pending_len() != 0 {
+                    return Err("Media v3 connection closed with incomplete object order".into());
+                }
+                return Ok(None);
+            }
+
+            tokio::select! {
+                biased;
+                completed = self.reads.join_next(), if !self.reads.is_empty() => {
+                    let completed = completed
+                        .ok_or_else(|| "Media v3 object reader ended unexpectedly".to_string())?
+                        .map_err(|error| format!("Media v3 object reader task failed: {error}"))?;
+                    if let Some(completed) = self.reorder.push(completed)? {
+                        return Ok(Some(completed));
+                    }
+                }
+                accepted = self.connection.accept_uni(), if !self.connection_closed
+                    && self.reads.len() + self.reorder.pending_len()
+                        < CLIENT_MEDIA_OBJECT_CAPACITY => {
+                    let mut stream = match accepted {
+                        Ok(stream) => stream,
+                        Err(_) => {
+                            self.connection_closed = true;
+                            continue;
+                        }
+                    };
+                    self.next_accept_index = self.next_accept_index.checked_add(1)
+                        .ok_or_else(|| "Media v3 accept index overflowed".to_string())?;
+                    let accept_index = self.next_accept_index;
+                    self.reads.spawn(async move {
+                        match tokio::time::timeout(
+                            CLIENT_MEDIA_OBJECT_READ_TIMEOUT,
+                            read_media_object_v3(&mut stream),
+                        )
+                        .await
+                        {
+                            Err(_) => MediaObjectReadOutcomeV3::Dropped {
+                                accept_index,
+                                reason: KeyframeRequestReasonV3::DeliveryTimeout,
+                            },
+                            Ok(Err(ProtocolError::Io(_))) => MediaObjectReadOutcomeV3::Dropped {
+                                accept_index,
+                                reason: KeyframeRequestReasonV3::TransportGap,
+                            },
+                            Ok(Err(error)) => MediaObjectReadOutcomeV3::Malformed(format!(
+                                "Invalid media v3 object: {error}"
+                            )),
+                            Ok(Ok(object)) => MediaObjectReadOutcomeV3::Object {
+                                accept_index,
+                                object,
+                            },
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl Drop for MediaObjectReceiverV3 {
+    fn drop(&mut self) {
+        self.reads.abort_all();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaObjectSequenceDecision {
     Deliver { discontinuity: bool },
@@ -901,6 +1085,93 @@ impl MediaObjectSequence {
         self.last_object_index = object_index;
         self.waiting_for_keyframe = false;
         MediaObjectSequenceDecision::Deliver { discontinuity }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaObjectSequenceDecisionV3 {
+    Deliver { discontinuity: bool },
+    DropLate,
+    DropUntilKeyframe,
+}
+
+#[derive(Debug, Default)]
+struct MediaObjectSequenceV3 {
+    group_id: Option<u64>,
+    last_object_id: Option<u32>,
+    last_sequence: Option<u64>,
+    group_payload_bytes: usize,
+    waiting_for_keyframe: bool,
+}
+
+impl MediaObjectSequenceV3 {
+    fn new() -> Self {
+        Self {
+            waiting_for_keyframe: true,
+            ..Self::default()
+        }
+    }
+
+    fn note_dropped_object(&mut self) -> bool {
+        let entered = !self.waiting_for_keyframe;
+        self.waiting_for_keyframe = true;
+        entered
+    }
+
+    fn classify(&mut self, object: &MediaObjectV3) -> MediaObjectSequenceDecisionV3 {
+        let header = &object.header;
+        if self
+            .group_id
+            .is_some_and(|group_id| header.group_id < group_id)
+            || self
+                .last_sequence
+                .is_some_and(|sequence| header.sequence <= sequence)
+        {
+            return MediaObjectSequenceDecisionV3::DropLate;
+        }
+
+        let new_group = self.group_id != Some(header.group_id);
+        let recovery_keyframe = header.object_id == 0
+            && header.flags.contains(FrameFlags::KEYFRAME)
+            && header.flags.contains(FrameFlags::CODEC_CONFIG);
+        if new_group && !recovery_keyframe {
+            self.waiting_for_keyframe = true;
+            return MediaObjectSequenceDecisionV3::DropUntilKeyframe;
+        }
+        if !new_group && self.waiting_for_keyframe {
+            return MediaObjectSequenceDecisionV3::DropUntilKeyframe;
+        }
+
+        let sequence_contiguous = self
+            .last_sequence
+            .is_none_or(|sequence| sequence.checked_add(1) == Some(header.sequence));
+        let object_contiguous = new_group
+            || self
+                .last_object_id
+                .is_some_and(|object_id| object_id.checked_add(1) == Some(header.object_id));
+        let next_group_bytes = if new_group {
+            object.payload.len()
+        } else {
+            self.group_payload_bytes
+                .saturating_add(object.payload.len())
+        };
+        if (!sequence_contiguous && !new_group)
+            || !object_contiguous
+            || next_group_bytes > MAX_MEDIA_GROUP_BYTES_V3
+        {
+            self.waiting_for_keyframe = true;
+            return MediaObjectSequenceDecisionV3::DropUntilKeyframe;
+        }
+
+        let discontinuity = header.flags.contains(FrameFlags::DISCONTINUITY)
+            || self.waiting_for_keyframe
+            || !sequence_contiguous;
+        self.group_id = Some(header.group_id);
+        self.last_object_id = Some(header.object_id);
+        self.last_sequence = Some(header.sequence);
+        self.group_payload_bytes = next_group_bytes;
+        self.waiting_for_keyframe = false;
+        MediaObjectSequenceDecisionV3::Deliver { discontinuity }
     }
 }
 
@@ -1100,68 +1371,151 @@ async fn open_negotiated_media_stream(
     (
         iroh::endpoint::Connection,
         iroh::endpoint::RecvStream,
+        Option<iroh::endpoint::SendStream>,
         NegotiatedV1Stream,
         MediaTransport,
     ),
     String,
 > {
-    match endpoint.connect(address.clone(), MEDIA_ALPN_V2).await {
+    match endpoint.connect(address.clone(), MEDIA_ALPN_V3).await {
         Ok(connection) => {
             let (mut send, mut recv) = connection
                 .open_bi()
                 .await
-                .map_err(|error| format!("Failed to open media v2 handshake: {error}"))?;
+                .map_err(|error| format!("Failed to open media v3 handshake: {error}"))?;
             let negotiation = negotiate_v1(
                 &mut send,
                 &mut recv,
                 nonce,
                 vec![Capability::VideoH264],
                 Some(Capability::VideoH264),
-                "media v2",
+                "media v3",
                 invitation,
             )
             .await?;
-            send.finish()
-                .map_err(|error| format!("Failed to finish media v2 handshake: {error}"))?;
             Ok((
                 connection,
                 recv,
+                Some(send),
                 negotiation,
-                MediaTransport::IndependentObjectsV2,
+                MediaTransport::GroupedObjectsV3,
             ))
         }
-        Err(v2_error) => {
-            let connection = endpoint
-                .connect(address.clone(), MEDIA_ALPN_V1)
-                .await
-                .map_err(|v1_error| {
-                    format!(
-                        "Failed to connect media v2 ({v2_error}); v1 compatibility connection also failed ({v1_error})"
-                    )
-                })?;
-            let (mut send, mut recv) = connection
-                .open_bi()
-                .await
-                .map_err(|error| format!("Failed to open media v1 stream: {error}"))?;
-            let negotiation = negotiate_v1(
-                &mut send,
-                &mut recv,
-                nonce,
-                vec![Capability::VideoH264],
-                Some(Capability::VideoH264),
-                "media v1",
-                invitation,
-            )
-            .await?;
-            send.finish()
-                .map_err(|error| format!("Failed to finish media v1 handshake: {error}"))?;
-            Ok((
-                connection,
-                recv,
-                negotiation,
-                MediaTransport::ReliableStreamV1,
-            ))
+        Err(v3_error) => match endpoint.connect(address.clone(), MEDIA_ALPN_V2).await {
+            Ok(connection) => {
+                let (mut send, mut recv) = connection
+                    .open_bi()
+                    .await
+                    .map_err(|error| format!("Failed to open media v2 handshake: {error}"))?;
+                let negotiation = negotiate_v1(
+                    &mut send,
+                    &mut recv,
+                    nonce,
+                    vec![Capability::VideoH264],
+                    Some(Capability::VideoH264),
+                    "media v2",
+                    invitation,
+                )
+                .await?;
+                send.finish()
+                    .map_err(|error| format!("Failed to finish media v2 handshake: {error}"))?;
+                Ok((
+                    connection,
+                    recv,
+                    None,
+                    negotiation,
+                    MediaTransport::IndependentObjectsV2,
+                ))
+            }
+            Err(v2_error) => {
+                let connection = endpoint
+                    .connect(address.clone(), MEDIA_ALPN_V1)
+                    .await
+                    .map_err(|v1_error| {
+                        format!(
+                            "Failed to connect media v3 ({v3_error}); v2 compatibility connection failed ({v2_error}); v1 compatibility connection also failed ({v1_error})"
+                        )
+                    })?;
+                let (mut send, mut recv) = connection
+                    .open_bi()
+                    .await
+                    .map_err(|error| format!("Failed to open media v1 stream: {error}"))?;
+                let negotiation = negotiate_v1(
+                    &mut send,
+                    &mut recv,
+                    nonce,
+                    vec![Capability::VideoH264],
+                    Some(Capability::VideoH264),
+                    "media v1",
+                    invitation,
+                )
+                .await?;
+                send.finish()
+                    .map_err(|error| format!("Failed to finish media v1 handshake: {error}"))?;
+                Ok((
+                    connection,
+                    recv,
+                    None,
+                    negotiation,
+                    MediaTransport::ReliableStreamV1,
+                ))
+            }
+        },
+    }
+}
+
+async fn run_media_control_writer_v3(
+    mut stream: iroh::endpoint::SendStream,
+    mut requests: tokio::sync::mpsc::Receiver<(KeyframeRequestReasonV3, Option<u64>)>,
+) {
+    let mut request_id = 0_u64;
+    while let Some((reason, last_sequence)) = requests.recv().await {
+        let Some(next_request_id) = request_id.checked_add(1) else {
+            eprintln!("[client] media v3 keyframe request id overflowed");
+            break;
+        };
+        request_id = next_request_id;
+        let request = MediaControlRequestV3::request_keyframe(request_id, last_sequence, reason);
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            write_media_control_request_v3(&mut stream, &request),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("[client] media v3 keyframe request failed: {error}");
+                break;
+            }
+            Err(_) => {
+                eprintln!("[client] media v3 keyframe request timed out");
+                break;
+            }
         }
+    }
+    let _ = stream.finish();
+}
+
+fn parse_keyframe_request_reason(reason: &str) -> Result<KeyframeRequestReasonV3, String> {
+    match reason {
+        "join" => Ok(KeyframeRequestReasonV3::Join),
+        "transport-gap" => Ok(KeyframeRequestReasonV3::TransportGap),
+        "delivery-timeout" => Ok(KeyframeRequestReasonV3::DeliveryTimeout),
+        "discontinuity" | "decoder-reset" | "decoder-error" => {
+            Ok(KeyframeRequestReasonV3::DecoderReset)
+        }
+        "frontend-backpressure" => Ok(KeyframeRequestReasonV3::FrontendBackpressure),
+        _ => Err(format!("Unsupported keyframe request reason: {reason}")),
+    }
+}
+
+fn try_queue_media_keyframe_request(
+    sender: Option<&tokio::sync::mpsc::Sender<(KeyframeRequestReasonV3, Option<u64>)>>,
+    reason: KeyframeRequestReasonV3,
+    last_sequence: Option<u64>,
+) {
+    if let Some(sender) = sender {
+        let _ = sender.try_send((reason, last_sequence));
     }
 }
 
@@ -1649,48 +2003,53 @@ pub async fn iroh_client_connect(
     let use_v1 = true;
     let input_alpn = if use_v1 { INPUT_ALPN_V1 } else { INPUT_ALPN };
 
-    let (frame_conn, mut frame_recv, media_negotiation, media_transport) = if use_v1 {
-        let first_attempt =
-            open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, invitation.as_deref())
-                .await;
-        let (connection, recv, negotiation, transport) = match first_attempt {
-            Ok(result) => result,
-            Err(invitation_error)
-                if invitation.is_some()
-                    && invitation_error.contains("Portal peer is not authorized") =>
-            {
-                // Recover only the narrow crash window where Sigil durably
-                // consumed the invitation but Portal did not durably clear it.
-                // The replay itself remains rejected; a second, ticket-free
-                // connection can succeed only as the already-enrolled Iroh
-                // peer authenticated by the exact invited host.
-                open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, None)
+    let (frame_conn, mut frame_recv, media_control_stream, media_negotiation, media_transport) =
+        if use_v1 {
+            let first_attempt = open_negotiated_media_stream(
+                &endpoint,
+                &addr,
+                handshake_nonce,
+                invitation.as_deref(),
+            )
+            .await;
+            let (connection, recv, control, negotiation, transport) = match first_attempt {
+                Ok(result) => result,
+                Err(invitation_error)
+                    if invitation.is_some()
+                        && invitation_error.contains("Portal peer is not authorized") =>
+                {
+                    // Recover only the narrow crash window where Sigil durably
+                    // consumed the invitation but Portal did not durably clear it.
+                    // The replay itself remains rejected; a second, ticket-free
+                    // connection can succeed only as the already-enrolled Iroh
+                    // peer authenticated by the exact invited host.
+                    open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, None)
                     .await
                     .map_err(|retry_error| {
                         format!(
                             "{invitation_error}; ticket-free enrollment recovery also failed: {retry_error}"
                         )
                     })?
-            }
-            Err(error) => return Err(error),
+                }
+                Err(error) => return Err(error),
+            };
+            (connection, recv, control, Some(negotiation), transport)
+        } else {
+            let connection = endpoint
+                .connect(addr.clone(), FRAME_ALPN)
+                .await
+                .map_err(|e| format!("Failed to connect frame stream: {e}"))?;
+            let (mut send, recv) = connection
+                .open_bi()
+                .await
+                .map_err(|e| format!("Failed to open frame stream: {e}"))?;
+            send.write_all(&[1u8])
+                .await
+                .map_err(|e| format!("Failed to send start: {e}"))?;
+            send.finish()
+                .map_err(|e| format!("Failed to finish frame start stream: {e}"))?;
+            (connection, recv, None, None, MediaTransport::LegacyV0)
         };
-        (connection, recv, Some(negotiation), transport)
-    } else {
-        let connection = endpoint
-            .connect(addr.clone(), FRAME_ALPN)
-            .await
-            .map_err(|e| format!("Failed to connect frame stream: {e}"))?;
-        let (mut send, recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| format!("Failed to open frame stream: {e}"))?;
-        send.write_all(&[1u8])
-            .await
-            .map_err(|e| format!("Failed to send start: {e}"))?;
-        send.finish()
-            .map_err(|e| format!("Failed to finish frame start stream: {e}"))?;
-        (connection, recv, None, MediaTransport::LegacyV0)
-    };
     let frame_connection_for_stats = frame_conn.clone();
     let media_session_id = media_negotiation
         .as_ref()
@@ -1869,6 +2228,16 @@ pub async fn iroh_client_connect(
         *ce = Some(endpoint.clone());
     }
     *state.media_connection.lock().await = Some((media_generation, frame_conn.clone()));
+    let media_control_requests = if let Some(control_stream) = media_control_stream {
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
+        *state.media_control.lock().await = Some((media_generation, control_tx.clone()));
+        tokio::spawn(run_media_control_writer_v3(control_stream, control_rx));
+        let _ = control_tx.try_send((KeyframeRequestReasonV3::Join, None));
+        Some(control_tx)
+    } else {
+        *state.media_control.lock().await = None;
+        None
+    };
     let frame_events_in_flight = Arc::new(AtomicUsize::new(0));
     *state.frame_delivery.lock().await =
         Some((media_generation, Arc::clone(&frame_events_in_flight)));
@@ -1986,6 +2355,9 @@ pub async fn iroh_client_connect(
         let mut media_objects = (media_transport == MediaTransport::IndependentObjectsV2)
             .then(|| MediaObjectReceiver::new(frame_connection_for_stats.clone()));
         let mut media_object_sequence = MediaObjectSequence::new();
+        let mut media_objects_v3 = (media_transport == MediaTransport::GroupedObjectsV3)
+            .then(|| MediaObjectReceiverV3::new(frame_connection_for_stats.clone()));
+        let mut media_object_sequence_v3 = MediaObjectSequenceV3::new();
 
         let mut decoder = if use_webcodecs {
             None
@@ -2052,6 +2424,86 @@ pub async fn iroh_client_connect(
                 pts_micros,
                 discontinuity,
             ) = match media_transport {
+                MediaTransport::GroupedObjectsV3 => {
+                    let receiver = media_objects_v3
+                        .as_mut()
+                        .expect("media v3 receiver must exist for media v3 transport");
+                    loop {
+                        let outcome = match receiver.next().await {
+                            Ok(Some(outcome)) => outcome,
+                            Ok(None) => {
+                                emit_frame_error(&app, media_generation, "Connection closed");
+                                break 'frames;
+                            }
+                            Err(error) => {
+                                emit_frame_error(&app, media_generation, error);
+                                break 'frames;
+                            }
+                        };
+                        match outcome {
+                            MediaObjectReadOutcomeV3::Dropped { reason, .. } => {
+                                let begins_resync = media_object_sequence_v3.note_dropped_object();
+                                let mut metrics = lock_client_media_metrics(&metrics);
+                                metrics.observe_transport_object_drop(!begins_resync);
+                                if begins_resync {
+                                    frontend_waiting_for_keyframe = true;
+                                    metrics.begin_frontend_resync(metrics_started.elapsed());
+                                    try_queue_media_keyframe_request(
+                                        media_control_requests.as_ref(),
+                                        reason,
+                                        media_object_sequence_v3.last_sequence,
+                                    );
+                                }
+                            }
+                            MediaObjectReadOutcomeV3::Malformed(error) => {
+                                emit_frame_error(&app, media_generation, error);
+                                break 'frames;
+                            }
+                            MediaObjectReadOutcomeV3::Object { object, .. } => {
+                                let was_waiting = media_object_sequence_v3.waiting_for_keyframe;
+                                let discontinuity = match media_object_sequence_v3.classify(&object)
+                                {
+                                    MediaObjectSequenceDecisionV3::Deliver { discontinuity } => {
+                                        discontinuity
+                                    }
+                                    MediaObjectSequenceDecisionV3::DropLate => {
+                                        lock_client_media_metrics(&metrics)
+                                            .observe_transport_object_drop(true);
+                                        continue;
+                                    }
+                                    MediaObjectSequenceDecisionV3::DropUntilKeyframe => {
+                                        frontend_waiting_for_keyframe = true;
+                                        let mut metrics = lock_client_media_metrics(&metrics);
+                                        metrics.observe_transport_object_drop(false);
+                                        metrics.begin_frontend_resync(metrics_started.elapsed());
+                                        if !was_waiting {
+                                            try_queue_media_keyframe_request(
+                                                media_control_requests.as_ref(),
+                                                KeyframeRequestReasonV3::TransportGap,
+                                                media_object_sequence_v3.last_sequence,
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                };
+                                let codec = match object.header.codec {
+                                    MediaCodec::H264 => "h264".to_string(),
+                                };
+                                break (
+                                    u32::from(object.header.width),
+                                    u32::from(object.header.height),
+                                    object.payload,
+                                    object.header.flags.contains(FrameFlags::KEYFRAME),
+                                    codec,
+                                    Some(object.header.sequence),
+                                    Some(object.header.capture_timestamp_us),
+                                    Some(object.header.pts_us),
+                                    discontinuity,
+                                );
+                            }
+                        }
+                    }
+                }
                 MediaTransport::IndependentObjectsV2 => {
                     let receiver = media_objects
                         .as_mut()
@@ -2235,10 +2687,18 @@ pub async fn iroh_client_connect(
                 continue;
             }
             if !try_reserve_frame_channel_slot(&frame_events_in_flight) {
+                let begins_resync = !frontend_waiting_for_keyframe;
                 frontend_waiting_for_keyframe = true;
                 let mut metrics = lock_client_media_metrics(&metrics);
                 metrics.observe_frontend_queue_drop();
                 metrics.begin_frontend_resync(metrics_started.elapsed());
+                if begins_resync {
+                    try_queue_media_keyframe_request(
+                        media_control_requests.as_ref(),
+                        KeyframeRequestReasonV3::FrontendBackpressure,
+                        sequence,
+                    );
+                }
                 continue;
             }
             lock_client_media_metrics(&metrics)
@@ -2450,6 +2910,30 @@ mod tests {
         }
     }
 
+    fn media_object_v3(
+        group_id: u64,
+        object_id: u32,
+        sequence: u64,
+        flags: FrameFlags,
+    ) -> MediaObjectV3 {
+        let payload = vec![sequence as u8];
+        let header = sigil_protocol::MediaObjectHeaderV3::h264(
+            1280,
+            800,
+            payload.len(),
+            if object_id == 0 { 0 } else { 128 },
+            flags,
+            object_id,
+            group_id,
+            sequence,
+            sequence * 1_000,
+            sequence as i64 * 1_000,
+            100,
+        )
+        .unwrap();
+        MediaObjectV3::new(header, payload).unwrap()
+    }
+
     fn completed_object_index(outcome: &MediaObjectReadOutcome) -> Option<u64> {
         outcome.object_index()
     }
@@ -2601,6 +3085,80 @@ mod tests {
                 discontinuity: false
             }
         );
+    }
+
+    #[test]
+    fn media_v3_groups_use_wire_object_identity_and_recover_on_new_group_zero() {
+        let keyframe = FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG);
+        let mut sequence = MediaObjectSequenceV3::new();
+
+        assert_eq!(
+            sequence.classify(&media_object_v3(10, 0, 10, keyframe)),
+            MediaObjectSequenceDecisionV3::Deliver {
+                discontinuity: true
+            }
+        );
+        assert_eq!(
+            sequence.classify(&media_object_v3(10, 1, 11, FrameFlags::NONE)),
+            MediaObjectSequenceDecisionV3::Deliver {
+                discontinuity: false
+            }
+        );
+        assert_eq!(
+            sequence.classify(&media_object_v3(10, 3, 13, FrameFlags::NONE)),
+            MediaObjectSequenceDecisionV3::DropUntilKeyframe
+        );
+        assert_eq!(
+            sequence.classify(&media_object_v3(10, 2, 12, FrameFlags::NONE)),
+            MediaObjectSequenceDecisionV3::DropUntilKeyframe
+        );
+        assert_eq!(
+            sequence.classify(&media_object_v3(
+                20,
+                0,
+                20,
+                keyframe.union(FrameFlags::DISCONTINUITY),
+            )),
+            MediaObjectSequenceDecisionV3::Deliver {
+                discontinuity: true
+            }
+        );
+        assert_eq!(
+            sequence.classify(&media_object_v3(10, 2, 12, FrameFlags::NONE)),
+            MediaObjectSequenceDecisionV3::DropLate
+        );
+    }
+
+    #[test]
+    fn media_v3_receiver_rejects_group_payload_growth_beyond_the_shared_cap() {
+        let keyframe = FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG);
+        let mut sequence = MediaObjectSequenceV3::new();
+        assert!(matches!(
+            sequence.classify(&media_object_v3(1, 0, 1, keyframe)),
+            MediaObjectSequenceDecisionV3::Deliver { .. }
+        ));
+        sequence.group_payload_bytes = MAX_MEDIA_GROUP_BYTES_V3;
+        assert_eq!(
+            sequence.classify(&media_object_v3(1, 1, 2, FrameFlags::NONE)),
+            MediaObjectSequenceDecisionV3::DropUntilKeyframe
+        );
+    }
+
+    #[test]
+    fn keyframe_request_reason_mapping_is_strict_and_coalesces_decoder_reasons() {
+        assert_eq!(
+            parse_keyframe_request_reason("transport-gap").unwrap(),
+            KeyframeRequestReasonV3::TransportGap
+        );
+        assert_eq!(
+            parse_keyframe_request_reason("discontinuity").unwrap(),
+            KeyframeRequestReasonV3::DecoderReset
+        );
+        assert_eq!(
+            parse_keyframe_request_reason("decoder-error").unwrap(),
+            KeyframeRequestReasonV3::DecoderReset
+        );
+        assert!(parse_keyframe_request_reason("please").is_err());
     }
 
     #[test]
@@ -3495,6 +4053,29 @@ pub async fn iroh_client_send_input(
 }
 
 #[tauri::command]
+pub async fn iroh_client_request_keyframe(
+    state: State<'_, AppState>,
+    generation: u64,
+    reason: String,
+) -> Result<bool, String> {
+    let reason = parse_keyframe_request_reason(&reason)?;
+    let control = state.media_control.lock().await;
+    let Some((current_generation, sender)) = control.as_ref() else {
+        return Ok(false);
+    };
+    if *current_generation != generation {
+        return Ok(false);
+    }
+    match sender.try_send((reason, None)) {
+        Ok(()) => Ok(true),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err("Media control channel closed".to_string())
+        }
+    }
+}
+
+#[tauri::command]
 pub async fn iroh_client_ack_frame(
     state: State<'_, AppState>,
     generation: u64,
@@ -3590,6 +4171,7 @@ pub async fn iroh_client_disconnect(state: State<'_, AppState>) -> Result<bool, 
     let _connection_serial = state.client_connection_serial.lock().await;
     next_audio_generation(&state.audio_connection_generation)?;
     lock_audio_deliveries(&state.audio_deliveries).clear();
+    *state.media_control.lock().await = None;
     // Do not rely on endpoint shutdown alone to retire the session. The frame
     // reader and diagnostics task both own connection clones, and a surviving
     // media connection keeps the host's encoder and one-client lease alive.

@@ -202,6 +202,7 @@ class PortalReleaseVerifierTests(unittest.TestCase):
         self.assertIn("five-asset pre-signature contract", workflow)
         self.assertIn("actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6", workflow)
         self.assertIn('test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"', workflow)
+        self.assertIn("artifact-metadata: write", workflow)
         self.assertIn("attestations: write", workflow)
         self.assertIn("id-token: write", workflow)
         self.assertNotIn("release create", workflow)

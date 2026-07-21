@@ -11,21 +11,15 @@
 <body>
   <a class="skip" href="#main">Skip to content</a>
 
-  <!--
-    goq.sh is the project and domain. Portal is the installed client;
-    sigil is the headless host CLI. "goq" is the games-over-QUIC
-    wordplay and repository name (github.com/FelineStateMachine/goq).
-    TODO(install-script): the curl one-liners below point at goq.sh but
-    those install scripts are NOT published yet. Publish them (client
-    app + host runtime package) before launch, then confirm the exact
-    commands here and in dither.js.
-  -->
+  <!-- Portal is downloaded as a signed desktop app. Sigil is installed on a
+       dedicated Bazzite machine through the fail-closed bootstrap command. -->
   <!-- ─── First screen: full-viewport dither with a floating panel ─── -->
   <div class="screen">
     <header class="topbar">
       <a class="topbar-github" href="https://github.com/FelineStateMachine/goq" rel="noopener">source&nbsp;</a>
       <nav class="topbar-nav">
         <a href="#features">features</a>
+        <a href="#roadmap">next</a>
         <a href="#how">how</a>
         <a href="#start">start</a>
       </nav>
@@ -42,24 +36,31 @@
           <rect x="14" y="7" width="2"  height="3"  fill="var(--moss)" />
           <rect x="19" y="7" width="2"  height="2"  fill="var(--moss)" />
         </svg>
-        <pre class="hero-ascii" role="img" aria-label="goq.sh">░▄▄▄░█▀█░█▀█░░░█▀▀░█░█
+        <pre class="hero-ascii" role="img" aria-label="goq.sh">░█▀█░█▀█░█▀█░░░█▀▀░█░█
 ░█▄█░█░█░█▄█░░░▀▀█░█▀█
 ░▄▄█░▀▀▀░░░█░▀░▀▀▀░▀░▀</pre>
-        <p class="hero-tagline">Your key is the address. Plug in, tap, connect.</p>
+        <p class="hero-tagline">Your key is the address. Plug in, tap, play.</p>
         <div class="install-group">
-          <div class="seg" role="radiogroup" aria-label="Install as">
+          <div class="seg" role="radiogroup" aria-label="Get goq">
             <label class="seg-opt">
-              <input type="radio" name="install-target" value="client" checked />
-              <span>client</span>
+              <input type="radio" name="release-target" value="portal" checked />
+              <span>portal</span>
             </label>
             <label class="seg-opt">
-              <input type="radio" name="install-target" value="host" />
-              <span>host</span>
+              <input type="radio" name="release-target" value="sigil" />
+              <span>sigil</span>
             </label>
           </div>
-          <div class="install" data-copy="curl -fsSL https://goq.sh | sh">
-            <code class="install-cmd"><span class="install-prompt">$</span> <span class="install-text">curl -fsSL https://goq.sh | sh</span></code>
-            <button class="install-copy" type="button" aria-label="Copy install command">copy</button>
+          <div class="release-action" data-release-target="portal">
+            <a class="portal-download" href="https://github.com/FelineStateMachine/goq/releases" rel="noopener">Portal downloads</a>
+            <p class="release-note">signed + notarized macOS builds will appear here · public alpha pending</p>
+          </div>
+          <div class="release-action" data-release-target="sigil" hidden>
+            <div class="install" data-copy="curl --proto '=https' --tlsv1.2 -fsS https://goq.sh/install-sigil -o /tmp/install-sigil && bash /tmp/install-sigil">
+              <code class="install-cmd"><span class="install-prompt">$</span> <span class="install-text">curl --proto '=https' --tlsv1.2 -fsS https://goq.sh/install-sigil -o /tmp/install-sigil &amp;&amp; bash /tmp/install-sigil</span></code>
+              <button class="install-copy" type="button" aria-label="Copy Sigil install command">copy</button>
+            </div>
+            <p class="release-note">non-root Bazzite setup · signed release channel pending</p>
           </div>
         </div>
         <p class="hero-note">Games over QUIC: one-to-one SteamOS streaming over iroh <br> Work in progress. Not a finished product.</p>
@@ -96,6 +97,35 @@
         <li class="feature reveal">
           <h3>One host, one client</h3>
           <p>A single active client, enforced, over an end-to-end encrypted iroh link, relay-assisted when a direct path isn't possible. No third-party streaming service.</p>
+        </li>
+      </ol>
+    </section>
+
+    <!-- ─── Promoted hardening roadmap ─────────────────────── -->
+    <section class="roadmap" id="roadmap">
+      <div class="section-rule" aria-hidden="true"></div>
+      <h2 class="section-title"><span aria-hidden="true">##</span> hardening next</h2>
+      <p class="roadmap-intro">The first target stays deliberately narrow: hardware H.264 at 1280×800/60. These are the promoted steps from a proven stream to one that adapts without accumulating latency.</p>
+      <ol class="roadmap-grid">
+        <li class="roadmap-item reveal">
+          <span class="roadmap-status">promoted · transport</span>
+          <h3><a href="https://github.com/FelineStateMachine/goq/issues/7" rel="noopener">Iroh/MoQ media objects</a></h3>
+          <p>Prioritized, cancellable video objects with explicit GOP boundaries and keyframe recovery. Input remains independent.</p>
+        </li>
+        <li class="roadmap-item reveal">
+          <span class="roadmap-status">promoted · control</span>
+          <h3><a href="https://github.com/FelineStateMachine/goq/issues/8" rel="noopener">Adaptive bitrate</a></h3>
+          <p>Feed RTT, loss, backpressure, and decode backlog into a bounded controller with measured recovery and no queue growth.</p>
+        </li>
+        <li class="roadmap-item reveal">
+          <span class="roadmap-status">promoted · motion</span>
+          <h3><a href="https://github.com/FelineStateMachine/goq/issues/9" rel="noopener">Motion-sensitive resolution</a></h3>
+          <p>Favor fresh, smooth motion at lower resolution, then restore detail after motion settles without breaking pointer mapping.</p>
+        </li>
+        <li class="roadmap-item reveal">
+          <span class="roadmap-status">promoted · codec</span>
+          <h3><a href="https://github.com/FelineStateMachine/goq/issues/10" rel="noopener">Auto Codec</a></h3>
+          <p>Select from end-to-end hardware support and measured latency. H.264 remains the safe baseline; compression ratio alone never wins.</p>
         </li>
       </ol>
     </section>
@@ -158,12 +188,12 @@
         <li class="start-step reveal">
           <span class="start-num" aria-hidden="true">01</span>
           <h3>provision sigil</h3>
-          <p>A bare-metal Linux box. The runbook walks an AMD Bazzite machine from blank to streaming. The daemon runs headless; Gamescope is the display.</p>
+          <p>Run the Sigil setup command on a dedicated AMD Bazzite machine. It accepts only signed runtime packages; Gamescope becomes the headless display.</p>
         </li>
         <li class="start-step reveal">
           <span class="start-num" aria-hidden="true">02</span>
           <h3>open portal</h3>
-          <p>In Portal, tap your FIDO2 key and identity is minted on the token. A D-pad PIN pad keeps it couch-friendly.</p>
+          <p>Download a signed Portal build on your client machine. Tap your FIDO2 key; the D-pad PIN pad keeps onboarding couch-friendly.</p>
         </li>
         <li class="start-step reveal">
           <span class="start-num" aria-hidden="true">03</span>
@@ -171,7 +201,7 @@
           <p>Tap the same key anywhere else: SteamOS appears, your controller just works. Hold Back+Start for a second to escape the session.</p>
         </li>
       </ol>
-      <p class="start-note">You'll need a FIDO2 key with hmac-secret support (YubiKey, Google Titan, …) and a Linux machine for Sigil. Portal builds run on Linux and macOS. <a class="footer-link" href="https://github.com/FelineStateMachine/goq" rel="noopener">Runbook and source →</a></p>
+      <p class="start-note">You'll need a FIDO2 key with hmac-secret support (YubiKey, Google Titan, …) and an AMD Bazzite machine for Sigil. The first signed Portal release targets macOS; other client packages remain source builds until they receive an equally strict release path. <a class="footer-link" href="https://github.com/FelineStateMachine/goq" rel="noopener">Runbook and source →</a></p>
     </section>
   </main>
 

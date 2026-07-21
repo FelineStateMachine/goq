@@ -163,13 +163,13 @@ pub(crate) fn reassert_client_cursor_grab(_window: &tauri::WebviewWindow) -> Res
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn reapply_hidden_cursor_rect(
     mut set_visible: impl FnMut(bool) -> Result<(), String>,
 ) -> Result<(), String> {
-    // Tao only invalidates its AppKit cursor rectangle when this boolean
-    // changes. Force that transition after focus returns while the balanced
-    // CoreGraphics hide remains active, so the intermediate state cannot flash.
+    // Tao only invalidates the platform cursor state when this boolean
+    // changes. Force that transition while the native grab is active; on
+    // macOS the balanced CoreGraphics hide prevents the intermediate state
+    // from flashing at the frozen cursor position.
     set_visible(true)?;
     set_visible(false)
 }

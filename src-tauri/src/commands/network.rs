@@ -1,15 +1,15 @@
 use super::auth::derive_iroh_secret_from_key;
 use super::enrollment::{connection_enrollment, mark_invitation_redeemed};
-use super::moq_catalog::subscribe_goq_video_track;
-#[cfg(test)]
-use super::network_diagnostics::PathMode;
-use super::network_diagnostics::{
-    NetworkDiagnosticsSnapshot, NetworkLeg, NetworkSessionDiagnostics,
-};
 use super::state::{
     AUDIO_DELIVERY_CAPACITY, AccumulatedMediaFeedback, AppState, AudioDeliveryState,
     CLIENT_INPUT_QUEUE_CAPACITY, FRAME_ALPN, INPUT_ALPN, MediaFeedbackSender,
     development_direct_node_available,
+};
+use crate::media::moq_catalog::subscribe_goq_video_track;
+#[cfg(test)]
+use crate::media::network_diagnostics::PathMode;
+use crate::media::network_diagnostics::{
+    NetworkDiagnosticsSnapshot, NetworkLeg, NetworkSessionDiagnostics,
 };
 use base64::Engine;
 use iroh::{Endpoint, SecretKey, endpoint::presets};

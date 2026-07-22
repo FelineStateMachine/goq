@@ -1,13 +1,74 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const REVISION_PREFIX: &str = "sha256:";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ConfigRevision(String);
+
+impl ConfigRevision {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let digest = Sha256::digest(bytes);
+        let mut value = String::with_capacity(REVISION_PREFIX.len() + digest.len() * 2);
+        value.push_str(REVISION_PREFIX);
+        for byte in digest {
+            use fmt::Write as _;
+            write!(&mut value, "{byte:02x}").expect("writing into a String cannot fail");
+        }
+        Self(value)
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        let digest = value.strip_prefix(REVISION_PREFIX).unwrap_or_default();
+        ensure!(
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "config revision must be sha256 followed by 64 lowercase hexadecimal digits"
+        );
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigRevision {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for ConfigRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadedHostConfig {
+    pub config: HostConfig,
+    pub bytes: Vec<u8>,
+    pub revision: ConfigRevision,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -317,6 +378,10 @@ impl HostConfig {
     pub const TEST_PATTERN_HEIGHT: u32 = 800;
 
     pub fn load(path: &Path) -> Result<Self> {
+        Ok(Self::load_document(path)?.config)
+    }
+
+    pub fn load_document(path: &Path) -> Result<LoadedHostConfig> {
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -331,11 +396,36 @@ impl HostConfig {
             .metadata()
             .with_context(|| format!("inspecting opened config {}", path.display()))?;
         validate_file_security(path, &metadata)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
+        ensure!(
+            metadata.len() <= MAX_CONFIG_BYTES,
+            "config exceeds its fixed size bound"
+        );
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        Read::by_ref(&mut file)
+            .take(MAX_CONFIG_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let config: Self = toml::from_str(&contents)
-            .with_context(|| format!("parsing config {}", path.display()))?;
+        ensure!(
+            bytes.len() as u64 <= MAX_CONFIG_BYTES,
+            "config exceeds its fixed size bound"
+        );
+        let config =
+            Self::parse(&bytes).with_context(|| format!("parsing config {}", path.display()))?;
+        let revision = ConfigRevision::from_bytes(&bytes);
+        Ok(LoadedHostConfig {
+            config,
+            bytes,
+            revision,
+        })
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() as u64 <= MAX_CONFIG_BYTES,
+            "config exceeds its fixed size bound"
+        );
+        let contents = std::str::from_utf8(bytes).context("config is not valid UTF-8")?;
+        let config: Self = toml::from_str(contents).context("parsing config TOML")?;
         config.validate()?;
         Ok(config)
     }
@@ -500,6 +590,30 @@ fn validate_file_security(path: &Path, metadata: &fs::Metadata) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_revision_is_exact_bounded_and_strict() {
+        let first = ConfigRevision::from_bytes(b"a = 1\n");
+        let second = ConfigRevision::from_bytes(b"a = 1\n\n");
+        assert_ne!(first, second);
+        assert_eq!(ConfigRevision::parse(first.as_str()).unwrap(), first);
+        assert!(ConfigRevision::parse("sha256:ABC").is_err());
+        assert!(ConfigRevision::parse("md5:00000000000000000000000000000000").is_err());
+    }
+
+    #[test]
+    fn load_document_hashes_the_same_bounded_bytes_it_parses() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("host.toml");
+        let bytes = b"identity_path = \"/tmp/host.key\"\nstate_path = \"/tmp/state\"\n";
+        fs::write(&path, bytes).unwrap();
+        let loaded = HostConfig::load_document(&path).unwrap();
+        assert_eq!(loaded.bytes, bytes);
+        assert_eq!(loaded.revision, ConfigRevision::from_bytes(bytes));
+
+        fs::write(&path, vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        assert!(HostConfig::load_document(&path).is_err());
+    }
 
     #[test]
     fn rejects_unknown_fields() {

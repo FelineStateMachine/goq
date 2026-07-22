@@ -3,6 +3,7 @@ mod audio;
 mod authorization;
 mod clock;
 mod config;
+mod config_management;
 mod cursor;
 mod identity;
 mod input;
@@ -14,6 +15,7 @@ mod source;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,7 +38,7 @@ use tracing_subscriber::EnvFilter;
 use crate::authorization::{
     AuthorizationPolicy, AuthorizationStore, grant_names, unix_timestamp_now,
 };
-use crate::config::{HostConfig, InputMode, VideoSource};
+use crate::config::{ConfigRevision, HostConfig, InputMode, VideoSource};
 use crate::cursor::PointerPositionTracker;
 use crate::input::InputBackend;
 use crate::server::{
@@ -99,6 +101,9 @@ enum ApplianceCommand {
         /// Emit the stable machine-readable schema.
         #[arg(long, required = true)]
         json: bool,
+        /// Public status schema. Version 1 remains the compatibility default.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=2))]
+        schema_version: u16,
     },
     /// Revoke the enrolled Portal and invalidate every outstanding invitation.
     EnrollmentReset {
@@ -108,6 +113,56 @@ enum ApplianceCommand {
         #[arg(long)]
         expected_host_fingerprint: String,
         /// Emit the stable machine-readable schema.
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Inspect or transactionally update the validated host configuration.
+    Config {
+        #[command(subcommand)]
+        command: ApplianceConfigCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ApplianceConfigCommand {
+    /// Show only the controller-editable configuration projection.
+    Show {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Validate a bounded JSON request from stdin without writing.
+    Validate {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Stage and atomically install a validated candidate while Sigil is stopped.
+    Set {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Commit a candidate proven by one exact stopped daemon instance.
+    Commit {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        transaction: String,
+        #[arg(long)]
+        expected_instance: String,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Restore the byte-exact prior configuration while Sigil is stopped.
+    Rollback {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        transaction: String,
         #[arg(long, required = true)]
         json: bool,
     },
@@ -247,8 +302,21 @@ struct ServeArgs {
     max_runtime_seconds: Option<u64>,
 }
 
+enum CliFailure {
+    General(anyhow::Error),
+    Management(config_management::ManagementError),
+}
+
+impl From<anyhow::Error> for CliFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::General(error)
+    }
+}
+
+type CliResult<T> = std::result::Result<T, CliFailure>;
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -257,30 +325,96 @@ async fn main() -> Result<()> {
         .init();
     server::install_panic_hook();
 
-    match Cli::parse().command {
-        Command::Appliance { command } => appliance_command(command),
-        Command::Identity { command } => identity_command(command),
-        Command::Config { command } => config_command(command).await,
-        Command::Capture { command } => capture_command(command).await,
-        Command::Invitation { command } => invitation_command(command),
-        Command::Enrollment { command } => enrollment_command(command),
-        Command::Serve(args) => serve_command(args).await,
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(CliFailure::Management(error)) => {
+            let response = serde_json::to_string(&error.response())
+                .expect("serializing a fixed management error cannot fail");
+            eprintln!("{response}");
+            ExitCode::FAILURE
+        }
+        Err(CliFailure::General(error)) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 
-fn appliance_command(command: ApplianceCommand) -> Result<()> {
+async fn run() -> CliResult<()> {
+    match Cli::parse().command {
+        Command::Appliance { command } => appliance_command(command),
+        Command::Identity { command } => identity_command(command).map_err(Into::into),
+        Command::Config { command } => config_command(command).await.map_err(Into::into),
+        Command::Capture { command } => capture_command(command).await.map_err(Into::into),
+        Command::Invitation { command } => invitation_command(command).map_err(Into::into),
+        Command::Enrollment { command } => enrollment_command(command).map_err(Into::into),
+        Command::Serve(args) => serve_command(args).await.map_err(Into::into),
+    }
+}
+
+fn appliance_command(command: ApplianceCommand) -> CliResult<()> {
     match command {
-        ApplianceCommand::Status { config, json: _ } => {
-            let status = appliance::collect_status(&config)?;
-            println!("{}", serde_json::to_string(&status)?);
+        ApplianceCommand::Status {
+            config,
+            json: _,
+            schema_version,
+        } => {
+            let status = appliance::collect_status(&config).map_err(CliFailure::from)?;
+            println!("{}", appliance::status_json(&status, schema_version)?);
         }
         ApplianceCommand::EnrollmentReset {
             config,
             expected_host_fingerprint,
             json: _,
         } => {
-            let result = appliance::reset_enrollment(&config, &expected_host_fingerprint)?;
-            println!("{}", serde_json::to_string(&result)?);
+            let result = appliance::reset_enrollment(&config, &expected_host_fingerprint)
+                .map_err(CliFailure::from)?;
+            println!(
+                "{}",
+                serde_json::to_string(&result).map_err(anyhow::Error::from)?
+            );
+        }
+        ApplianceCommand::Config { command } => {
+            let result = match command {
+                ApplianceConfigCommand::Show { config, json: _ } => serde_json::to_value(
+                    config_management::show(&config).map_err(CliFailure::Management)?,
+                ),
+                ApplianceConfigCommand::Validate { config, json: _ } => {
+                    let request = config_management::read_request(std::io::stdin().lock())
+                        .map_err(CliFailure::Management)?;
+                    serde_json::to_value(
+                        config_management::validate(&config, &request)
+                            .map_err(CliFailure::Management)?,
+                    )
+                }
+                ApplianceConfigCommand::Set { config, json: _ } => {
+                    let request = config_management::read_request(std::io::stdin().lock())
+                        .map_err(CliFailure::Management)?;
+                    serde_json::to_value(
+                        config_management::set(&config, &request)
+                            .map_err(CliFailure::Management)?,
+                    )
+                }
+                ApplianceConfigCommand::Commit {
+                    config,
+                    transaction,
+                    expected_instance,
+                    json: _,
+                } => serde_json::to_value(
+                    config_management::commit(&config, &transaction, &expected_instance)
+                        .map_err(CliFailure::Management)?,
+                ),
+                ApplianceConfigCommand::Rollback {
+                    config,
+                    transaction,
+                    json: _,
+                } => serde_json::to_value(
+                    config_management::rollback(&config, &transaction)
+                        .map_err(CliFailure::Management)?,
+                ),
+            }
+            .map_err(anyhow::Error::from)?;
+            println!("{result}");
         }
     }
     Ok(())
@@ -623,17 +757,25 @@ impl Drop for CaptureTaskGuard {
 }
 
 async fn serve_command(args: ServeArgs) -> Result<()> {
-    let mut config = load_serve_config(&args)?;
-    config.validate()?;
-    config.ensure_runtime_directory()?;
     let configured_service = args.config.is_some();
-    let _lifecycle = appliance::LifecycleGuard::acquire(&config.state_path, configured_service)?;
+    let (mut config, loaded_config_revision, _lifecycle) = if let Some(config_path) = &args.config {
+        let (loaded, lifecycle) =
+            config_management::prepare_service(config_path).map_err(anyhow::Error::new)?;
+        (loaded.config, Some(loaded.revision), lifecycle)
+    } else {
+        let loaded = load_serve_config(&args)?;
+        loaded.config.validate()?;
+        loaded.config.ensure_runtime_directory()?;
+        let lifecycle = appliance::LifecycleGuard::acquire(&loaded.config.state_path, false)?;
+        (loaded.config, loaded.revision, lifecycle)
+    };
     let secret = identity::load(&config.identity_path)?;
     let sessions = Arc::new(SessionRegistry::default());
     let publisher = appliance::RuntimePublisher::start(
         secret.public(),
         Arc::clone(&sessions),
         configured_service,
+        loaded_config_revision,
     )?;
     let authorization_result = if configured_service {
         AuthorizationStore::open(config.state_path.clone(), secret.public())
@@ -903,10 +1045,16 @@ async fn wait_for_shutdown_signal() -> Result<&'static str> {
     }
 }
 
-fn load_serve_config(args: &ServeArgs) -> Result<HostConfig> {
-    if let Some(path) = &args.config {
-        return HostConfig::load(path);
-    }
+struct LoadedServeConfig {
+    config: HostConfig,
+    revision: Option<ConfigRevision>,
+}
+
+fn load_serve_config(args: &ServeArgs) -> Result<LoadedServeConfig> {
+    ensure!(
+        args.config.is_none(),
+        "configured service loading must hold its lifecycle transaction locks"
+    );
     let identity_path = args
         .identity
         .clone()
@@ -924,19 +1072,22 @@ fn load_serve_config(args: &ServeArgs) -> Result<HostConfig> {
             .unwrap_or_else(|| Path::new("."))
             .join("runtime")
     });
-    Ok(HostConfig {
-        identity_path,
-        state_path,
-        source: source.into(),
-        width: Some(args.width),
-        height: Some(args.height),
-        framerate: args.framerate,
-        codec: "h264".into(),
-        input_mode: InputMode::Log,
-        uinput: None,
-        ffmpeg_path: args.ffmpeg.clone(),
-        gamescope_pipewire: None,
-        audio: None,
+    Ok(LoadedServeConfig {
+        config: HostConfig {
+            identity_path,
+            state_path,
+            source: source.into(),
+            width: Some(args.width),
+            height: Some(args.height),
+            framerate: args.framerate,
+            codec: "h264".into(),
+            input_mode: InputMode::Log,
+            uinput: None,
+            ffmpeg_path: args.ffmpeg.clone(),
+            gamescope_pipewire: None,
+            audio: None,
+        },
+        revision: None,
     })
 }
 
@@ -1055,6 +1206,32 @@ mod tests {
             Cli::try_parse_from(["sigil", "appliance", "status", "--config", "/tmp/host.toml"])
                 .is_err()
         );
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "appliance",
+                "status",
+                "--config",
+                "/tmp/host.toml",
+                "--json",
+                "--schema-version",
+                "2",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "appliance",
+                "status",
+                "--config",
+                "/tmp/host.toml",
+                "--json",
+                "--schema-version",
+                "3",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1077,6 +1254,63 @@ mod tests {
                 "enrollment-reset",
                 "--config",
                 "/tmp/host.toml",
+                "--json",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn appliance_config_commands_require_explicit_machine_inputs() {
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "appliance",
+                "config",
+                "show",
+                "--config",
+                "/tmp/host.toml",
+                "--json",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "appliance",
+                "config",
+                "set",
+                "--config",
+                "/tmp/host.toml",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "appliance",
+                "config",
+                "commit",
+                "--config",
+                "/tmp/host.toml",
+                "--transaction",
+                "0123456789abcdef0123456789abcdef",
+                "--expected-instance",
+                "fedcba9876543210fedcba9876543210",
+                "--json",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "appliance",
+                "config",
+                "commit",
+                "--config",
+                "/tmp/host.toml",
+                "--transaction",
+                "0123456789abcdef0123456789abcdef",
                 "--json",
             ])
             .is_err()

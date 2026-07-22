@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    time::{Duration, Instant},
+    fs::OpenOptions,
+    io::Read,
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -10,13 +13,21 @@ use iroh_moq::{Moq, MoqSession};
 use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
 use sigil_protocol::{
     CONTROL_ALPN_V1, Capability, ClientHello, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN,
-    GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, InputEvent, KeyframeRequestReasonV3,
-    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3,
-    MediaCodec, MediaControlRequestV3, MediaFrame, MediaObjectV3, PointerSurfaceDimensions,
-    ProtocolError, decode_media_frame_object, media_moq_broadcast_name, read_host_hello,
+    GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, INVITATION_CLOCK_SKEW_SECS, InputEvent,
+    InvitationGrants, KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN, MAX_MEDIA_GROUP_BYTES_V3,
+    MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3, MediaCodec,
+    MediaControlRequestV3, MediaFrame, MediaObjectV3, PointerSurfaceDimensions, ProtocolError,
+    SignedInvitation, decode_media_frame_object, media_moq_broadcast_name, read_host_hello,
     read_input_ack, read_media_frame, read_media_object, read_media_object_v3, write_client_hello,
     write_input_event, write_media_control_request_v3,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+#[allow(dead_code)]
+#[path = "../identity.rs"]
+mod identity;
 
 mod moq_catalog;
 
@@ -29,6 +40,13 @@ const MEDIA_OBJECT_CAPACITY: usize = 4;
 struct Args {
     #[arg(long)]
     node_id: EndpointId,
+    /// Owner-only 32-byte Iroh identity. Omit for the existing ephemeral probe.
+    #[arg(long, value_name = "PATH")]
+    identity: Option<PathBuf>,
+    /// Owner-only one-time Sigil invitation file. Sent only on the first media
+    /// handshake and requires a persistent identity bound to that invitation.
+    #[arg(long, value_name = "PATH", requires = "identity")]
+    invitation: Option<PathBuf>,
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(1..=36_000))]
     frames: u32,
     #[arg(long, default_value_t = 15)]
@@ -110,6 +128,7 @@ impl MediaTransport {
 
 const KEYFRAME_SMOKE_REQUEST_AFTER_FRAMES: u32 = 3;
 const KEYFRAME_SMOKE_MINIMUM_FRAMES: u32 = KEYFRAME_SMOKE_REQUEST_AFTER_FRAMES + 1;
+const MAX_INVITATION_FILE_BYTES: u64 = (MAX_INVITATION_TOKEN_LEN + 2) as u64;
 
 #[derive(Debug)]
 enum MediaObjectOutcome {
@@ -955,7 +974,22 @@ async fn main() -> Result<()> {
         "--keyframe-smoke requires at least {KEYFRAME_SMOKE_MINIMUM_FRAMES} accepted frames"
     );
 
-    let secret = SecretKey::generate();
+    let secret = match args.identity.as_deref() {
+        Some(path) => identity::load(path).context("loading persistent probe identity")?,
+        None => SecretKey::generate(),
+    };
+    let mut required_grants = InvitationGrants::VIEW;
+    if args.pointer_smoke {
+        required_grants = required_grants.union(InvitationGrants::POINTER_KEYBOARD);
+    }
+    if args.gamepad_smoke {
+        required_grants = required_grants.union(InvitationGrants::GAMEPAD);
+    }
+    let invitation = args
+        .invitation
+        .as_deref()
+        .map(|path| load_invitation_file(path, args.node_id, secret.public(), required_grants))
+        .transpose()?;
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).context("generating handshake nonce")?;
     let endpoint = Endpoint::builder(presets::N0)
@@ -995,6 +1029,7 @@ async fn main() -> Result<()> {
         vec![Capability::VideoH264],
         Capability::VideoH264,
         handshake_name,
+        invitation.as_deref(),
     )
     .await?;
     let session_id = media_negotiation.session_id;
@@ -1053,6 +1088,7 @@ async fn main() -> Result<()> {
         input_offers,
         Capability::InputAck,
         "input",
+        None,
     )
     .await?;
     ensure!(
@@ -1683,6 +1719,118 @@ fn parse_minimum_fps(value: &str) -> std::result::Result<f64, String> {
     Ok(minimum_fps)
 }
 
+fn load_invitation_file(
+    path: &Path,
+    expected_host: EndpointId,
+    expected_peer: EndpointId,
+    required_grants: InvitationGrants,
+) -> Result<String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(path).with_context(|| {
+        format!(
+            "opening invitation {} without following symlinks",
+            path.display()
+        )
+    })?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting invitation {}", path.display()))?;
+    ensure!(metadata.is_file(), "invitation must be a regular file");
+    ensure!(
+        metadata.len() <= MAX_INVITATION_FILE_BYTES,
+        "invitation {} exceeds the bounded file size",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        ensure!(
+            metadata.mode() & 0o077 == 0,
+            "invitation {} must not be readable or writable by group or other users",
+            path.display()
+        );
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() },
+            "invitation {} is not owned by the current user",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_INVITATION_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading invitation {}", path.display()))?;
+    ensure!(
+        bytes.len() as u64 <= MAX_INVITATION_FILE_BYTES,
+        "invitation {} grew beyond the bounded file size while being read",
+        path.display()
+    );
+    let token_bytes = bytes
+        .strip_suffix(b"\r\n")
+        .or_else(|| bytes.strip_suffix(b"\n"))
+        .unwrap_or(&bytes);
+    ensure!(
+        !token_bytes.is_empty() && token_bytes.len() <= MAX_INVITATION_TOKEN_LEN,
+        "invitation token has an invalid length"
+    );
+    ensure!(
+        !token_bytes.contains(&b'\n') && !token_bytes.contains(&b'\r'),
+        "invitation file contains unexpected line breaks"
+    );
+    let token = std::str::from_utf8(token_bytes).context("invitation file is not UTF-8")?;
+    let invitation =
+        SignedInvitation::decode(token).context("decoding and verifying invitation file")?;
+    ensure!(
+        invitation.claims.host_node_id == *expected_host.as_bytes(),
+        "invitation belongs to a different Sigil host"
+    );
+    ensure!(
+        invitation.claims.intended_peer_id == *expected_peer.as_bytes(),
+        "invitation is bound to a different probe identity"
+    );
+    ensure!(
+        invitation.claims.grants.contains(required_grants),
+        "invitation does not grant every requested probe capability"
+    );
+    ensure!(
+        invitation
+            .claims
+            .grants
+            .contains(InvitationGrants::POINTER_KEYBOARD)
+            || invitation.claims.grants.contains(InvitationGrants::GAMEPAD),
+        "invitation must grant pointer/keyboard or gamepad for the probe input acknowledgment"
+    );
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    ensure!(
+        now >= invitation
+            .claims
+            .issued_at_unix
+            .saturating_sub(INVITATION_CLOCK_SKEW_SECS),
+        "invitation was issued too far in the future"
+    );
+    ensure!(
+        now <= invitation.claims.expires_at_unix,
+        "invitation has expired"
+    );
+    Ok(token.to_owned())
+}
+
+fn probe_client_hello(
+    nonce: [u8; 16],
+    capabilities: Vec<Capability>,
+    invitation: Option<&str>,
+) -> ClientHello {
+    let hello = ClientHello::new("sigil-probe/0.1.0", nonce, capabilities);
+    match invitation {
+        Some(invitation) => hello.with_invitation(invitation),
+        None => hello,
+    }
+}
+
 async fn negotiate(
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
@@ -1690,13 +1838,11 @@ async fn negotiate(
     capabilities: Vec<Capability>,
     required: Capability,
     name: &str,
+    invitation: Option<&str>,
 ) -> Result<Negotiated> {
-    write_client_hello(
-        send,
-        &ClientHello::new("sigil-probe/0.1.0", nonce, capabilities),
-    )
-    .await
-    .with_context(|| format!("writing {name} hello"))?;
+    write_client_hello(send, &probe_client_hello(nonce, capabilities, invitation))
+        .await
+        .with_context(|| format!("writing {name} hello"))?;
     let response = tokio::time::timeout(Duration::from_secs(10), read_host_hello(recv))
         .await
         .with_context(|| format!("timed out waiting for {name} hello"))??
@@ -2174,6 +2320,233 @@ mod tests {
         );
     }
 
+    fn test_invitation(
+        host: &SecretKey,
+        peer: &SecretKey,
+        grants: InvitationGrants,
+        issued_at_unix: u64,
+        expires_at_unix: u64,
+    ) -> String {
+        let claims = sigil_protocol::InvitationClaims::new(
+            *host.public().as_bytes(),
+            *peer.public().as_bytes(),
+            issued_at_unix,
+            expires_at_unix,
+            1,
+            [0x55; 32],
+            grants,
+        )
+        .unwrap();
+        SignedInvitation::issue(claims, &host.to_bytes())
+            .unwrap()
+            .encode()
+    }
+
+    fn write_private_invitation(path: &Path, token: &str, ending: &[u8]) {
+        let mut bytes = token.as_bytes().to_vec();
+        bytes.extend_from_slice(ending);
+        std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn persistent_probe_credentials_are_explicit_and_paired() {
+        let node_id = SecretKey::from_bytes(&[0x2a; 32]).public().to_string();
+        assert!(
+            Args::try_parse_from([
+                "sigil-probe",
+                "--node-id",
+                &node_id,
+                "--invitation",
+                "probe.goq-invite",
+            ])
+            .is_err()
+        );
+        let persistent = Args::try_parse_from([
+            "sigil-probe",
+            "--node-id",
+            &node_id,
+            "--identity",
+            "probe.key",
+            "--invitation",
+            "probe.goq-invite",
+        ])
+        .unwrap();
+        assert_eq!(persistent.identity, Some(PathBuf::from("probe.key")));
+        assert_eq!(
+            persistent.invitation,
+            Some(PathBuf::from("probe.goq-invite"))
+        );
+    }
+
+    #[test]
+    fn private_invitation_preflight_accepts_only_the_bound_current_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("probe.goq-invite");
+        let host = SecretKey::from_bytes(&[0x31; 32]);
+        let peer = SecretKey::from_bytes(&[0x32; 32]);
+        let other = SecretKey::from_bytes(&[0x33; 32]);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = test_invitation(
+            &host,
+            &peer,
+            InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD),
+            now.saturating_sub(1),
+            now + 600,
+        );
+
+        write_private_invitation(&path, &token, b"\n");
+        assert_eq!(
+            load_invitation_file(
+                &path,
+                host.public(),
+                peer.public(),
+                InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD),
+            )
+            .unwrap(),
+            token
+        );
+        write_private_invitation(&path, &token, b"\r\n");
+        assert!(
+            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
+                .is_ok()
+        );
+        assert!(
+            load_invitation_file(&path, other.public(), peer.public(), InvitationGrants::VIEW,)
+                .is_err()
+        );
+        assert!(
+            load_invitation_file(&path, host.public(), other.public(), InvitationGrants::VIEW,)
+                .is_err()
+        );
+        assert!(
+            load_invitation_file(
+                &path,
+                host.public(),
+                peer.public(),
+                InvitationGrants::POINTER_KEYBOARD,
+            )
+            .is_err()
+        );
+
+        let view_only = test_invitation(
+            &host,
+            &peer,
+            InvitationGrants::VIEW,
+            now.saturating_sub(1),
+            now + 600,
+        );
+        write_private_invitation(&path, &view_only, b"\n");
+        assert!(
+            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
+                .unwrap_err()
+                .to_string()
+                .contains("input acknowledgment")
+        );
+
+        let expired = test_invitation(
+            &host,
+            &peer,
+            InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD),
+            now.saturating_sub(120),
+            now.saturating_sub(60),
+        );
+        write_private_invitation(&path, &expired, b"\n");
+        assert!(
+            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+        write_private_invitation(&path, &token, b"\n\n");
+        assert!(
+            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
+                .is_err()
+        );
+        let future = test_invitation(
+            &host,
+            &peer,
+            InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD),
+            now + INVITATION_CLOCK_SKEW_SECS + 1,
+            now + INVITATION_CLOCK_SKEW_SECS + 61,
+        );
+        write_private_invitation(&path, &future, b"\n");
+        assert!(
+            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
+                .unwrap_err()
+                .to_string()
+                .contains("future")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invitation_reader_rejects_unsafe_files() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("probe.goq-invite");
+        let link = temp.path().join("linked.goq-invite");
+        let host = SecretKey::from_bytes(&[0x41; 32]);
+        let peer = SecretKey::from_bytes(&[0x42; 32]);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = test_invitation(
+            &host,
+            &peer,
+            InvitationGrants::VIEW,
+            now.saturating_sub(1),
+            now + 60,
+        );
+        write_private_invitation(&path, &token, b"\n");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
+                .is_err()
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&path, &link).unwrap();
+        assert!(
+            load_invitation_file(&link, host.public(), peer.public(), InvitationGrants::VIEW,)
+                .is_err()
+        );
+        std::fs::write(&path, vec![b'x'; MAX_INVITATION_FILE_BYTES as usize + 1]).unwrap();
+        assert!(
+            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invitation_is_attached_only_when_the_caller_selects_the_media_hello() {
+        let host = SecretKey::from_bytes(&[0x51; 32]);
+        let peer = SecretKey::from_bytes(&[0x52; 32]);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = test_invitation(
+            &host,
+            &peer,
+            InvitationGrants::VIEW,
+            now.saturating_sub(1),
+            now + 60,
+        );
+        let media = probe_client_hello([7; 16], vec![Capability::VideoH264], Some(&token));
+        let input = probe_client_hello([7; 16], vec![Capability::InputAck], None);
+        assert_eq!(media.invitation.as_deref(), Some(token.as_str()));
+        assert_eq!(input.invitation, None);
+    }
+
     #[test]
     fn media_compatibility_flags_are_mutually_exclusive() {
         let node_id = SecretKey::from_bytes(&[0x2a; 32]).public().to_string();
@@ -2181,6 +2554,8 @@ mod tests {
         assert!(!default.media_v1);
         assert!(!default.media_v2);
         assert!(!default.media_v3);
+        assert_eq!(default.identity, None);
+        assert_eq!(default.invitation, None);
         assert_eq!(default.expect_size, None);
         let strict = Args::try_parse_from([
             "sigil-probe",

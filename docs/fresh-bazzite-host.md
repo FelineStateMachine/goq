@@ -33,6 +33,8 @@ sigil capture probe --source gamescope-pipewire --config <path> --frames <count>
 sigil serve --identity <path> --source test-pattern
 sigil serve --config <path>
 sigil-probe --node-id <host-node-id> --frames <count>
+sigil-probe --node-id <host-node-id> --identity <probe.key> \
+  [--invitation <probe.goq-invite>] --frames <count>
 portal --dev-connect <host-node-id>
 ```
 
@@ -109,6 +111,57 @@ profile.
 
 Do not put an identity seed in an environment variable or command-line
 argument. Store it in a mode `0600` file and pass only its path.
+
+For an authenticated headless hardware probe, create a dedicated persistent
+probe identity on the client and bind a short-lived invitation to its printed
+public ID. This enrollment is intentionally separate from the ordinary Portal
+profile and therefore belongs only in an isolated temporary host state:
+
+```bash
+# On the client:
+umask 077
+probe_state="$HOME/.local/state/goq-probe"
+install -d -m 0700 "$probe_state"
+sigil identity init --output "$probe_state/probe.key"
+
+# On the host's isolated test state/config, using the peer ID printed above:
+proof_state="$HOME/.local/state/sigil-spark-hardware-proof"
+sigil invitation create \
+  --config "$proof_state/host.toml" \
+  --peer PROBE_PEER_ID \
+  --pointer-keyboard \
+  --output "$proof_state/probe.goq-invite"
+
+# From the client, copy the exact invitation over the authenticated SSH path.
+scp tank@umpc:.local/state/sigil-spark-hardware-proof/probe.goq-invite \
+  "$probe_state/probe.goq-invite"
+chmod 0600 "$probe_state/probe.goq-invite"
+
+# First connection redeems the one-time invitation.
+sigil-probe --node-id HOST_NODE_ID \
+  --identity "$probe_state/probe.key" \
+  --invitation "$probe_state/probe.goq-invite" \
+  --keyframe-smoke --frames 120
+
+# Later connections use the same identity without replaying the invitation.
+sigil-probe --node-id HOST_NODE_ID \
+  --identity "$probe_state/probe.key" \
+  --keyframe-smoke --frames 120
+```
+
+Both credential files must be regular files owned by the current user with no
+group or other permissions. The probe verifies the invitation signature,
+host/peer binding, expiry, and requested grants before opening a network
+connection, sends it only on the initial media handshake, and never prints its
+contents. Delete the exact invitation file only after enrollment is confirmed;
+if a later session step fails after redemption, retry ticket-free with the same
+identity. After `sigil enrollment show` confirms the temporary probe peer,
+remove both exact copies:
+
+```bash
+rm -- "$HOME/.local/state/goq-probe/probe.goq-invite"
+ssh tank@umpc 'rm -- "$HOME/.local/state/sigil-spark-hardware-proof/probe.goq-invite"'
+```
 
 ## 1. Choose and install Bazzite
 

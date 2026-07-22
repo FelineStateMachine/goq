@@ -16,6 +16,8 @@ pub const MEDIA_TRANSPORT_NAMES: [&str; 5] = [
     "grouped-v3",
 ];
 
+pub(crate) const CLIENT_ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(crate) struct NegotiatedV1Stream {
     pub(crate) session_id: u64,
     pub(crate) capabilities: Vec<Capability>,

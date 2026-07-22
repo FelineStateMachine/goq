@@ -42,4 +42,24 @@ host, copy the runner to that host, then execute there:
 ./run-bazzite-hardware-uat.sh UAT_ROOT FULL_COMMIT WORKFLOW_RUN_ID
 ```
 
-The runner rejects reused output directories and concurrent hardware runs.
+If more than one exact AMD render-node/factory pair satisfies the complete UAT
+contract, discovery fails closed and prints the eligible pairs. Select one pair
+explicitly and rerun:
+
+```sh
+./run-bazzite-hardware-uat.sh UAT_ROOT FULL_COMMIT WORKFLOW_RUN_ID \
+  --render-node /dev/dri/renderD129 \
+  --va-encoder varenderD129h264enc
+```
+
+The two override options are inseparable, and the requested pair must pass the
+same device, driver, factory binding, property, CBR, and CQP checks as automatic
+selection. The runner rejects reused output directories and concurrent hardware
+runs.
+Before generating its isolated configs, it enumerates DRM render nodes through
+sysfs, considers only nodes backed by `amdgpu`, and matches each accessible node
+to the exact dynamically registered GstVA H.264 factory whose read-only
+`device-path` names that node. The chosen factory must advertise both CBR (for
+the in-process fixed/native legs) and CQP (for the external compatibility leg).
+The gate therefore does not assume either `/dev/dri/renderD128` or the generic
+`vah264enc` factory. The selected pair is recorded in `summary.env`.

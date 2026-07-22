@@ -2,14 +2,190 @@
 
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-  echo "usage: $0 UAT_ROOT UAT_COMMIT WORKFLOW_RUN_ID" >&2
+gst_property_block_contains() {
+  local property="$1"
+  local needle="$2"
+
+  awk -v property="$property" -v needle="$needle" '
+    $0 ~ ("^  " property "[[:space:]]+:") {
+      inside = 1
+    }
+    inside && index($0, needle) {
+      found = 1
+    }
+    inside && $0 !~ ("^  " property "[[:space:]]+:") \
+      && $0 ~ /^  [^[:space:]].*[[:space:]]+:/ {
+      exit
+    }
+    END { exit !found }
+  '
+}
+
+gst_property_block_is_writable() {
+  local property="$1"
+
+  awk -v property="$property" '
+    $0 ~ ("^  " property "[[:space:]]+:") {
+      inside = 1
+    }
+    inside && index(tolower($0), "writable") {
+      found = 1
+    }
+    inside && $0 !~ ("^  " property "[[:space:]]+:") \
+      && $0 ~ /^  [^[:space:]].*[[:space:]]+:/ {
+      exit
+    }
+    END { exit !found }
+  '
+}
+
+gstva_factory_supports_uat() {
+  local inspection="$1"
+  local property
+
+  gst_property_block_contains rate-control cbr <<<"$inspection" || return 1
+  gst_property_block_contains rate-control cqp <<<"$inspection" || return 1
+  for property in \
+    aud b-frames key-int-max rate-control ref-frames target-usage bitrate qpi qpp
+  do
+    gst_property_block_is_writable "$property" <<<"$inspection" || return 1
+  done
+}
+
+select_amd_gstva_h264_encoder() {
+  local gst_inspect_path="$1"
+  local sysfs_root="${2:-/sys/class/drm}"
+  local device_root="${3:-/dev/dri}"
+  local require_character="${4:-true}"
+  local override_node="${5:-}"
+  local override_factory="${6:-}"
+  local factory
+  local factories
+  local inspection
+  local node_name
+  local sysfs_node
+  local driver
+  local candidate
+  local pair
+  local candidate_count=0
+
+  render_node=''
+  va_encoder=''
+  va_candidates=''
+  factories="$(
+    LC_ALL=C "$gst_inspect_path" 2>/dev/null | awk '
+      $2 ~ /^va(renderD[0-9]+)?h264(lp)?enc:$/ {
+        sub(/:$/, "", $2)
+        print $2
+      }
+    ' | sort -u
+  )" || return 1
+
+  for sysfs_node in "$sysfs_root"/renderD*; do
+    [[ -e "$sysfs_node/device/driver" ]] || continue
+    node_name="$(basename "$sysfs_node")"
+    [[ "$node_name" =~ ^renderD[0-9]+$ ]] || continue
+    driver="$(basename "$(readlink -f "$sysfs_node/device/driver")")" || continue
+    [[ "$driver" == amdgpu ]] || continue
+    candidate="$device_root/$node_name"
+    [[ -e "$candidate" && ! -L "$candidate" && -r "$candidate" && -w "$candidate" ]] \
+      || continue
+    if [[ "$require_character" == true && ! -c "$candidate" ]]; then
+      continue
+    fi
+
+    while IFS= read -r factory; do
+      [[ -n "$factory" ]] || continue
+      if ! inspection="$(LC_ALL=C "$gst_inspect_path" "$factory" 2>/dev/null)"; then
+        continue
+      fi
+      gst_property_block_contains device-path "Default: \"$candidate\"" \
+        <<<"$inspection" || continue
+      gstva_factory_supports_uat "$inspection" || continue
+      pair="$candidate $factory"
+      if [[ -n "$va_candidates" ]]; then
+        va_candidates="$va_candidates
+$pair"
+      else
+        va_candidates="$pair"
+      fi
+      candidate_count=$((candidate_count + 1))
+      if [[ -n "$override_node" && "$candidate" == "$override_node" \
+        && "$factory" == "$override_factory" ]]; then
+        render_node="$candidate"
+        va_encoder="$factory"
+      elif [[ -z "$override_node" && "$candidate_count" -eq 1 ]]; then
+        render_node="$candidate"
+        va_encoder="$factory"
+      fi
+    done <<<"$factories"
+  done
+
+  if [[ -n "$override_node" ]]; then
+    [[ -n "$render_node" && -n "$va_encoder" ]]
+    return
+  fi
+  if [[ "$candidate_count" -eq 1 ]]; then
+    return 0
+  fi
+  render_node=''
+  va_encoder=''
+  [[ "$candidate_count" -eq 0 ]] && return 1
+  return 2
+}
+
+if [[ "${SIGIL_HARDWARE_UAT_SOURCE_ONLY:-}" == 1 ]]; then
+  if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+  fi
+  exit 0
+fi
+
+usage() {
+  echo "usage: $0 UAT_ROOT UAT_COMMIT WORKFLOW_RUN_ID [--render-node PATH --va-encoder FACTORY]" >&2
+}
+
+if [[ $# -lt 3 ]]; then
+  usage
   exit 64
 fi
 
 uat_root="$1"
 uat_commit="$2"
 workflow_run_id="$3"
+shift 3
+render_node_override=''
+va_encoder_override=''
+render_node_override_set=false
+va_encoder_override_set=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --render-node)
+      [[ $# -ge 2 && "$render_node_override_set" == false && -n "$2" ]] \
+        || { usage; exit 64; }
+      render_node_override="$2"
+      render_node_override_set=true
+      shift 2
+      ;;
+    --va-encoder)
+      [[ $# -ge 2 && "$va_encoder_override_set" == false && -n "$2" ]] \
+        || { usage; exit 64; }
+      va_encoder_override="$2"
+      va_encoder_override_set=true
+      shift 2
+      ;;
+    *)
+      usage
+      exit 64
+      ;;
+  esac
+done
+if [[ "$render_node_override_set" == true || "$va_encoder_override_set" == true ]]; then
+  [[ "$render_node_override_set" == true && "$va_encoder_override_set" == true ]] || {
+    echo "--render-node and --va-encoder must be provided together" >&2
+    exit 64
+  }
+fi
 short_commit="${uat_commit:0:12}"
 
 [[ "$uat_commit" =~ ^[0-9a-f]{40}$ ]] || {
@@ -206,10 +382,36 @@ xprop="$(command -v xprop)"
 gst_launch="$(command -v gst-launch-1.0)"
 gst_inspect="$(command -v gst-inspect-1.0)"
 ffmpeg="$(command -v ffmpeg)"
-render_node=/dev/dri/renderD128
-va_encoder=vah264enc
-[[ -S "$XDG_RUNTIME_DIR/pipewire-0" && -r "$render_node" && -w "$render_node" ]]
-"$gst_inspect" "$va_encoder" >/dev/null
+[[ -S "$XDG_RUNTIME_DIR/pipewire-0" ]]
+selection_status=0
+select_amd_gstva_h264_encoder \
+  "$gst_inspect" /sys/class/drm /dev/dri true \
+  "$render_node_override" "$va_encoder_override" || selection_status=$?
+if [[ "$selection_status" -ne 0 ]]; then
+  if [[ -n "$render_node_override" ]]; then
+    echo "the requested render-node and VA-encoder pair is not eligible for this UAT" >&2
+  elif [[ "$selection_status" -eq 2 ]]; then
+    echo "multiple AMD GstVA H.264 encoder pairs are eligible; select one exact pair with --render-node and --va-encoder" >&2
+  else
+    echo "no accessible AMD render node has a GstVA H.264 factory satisfying the CBR and CQP UAT contract" >&2
+  fi
+  if [[ -n "$va_candidates" ]]; then
+    while IFS= read -r pair; do
+      printf 'eligible_pair=%s\n' "$pair" >&2
+    done <<<"$va_candidates"
+  fi
+  exit 1
+fi
+if [[ -n "$render_node_override" ]]; then
+  vaapi_selection_mode=explicit
+else
+  vaapi_selection_mode=automatic-unique
+fi
+{
+  echo "vaapi_render_node=$render_node"
+  echo "vaapi_encoder=$va_encoder"
+  echo "vaapi_selection_mode=$vaapi_selection_mode"
+} >"$private/vaapi-selection.env"
 
 cat >"$fixed_config" <<EOF
 identity_path = "$host_identity"
@@ -812,6 +1014,9 @@ fi
   echo "fixed_observed_fps=$fixed_observed_fps"
   echo external_cqp_minimum_fps=55
   echo "external_cqp_observed_fps=$external_cqp_observed_fps"
+  echo "vaapi_render_node=$render_node"
+  echo "vaapi_encoder=$va_encoder"
+  echo "vaapi_selection_mode=$vaapi_selection_mode"
   echo cross_state_capture_contention=rejected
   echo gamescope_pointer_restart_cycles=2
   echo gamescope_pointer_feedback_recovery=pass

@@ -1563,7 +1563,10 @@ property to return, then rerun the pointer and feedback smoke without replaying
 the redeemed invitation. Both runs must pass, the Sigil PID must remain
 unchanged, and the host log must contain one `Gamescope Xwayland pointer
 feedback reconnected` event per restart. The packaged hardware UAT performs
-this sequence after its fixed-mode session checks.
+this sequence after its fixed-mode session checks. That runner independently
+enumerates `amdgpu` render nodes and matches the exact GstVA H.264 factory by
+its inspected `device-path`; it never assumes `renderD128` is the AMD device or
+that the matching factory is named `vah264enc`.
 
 For a deterministic pre-demo gamepad proof, leave `evtest "$gamepad_node"`
 running on the host and run this from the client checkout:

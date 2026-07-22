@@ -7,19 +7,19 @@ import {
   DecoderRecoveryState,
 } from './decoder-recovery.mjs';
 
-const main = await readFile(new URL('./main.js', import.meta.url), 'utf8');
+const pipeline = await readFile(new URL('./video-pipeline.mjs', import.meta.url), 'utf8');
 
-test('connect wiring uses the recovery state instead of removed legacy state', () => {
-  assert.doesNotMatch(main, /waitingForDecoderKeyframe/);
-  assert.match(main, /decoderRecovery\.reset\(\);/);
+test('video pipeline uses the recovery state instead of removed legacy state', () => {
+  assert.doesNotMatch(pipeline, /waitingForDecoderKeyframe/);
+  assert.match(pipeline, /decoderRecovery\.reset\(\);/);
 });
 
 test('decoder callbacks cannot mutate a replacement decoder session', () => {
   assert.match(
-    main,
+    pipeline,
     /output: \(frame\) => \{\s*if \(videoDecoder !== decoder\) \{\s*frame\.close\(\);\s*return;/,
   );
-  assert.match(main, /error: \(e\) => \{\s*if \(videoDecoder !== decoder\) return;/);
+  assert.match(pipeline, /error: \(error\) => \{\s*if \(videoDecoder !== decoder\) return;/);
 });
 
 test('a delivered discontinuity keyframe resets without requesting its replacement', () => {
@@ -37,7 +37,7 @@ test('a delivered discontinuity keyframe resets without requesting its replaceme
   assert.equal(recovery.confirmKeyframeEnqueued(true), true);
   assert.deepEqual(requests, []);
   assert.match(
-    main,
+    pipeline,
     /enterDecoderRecovery\(DECODER_RECOVERY_REASONS\.DISCONTINUITY, \{\s*requestKeyframe: !keyframe,/,
   );
 });

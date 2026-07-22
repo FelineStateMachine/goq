@@ -387,6 +387,25 @@ impl MotionResolutionPolicy {
     }
 }
 
+fn motion_resolution_policy(width: u32, height: u32) -> Result<Option<MotionResolutionPolicy>> {
+    let native = VideoDimensions {
+        width: u16::try_from(width).context("native width exceeds protocol")?,
+        height: u16::try_from(height).context("native height exceeds protocol")?,
+    };
+    match MotionResolutionPolicy::new(native) {
+        Ok(policy) => Ok(Some(policy)),
+        Err(error) => {
+            warn!(
+                %error,
+                width,
+                height,
+                "motion resolution disabled because this native mode has no exact reduced tier"
+            );
+            Ok(None)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FeedbackIngressCursor {
     last_report_id: Option<u64>,
@@ -2979,10 +2998,8 @@ async fn serve_media_feedback(
     let mut receiver_open = true;
     let mut controller = ShadowBitrateController::new(ceiling_kbps, lease.telemetry.snapshot());
     let mut resolution_controller = if encoder_actuation_available {
-        Some(MotionResolutionPolicy::new(VideoDimensions {
-            width: u16::try_from(config.width).context("native width exceeds protocol")?,
-            height: u16::try_from(config.height).context("native height exceeds protocol")?,
-        })?)
+        let (width, height) = config.resolved_dimensions()?;
+        motion_resolution_policy(width, height)?
     } else {
         None
     };
@@ -4913,6 +4930,8 @@ mod tests {
             })
             .is_err()
         );
+        assert!(motion_resolution_policy(1_920, 1_080).unwrap().is_some());
+        assert!(motion_resolution_policy(1_366, 768).unwrap().is_none());
     }
 
     #[test]
@@ -5572,8 +5591,8 @@ mod tests {
             identity_path: "identity".into(),
             state_path: "state".into(),
             source: VideoSource::TestPattern,
-            width: 1280,
-            height: 800,
+            width: Some(1280),
+            height: Some(800),
             framerate: 60,
             codec: "h264".to_owned(),
             input_mode: crate::config::InputMode::Disabled,

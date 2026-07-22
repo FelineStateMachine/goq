@@ -37,8 +37,10 @@ Steam and games.
   input messages, limits, and ALPNs.
 - The Linux host is the pure Rust `sigil` binary with no Tauri or webview
   dependency.
-- The Bazzite path captures the exact Gamescope PipeWire node and uses AMD
-  GstVA H.264 at the fixed 1280×800/60 first target.
+- The Bazzite path captures the exact Gamescope PipeWire node, derives the
+  encoded size from its bounded native caps by default, and uses AMD GstVA
+  H.264. An explicit width/height pair remains available for downscale proofs;
+  1280×800/60 is the first measured target, not a product constraint.
 - Gamescope video keeps the proven external `gst-launch` pipeline as its
   configuration default. Linux builds made explicitly with
   `in-process-gstreamer` can opt into an in-process pipeline for bounded
@@ -50,10 +52,12 @@ Steam and games.
   in-process CBR bitrate decision only after exact encoder readback. External
   encoder sessions remain explicitly advisory-only.
 - On the opt-in in-process backend, fresh damage-driven frame progress and
-  authenticated receiver pressure select either native 1280x800 or the exact
-  same-aspect 960x600 motion tier. A switch commits only when GStreamer emits a
-  target-size IDR with SPS/PPS; Portal then starts a new decoder epoch while
-  pointer mapping remains tied to the native Gamescope surface.
+  authenticated receiver pressure select either the resolved native mode or
+  an exact same-aspect three-quarter motion tier when one exists. A switch
+  commits only when GStreamer emits a target-size IDR with SPS/PPS; Portal then
+  starts a new decoder epoch while pointer mapping remains tied independently
+  to the native Gamescope surface. Modes without an exact even reduced tier
+  continue at native resolution instead of rejecting the stream.
 - Portal delivers encoded frames to WebCodecs through a raw Tauri binary
   channel. The handoff is capped at four frames, the decode queue and
   presentation queue at two, and a bounded watchdog recovers a suspended
@@ -297,7 +301,8 @@ The promoted streaming-hardening roadmap is tracked as bounded
 [adaptive bitrate](https://github.com/FelineStateMachine/goq/issues/8),
 [motion-sensitive resolution](https://github.com/FelineStateMachine/goq/issues/9),
 and [Auto Codec](https://github.com/FelineStateMachine/goq/issues/10). H.264 at
-1280×800/60 remains the known-safe first target while that work lands.
+1280×800/60 remains a known-safe benchmark while production capture accepts
+any even native mode within the protocol's bounded pixel limits.
 
 ## License
 

@@ -356,6 +356,12 @@ async fn config_command(command: ConfigCommand) -> Result<()> {
                     preflight.pointer_surface_dimensions.width,
                     preflight.pointer_surface_dimensions.height
                 );
+                println!(
+                    "encoded_mode={}x{}@{}",
+                    preflight.video_mode.width,
+                    preflight.video_mode.height,
+                    preflight.video_mode.framerate
+                );
                 println!("capture_preflight=ok");
                 if config.audio.is_some() {
                     let target = audio::preflight_audio(&config).await?;
@@ -396,8 +402,8 @@ async fn probe_test_pattern(args: CaptureProbeArgs) -> Result<()> {
         identity_path: PathBuf::from("unused-by-capture-probe"),
         state_path: PathBuf::from("."),
         source: VideoSource::TestPattern,
-        width,
-        height,
+        width: Some(width),
+        height: Some(height),
         framerate: 60,
         codec: "h264".into(),
         input_mode: InputMode::Disabled,
@@ -430,17 +436,26 @@ async fn probe_gamescope_pipewire(args: CaptureProbeArgs) -> Result<()> {
         config.source == VideoSource::GamescopePipewire,
         "capture config source must be gamescope-pipewire"
     );
+    let preflight = source::preflight_gamescope_pipewire(&config).await?;
+    let observed = (
+        u32::from(preflight.video_mode.width),
+        u32::from(preflight.video_mode.height),
+    );
     if let Some(expected) = args.expect_size {
         ensure!(
-            expected == (config.width, config.height),
-            "expected size {}x{} does not match configured size {}x{}",
+            expected == observed,
+            "expected size {}x{} does not match resolved encoded size {}x{}",
             expected.0,
             expected.1,
-            config.width,
-            config.height
+            observed.0,
+            observed.1
         );
     }
-    let configured_framerate = config.framerate;
+    println!(
+        "resolved_encoded_mode={}x{}@{}",
+        observed.0, observed.1, preflight.video_mode.framerate
+    );
+    let configured_framerate = preflight.video_mode.framerate;
     let source = source::spawn_gamescope_pipewire(config, clock::SessionClock::start()).await?;
     consume_capture_probe(
         args,
@@ -551,7 +566,7 @@ impl Drop for CaptureTaskGuard {
 }
 
 async fn serve_command(args: ServeArgs) -> Result<()> {
-    let config = load_serve_config(&args)?;
+    let mut config = load_serve_config(&args)?;
     config.validate()?;
     config.ensure_runtime_directory()?;
     let secret = identity::load(&config.identity_path)?;
@@ -563,9 +578,9 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     } else {
         AuthorizationPolicy::TestPatternProof
     };
-    let input_backend = InputBackend::initialize(&config)?;
-
     let pointer_surface_dimensions = if config.source == VideoSource::TestPattern {
+        let (width, height) = config.test_pattern_dimensions()?;
+        config.apply_resolved_dimensions(width, height)?;
         let status = tokio::process::Command::new(&config.ffmpeg_path)
             .arg("-version")
             .stdin(std::process::Stdio::null())
@@ -585,14 +600,22 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
             target_object = %preflight.target_object,
             pointer_surface_width = preflight.pointer_surface_dimensions.width,
             pointer_surface_height = preflight.pointer_surface_dimensions.height,
+            encoded_width = preflight.video_mode.width,
+            encoded_height = preflight.video_mode.height,
+            encoded_framerate = preflight.video_mode.framerate,
             "Gamescope PipeWire capture preflight passed"
         );
+        config.apply_resolved_dimensions(
+            u32::from(preflight.video_mode.width),
+            u32::from(preflight.video_mode.height),
+        )?;
         if config.audio.is_some() {
             audio::preflight_audio_static(&config).await?;
             info!("PipeWire Opus audio static preflight passed");
         }
         Some(preflight.pointer_surface_dimensions)
     };
+    let input_backend = InputBackend::initialize(&config)?;
 
     let pointer_positions = if config.source == VideoSource::GamescopePipewire
         && config.input_mode == InputMode::Uinput
@@ -773,8 +796,8 @@ fn load_serve_config(args: &ServeArgs) -> Result<HostConfig> {
         identity_path,
         state_path,
         source: source.into(),
-        width: args.width,
-        height: args.height,
+        width: Some(args.width),
+        height: Some(args.height),
         framerate: args.framerate,
         codec: "h264".into(),
         input_mode: InputMode::Log,

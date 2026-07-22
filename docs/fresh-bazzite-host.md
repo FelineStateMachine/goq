@@ -1053,8 +1053,6 @@ cat >"$probe_config" <<EOF
 identity_path = "$HOME/.local/share/sigil-spark/identity/host.key"
 state_path = "$HOME/.local/state/sigil-spark/runtime"
 source = "gamescope-pipewire"
-width = 1280
-height = 800
 framerate = 60
 codec = "h264"
 input_mode = "uinput"
@@ -1081,6 +1079,12 @@ bitrate_kbps = 12000
 EOF
 chmod 0600 "$probe_config"
 ```
+
+With `width` and `height` absent, Sigil uses the single bounded native size
+advertised by the selected Gamescope node. Set both fields only to request an
+explicit same-aspect encoded downscale; partial or distorting overrides are
+rejected. `framerate` is a maximum encoder cadence because current Gamescope
+PipeWire caps advertise `0/1` rather than a trustworthy native rate.
 
 Omitting `encoder_backend` has the same external default. After the external
 baseline passes, a locally built Linux binary containing the feature can use:
@@ -1257,21 +1261,22 @@ configured—prints the exact resolved sink target:
 ```
 
 Node enumeration and preflight are not enough. Consume 300 frames and verify a
-decodable H.264 keyframe, the configured output size, and a changing sequence:
+decodable H.264 keyframe, the resolved output size, and a changing sequence:
 
 ```bash
 "$HOME/.local/libexec/sigil-spark/current/sigil" capture probe \
   --source gamescope-pipewire \
   --config "$probe_config" \
   --frames 300 \
-  --expect-size 1280x800 \
   --minimum-fps 55
 ```
 
-The pipeline explicitly negotiates and converts its encoder input to NV12 at
-1280×800/60; do not infer that the underlying Gamescope/KMS output itself has
-that size. Record Gamescope's native PipeWire caps separately. The capture
-pipeline requests two PipeWire source buffers and then uses an explicit
+The probe prints `resolved_encoded_mode=<width>x<height>@<cap>` before capture
+and the dimensions observed on encoded frames afterward. Repeat with
+`--expect-size <width>x<height>` when recording a strict benchmark. The
+pipeline explicitly negotiates and converts its encoder input to NV12 at that
+resolved size and configured cadence ceiling. The capture pipeline bounds the
+PipeWire source pool between one and four buffers and then uses an explicit
 one-buffer, leaky-downstream queue; encoder-internal buffering is separate and
 must be measured on the installed GstVA version. Gamescope's stream is
 damage-driven and may emit no buffers while the image is static. The versioned
@@ -1297,19 +1302,21 @@ configuration whose `encoder_backend` is `in-process-gstreamer`. The external
 
 Connect Portal, enable host debug logs, and repeat at least ten cycles of a
 high-motion 3D scene followed by a static high-frequency test card. For each
-cycle retain the host journal and Portal console. The host decision record must
-show an applied 960x600 motion/pressure target, followed by an applied 1280x800
+cycle retain the host journal and Portal console. When the resolved native
+dimensions admit an exact even three-quarter tier, the host decision record
+must show that reduced motion/pressure target followed by the resolved native
 recovery target only after at least two seconds of stillness, three fresh clean
 feedback windows, and the three-second transition cooldown. A stale feedback
-window must never restore native resolution.
+window must never restore native resolution. A valid native mode without such
+a tier must remain streamable with motion adaptation visibly disabled.
 
 At each boundary verify that the first delivered target-size frame is a
 keyframe with SPS/PPS and a discontinuity, no preceding-resolution delta is
 presented afterward, and Portal stays connected without a WebCodecs error.
 Absolute pointer tests at the canvas center and four corners must continue to
 land on the native Gamescope surface at both encoded resolutions. The Portal
-window must not resize merely because 1280x800 and 960x600 have the same aspect
-ratio.
+window must not resize merely because the native and reduced modes have the
+same aspect ratio.
 
 Record transition request-to-configured-IDR time and Portal
 configured-IDR-to-first-presentation time separately. These are recovery
@@ -1374,7 +1381,8 @@ Only after the headless gate passes:
    the exact `host-gamescope-probe.toml` that will be installed.
 3. Install that validated file as `host.toml`; do not reconstruct or partially
    merge its strict node, encoder-factory, and render-node selection.
-4. Leave resolution at 1280×800 and frame rate at 60.
+4. Leave width and height absent for native resolution; retain frame rate 60 as
+   the explicit encoder ceiling unless a different measured cap is under test.
 5. Start the service and confirm the capture queue is bounded to one frame.
 6. Connect from the Mac with the Bazzite host's new development node ID.
 7. Enable the service only after the attached and headless capture probes pass.
@@ -1441,7 +1449,6 @@ sudo libinput debug-events --device "$pointer_node"
 target/debug/sigil-probe \
   --node-id <host-node-id> \
   --frames 120 \
-  --expect-size 1280x800 \
   --pointer-smoke
 ```
 
@@ -1465,7 +1472,6 @@ cargo build --locked -p sigil-host --bin sigil-probe
 target/debug/sigil-probe \
   --node-id <host-node-id> \
   --frames 120 \
-  --expect-size 1280x800 \
   --gamepad-smoke
 ```
 

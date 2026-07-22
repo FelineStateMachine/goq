@@ -76,6 +76,8 @@ pub struct EncoderControlStatus {
 /// the latest revision. Revisions are process-monotonic and never wrap.
 #[derive(Clone, Debug)]
 pub struct EncoderControl {
+    initial_width: u16,
+    initial_height: u16,
     next_revision: Arc<AtomicU64>,
     desired: watch::Sender<EncoderControlDesired>,
     status: watch::Receiver<EncoderControlStatus>,
@@ -86,7 +88,10 @@ pub struct EncoderControl {
     expect(dead_code, reason = "constructed only by the opt-in encoder backend")
 )]
 impl EncoderControl {
-    fn new() -> (
+    fn new(
+        initial_width: u16,
+        initial_height: u16,
+    ) -> (
         Self,
         watch::Receiver<EncoderControlDesired>,
         watch::Sender<EncoderControlStatus>,
@@ -95,6 +100,8 @@ impl EncoderControl {
         let (status_tx, status) = watch::channel(EncoderControlStatus::default());
         (
             Self {
+                initial_width,
+                initial_height,
                 next_revision: Arc::new(AtomicU64::new(0)),
                 desired,
                 status,
@@ -102,6 +109,10 @@ impl EncoderControl {
             desired_rx,
             status_tx,
         )
+    }
+
+    pub(crate) fn initial_dimensions(&self) -> (u16, u16) {
+        (self.initial_width, self.initial_height)
     }
 
     fn next_revision(&self) -> Result<u64> {
@@ -315,7 +326,11 @@ pub(crate) struct EncoderControlTestHarness {
 #[cfg(test)]
 impl EncoderControlTestHarness {
     pub(crate) fn new() -> Self {
-        let (control, desired, status) = EncoderControl::new();
+        Self::with_dimensions(1_280, 800)
+    }
+
+    pub(crate) fn with_dimensions(width: u16, height: u16) -> Self {
+        let (control, desired, status) = EncoderControl::new(width, height);
         Self {
             control,
             status,
@@ -608,7 +623,7 @@ fn spawn_in_process_pipeline(
 ) -> Result<EncodedSource> {
     let (sender, receiver) = watch::channel(None);
     let (current_gop_sender, current_gop) = watch::channel(None);
-    let (control, desired, status) = EncoderControl::new();
+    let (control, desired, status) = EncoderControl::new(initial_width, initial_height);
     let task = tokio::spawn(async move {
         tokio::task::spawn_blocking(move || {
             run_in_process_pipeline(
@@ -2130,9 +2145,44 @@ mod tests {
         }
     }
 
+    fn gamescope_dump(serial: u64, width: u16, height: u16) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([{
+            "type": "PipeWire:Interface:Node",
+            "info": {
+                "props": {
+                    "node.name": "gamescope",
+                    "media.class": "Video/Source",
+                    "device.bus-path": "pci-0000:04:00.0",
+                    "object.serial": serial,
+                },
+                "params": {
+                    "EnumFormat": [{
+                        "mediaType": "video",
+                        "mediaSubtype": "raw",
+                        "format": "NV12",
+                        "size": { "width": width, "height": height },
+                    }],
+                },
+            },
+        }]))
+        .unwrap()
+    }
+
+    #[test]
+    fn encoder_control_retains_initial_session_dimensions() {
+        let (native, _desired, _status) = EncoderControl::new(2_560, 1_600);
+        let (other, _desired, _status) = EncoderControl::new(1_366, 768);
+
+        assert_eq!(native.initial_dimensions(), (2_560, 1_600));
+        assert_eq!(other.initial_dimensions(), (1_366, 768));
+        native.request_resolution(1_280, 800).unwrap();
+        assert_eq!(native.initial_dimensions(), (2_560, 1_600));
+        assert_eq!(other.initial_dimensions(), (1_366, 768));
+    }
+
     #[tokio::test]
     async fn encoder_control_coalesces_latest_state_and_acknowledges_only_configured_idr() {
-        let (control, mut desired, status) = EncoderControl::new();
+        let (control, mut desired, status) = EncoderControl::new(1_280, 800);
 
         let superseded_bitrate_revision = control.request_bitrate_kbps(4_000).unwrap();
         let bitrate_revision = control.request_bitrate_kbps(8_000).unwrap();
@@ -2227,7 +2277,7 @@ mod tests {
                 .is_err()
         );
 
-        let (closed_control, _desired, closed_status) = EncoderControl::new();
+        let (closed_control, _desired, closed_status) = EncoderControl::new(1_280, 800);
         let closed_revision = closed_control.request_force_keyframe().unwrap();
         drop(closed_status);
         assert!(
@@ -2242,7 +2292,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_waiter_accepts_a_newer_configured_idr_revision() {
-        let (control, _desired, status) = EncoderControl::new();
+        let (control, _desired, status) = EncoderControl::new(1_280, 800);
         let recovery_revision = control.request_force_keyframe().unwrap();
         let newer_revision = control.request_force_keyframe().unwrap();
         assert!(newer_revision > recovery_revision);
@@ -2754,6 +2804,37 @@ mod tests {
             (portrait.video_mode.width, portrait.video_mode.height),
             (1_600, 2_560)
         );
+    }
+
+    #[test]
+    fn unconfigured_gamescope_mode_follows_each_resolved_session() {
+        let mut config = gamescope_config();
+        config.width = None;
+        config.height = None;
+
+        for (serial, width, height) in [
+            (731, 2_560, 1_600),
+            (900, 1_280, 800),
+            (901, 1_920, 1_080),
+            (902, 1_366, 768),
+        ] {
+            let resolved =
+                resolve_pipewire_node(&gamescope_dump(serial, width, height), &config).unwrap();
+            assert_eq!(resolved.target_object, serial.to_string());
+            assert_eq!(
+                resolved.pointer_surface_dimensions,
+                PointerSurfaceDimensions::new(width, height).unwrap()
+            );
+            assert_eq!(
+                resolved.video_mode,
+                CaptureVideoMode {
+                    width,
+                    height,
+                    framerate: 60,
+                }
+            );
+            assert_eq!(config.configured_dimensions(), None);
+        }
     }
 
     #[test]

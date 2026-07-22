@@ -758,7 +758,7 @@ impl Drop for CaptureTaskGuard {
 
 async fn serve_command(args: ServeArgs) -> Result<()> {
     let configured_service = args.config.is_some();
-    let (mut config, loaded_config_revision, _lifecycle) = if let Some(config_path) = &args.config {
+    let (config, loaded_config_revision, _lifecycle) = if let Some(config_path) = &args.config {
         let (loaded, lifecycle) =
             config_management::prepare_service(config_path).map_err(anyhow::Error::new)?;
         (loaded.config, Some(loaded.revision), lifecycle)
@@ -797,8 +797,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
 
     let preflight_result: Result<(InputBackend, Option<PointerPositionTracker>)> = async {
         let pointer_surface_dimensions = if config.source == VideoSource::TestPattern {
-            let (width, height) = config.test_pattern_dimensions()?;
-            config.apply_resolved_dimensions(width, height)?;
+            config.test_pattern_dimensions()?;
             let status = tokio::process::Command::new(&config.ffmpeg_path)
                 .arg("-version")
                 .stdin(std::process::Stdio::null())
@@ -823,10 +822,6 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
                 encoded_framerate = preflight.video_mode.framerate,
                 "Gamescope PipeWire capture preflight passed"
             );
-            config.apply_resolved_dimensions(
-                u32::from(preflight.video_mode.width),
-                u32::from(preflight.video_mode.height),
-            )?;
             if config.audio.is_some() {
                 audio::preflight_audio_static(&config).await?;
                 info!("PipeWire Opus audio static preflight passed");

@@ -100,6 +100,17 @@ enum ApplianceCommand {
         #[arg(long, required = true)]
         json: bool,
     },
+    /// Revoke the enrolled Portal and invalidate every outstanding invitation.
+    EnrollmentReset {
+        #[arg(long)]
+        config: PathBuf,
+        /// Redacted host fingerprint from `appliance status`.
+        #[arg(long)]
+        expected_host_fingerprint: String,
+        /// Emit the stable machine-readable schema.
+        #[arg(long, required = true)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -164,6 +175,12 @@ enum EnrollmentCommand {
     Revoke {
         #[arg(long)]
         config: PathBuf,
+        /// Redacted host fingerprint from `appliance status`.
+        #[arg(long)]
+        expected_host_fingerprint: String,
+        /// Emit the stable machine-readable schema.
+        #[arg(long, required = true)]
+        json: bool,
     },
 }
 
@@ -257,6 +274,14 @@ fn appliance_command(command: ApplianceCommand) -> Result<()> {
             let status = appliance::collect_status(&config)?;
             println!("{}", serde_json::to_string(&status)?);
         }
+        ApplianceCommand::EnrollmentReset {
+            config,
+            expected_host_fingerprint,
+            json: _,
+        } => {
+            let result = appliance::reset_enrollment(&config, &expected_host_fingerprint)?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
     }
     Ok(())
 }
@@ -327,12 +352,13 @@ fn enrollment_command(command: EnrollmentCommand) -> Result<()> {
                 _ => unreachable!("validated authorization state is internally consistent"),
             }
         }
-        EnrollmentCommand::Revoke { config } => {
-            let (_config, _secret, store) = authorization_store_from_config(&config)?;
-            let revoked = store.revoke(unix_timestamp_now()?)?;
-            let snapshot = store.snapshot()?;
-            println!("revoked={revoked}");
-            println!("enrollment_epoch={}", snapshot.epoch);
+        EnrollmentCommand::Revoke {
+            config,
+            expected_host_fingerprint,
+            json: _,
+        } => {
+            let result = appliance::reset_enrollment(&config, &expected_host_fingerprint)?;
+            println!("{}", serde_json::to_string(&result)?);
         }
     }
     Ok(())
@@ -600,9 +626,9 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     let mut config = load_serve_config(&args)?;
     config.validate()?;
     config.ensure_runtime_directory()?;
-    let secret = identity::load(&config.identity_path)?;
     let configured_service = args.config.is_some();
     let _lifecycle = appliance::LifecycleGuard::acquire(&config.state_path, configured_service)?;
+    let secret = identity::load(&config.identity_path)?;
     let sessions = Arc::new(SessionRegistry::default());
     let publisher = appliance::RuntimePublisher::start(
         secret.public(),
@@ -993,9 +1019,22 @@ mod tests {
                 "enrollment",
                 "revoke",
                 "--config",
-                "/tmp/host.toml"
+                "/tmp/host.toml",
+                "--expected-host-fingerprint",
+                "aaaaaaaa…bbbbbbbb",
+                "--json",
             ])
             .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "enrollment",
+                "revoke",
+                "--config",
+                "/tmp/host.toml"
+            ])
+            .is_err()
         );
     }
 
@@ -1015,6 +1054,32 @@ mod tests {
         assert!(
             Cli::try_parse_from(["sigil", "appliance", "status", "--config", "/tmp/host.toml"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn appliance_enrollment_reset_requires_confirmation_and_json() {
+        let valid = [
+            "sigil",
+            "appliance",
+            "enrollment-reset",
+            "--config",
+            "/tmp/host.toml",
+            "--expected-host-fingerprint",
+            "aaaaaaaa…bbbbbbbb",
+            "--json",
+        ];
+        assert!(Cli::try_parse_from(valid).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "appliance",
+                "enrollment-reset",
+                "--config",
+                "/tmp/host.toml",
+                "--json",
+            ])
+            .is_err()
         );
     }
 

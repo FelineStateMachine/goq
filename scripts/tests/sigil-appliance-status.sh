@@ -44,6 +44,7 @@ host_log="$temp_root/host.log"
 second_log="$temp_root/second.log"
 live_status="$temp_root/live-status.json"
 stopped_status="$temp_root/stopped-status.json"
+reset_status="$temp_root/reset-status.json"
 
 mkdir -m 0700 "$identity_directory" "$state_directory" "$runtime_directory"
 "$sigil" identity init --output "$identity_path" >"$temp_root/identity.log"
@@ -131,17 +132,57 @@ if len(fingerprint) != 17 or "…" not in fingerprint:
     raise SystemExit("host fingerprint is not bounded and redacted")
 PY
 
+host_fingerprint="$(python3 - "$live_status" <<'PY'
+import json
+import pathlib
+import sys
+
+print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["identity"]["host_fingerprint"])
+PY
+)"
+
+if XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance enrollment-reset \
+    --config "$config_path" \
+    --expected-host-fingerprint "$host_fingerprint" \
+    --json \
+    >"$temp_root/live-reset.log" 2>&1; then
+  printf 'enrollment reset unexpectedly mutated a live Sigil daemon\n' >&2
+  exit 1
+fi
+grep -Fq 'another Sigil daemon already owns this state directory' \
+  "$temp_root/live-reset.log"
+
 wait "$host_pid"
 host_pid=''
+[[ ! -e "$state_directory/authorization-v1.json" ]]
+if XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance enrollment-reset \
+    --config "$config_path" \
+    --expected-host-fingerprint '00000000…00000000' \
+    --json \
+    >"$temp_root/mismatch-reset.log" 2>&1; then
+  printf 'enrollment reset accepted the wrong host fingerprint\n' >&2
+  exit 1
+fi
+[[ ! -e "$state_directory/authorization-v1.json" ]]
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance enrollment-reset \
+    --config "$config_path" \
+    --expected-host-fingerprint "$host_fingerprint" \
+    --json >"$reset_status"
 XDG_RUNTIME_DIR="$runtime_directory" \
   "$sigil" appliance status --config "$config_path" --json >"$stopped_status"
 
-python3 - "$stopped_status" <<'PY'
+python3 - "$stopped_status" "$reset_status" "$host_node_id" <<'PY'
 import json
 import pathlib
 import sys
 
 status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+reset_raw = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+reset = json.loads(reset_raw)
+host_node_id = sys.argv[3]
 runtime = status.get("runtime", {})
 if runtime.get("daemon") != "stopped":
     raise SystemExit(f"clean shutdown did not publish stopped: {runtime}")
@@ -149,6 +190,18 @@ if runtime.get("session") != "inactive":
     raise SystemExit("stopped daemon did not report an inactive session")
 if runtime.get("uptime_ms") is not None:
     raise SystemExit("stopped daemon retained a live uptime")
+if reset.get("schema_version") != 1 or reset.get("operation") != "enrollment_reset":
+    raise SystemExit("unexpected enrollment reset schema")
+if reset.get("had_enrollment") is not False:
+    raise SystemExit("empty enrollment reset reported an enrolled Portal")
+if reset.get("current_epoch") != reset.get("previous_epoch") + 1:
+    raise SystemExit("enrollment reset did not advance exactly one epoch")
+if reset.get("invitations_invalidated") is not True:
+    raise SystemExit("enrollment reset did not report invitation invalidation")
+if host_node_id in reset_raw:
+    raise SystemExit("enrollment reset leaked the complete host node ID")
+if status.get("enrollment", {}).get("epoch") != reset.get("current_epoch"):
+    raise SystemExit("status does not reflect the enrollment reset epoch")
 PY
 
 if env -u XDG_RUNTIME_DIR \

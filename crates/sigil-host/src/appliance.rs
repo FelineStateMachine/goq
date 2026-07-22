@@ -139,6 +139,17 @@ pub struct ApplianceStatusV1 {
 }
 
 #[derive(Debug, Serialize)]
+pub struct EnrollmentResetV1 {
+    schema_version: u16,
+    operation: &'static str,
+    host_fingerprint: String,
+    had_enrollment: bool,
+    previous_epoch: u64,
+    current_epoch: u64,
+    invitations_invalidated: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct ConfigStatus {
     state: &'static str,
 }
@@ -405,6 +416,43 @@ pub fn collect_status(config_path: &Path) -> Result<ApplianceStatusV1> {
     Ok(assemble_status(host, authorization, runtime))
 }
 
+pub fn reset_enrollment(
+    config_path: &Path,
+    expected_host_fingerprint: &str,
+) -> Result<EnrollmentResetV1> {
+    let config = HostConfig::load(config_path)?;
+    config.ensure_runtime_directory()?;
+    let _lifecycle = LifecycleGuard::acquire(&config.state_path, true)?;
+    let secret = crate::identity::load(&config.identity_path)?;
+    let host = secret.public();
+    let host_fingerprint = fingerprint(host);
+    ensure!(
+        expected_host_fingerprint == host_fingerprint,
+        "expected host fingerprint does not match this Sigil appliance"
+    );
+
+    let store = AuthorizationStore::open(config.state_path, host)?;
+    let outcome = store.revoke_with_outcome(crate::authorization::unix_timestamp_now()?)?;
+    ensure!(
+        outcome.current_epoch
+            == outcome
+                .previous_epoch
+                .checked_add(1)
+                .context("authorization epoch exhausted")?,
+        "enrollment reset did not advance the authorization epoch"
+    );
+
+    Ok(EnrollmentResetV1 {
+        schema_version: 1,
+        operation: "enrollment_reset",
+        host_fingerprint,
+        had_enrollment: outcome.had_enrollment,
+        previous_epoch: outcome.previous_epoch,
+        current_epoch: outcome.current_epoch,
+        invitations_invalidated: true,
+    })
+}
+
 fn assemble_status(
     host: EndpointId,
     authorization: AuthorizationInspection,
@@ -625,7 +673,7 @@ fn unix_timestamp_millis() -> Result<u64> {
     .unwrap_or(u64::MAX))
 }
 
-fn fingerprint(id: EndpointId) -> String {
+pub(crate) fn fingerprint(id: EndpointId) -> String {
     let full = id.to_string();
     debug_assert_eq!(full.len(), 64);
     format!("{}…{}", &full[..8], &full[full.len() - 8..])

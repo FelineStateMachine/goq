@@ -48,6 +48,13 @@ pub struct AuthorizationInspection {
     pub storage_present: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RevocationOutcome {
+    pub had_enrollment: bool,
+    pub previous_epoch: u64,
+    pub current_epoch: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthorizationState {
@@ -400,11 +407,12 @@ impl AuthorizationStore {
         })
     }
 
-    pub fn revoke(&self, now: u64) -> Result<bool> {
+    pub fn revoke_with_outcome(&self, now: u64) -> Result<RevocationOutcome> {
         let lock = self.open_lock()?;
         self.lock_exclusive(&lock)?;
         let mut state = self.load_state()?;
         state.validate(self.host)?;
+        let previous_epoch = state.enrollment_epoch;
         let had_enrollment = state.enrollment.take().is_some();
         state.enrollment_epoch = state
             .enrollment_epoch
@@ -412,7 +420,11 @@ impl AuthorizationStore {
             .context("authorization epoch exhausted")?;
         state.prune_expired(now);
         self.write_state(&state)?;
-        Ok(had_enrollment)
+        Ok(RevocationOutcome {
+            had_enrollment,
+            previous_epoch,
+            current_epoch: state.enrollment_epoch,
+        })
     }
 
     fn state_path(&self) -> PathBuf {
@@ -777,7 +789,7 @@ mod tests {
             [4; 32],
             InvitationGrants::VIEW,
         );
-        assert!(!store.revoke(1_001).unwrap());
+        assert!(!store.revoke_with_outcome(1_001).unwrap().had_enrollment);
         assert!(
             store
                 .authorize_or_redeem(peer.public(), Some(&token), 1_002)
@@ -832,7 +844,7 @@ mod tests {
         store
             .authorize_or_redeem(peer.public(), Some(&first), 1_001)
             .unwrap();
-        assert!(store.revoke(1_002).unwrap());
+        assert!(store.revoke_with_outcome(1_002).unwrap().had_enrollment);
 
         let reopened =
             AuthorizationStore::open(store.state_directory.clone(), host.public()).unwrap();

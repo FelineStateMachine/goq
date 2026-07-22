@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - website/**
+      - release/sigil-minisign.pub
+      - scripts/verify-sigil-bootstrap.py
       - scripts/verify-website.sh
       - wrangler.jsonc
       - .github/workflows/website.yml
@@ -11,6 +13,8 @@ on:
     branches: [main]
     paths:
       - website/**
+      - release/sigil-minisign.pub
+      - scripts/verify-sigil-bootstrap.py
       - scripts/verify-website.sh
       - wrangler.jsonc
       - .github/workflows/website.yml

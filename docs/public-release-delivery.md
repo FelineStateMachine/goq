@@ -48,6 +48,11 @@ The bootstrap:
 6. Does not start or restart Sigil, overwrite identity or host configuration,
    modify `/etc`, or guess ambiguous hardware.
 
+`scripts/verify-sigil-bootstrap.py` keeps the channel fully closed while the
+sentinels are present. Once opened, it requires the bootstrap's embedded key to
+exactly match `release/sigil-minisign.pub` and rejects partial configuration or
+a malformed immutable release tag before the website can deploy.
+
 A clean Bazzite image may not include Minisign. The public-alpha gate must
 either provision a pinned verifier with its own hard-coded digest or make the
 verifier prerequisite explicit; it must never silently downgrade to SHA-only

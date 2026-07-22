@@ -41,6 +41,7 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
   'test "${1:-}" = zigbuild' \
+  'case " $* " in *" --features in-process-gstreamer "*) ;; *) exit 64 ;; esac' \
   'output="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"' \
   'install -d -m 0700 "$output"' \
   'printf "#!/usr/bin/env bash\\nexit 0\\n" >"$output/sigil"' \

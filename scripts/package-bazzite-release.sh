@@ -23,9 +23,8 @@ an isolated Cargo target directory. The package includes atomic install,
 upgrade/rollback support, the systemd user unit, PipeWire sink, staged udev
 rule, complete checksums, and build provenance. It never includes the source
 tree, host identity, hardware configuration, environment files, or evidence.
-Product mode intentionally uses Sigil's default feature set; the opt-in
-in-process-gstreamer backend is excluded until its native/cross-build gate is
-approved.
+Product mode builds Sigil with the default feature set plus the approved
+in-process-gstreamer backend. The manifest records that exact feature contract.
 
 Options:
   --output PATH          New .tar.gz bundle path (required; must not exist)
@@ -195,8 +194,9 @@ else
   git -C "$repo_dir" archive --format=tar "$git_commit" | tar -xf - -C "$build_source"
   (
     cd "$build_source"
-    CARGO_TARGET_DIR="$build_target" cargo zigbuild --locked -p sigil-host --bins \
-      --target "$linux_target" --release
+    PKG_CONFIG_ALLOW_CROSS=1 CARGO_TARGET_DIR="$build_target" \
+      cargo zigbuild --locked -p sigil-host --bins \
+      --target "$linux_target" --release --features in-process-gstreamer
   )
   host_binary="$build_target/$linux_output_target/release/sigil"
   probe_binary="$build_target/$linux_output_target/release/sigil-probe"
@@ -269,7 +269,7 @@ manifest = {
     "version": version,
     "target": target,
     "profile": "release",
-    "features": ["default"],
+    "features": ["default", "in-process-gstreamer"],
     "demo_direct_node": False,
     "git_commit": commit,
     "git_dirty": dirty == "true",

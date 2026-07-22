@@ -44,12 +44,12 @@ low-latency encoder properties do not match. This implementation still needs
 the attached-display and headless appliance gates below before it is proven on
 the target Bazzite image.
 
-The proven compatibility backend launches the video pipeline through the
-configured `gst-launch-1.0` executable and remains the default when
-`encoder_backend` is omitted. `encoder_backend = "in-process-gstreamer"` is an
-explicit test opt-in. Sigil rejects that setting unless it is a Linux binary
-built with the matching Cargo feature; it must never silently fall back to the
-external backend. The public release package does not enable this feature yet.
+The compatibility backend launches the video pipeline through the configured
+`gst-launch-1.0` executable and remains the runtime default when
+`encoder_backend` is omitted. Published Sigil packages also include the
+`in-process-gstreamer` backend so a host can opt into the bounded appsink path
+without replacing its package. Sigil must never silently fall back to the
+external backend when that explicit configuration is unavailable.
 
 The host identity file is part of the normal daemon design. The client-side
 `--dev-connect` passkey bypass is accepted by debug builds and by an explicitly

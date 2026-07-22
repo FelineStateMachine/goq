@@ -56,7 +56,14 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             build-essential \
             ffmpeg \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-tools \
             libayatana-appindicator3-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer1.0-dev \
             librsvg2-dev \
             libssl-dev \
             libudev-dev \
@@ -79,6 +86,8 @@ jobs:
           cargo install cargo-zigbuild --locked --version 0.23.0
 
       - name: Run complete repository gate
+        env:
+          GOQ_VERIFY_IN_PROCESS_GSTREAMER: "1"
         run: ./scripts/verify-demo-build.sh
 
       - name: Build and verify unsigned candidate

@@ -385,7 +385,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        GamescopePipewireConfig, InputMode, PipewireAudioConfig, VaapiRateControl, VideoSource,
+        GamescopeEncoderBackend, GamescopePipewireConfig, InputMode, PipewireAudioConfig,
+        VaapiRateControl, VideoSource,
     };
     use crate::source::resolve_pipewire_node_exact;
 
@@ -409,6 +410,7 @@ mod tests {
                 pw_dump_path: "/usr/bin/pw-dump".into(),
                 gst_launch_path: "/usr/bin/gst-launch-1.0".into(),
                 gst_inspect_path: "/usr/bin/gst-inspect-1.0".into(),
+                encoder_backend: GamescopeEncoderBackend::ExternalGstLaunch,
                 vaapi_encoder: "vah264enc".into(),
                 vaapi_render_node: "/dev/dri/renderD128".into(),
                 rate_control: VaapiRateControl::Cbr,

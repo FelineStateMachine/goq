@@ -1,0 +1,11 @@
+{
+  "name": "Goq Sigil",
+  "author": "Feline State Machine",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility", "streaming", "gaming"],
+    "description": "Controller-first local management for a Goq Sigil host.",
+    "image": "https://goq.sh/assets/decky-sigil.webp"
+  }
+}

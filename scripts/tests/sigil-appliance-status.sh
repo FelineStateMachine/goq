@@ -42,9 +42,14 @@ alternate_runtime_directory="$temp_root/runtime-alternate"
 invalid_runtime_directory="$temp_root/invalid-runtime"
 config_directory="$temp_root/config"
 unsafe_config_directory="$temp_root/config-unsafe"
+gamescope_probe_state="$temp_root/gamescope-probe-state"
 identity_path="$identity_directory/host.key"
 config_path="$config_directory/host.toml"
 unsafe_config_path="$unsafe_config_directory/host.toml"
+gamescope_probe_config="$config_directory/gamescope-probe.toml"
+fake_pw_dump="$temp_root/fake-pw-dump"
+fake_gst_inspect="$temp_root/fake-gst-inspect"
+gamescope_preflight_marker="$temp_root/gamescope-preflight-ran"
 host_log="$temp_root/host.log"
 second_log="$temp_root/second.log"
 live_status="$temp_root/live-status.json"
@@ -59,6 +64,7 @@ candidate_status="$temp_root/candidate-status.json"
 mkdir -m 0700 \
   "$identity_directory" \
   "$state_directory" \
+  "$gamescope_probe_state" \
   "$runtime_directory" \
   "$alternate_runtime_directory"
 mkdir -m 0755 "$config_directory"
@@ -82,6 +88,44 @@ printf '%s\n' \
   "ffmpeg_path = \"$ffmpeg\"" \
   >"$config_path"
 chmod 0600 "$config_path"
+
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  "printf '[]\\n'" \
+  >"$fake_pw_dump"
+chmod 0700 "$fake_pw_dump"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  "touch '$gamescope_preflight_marker'" \
+  'exit 1' \
+  >"$fake_gst_inspect"
+chmod 0700 "$fake_gst_inspect"
+false_path="/usr/bin/false"
+[[ -x "$false_path" ]]
+printf '%s\n' \
+  "identity_path = \"$identity_path\"" \
+  "state_path = \"$gamescope_probe_state\"" \
+  'source = "gamescope-pipewire"' \
+  'width = 1280' \
+  'height = 800' \
+  'framerate = 60' \
+  'codec = "h264"' \
+  'input_mode = "disabled"' \
+  "ffmpeg_path = \"$ffmpeg\"" \
+  '' \
+  '[gamescope_pipewire]' \
+  'node_name = "gamescope"' \
+  'media_class = "Video/Source"' \
+  'xwayland_display = ":0"' \
+  "pw_dump_path = \"$fake_pw_dump\"" \
+  "gst_launch_path = \"$false_path\"" \
+  "gst_inspect_path = \"$fake_gst_inspect\"" \
+  'vaapi_encoder = "vah264enc"' \
+  'vaapi_render_node = "/dev/dri/renderD128"' \
+  'rate_control = "cqp"' \
+  'quantizer = 24' \
+  >"$gamescope_probe_config"
+chmod 0600 "$gamescope_probe_config"
 
 cp "$config_path" "$unsafe_config_path"
 chmod 0600 "$unsafe_config_path"
@@ -181,7 +225,21 @@ if XDG_RUNTIME_DIR="$runtime_directory" \
   printf 'a second per-user Sigil daemon unexpectedly started\n' >&2
   exit 1
 fi
-grep -Fq 'another Sigil daemon already owns this state directory' "$second_log"
+grep -Fq 'another Sigil daemon or capture probe already owns this lifecycle scope' "$second_log"
+
+if XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" capture probe \
+    --source gamescope-pipewire \
+    --config "$gamescope_probe_config" \
+    --frames 1 \
+    >"$temp_root/contended-capture.out" \
+    2>"$temp_root/contended-capture.error"; then
+  printf 'Gamescope capture probe overlapped a live Sigil daemon\n' >&2
+  exit 1
+fi
+grep -Fq 'another Sigil daemon or capture probe already owns this lifecycle scope' \
+  "$temp_root/contended-capture.error"
+[[ ! -e "$gamescope_preflight_marker" ]]
 
 python3 - "$live_status" "$host_node_id" <<'PY'
 import json
@@ -247,11 +305,31 @@ if env -u XDG_RUNTIME_DIR \
   printf 'enrollment reset unexpectedly mutated a live Sigil daemon\n' >&2
   exit 1
 fi
-grep -Fq 'another Sigil daemon already owns this state directory' \
+grep -Fq 'another Sigil daemon or capture probe already owns this lifecycle scope' \
   "$temp_root/live-reset.log"
 
 wait "$host_pid"
 host_pid=''
+if XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" capture probe \
+    --source gamescope-pipewire \
+    --config "$gamescope_probe_config" \
+    --frames 1 \
+    >"$temp_root/released-capture.out" \
+    2>"$temp_root/released-capture.error"; then
+  printf 'fake Gamescope capture unexpectedly completed\n' >&2
+  exit 1
+fi
+[[ -e "$gamescope_preflight_marker" ]]
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" serve \
+    --identity "$identity_path" \
+    --source test-pattern \
+    --state-path "$temp_root/post-probe-state" \
+    --ffmpeg "$ffmpeg" \
+    --max-runtime-seconds 1 \
+    >"$temp_root/post-probe-serve.out" 2>&1
+grep -Fq 'status=ready' "$temp_root/post-probe-serve.out"
 [[ ! -e "$state_directory/authorization-v1.json" ]]
 if XDG_RUNTIME_DIR="$runtime_directory" \
   "$sigil" appliance enrollment-reset \

@@ -622,15 +622,9 @@ async fn probe_test_pattern(args: CaptureProbeArgs) -> Result<()> {
     config.validate()?;
 
     let configured_framerate = config.framerate;
+    validate_capture_probe_args(&args, configured_framerate)?;
     let source = source::spawn_test_pattern(config, clock::SessionClock::start());
-    consume_capture_probe(
-        args,
-        source.frames,
-        source.task,
-        "test-pattern",
-        configured_framerate,
-    )
-    .await
+    consume_capture_probe(args, source, None, "test-pattern", configured_framerate).await
 }
 
 async fn probe_gamescope_pipewire(args: CaptureProbeArgs) -> Result<()> {
@@ -643,6 +637,9 @@ async fn probe_gamescope_pipewire(args: CaptureProbeArgs) -> Result<()> {
         config.source == VideoSource::GamescopePipewire,
         "capture config source must be gamescope-pipewire"
     );
+    config.ensure_runtime_directory()?;
+    let _lifecycle = appliance::LifecycleGuard::acquire(&config.state_path, true)
+        .context("acquiring exclusive Gamescope capture lifecycle")?;
     let preflight = source::preflight_gamescope_pipewire(&config).await?;
     let observed = (
         u32::from(preflight.video_mode.width),
@@ -663,11 +660,17 @@ async fn probe_gamescope_pipewire(args: CaptureProbeArgs) -> Result<()> {
         observed.0, observed.1, preflight.video_mode.framerate
     );
     let configured_framerate = preflight.video_mode.framerate;
-    let source = source::spawn_gamescope_pipewire(config, clock::SessionClock::start()).await?;
+    validate_capture_probe_args(&args, configured_framerate)?;
+    let source::ProbeEncodedSource { source, shutdown } =
+        source::spawn_gamescope_pipewire_for_probe(
+            config,
+            clock::SessionClock::start(),
+            preflight,
+        )?;
     consume_capture_probe(
         args,
-        source.frames,
-        source.task,
+        source,
+        shutdown,
         "Gamescope PipeWire",
         configured_framerate,
     )
@@ -676,20 +679,21 @@ async fn probe_gamescope_pipewire(args: CaptureProbeArgs) -> Result<()> {
 
 async fn consume_capture_probe(
     args: CaptureProbeArgs,
-    mut receiver: tokio::sync::watch::Receiver<Option<source::EncodedFrame>>,
-    task: tokio::task::JoinHandle<Result<()>>,
+    source: source::EncodedSource,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     source_name: &str,
     configured_framerate: u32,
 ) -> Result<()> {
-    if let Some(minimum_fps) = args.minimum_fps {
-        ensure!(
-            minimum_fps.is_finite()
-                && minimum_fps > 0.0
-                && minimum_fps <= f64::from(configured_framerate),
-            "--minimum-fps must be finite, positive, and no greater than configured framerate {configured_framerate}"
-        );
-    }
-    let task = CaptureTaskGuard::new(task);
+    debug_assert!(validate_capture_probe_args(&args, configured_framerate).is_ok());
+    let source::EncodedSource {
+        frames: mut receiver,
+        current_gop,
+        task,
+        pointer_surface_dimensions: _,
+        encoder_control,
+    } = source;
+    drop(current_gop);
+    drop(encoder_control);
     let started = Instant::now();
     let mut received = 0_u32;
     let mut keyframes = 0_u32;
@@ -699,28 +703,48 @@ async fn consume_capture_probe(
     let mut dropped = 0_u64;
     let mut max_post_encode_queue_age_micros = 0_u128;
 
-    while received < args.frames {
-        tokio::time::timeout(Duration::from_secs(5), receiver.changed())
-            .await
-            .with_context(|| format!("timed out waiting for encoded {source_name} frame"))?
-            .with_context(|| format!("{source_name} encoder stopped"))?;
-        let Some(frame) = receiver.borrow_and_update().clone() else {
-            continue;
-        };
-        max_post_encode_queue_age_micros =
-            max_post_encode_queue_age_micros.max(frame.observed_at.elapsed().as_micros());
-        if let Some(previous) = last_sequence {
-            dropped += frame.sequence.saturating_sub(previous + 1);
+    let capture_result: Result<()> = async {
+        while received < args.frames {
+            tokio::time::timeout(Duration::from_secs(5), receiver.changed())
+                .await
+                .with_context(|| format!("timed out waiting for encoded {source_name} frame"))?
+                .with_context(|| format!("{source_name} encoder stopped"))?;
+            let Some(frame) = receiver.borrow_and_update().clone() else {
+                continue;
+            };
+            max_post_encode_queue_age_micros =
+                max_post_encode_queue_age_micros.max(frame.observed_at.elapsed().as_micros());
+            if let Some(previous) = last_sequence {
+                dropped += frame.sequence.saturating_sub(previous + 1);
+            }
+            last_sequence = Some(frame.sequence);
+            keyframes += u32::from(frame.keyframe);
+            decodable_keyframes += u32::from(frame.keyframe && frame.codec_config);
+            encoded_bytes = encoded_bytes.saturating_add(frame.data.len() as u64);
+            received += 1;
         }
-        last_sequence = Some(frame.sequence);
-        keyframes += u32::from(frame.keyframe);
-        decodable_keyframes += u32::from(frame.keyframe && frame.codec_config);
-        encoded_bytes = encoded_bytes.saturating_add(frame.data.len() as u64);
-        received += 1;
+        Ok(())
     }
+    .await;
 
     let elapsed = started.elapsed();
-    task.abort_and_wait().await;
+    drop(receiver);
+    if let Some(shutdown) = shutdown {
+        let _ = shutdown.send(());
+    }
+    let source_result = task
+        .await
+        .with_context(|| format!("joining {source_name} capture task"))?;
+    match (capture_result, source_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(()), Err(error)) => return Err(error),
+        (Err(error), Err(source_error)) => {
+            return Err(error.context(format!(
+                "{source_name} capture teardown also failed: {source_error:#}"
+            )));
+        }
+    }
     ensure!(keyframes > 0, "capture probe produced no H.264 keyframe");
     ensure!(
         decodable_keyframes > 0,
@@ -749,27 +773,16 @@ async fn consume_capture_probe(
     Ok(())
 }
 
-struct CaptureTaskGuard(Option<tokio::task::JoinHandle<Result<()>>>);
-
-impl CaptureTaskGuard {
-    fn new(task: tokio::task::JoinHandle<Result<()>>) -> Self {
-        Self(Some(task))
+fn validate_capture_probe_args(args: &CaptureProbeArgs, configured_framerate: u32) -> Result<()> {
+    if let Some(minimum_fps) = args.minimum_fps {
+        ensure!(
+            minimum_fps.is_finite()
+                && minimum_fps > 0.0
+                && minimum_fps <= f64::from(configured_framerate),
+            "--minimum-fps must be finite, positive, and no greater than configured framerate {configured_framerate}"
+        );
     }
-
-    async fn abort_and_wait(mut self) {
-        if let Some(task) = self.0.take() {
-            task.abort();
-            let _ = task.await;
-        }
-    }
-}
-
-impl Drop for CaptureTaskGuard {
-    fn drop(&mut self) {
-        if let Some(task) = self.0.take() {
-            task.abort();
-        }
-    }
+    Ok(())
 }
 
 async fn serve_command(args: ServeArgs) -> Result<()> {
@@ -1121,6 +1134,22 @@ mod tests {
     fn parses_expected_size() {
         assert_eq!(parse_size("1280x800").unwrap(), (1280, 800));
         assert!(parse_size("1280").is_err());
+    }
+
+    #[test]
+    fn capture_probe_threshold_is_validated_before_source_start() {
+        let args = |minimum_fps| CaptureProbeArgs {
+            source: SourceArg::TestPattern,
+            frames: 1,
+            expect_size: None,
+            minimum_fps,
+            config: None,
+        };
+        assert!(validate_capture_probe_args(&args(None), 60).is_ok());
+        assert!(validate_capture_probe_args(&args(Some(55.0)), 60).is_ok());
+        assert!(validate_capture_probe_args(&args(Some(0.0)), 60).is_err());
+        assert!(validate_capture_probe_args(&args(Some(61.0)), 60).is_err());
+        assert!(validate_capture_probe_args(&args(Some(f64::NAN)), 60).is_err());
     }
 
     #[test]

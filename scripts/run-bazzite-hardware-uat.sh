@@ -182,7 +182,9 @@ timeout --signal=TERM --kill-after=2s 5s "$probe" --version
 host_identity="$private/host.key"
 probe_identity="$private/probe.key"
 state="$private/state"
+external_cqp_state="$private/external-cqp-state"
 fixed_config="$private/host-1280x800.toml"
+external_cqp_config="$private/host-1280x800-external-cqp.toml"
 native_config="$private/host-native.toml"
 invitation="$private/probe.goq-invite"
 
@@ -193,6 +195,7 @@ probe_node_id="$(sed -n 's/^node_id=//p' "$private/probe-identity.log")"
 [[ -n "$host_node_id" && -n "$probe_node_id" ]]
 
 pw_dump="$(command -v pw-dump)"
+pw_link="$(command -v pw-link)"
 gst_launch="$(command -v gst-launch-1.0)"
 gst_inspect="$(command -v gst-inspect-1.0)"
 ffmpeg="$(command -v ffmpeg)"
@@ -248,13 +251,43 @@ vaapi_render_node = "$render_node"
 rate_control = "cbr"
 bitrate_kbps = 12000
 EOF
-chmod 0600 "$fixed_config" "$native_config"
+
+cat >"$external_cqp_config" <<EOF
+identity_path = "$host_identity"
+state_path = "$external_cqp_state"
+source = "gamescope-pipewire"
+width = 1280
+height = 800
+framerate = 60
+codec = "h264"
+input_mode = "log"
+ffmpeg_path = "$ffmpeg"
+
+[gamescope_pipewire]
+node_name = "gamescope"
+media_class = "Video/Source"
+xwayland_display = ":0"
+pw_dump_path = "$pw_dump"
+gst_launch_path = "$gst_launch"
+gst_inspect_path = "$gst_inspect"
+encoder_backend = "external-gst-launch"
+vaapi_encoder = "$va_encoder"
+vaapi_render_node = "$render_node"
+rate_control = "cqp"
+quantizer = 24
+EOF
+chmod 0600 "$fixed_config" "$external_cqp_config" "$native_config"
 
 "$sigil" config check --config "$fixed_config" >"$private/fixed-config-check.log"
+"$sigil" config check --config "$external_cqp_config" \
+  >"$private/external-cqp-config-check.log"
 "$sigil" config check --config "$native_config" >"$private/native-config-check.log"
 grep -Fxq config=ok "$private/fixed-config-check.log"
 grep -Fxq capture_preflight=ok "$private/fixed-config-check.log"
 grep -Fxq encoded_mode=1280x800@60 "$private/fixed-config-check.log"
+grep -Fxq config=ok "$private/external-cqp-config-check.log"
+grep -Fxq capture_preflight=ok "$private/external-cqp-config-check.log"
+grep -Fxq encoded_mode=1280x800@60 "$private/external-cqp-config-check.log"
 grep -Fxq config=ok "$private/native-config-check.log"
 grep -Fxq capture_preflight=ok "$private/native-config-check.log"
 native_size="$(sed -n 's/^encoded_mode=\([0-9][0-9]*x[0-9][0-9]*\)@60$/\1/p' "$private/native-config-check.log")"
@@ -274,6 +307,7 @@ native_size="$(sed -n 's/^encoded_mode=\([0-9][0-9]*x[0-9][0-9]*\)@60$/\1/p' "$p
 [[ "$(stat -c %a "$invitation")" == 600 ]]
 
 restore_required=false
+capture_probe_pid=''
 rollback_units=()
 rollback_helper="$private/rollback-original.sh"
 fixed_candidate_unit="goq-uat-fixed-candidate-$invocation_id"
@@ -354,6 +388,11 @@ cleanup() {
   local status=$?
   trap - EXIT
   trap '' INT TERM HUP
+  if [[ -n "$capture_probe_pid" ]] && kill -0 "$capture_probe_pid" 2>/dev/null; then
+    kill "$capture_probe_pid" 2>/dev/null || true
+    wait "$capture_probe_pid" 2>/dev/null || true
+    capture_probe_pid=''
+  fi
   if ! restore_original; then
     echo "CRITICAL: original Sigil service did not return ready; rollback timer remains armed" >&2
     status=1
@@ -505,6 +544,52 @@ validate_host_recovery() {
   ! grep -Eq 'forced-IDR request failed|forced-IDR recovery was not acknowledged|forced-IDR acknowledgement task failed|forced-IDR acknowledgement task ended without a result' "$plain"
 }
 
+capture_inventory() {
+  local phase="$1"
+  ps -u "$(id -u)" -o pid=,comm=,args= >"$evidence/$phase-processes.txt"
+  awk -v own_pid="$$" '
+    $1 == own_pid { next }
+    ($2 == "sigil" || $2 == "sigil-host") &&
+      ($0 ~ / serve( |$)/ || $0 ~ / capture probe( |$)/) { print; next }
+    $2 ~ /^gst-launch/ && $0 ~ /pipewiresrc/ { print }
+  ' "$evidence/$phase-processes.txt" >"$evidence/$phase-conflicts.txt"
+  if [[ -s "$evidence/$phase-conflicts.txt" ]]; then
+    echo "a Sigil or GStreamer PipeWire capture process survived $phase" >&2
+    cat "$evidence/$phase-conflicts.txt" >&2
+    return 1
+  fi
+  "$pw_link" -l >"$evidence/$phase-pipewire-links.txt"
+  if grep -Fiq gamescope "$evidence/$phase-pipewire-links.txt"; then
+    echo "a Gamescope PipeWire consumer link survived $phase" >&2
+    cat "$evidence/$phase-pipewire-links.txt" >&2
+    return 1
+  fi
+  "$pw_dump" >"$evidence/$phase-pipewire.json"
+}
+
+validate_capture_log() {
+  local log="$1"
+  grep -Fxq probe=ok "$log"
+  grep -Fxq dropped_after_encode_before_probe_consumer=0 "$log"
+}
+
+run_capture_probe() {
+  local name="$1"
+  local config="$2"
+  local size="$3"
+  local minimum_fps="${4:-}"
+  local command=(
+    "$sigil" capture probe --source gamescope-pipewire
+    --config "$config" --frames 300 --expect-size "$size"
+  )
+  [[ -z "$minimum_fps" ]] || command+=(--minimum-fps "$minimum_fps")
+  capture_inventory "pre-$name"
+  timeout --signal=TERM --kill-after=5s 90s "${command[@]}" \
+    >"$evidence/$name-capture.log"
+  validate_capture_log "$evidence/$name-capture.log"
+  capture_inventory "post-$name"
+}
+
 fixed_timer="goq-uat-fixed-$invocation_id"
 arm_rollback "$fixed_timer"
 restore_required=true
@@ -515,12 +600,42 @@ if systemctl --user is-active --quiet sigil-host.service; then
 fi
 [[ "$(systemctl --user show -p MainPID --value sigil-host.service)" -eq 0 ]]
 
-timeout --signal=TERM --kill-after=5s 60s \
+run_capture_probe fixed "$fixed_config" 1280x800 55
+
+capture_inventory pre-external-cqp
+timeout --signal=TERM --kill-after=5s 90s \
   "$sigil" capture probe --source gamescope-pipewire \
-    --config "$fixed_config" --frames 300 --expect-size 1280x800 --minimum-fps 55 \
-    >"$evidence/fixed-capture.log"
-grep -Fxq probe=ok "$evidence/fixed-capture.log"
-grep -Fxq dropped_after_encode_before_probe_consumer=0 "$evidence/fixed-capture.log"
+    --config "$external_cqp_config" --frames 300 --expect-size 1280x800 \
+    --minimum-fps 55 >"$evidence/external-cqp-capture.log" &
+capture_probe_pid=$!
+external_link_ready=false
+for _ in $(seq 1 200); do
+  if ! kill -0 "$capture_probe_pid" 2>/dev/null; then
+    break
+  fi
+  if "$pw_link" -l | grep -Fiq gamescope; then
+    external_link_ready=true
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$external_link_ready" != true ]]; then
+  echo "external CQP probe never opened a Gamescope PipeWire consumer link" >&2
+  exit 1
+fi
+if timeout --signal=TERM --kill-after=2s 10s \
+  "$sigil" capture probe --source gamescope-pipewire \
+    --config "$fixed_config" --frames 1 --expect-size 1280x800 \
+    >"$evidence/contended-capture.out" 2>"$evidence/contended-capture.error"; then
+  echo "a second Gamescope capture probe overlapped external CQP capture" >&2
+  exit 1
+fi
+grep -Fq 'another Sigil daemon or capture probe already owns this lifecycle scope' \
+  "$evidence/contended-capture.error"
+wait "$capture_probe_pid"
+capture_probe_pid=''
+validate_capture_log "$evidence/external-cqp-capture.log"
+capture_inventory post-external-cqp
 
 start_candidate fixed "$fixed_config"
 run_probe_cycle fixed iroh-moq 1280x800 1001 "$invitation" 1500 relay
@@ -551,12 +666,7 @@ stop_candidate
 native_timer="goq-uat-native-$invocation_id"
 arm_rollback "$native_timer"
 systemctl --user stop "$fixed_timer.timer" "$fixed_timer.service" 2>/dev/null || true
-timeout --signal=TERM --kill-after=5s 90s \
-  "$sigil" capture probe --source gamescope-pipewire \
-    --config "$native_config" --frames 300 --expect-size "$native_size" \
-    >"$evidence/native-capture.log"
-grep -Fxq probe=ok "$evidence/native-capture.log"
-grep -Fxq dropped_after_encode_before_probe_consumer=0 "$evidence/native-capture.log"
+run_capture_probe native "$native_config" "$native_size"
 
 start_candidate native "$native_config"
 run_probe_cycle native iroh-moq "$native_size" 2001 "" 1500
@@ -622,8 +732,11 @@ native_unique_sessions="$(awk -F= '$1 == "session_id" { print $2 }' \
 [[ "$fixed_unique_sessions" -eq 20 && "$native_unique_sessions" -eq 20 ]]
 total_sessions="${#all_raw_probes[@]}"
 fixed_observed_fps="$(sed -n 's/^observed_fps=//p' "$evidence/fixed-capture.log")"
+external_cqp_observed_fps="$(sed -n 's/^observed_fps=//p' \
+  "$evidence/external-cqp-capture.log")"
 native_observed_fps="$(sed -n 's/^observed_fps=//p' "$evidence/native-capture.log")"
-[[ -n "$fixed_observed_fps" && -n "$native_observed_fps" ]]
+[[ -n "$fixed_observed_fps" && -n "$external_cqp_observed_fps" \
+  && -n "$native_observed_fps" ]]
 if awk -v fps="$native_observed_fps" 'BEGIN { exit !(fps >= 55) }'; then
   native_55fps_status=met
 else
@@ -637,6 +750,9 @@ fi
   echo fixed_size=1280x800
   echo fixed_minimum_fps=55
   echo "fixed_observed_fps=$fixed_observed_fps"
+  echo external_cqp_minimum_fps=55
+  echo "external_cqp_observed_fps=$external_cqp_observed_fps"
+  echo cross_state_capture_contention=rejected
   echo "native_size=$native_size"
   echo native_performance_gate=observational
   echo "native_observed_fps=$native_observed_fps"

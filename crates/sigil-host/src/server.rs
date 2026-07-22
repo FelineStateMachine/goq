@@ -10,12 +10,12 @@ use iroh::endpoint::{Connection, SendStream};
 use iroh::protocol::ProtocolHandler;
 use sigil_protocol::{
     AUDIO_HEADER_LEN, AudioFlags, AudioPacket, AudioPacketHeader, Capability, ClientHello,
-    FrameFlags, HostHello, InputAck, InvitationGrants, MAX_AUDIO_PAYLOAD_LEN,
-    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MAX_MEDIA_OBJECT_ID_V3,
-    MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MediaControlRequestV3, MediaFrame, MediaFrameHeader,
-    MediaObjectHeaderV3, MediaObjectV3, read_client_hello, read_input_event,
-    read_media_control_request_v3, write_host_hello, write_input_ack, write_media_frame,
-    write_media_object_v3,
+    FrameFlags, HostHello, InputAck, InvitationGrants, KeyframeRequestReasonV3,
+    MAX_AUDIO_PAYLOAD_LEN, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,
+    MAX_MEDIA_OBJECT_ID_V3, MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MediaControlRequestV3,
+    MediaFrame, MediaFrameHeader, MediaObjectHeaderV3, MediaObjectV3, read_client_hello,
+    read_input_event, read_media_control_request_v3, write_host_hello, write_input_ack,
+    write_media_frame, write_media_object_v3,
 };
 use tracing::{debug, error, info, warn};
 
@@ -786,12 +786,10 @@ impl MediaV3Scheduler {
         }
     }
 
-    fn fail(&mut self, sequence: u64) -> Vec<u64> {
-        let Some(index) = self.in_flight.iter().position(|value| *value == sequence) else {
-            return Vec::new();
-        };
+    fn fail(&mut self, sequence: u64) -> Option<Vec<u64>> {
+        let index = self.in_flight.iter().position(|value| *value == sequence)?;
         self.in_flight.swap_remove(index);
-        self.enter_resync()
+        Some(self.enter_resync())
     }
 
     fn fail_all(&mut self) -> Vec<u64> {
@@ -818,14 +816,37 @@ fn apply_media_v3_keyframe_request(
     group_cursor: &mut MediaV3GroupCursor,
     replay_cursor: &mut MediaReplayCursor,
     through_sequence: Option<u64>,
+    reason: KeyframeRequestReasonV3,
 ) -> (bool, Vec<u64>) {
-    if scheduler.waiting_for_keyframe {
+    // Every v3 session already begins by replaying the bounded current GOP
+    // from object zero. A Join arriving after that replay was scheduled must
+    // not cancel the only decodable image on a damage-driven static source.
+    if reason == KeyframeRequestReasonV3::Join || scheduler.waiting_for_keyframe {
         return (false, Vec::new());
     }
     let cancel_sequences = scheduler.request_keyframe();
     group_cursor.request_keyframe();
     replay_cursor.enter_resync_through(through_sequence);
     (true, cancel_sequences)
+}
+
+fn apply_media_v3_send_failure(
+    scheduler: &mut MediaV3Scheduler,
+    group_cursor: &mut MediaV3GroupCursor,
+    replay_cursor: &mut MediaReplayCursor,
+    sequence: u64,
+    through_sequence: Option<u64>,
+) -> Option<Vec<u64>> {
+    let cancel_sequences = scheduler.fail(sequence)?;
+    group_cursor.request_keyframe();
+    replay_cursor.enter_resync_through(through_sequence);
+    Some(cancel_sequences)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaV3ControlDecision {
+    Accept,
+    Pace(Duration),
 }
 
 #[derive(Debug, Default)]
@@ -835,20 +856,27 @@ struct MediaV3ControlGate {
 }
 
 impl MediaV3ControlGate {
-    fn accept(&mut self, request: MediaControlRequestV3, now: Instant) -> Result<bool> {
+    fn accept(
+        &mut self,
+        request: MediaControlRequestV3,
+        now: Instant,
+    ) -> Result<MediaV3ControlDecision> {
         ensure!(
             self.last_request_id
                 .is_none_or(|last| request.request_id > last),
             "v3 media control request IDs must be strictly increasing"
         );
         self.last_request_id = Some(request.request_id);
-        if self.last_accepted_at.is_some_and(|last| {
-            now.saturating_duration_since(last) < MEDIA_V3_CONTROL_REQUEST_INTERVAL
-        }) {
-            return Ok(false);
+        if let Some(last) = self.last_accepted_at {
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed < MEDIA_V3_CONTROL_REQUEST_INTERVAL {
+                return Ok(MediaV3ControlDecision::Pace(
+                    MEDIA_V3_CONTROL_REQUEST_INTERVAL - elapsed,
+                ));
+            }
         }
         self.last_accepted_at = Some(now);
-        Ok(true)
+        Ok(MediaV3ControlDecision::Accept)
     }
 }
 
@@ -861,12 +889,20 @@ where
 {
     let mut gate = MediaV3ControlGate::default();
     while let Some(request) = read_media_control_request_v3(&mut reader).await? {
-        if !gate.accept(request, Instant::now())? {
-            debug!(
-                request_id = request.request_id,
-                "rate-limited v3 keyframe request"
-            );
-            continue;
+        match gate.accept(request, Instant::now())? {
+            MediaV3ControlDecision::Accept => {}
+            MediaV3ControlDecision::Pace(retry_after) => {
+                // Stop reading during the rejection interval so QUIC flow
+                // control, rather than this task, absorbs an abusive burst.
+                // This also bounds rejection logging to the configured rate.
+                debug!(
+                    request_id = request.request_id,
+                    retry_after_ms = retry_after.as_millis(),
+                    "paced rate-limited v3 keyframe request"
+                );
+                tokio::time::sleep(retry_after).await;
+                continue;
+            }
         }
         sender.send_replace(Some(request));
         if sender.is_closed() {
@@ -1786,6 +1822,7 @@ async fn run_media_v3_session(
                     &mut group_cursor,
                     &mut replay_cursor,
                     through_sequence,
+                    request.reason,
                 );
                 if !cancel_sequences.is_empty() {
                     send_tasks.abort_all();
@@ -1808,17 +1845,32 @@ async fn run_media_v3_session(
                 match task.expect("guarded by non-empty send task set") {
                     Ok((sequence, Ok(()))) => scheduler.complete(sequence),
                     Ok((sequence, Err(error))) => {
-                        warn!(sequence, %error, "media v3 object send failed; waiting for keyframe");
-                        let cancel_sequences = scheduler.fail(sequence);
-                        group_cursor.request_keyframe();
                         let through_sequence = current_gop_receiver
                             .borrow()
                             .as_ref()
                             .and_then(|gop| gop.frames.last())
                             .map(|frame| frame.sequence);
-                        replay_cursor.enter_resync_through(through_sequence);
-                        if !cancel_sequences.is_empty() {
-                            send_tasks.abort_all();
+                        if let Some(cancel_sequences) = apply_media_v3_send_failure(
+                            &mut scheduler,
+                            &mut group_cursor,
+                            &mut replay_cursor,
+                            sequence,
+                            through_sequence,
+                        ) {
+                            warn!(
+                                sequence,
+                                %error,
+                                "media v3 object send failed; waiting for keyframe"
+                            );
+                            if !cancel_sequences.is_empty() {
+                                send_tasks.abort_all();
+                            }
+                        } else {
+                            debug!(
+                                sequence,
+                                %error,
+                                "ignored stale media v3 object failure from a superseded group"
+                            );
                         }
                     }
                     Err(error) if error.is_cancelled() => {}
@@ -1936,20 +1988,30 @@ async fn run_media_v3_session(
                         Ok(Ok(stream)) => stream,
                         Ok(Err(error)) => {
                             warn!(sequence, %error, "opening media v3 object stream failed");
-                            if !scheduler.fail(sequence).is_empty() {
+                            if let Some(cancel_sequences) = apply_media_v3_send_failure(
+                                &mut scheduler,
+                                &mut group_cursor,
+                                &mut replay_cursor,
+                                sequence,
+                                Some(replay_through_sequence),
+                            ) && !cancel_sequences.is_empty()
+                            {
                                 send_tasks.abort_all();
                             }
-                            group_cursor.request_keyframe();
-                            replay_cursor.enter_resync_through(Some(replay_through_sequence));
                             break;
                         }
                         Err(_) => {
                             warn!(sequence, "opening media v3 object stream timed out");
-                            if !scheduler.fail(sequence).is_empty() {
+                            if let Some(cancel_sequences) = apply_media_v3_send_failure(
+                                &mut scheduler,
+                                &mut group_cursor,
+                                &mut replay_cursor,
+                                sequence,
+                                Some(replay_through_sequence),
+                            ) && !cancel_sequences.is_empty()
+                            {
                                 send_tasks.abort_all();
                             }
-                            group_cursor.request_keyframe();
-                            replay_cursor.enter_resync_through(Some(replay_through_sequence));
                             break;
                         }
                     };
@@ -1958,11 +2020,16 @@ async fn run_media_v3_session(
                         media_v3_transport_priority(media_object.header.publisher_priority)?;
                     if let Err(error) = stream.stream().set_priority(transport_priority) {
                         warn!(sequence, %error, "setting media v3 object priority failed");
-                        if !scheduler.fail(sequence).is_empty() {
+                        if let Some(cancel_sequences) = apply_media_v3_send_failure(
+                            &mut scheduler,
+                            &mut group_cursor,
+                            &mut replay_cursor,
+                            sequence,
+                            Some(replay_through_sequence),
+                        ) && !cancel_sequences.is_empty()
+                        {
                             send_tasks.abort_all();
                         }
-                        group_cursor.request_keyframe();
-                        replay_cursor.enter_resync_through(Some(replay_through_sequence));
                         break;
                     }
                     send_tasks.spawn(async move {
@@ -2775,6 +2842,7 @@ mod tests {
             &mut group_cursor,
             &mut replay_cursor,
             Some(42),
+            KeyframeRequestReasonV3::Join,
         );
 
         assert!(!transitioned);
@@ -2803,6 +2871,121 @@ mod tests {
     }
 
     #[test]
+    fn media_v3_late_join_preserves_active_static_current_gop() {
+        let mut scheduler = MediaV3Scheduler::default();
+        let mut group_cursor = MediaV3GroupCursor::default();
+        let mut replay_cursor = MediaReplayCursor::default();
+        let keyframe = media_v3_encoded_frame(10, true, true, 1);
+        let delta = media_v3_encoded_frame(11, false, false, 1);
+
+        assert!(matches!(
+            group_cursor.classify(&keyframe),
+            MediaV3GroupDecision::Send(_)
+        ));
+        assert!(matches!(
+            scheduler.schedule(keyframe.sequence, true),
+            MediaV3ScheduleDecision::Send { .. }
+        ));
+        replay_cursor.commit_sent(&keyframe);
+        assert!(matches!(
+            group_cursor.classify(&delta),
+            MediaV3GroupDecision::Send(_)
+        ));
+        assert!(matches!(
+            scheduler.schedule(delta.sequence, false),
+            MediaV3ScheduleDecision::Send { .. }
+        ));
+        replay_cursor.commit_sent(&delta);
+
+        let (transitioned, cancel_sequences) = apply_media_v3_keyframe_request(
+            &mut scheduler,
+            &mut group_cursor,
+            &mut replay_cursor,
+            Some(delta.sequence),
+            KeyframeRequestReasonV3::Join,
+        );
+
+        assert!(!transitioned);
+        assert!(cancel_sequences.is_empty());
+        assert_eq!(scheduler.in_flight, vec![10, 11]);
+        assert!(!scheduler.waiting_for_keyframe);
+        assert!(!scheduler.discontinuity_pending);
+        assert_eq!(group_cursor.group_id, Some(10));
+        assert_eq!(group_cursor.last_sequence, Some(11));
+        assert!(!group_cursor.waiting_for_keyframe);
+        assert_eq!(replay_cursor.last_sequence, Some(11));
+        assert!(!replay_cursor.waiting_for_keyframe);
+    }
+
+    #[test]
+    fn media_v3_stale_old_group_failure_preserves_replacement_group() {
+        let mut scheduler = MediaV3Scheduler::default();
+        let mut group_cursor = MediaV3GroupCursor::default();
+        let mut replay_cursor = MediaReplayCursor::default();
+        let old_keyframe = media_v3_encoded_frame(60, true, true, 1);
+        let old_delta = media_v3_encoded_frame(61, false, false, 1);
+        let replacement = media_v3_encoded_frame(70, true, true, 1);
+
+        for frame in [&old_keyframe, &old_delta] {
+            assert!(matches!(
+                group_cursor.classify(frame),
+                MediaV3GroupDecision::Send(_)
+            ));
+            assert!(matches!(
+                scheduler.schedule(frame.sequence, frame.keyframe && frame.codec_config),
+                MediaV3ScheduleDecision::Send { .. }
+            ));
+            replay_cursor.commit_sent(frame);
+        }
+        assert!(matches!(
+            group_cursor.classify(&replacement),
+            MediaV3GroupDecision::Send(_)
+        ));
+        assert_eq!(
+            scheduler.schedule(replacement.sequence, true),
+            MediaV3ScheduleDecision::Send {
+                discontinuity: true,
+                cancel_sequences: vec![60, 61],
+            }
+        );
+        replay_cursor.commit_sent(&replacement);
+
+        assert_eq!(
+            apply_media_v3_send_failure(
+                &mut scheduler,
+                &mut group_cursor,
+                &mut replay_cursor,
+                old_keyframe.sequence,
+                Some(replacement.sequence),
+            ),
+            None
+        );
+        assert_eq!(scheduler.in_flight, vec![70]);
+        assert!(!scheduler.waiting_for_keyframe);
+        assert_eq!(group_cursor.group_id, Some(70));
+        assert!(!group_cursor.waiting_for_keyframe);
+        assert_eq!(replay_cursor.last_sequence, Some(70));
+        assert!(!replay_cursor.waiting_for_keyframe);
+
+        let next_delta = media_v3_encoded_frame(71, false, false, 1);
+        assert!(matches!(
+            group_cursor.classify(&next_delta),
+            MediaV3GroupDecision::Send(MediaV3ObjectPosition {
+                group_id: 70,
+                object_id: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            scheduler.schedule(next_delta.sequence, false),
+            MediaV3ScheduleDecision::Send {
+                discontinuity: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn media_v3_control_gate_is_monotonic_and_accepts_at_most_ten_per_second() {
         let started = Instant::now();
         let request = |request_id| {
@@ -2813,23 +2996,57 @@ mod tests {
             )
         };
         let mut gate = MediaV3ControlGate::default();
-        assert!(gate.accept(request(1), started).unwrap());
-        assert!(
-            !gate
-                .accept(
-                    request(2),
-                    started + MEDIA_V3_CONTROL_REQUEST_INTERVAL - Duration::from_nanos(1),
-                )
-                .unwrap()
+        assert_eq!(
+            gate.accept(request(1), started).unwrap(),
+            MediaV3ControlDecision::Accept
         );
-        assert!(
-            gate.accept(request(3), started + MEDIA_V3_CONTROL_REQUEST_INTERVAL,)
-                .unwrap()
+        assert_eq!(
+            gate.accept(
+                request(2),
+                started + MEDIA_V3_CONTROL_REQUEST_INTERVAL - Duration::from_nanos(1),
+            )
+            .unwrap(),
+            MediaV3ControlDecision::Pace(Duration::from_nanos(1))
+        );
+        assert_eq!(
+            gate.accept(request(3), started + MEDIA_V3_CONTROL_REQUEST_INTERVAL)
+                .unwrap(),
+            MediaV3ControlDecision::Accept
         );
         assert!(
             gate.accept(request(3), started + Duration::from_secs(1))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn media_v3_rejected_control_requests_apply_read_side_pacing() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let requests = [1, 2, 3].map(|request_id| {
+            MediaControlRequestV3::request_keyframe(
+                request_id,
+                None,
+                KeyframeRequestReasonV3::TransportGap,
+            )
+        });
+        let (mut writer, reader) = tokio::io::duplex(128);
+        for request in &requests {
+            sigil_protocol::write_media_control_request_v3(&mut writer, request)
+                .await
+                .unwrap();
+        }
+        writer.shutdown().await.unwrap();
+        let (sender, mut receiver) = tokio::sync::watch::channel(None);
+
+        let started = Instant::now();
+        forward_media_v3_control_requests(reader, sender)
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() >= MEDIA_V3_CONTROL_REQUEST_INTERVAL);
+        receiver.changed().await.unwrap();
+        assert_eq!(*receiver.borrow_and_update(), Some(requests[2]));
     }
 
     #[tokio::test]

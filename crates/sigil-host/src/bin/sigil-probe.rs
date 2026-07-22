@@ -1159,6 +1159,8 @@ async fn main() -> Result<()> {
     let mut object_sequence_v3 = MediaObjectSequenceV3::new();
     let mut keyframe_request_sent = false;
     let mut keyframe_recovery_verified = false;
+    let mut keyframe_request_sent_at: Option<Instant> = None;
+    let mut keyframe_recovery_micros = None;
     let mut keyframe_request_group_id = None;
     let mut keyframe_request_last_sequence = None;
 
@@ -1204,6 +1206,9 @@ async fn main() -> Result<()> {
                                     .is_some_and(|prior| frame.header.sequence > prior),
                                 "MoQ keyframe request recovery did not advance media sequence"
                             );
+                            keyframe_recovery_micros = keyframe_request_sent_at.map(|sent_at| {
+                                u64::try_from(sent_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+                            });
                             keyframe_recovery_verified = true;
                         }
                         break (
@@ -1329,6 +1334,11 @@ async fn main() -> Result<()> {
                                         }),
                                         "keyframe request recovery did not advance media sequence"
                                     );
+                                    keyframe_recovery_micros =
+                                        keyframe_request_sent_at.map(|sent_at| {
+                                            u64::try_from(sent_at.elapsed().as_micros())
+                                                .unwrap_or(u64::MAX)
+                                        });
                                     keyframe_recovery_verified = true;
                                 }
                                 break (object.into(), recovery);
@@ -1398,6 +1408,7 @@ async fn main() -> Result<()> {
             .context("timed out writing v3 keyframe request")??;
             keyframe_request_group_id = frame.v3_group_id;
             keyframe_request_last_sequence = Some(frame.sequence);
+            keyframe_request_sent_at = Some(Instant::now());
             keyframe_request_sent = true;
             match media_transport {
                 MediaTransport::UpstreamMoq => {
@@ -1561,8 +1572,13 @@ async fn main() -> Result<()> {
     );
     if args.keyframe_smoke {
         println!("keyframe_request_id={}", args.keyframe_request_id);
+        println!(
+            "keyframe_recovery_micros={}",
+            keyframe_recovery_micros.context("keyframe recovery latency was not measured")?
+        );
     } else {
         println!("keyframe_request_id=not-requested");
+        println!("keyframe_recovery_micros=not-requested");
     }
     match accepted_fps {
         Some(fps) => println!("accepted_fps={fps:.3}"),

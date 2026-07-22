@@ -416,6 +416,12 @@ validate_probe_log() {
   grep -Fxq 'frame_sequence=monotonic' "$log_path" || return 1
   grep -Fxq "keyframe_recovery=${keyframe_recovery}" "$log_path" || return 1
   grep -Fxq "keyframe_request_id=${expected_request_id}" "$log_path" || return 1
+  if [[ "$expected_request_id" == not-requested ]]; then
+    grep -Fxq 'keyframe_recovery_micros=not-requested' "$log_path" || return 1
+  else
+    awk -F= '$1 == "keyframe_recovery_micros" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+  fi
   awk -F= '$1 == "media_objects_dropped" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
     "$log_path" || return 1
   awk -F= '$1 == "media_objects_late" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
@@ -623,7 +629,7 @@ printf 'probe_binary=%s\n' "$probe_bin"
 printf 'probe_sha256=%s\n' "$(sha256_file "$probe_bin")"
 printf 'node_id=%s\n' "$node_id"
 printf 'primary_frames=%s\n' "$primary_frames"
-grep -E '^(transport|control_alpn|transport_alpn|first_configured_idr|frame_sequence|group_sequence|keyframe_recovery|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|moq_catalog|moq_group_capacity|moq_cancelled_groups|moq_group_gaps|moq_unrecovered_group_gaps|moq_maximum_group_objects|moq_maximum_group_bytes|moq_historical_suffix_frames|recovery_barrier|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
+grep -E '^(transport|control_alpn|transport_alpn|first_configured_idr|frame_sequence|group_sequence|keyframe_recovery|keyframe_recovery_micros|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|moq_catalog|moq_group_capacity|moq_cancelled_groups|moq_group_gaps|moq_unrecovered_group_gaps|moq_maximum_group_objects|moq_maximum_group_bytes|moq_historical_suffix_frames|recovery_barrier|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
 printf 'keyframe_request_correlation=%s\n' \
   "$([[ "$media_v1" == false && "$media_v2" == false ]] && printf unique || printf not-requested)"
 printf 'active_client_rejection=ok\n'

@@ -115,10 +115,10 @@ not authentication.
 5. **Upstream Iroh/MoQ transport implemented; hardware proof pending:** an
    authenticated control lease gates a session-scoped upstream MoQ broadcast;
    bounded native groups cancel stale GOPs and recover through explicit
-   keyframe requests. The external encoder responds at its next natural
-   configured IDR. An opt-in in-process encoder-control foundation exists, but
-   its Bazzite/package acceptance and induced-loss relay proof remain in issue
-   #7.
+   keyframe requests. The opt-in in-process encoder turns recovery requests
+   into coalesced forced IDRs without blocking media publication; the external
+   encoder responds at its next natural configured IDR. Bazzite/package
+   acceptance and induced-loss relay proof remain in issue #7.
 6. **Host hardware-proven; physical client controller pending:** the virtual
    Xbox-style controller negotiated over Iroh and produced the expected
    button, stick, trigger, D-pad, and neutral-release events on the Bazzite

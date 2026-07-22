@@ -979,6 +979,11 @@ struct MediaV3Telemetry {
     selected_path_rtt_micros: AtomicU64,
     selected_path_lost_packets: AtomicU64,
     selected_path_congestion_events: AtomicU64,
+    keyframe_control_requests: AtomicU64,
+    encoder_force_requests: AtomicU64,
+    encoder_force_acknowledgements: AtomicU64,
+    encoder_force_failures: AtomicU64,
+    last_encoder_force_ack_micros: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1003,6 +1008,178 @@ struct ResolutionEncoderProposal {
     control: EncoderControl,
     target: VideoDimensions,
     revision: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ForcedIdrDisposition {
+    JoinReplay,
+    Unavailable,
+    Requested { revision: u64 },
+    Coalesced { revision: u64 },
+    Failed { error: String },
+}
+
+struct ForcedIdrAcknowledgement {
+    requested_revision: u64,
+    elapsed: Duration,
+    result: Result<crate::source::EncoderControlStatus>,
+}
+
+struct ForcedIdrCoordinator {
+    control: Option<EncoderControl>,
+    pending_revision: Option<u64>,
+    acknowledgements: tokio::task::JoinSet<ForcedIdrAcknowledgement>,
+    telemetry: Arc<MediaV3Telemetry>,
+}
+
+impl ForcedIdrCoordinator {
+    fn new(control: Option<EncoderControl>, telemetry: Arc<MediaV3Telemetry>) -> Self {
+        Self {
+            control,
+            pending_revision: None,
+            acknowledgements: tokio::task::JoinSet::new(),
+            telemetry,
+        }
+    }
+
+    fn request(&mut self, reason: KeyframeRequestReasonV3) -> ForcedIdrDisposition {
+        self.telemetry
+            .keyframe_control_requests
+            .fetch_add(1, Ordering::Relaxed);
+        if reason == KeyframeRequestReasonV3::Join {
+            return ForcedIdrDisposition::JoinReplay;
+        }
+        if let Some(revision) = self.pending_revision {
+            return ForcedIdrDisposition::Coalesced { revision };
+        }
+        let Some(control) = self.control.clone() else {
+            return ForcedIdrDisposition::Unavailable;
+        };
+        let revision = match control.request_force_keyframe() {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.telemetry
+                    .encoder_force_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return ForcedIdrDisposition::Failed {
+                    error: error.to_string(),
+                };
+            }
+        };
+        self.pending_revision = Some(revision);
+        self.telemetry
+            .encoder_force_requests
+            .fetch_add(1, Ordering::Relaxed);
+        self.acknowledgements.spawn(async move {
+            let started_at = Instant::now();
+            let result = control
+                .wait_for_recovery_keyframe_acknowledged(revision, ENCODER_CONTROL_COMMIT_TIMEOUT)
+                .await;
+            ForcedIdrAcknowledgement {
+                requested_revision: revision,
+                elapsed: started_at.elapsed(),
+                result,
+            }
+        });
+        ForcedIdrDisposition::Requested { revision }
+    }
+
+    fn complete(
+        &mut self,
+        result: Option<Result<ForcedIdrAcknowledgement, tokio::task::JoinError>>,
+        remote: EndpointId,
+        transport: &'static str,
+    ) {
+        let pending_revision = self.pending_revision.take();
+        match result {
+            Some(Ok(acknowledgement)) => match acknowledgement.result {
+                Ok(status) => {
+                    let elapsed_micros =
+                        u64::try_from(acknowledgement.elapsed.as_micros()).unwrap_or(u64::MAX);
+                    self.telemetry
+                        .encoder_force_acknowledgements
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.telemetry
+                        .last_encoder_force_ack_micros
+                        .store(elapsed_micros, Ordering::Relaxed);
+                    debug!(
+                        %remote,
+                        transport,
+                        requested_revision = acknowledgement.requested_revision,
+                        acknowledged_revision = ?status.acknowledged_force_keyframe_revision,
+                        elapsed_micros,
+                        "forced-IDR recovery acknowledged"
+                    );
+                }
+                Err(error) => {
+                    self.telemetry
+                        .encoder_force_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        %remote,
+                        transport,
+                        requested_revision = acknowledgement.requested_revision,
+                        %error,
+                        "forced-IDR recovery was not acknowledged; retaining natural-IDR fallback"
+                    );
+                }
+            },
+            Some(Err(error)) => {
+                self.telemetry
+                    .encoder_force_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    %remote,
+                    transport,
+                    ?pending_revision,
+                    %error,
+                    "forced-IDR acknowledgement task failed; retaining natural-IDR fallback"
+                );
+            }
+            None => {
+                self.telemetry
+                    .encoder_force_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    %remote,
+                    transport,
+                    ?pending_revision,
+                    "forced-IDR acknowledgement task ended without a result"
+                );
+            }
+        }
+    }
+
+    async fn abort_and_drain(&mut self, remote: EndpointId, transport: &'static str) {
+        self.pending_revision = None;
+        self.acknowledgements.abort_all();
+        while self.acknowledgements.join_next().await.is_some() {}
+        debug!(
+            %remote,
+            transport,
+            keyframe_control_requests = self
+                .telemetry
+                .keyframe_control_requests
+                .load(Ordering::Relaxed),
+            encoder_force_requests = self
+                .telemetry
+                .encoder_force_requests
+                .load(Ordering::Relaxed),
+            encoder_force_acknowledgements = self
+                .telemetry
+                .encoder_force_acknowledgements
+                .load(Ordering::Relaxed),
+            encoder_force_failures = self
+                .telemetry
+                .encoder_force_failures
+                .load(Ordering::Relaxed),
+            last_encoder_force_ack_micros = self
+                .telemetry
+                .last_encoder_force_ack_micros
+                .load(Ordering::Relaxed),
+            "forced-IDR recovery session summary"
+        );
+    }
 }
 
 impl MediaV3Telemetry {
@@ -2118,6 +2295,22 @@ fn apply_media_v3_keyframe_request(
     (true, cancel_sequences)
 }
 
+fn apply_moq_keyframe_request(
+    publisher: &mut MoqGroupPublisher,
+    replay_cursor: &mut MediaReplayCursor,
+    through_sequence: Option<u64>,
+    reason: KeyframeRequestReasonV3,
+) -> Option<u64> {
+    // The bounded current group is already the late joiner's decodable replay.
+    // Aborting it on Join can strand a static source until its next natural IDR.
+    if reason == KeyframeRequestReasonV3::Join {
+        return None;
+    }
+    let cancelled_group = publisher.request_keyframe();
+    replay_cursor.enter_resync_through(through_sequence);
+    cancelled_group
+}
+
 fn apply_media_v3_send_failure(
     scheduler: &mut MediaV3Scheduler,
     group_cursor: &mut MediaV3GroupCursor,
@@ -2687,7 +2880,6 @@ async fn serve_control_moq(
     };
     let source_task = SourceTaskGuard::new(source_task);
     sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
-    let _encoder_control = encoder_control;
 
     let mut broadcast = Broadcast::new().produce();
     let track = broadcast
@@ -2748,6 +2940,7 @@ async fn serve_control_moq(
         closed,
         track,
         &mut broadcast,
+        encoder_control,
         Arc::clone(&lease.media_v3_telemetry),
     )
     .await;
@@ -2774,6 +2967,7 @@ async fn run_control_moq_session(
     mut moq_closed: tokio::sync::oneshot::Receiver<()>,
     track: TrackProducer,
     broadcast: &mut BroadcastProducer,
+    encoder_control: Option<EncoderControl>,
     telemetry: Arc<MediaV3Telemetry>,
 ) -> Result<()> {
     let maximum_replay_age = maximum_media_replay_age(config.framerate);
@@ -2786,6 +2980,7 @@ async fn run_control_moq_session(
     ));
     let mut control_task_finished = false;
     let mut control_receiver_open = true;
+    let mut forced_idr = ForcedIdrCoordinator::new(encoder_control, Arc::clone(&telemetry));
 
     let result = async {
         loop {
@@ -2818,13 +3013,27 @@ async fn run_control_moq_session(
                         .as_ref()
                         .and_then(|gop| gop.frames.last())
                         .map(|frame| frame.sequence);
-                    let cancelled_group = publisher.request_keyframe();
+                    let cancelled_group = apply_moq_keyframe_request(
+                        &mut publisher,
+                        &mut replay_cursor,
+                        through_sequence,
+                        request.reason,
+                    );
                     if cancelled_group.is_some() {
                         telemetry
                             .scheduler_cancellations
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    replay_cursor.enter_resync_through(through_sequence);
+                    let forced_idr_disposition = forced_idr.request(request.reason);
+                    if let ForcedIdrDisposition::Failed { error } = &forced_idr_disposition {
+                        warn!(
+                            %remote,
+                            request_id = request.request_id,
+                            ?request.reason,
+                            %error,
+                            "forced-IDR request failed; retaining natural-IDR fallback"
+                        );
+                    }
                     debug!(
                         %remote,
                         request_id = request.request_id,
@@ -2832,8 +3041,14 @@ async fn run_control_moq_session(
                         advisory_last_sequence = ?request.last_sequence,
                         coalesced = cancelled_group.is_none(),
                         ?cancelled_group,
+                        ?forced_idr_disposition,
                         "accepted MoQ keyframe request"
                     );
+                }
+                acknowledgement = forced_idr.acknowledgements.join_next(),
+                    if forced_idr.pending_revision.is_some() =>
+                {
+                    forced_idr.complete(acknowledgement, remote, "iroh-moq");
                 }
                 reason = connection.closed() => {
                     debug!(%remote, ?reason, "MoQ control connection closed");
@@ -2932,6 +3147,7 @@ async fn run_control_moq_session(
     }
     .await;
 
+    forced_idr.abort_and_drain(remote, "iroh-moq").await;
     publisher.abort();
     let _ = broadcast.abort(MoqError::Cancel);
     if !control_task_finished {
@@ -3791,7 +4007,6 @@ async fn serve_media_v3(
     };
     let source_task = SourceTaskGuard::new(source_task);
     sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
-    let _encoder_control = encoder_control;
 
     let mut media_hello = HostHello::accepted(
         lease.session_id,
@@ -3812,6 +4027,7 @@ async fn serve_media_v3(
         &mut current_gop_receiver,
         recv,
         remote,
+        encoder_control,
         Arc::clone(&lease.media_v3_telemetry),
     )
     .await;
@@ -4036,6 +4252,7 @@ async fn run_media_v3_session(
     current_gop_receiver: &mut tokio::sync::watch::Receiver<Option<EncodedGop>>,
     control_recv: iroh::endpoint::RecvStream,
     remote: EndpointId,
+    encoder_control: Option<EncoderControl>,
     telemetry: Arc<MediaV3Telemetry>,
 ) -> Result<()> {
     let maximum_replay_age = maximum_media_replay_age(config.framerate);
@@ -4051,6 +4268,7 @@ async fn run_media_v3_session(
     ));
     let mut control_task_finished = false;
     let mut control_receiver_open = true;
+    let mut forced_idr = ForcedIdrCoordinator::new(encoder_control, Arc::clone(&telemetry));
 
     let result = loop {
         telemetry.record_selected_path(connection);
@@ -4101,6 +4319,16 @@ async fn run_media_v3_session(
                     );
                     send_tasks.abort_all();
                 }
+                let forced_idr_disposition = forced_idr.request(request.reason);
+                if let ForcedIdrDisposition::Failed { error } = &forced_idr_disposition {
+                    warn!(
+                        %remote,
+                        request_id = request.request_id,
+                        ?request.reason,
+                        %error,
+                        "forced-IDR request failed; retaining natural-IDR fallback"
+                    );
+                }
                 debug!(
                     %remote,
                     request_id = request.request_id,
@@ -4108,8 +4336,14 @@ async fn run_media_v3_session(
                     advisory_last_sequence = ?request.last_sequence,
                     coalesced = !transitioned,
                     ?cancel_sequences,
+                    ?forced_idr_disposition,
                     "accepted media v3 keyframe request"
                 );
+            }
+            acknowledgement = forced_idr.acknowledgements.join_next(),
+                if forced_idr.pending_revision.is_some() =>
+            {
+                forced_idr.complete(acknowledgement, remote, "grouped-v3");
             }
             closed = connection.closed() => {
                 debug!(%remote, ?closed, "media v3 connection closed");
@@ -4347,6 +4581,7 @@ async fn run_media_v3_session(
         }
     };
 
+    forced_idr.abort_and_drain(remote, "grouped-v3").await;
     send_tasks.abort_all();
     while send_tasks.join_next().await.is_some() {}
     if !control_task_finished {
@@ -5677,6 +5912,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_moq_late_join_preserves_active_static_group() {
+        let track_info = Track {
+            name: MOQ_VIDEO_H264_TRACK.to_owned(),
+            priority: MOQ_VIDEO_TRACK_PRIORITY,
+        };
+        let mut broadcast = Broadcast::new().produce();
+        let track = broadcast.create_track(track_info.clone()).unwrap();
+        let mut consumer = broadcast.consume().subscribe_track(&track_info).unwrap();
+        let mut publisher = MoqGroupPublisher::new(track);
+        let mut replay_cursor = MediaReplayCursor::default();
+        let config = moq_test_config();
+        let keyframe = media_v3_encoded_frame(10, true, true, 1);
+        let first_delta = media_v3_encoded_frame(11, false, false, 1);
+        let next_delta = media_v3_encoded_frame(12, false, false, 1);
+
+        publisher.publish(&config, &keyframe, false).unwrap();
+        replay_cursor.commit_sent(&keyframe);
+        let mut active_group = consumer.recv_group().await.unwrap().unwrap();
+        assert!(active_group.read_frame().await.unwrap().is_some());
+
+        publisher.publish(&config, &first_delta, false).unwrap();
+        replay_cursor.commit_sent(&first_delta);
+        assert!(active_group.read_frame().await.unwrap().is_some());
+
+        assert_eq!(
+            apply_moq_keyframe_request(
+                &mut publisher,
+                &mut replay_cursor,
+                Some(first_delta.sequence),
+                KeyframeRequestReasonV3::Join,
+            ),
+            None
+        );
+        assert_eq!(replay_cursor.last_sequence, Some(first_delta.sequence));
+        assert!(!replay_cursor.waiting_for_keyframe);
+        assert_eq!(
+            publisher.publish(&config, &next_delta, false).unwrap(),
+            MoqGroupDecision::Published {
+                group_id: 0,
+                frame_id: 2,
+                cancelled_previous: false,
+            }
+        );
+        assert!(active_group.read_frame().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn upstream_moq_resync_aborts_current_group_and_waits_for_configured_idr() {
         let track_info = Track {
             name: MOQ_VIDEO_H264_TRACK.to_owned(),
@@ -5710,6 +5992,66 @@ mod tests {
                 cancelled_previous: false,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn forced_idr_recovery_is_one_slot_join_safe_and_rearms_after_ack() {
+        let telemetry = Arc::new(MediaV3Telemetry::default());
+        let harness = crate::source::EncoderControlTestHarness::new();
+        let mut coordinator =
+            ForcedIdrCoordinator::new(Some(harness.control.clone()), Arc::clone(&telemetry));
+
+        assert_eq!(
+            coordinator.request(KeyframeRequestReasonV3::Join),
+            ForcedIdrDisposition::JoinReplay
+        );
+        assert_eq!(harness.requested_force_keyframe_revision(), None);
+
+        let requested_revision = match coordinator.request(KeyframeRequestReasonV3::DecoderReset) {
+            ForcedIdrDisposition::Requested { revision } => revision,
+            disposition => panic!("unexpected forced-IDR disposition: {disposition:?}"),
+        };
+        assert_eq!(
+            harness.requested_force_keyframe_revision(),
+            Some(requested_revision)
+        );
+        assert_eq!(
+            coordinator.request(KeyframeRequestReasonV3::TransportGap),
+            ForcedIdrDisposition::Coalesced {
+                revision: requested_revision
+            }
+        );
+        assert_eq!(telemetry.encoder_force_requests.load(Ordering::Relaxed), 1);
+
+        let newer_revision = harness.control.request_force_keyframe().unwrap();
+        harness.status.send_modify(|status| {
+            status.requested_force_keyframe_revision = Some(newer_revision);
+            status.acknowledged_force_keyframe_revision = Some(newer_revision);
+        });
+        let acknowledgement = coordinator.acknowledgements.join_next().await;
+        coordinator.complete(acknowledgement, endpoint(1), "test");
+        assert_eq!(coordinator.pending_revision, None);
+        assert_eq!(
+            telemetry
+                .encoder_force_acknowledgements
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(telemetry.encoder_force_failures.load(Ordering::Relaxed), 0);
+
+        assert!(matches!(
+            coordinator.request(KeyframeRequestReasonV3::DecoderReset),
+            ForcedIdrDisposition::Requested { revision } if revision > newer_revision
+        ));
+        coordinator.abort_and_drain(endpoint(1), "test").await;
+
+        let fallback_telemetry = Arc::new(MediaV3Telemetry::default());
+        let mut fallback = ForcedIdrCoordinator::new(None, fallback_telemetry);
+        assert_eq!(
+            fallback.request(KeyframeRequestReasonV3::DecoderReset),
+            ForcedIdrDisposition::Unavailable
+        );
+        assert!(fallback.acknowledgements.is_empty());
     }
 
     #[tokio::test]

@@ -225,6 +225,36 @@ impl EncoderControl {
             .with_context(|| format!("timed out waiting for force-keyframe revision {revision}"))?
     }
 
+    /// Wait for recovery to reach any configured IDR at or after `revision`.
+    ///
+    /// Recovery requests are deliberately coalesced with later encoder
+    /// controls. Unlike transactional adaptive updates, a newer configured IDR
+    /// still satisfies the decoder barrier established by an older request.
+    pub async fn wait_for_recovery_keyframe_acknowledged(
+        &self,
+        revision: u64,
+        timeout: Duration,
+    ) -> Result<EncoderControlStatus> {
+        let mut status = self.status.clone();
+        let wait = async {
+            loop {
+                let snapshot = *status.borrow_and_update();
+                if snapshot
+                    .acknowledged_force_keyframe_revision
+                    .is_some_and(|acknowledged| acknowledged >= revision)
+                {
+                    return Ok(snapshot);
+                }
+                status.changed().await.context(
+                    "encoder control status closed before recovery keyframe was acknowledged",
+                )?;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.with_context(|| {
+            format!("timed out waiting for recovery keyframe revision {revision}")
+        })?
+    }
+
     /// Wait until the exact target dimensions emerge from the encoder on an
     /// independently decodable access unit. A property write or caps event is
     /// not an application acknowledgement.
@@ -291,6 +321,10 @@ impl EncoderControlTestHarness {
             status,
             _desired: desired,
         }
+    }
+
+    pub(crate) fn requested_force_keyframe_revision(&self) -> Option<u64> {
+        self._desired.borrow().force_keyframe_revision
     }
 }
 
@@ -2203,6 +2237,35 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("status closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_waiter_accepts_a_newer_configured_idr_revision() {
+        let (control, _desired, status) = EncoderControl::new();
+        let recovery_revision = control.request_force_keyframe().unwrap();
+        let newer_revision = control.request_force_keyframe().unwrap();
+        assert!(newer_revision > recovery_revision);
+        status.send_modify(|status| {
+            status.requested_force_keyframe_revision = Some(newer_revision);
+            status.acknowledged_force_keyframe_revision = Some(newer_revision);
+        });
+
+        let acknowledged = control
+            .wait_for_recovery_keyframe_acknowledged(recovery_revision, Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            acknowledged.acknowledged_force_keyframe_revision,
+            Some(newer_revision)
+        );
+        assert!(
+            control
+                .wait_for_force_keyframe_acknowledged(recovery_revision, Duration::from_millis(10),)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("superseded")
         );
     }
 

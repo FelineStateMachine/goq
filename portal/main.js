@@ -1440,7 +1440,9 @@ function updateStreamStats() {
     frontendDroppedTotal: frontendDroppedFrames,
     decoderDroppedTotal: droppedFrames,
     presenterDroppedTotal: presentationDroppedFrames,
-    deliveryLatencyP95Ms: frontendIpcSendDurationStats?.p95Ms ?? null,
+    // Portal has no clock-synchronized capture-to-delivery measurement yet.
+    // IPC send duration is a different boundary and must not be mislabeled.
+    transportDeliveryP95Ms: null,
     decodeLatencyP95Ms: decodePercentiles.p95,
     presentationLatencyP95Ms: presentPercentiles.p95,
     resyncActive: decoderRecovery.recovering || frontendResyncStats?.active === true,

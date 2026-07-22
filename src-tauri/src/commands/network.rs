@@ -97,6 +97,7 @@ const CLIENT_ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_MEDIA_FEEDBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_MEDIA_FEEDBACK_INTERVAL_MS: u16 = 1_000;
 const CLIENT_MEDIA_FEEDBACK_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_ADAPTIVE_DECISION_DELIVERY_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_FRAME_RATE_WINDOW: Duration = Duration::from_secs(1);
 const CLIENT_FRAME_TIMING_WINDOW: Duration = Duration::from_secs(5);
 // Host configuration permits at most 240 fps. Leave a little headroom for
@@ -799,13 +800,13 @@ pub struct ClientMediaFeedbackReport {
     pub resync_active: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct AdaptiveBitrateDecisionPayload {
     generation: u64,
     decision: AdaptiveBitrateDecisionDiagnostic,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct AdaptiveBitrateDecisionDiagnostic {
     decision_id: u64,
     report_id: u64,
@@ -2016,6 +2017,67 @@ fn adaptive_bitrate_decision_diagnostic(
     }
 }
 
+#[derive(Debug, Default)]
+struct AdaptiveDecisionSequence {
+    last_decision_id: Option<u64>,
+    last_report_id: Option<u64>,
+}
+
+impl AdaptiveDecisionSequence {
+    fn accept(&mut self, decision: &AdaptiveBitrateDecisionV1) -> Result<(), String> {
+        if self
+            .last_decision_id
+            .is_some_and(|previous| decision.decision_id <= previous)
+        {
+            return Err(format!(
+                "adaptive decision ID did not increase: previous={:?}, current={}",
+                self.last_decision_id, decision.decision_id
+            ));
+        }
+        if self
+            .last_report_id
+            .is_some_and(|previous| decision.report_id <= previous)
+        {
+            return Err(format!(
+                "adaptive decision report ID did not increase: previous={:?}, current={}",
+                self.last_report_id, decision.report_id
+            ));
+        }
+        self.last_decision_id = Some(decision.decision_id);
+        self.last_report_id = Some(decision.report_id);
+        Ok(())
+    }
+}
+
+async fn emit_paced_adaptive_decisions<F>(
+    generation: u64,
+    mut decisions: tokio::sync::watch::Receiver<Option<AdaptiveBitrateDecisionV1>>,
+    delivery_interval: Duration,
+    mut emit: F,
+) -> Result<(), String>
+where
+    F: FnMut(AdaptiveBitrateDecisionPayload) -> Result<(), String>,
+{
+    let mut delivery = tokio::time::interval(delivery_interval);
+    delivery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        decisions
+            .changed()
+            .await
+            .map_err(|_| "adaptive decision receiver closed".to_string())?;
+        // The first tick is immediate. Later ticks pace the webview boundary;
+        // any host burst replaces the watch value while this task waits.
+        delivery.tick().await;
+        let Some(decision) = *decisions.borrow_and_update() else {
+            continue;
+        };
+        emit(AdaptiveBitrateDecisionPayload {
+            generation,
+            decision: adaptive_bitrate_decision_diagnostic(decision),
+        })?;
+    }
+}
+
 async fn run_media_feedback_session(
     app: AppHandle,
     generation: u64,
@@ -2023,6 +2085,7 @@ async fn run_media_feedback_session(
     mut recv: iroh::endpoint::RecvStream,
     mut reports: tokio::sync::watch::Receiver<Option<MediaFeedbackReportV1>>,
 ) {
+    let (decision_tx, decision_rx) = tokio::sync::watch::channel(None);
     let writer = async {
         loop {
             reports
@@ -2043,36 +2106,46 @@ async fn run_media_feedback_session(
         Ok::<(), String>(())
     };
     let reader = async {
+        let mut sequence = AdaptiveDecisionSequence::default();
         loop {
             let decision = read_adaptive_bitrate_decision_v1(&mut recv)
                 .await
                 .map_err(|error| format!("adaptive decision read failed: {error}"))?
                 .ok_or_else(|| "adaptive decision stream closed".to_string())?;
-            let _ = app.emit(
-                "adaptive-bitrate-decision",
-                AdaptiveBitrateDecisionPayload {
-                    generation,
-                    decision: adaptive_bitrate_decision_diagnostic(decision),
-                },
-            );
+            sequence.accept(&decision)?;
+            decision_tx.send_replace(Some(decision));
         }
         #[allow(unreachable_code)]
         Ok::<(), String>(())
     };
+    let decision_app = app.clone();
+    let decision_emitter = emit_paced_adaptive_decisions(
+        generation,
+        decision_rx,
+        CLIENT_ADAPTIVE_DECISION_DELIVERY_INTERVAL,
+        move |payload| {
+            decision_app
+                .emit("adaptive-bitrate-decision", payload)
+                .map_err(|error| format!("adaptive decision event delivery failed: {error}"))
+        },
+    );
     let terminal = tokio::select! {
         terminal = writer => terminal,
         terminal = reader => terminal,
+        terminal = decision_emitter => terminal,
     };
     if let Err(error) = terminal {
         eprintln!("[client] {error}");
-        let _ = app.emit(
+        if let Err(emit_error) = app.emit(
             "adaptive-feedback-state",
             serde_json::json!({
                 "generation": generation,
                 "available": false,
                 "error": error,
             }),
-        );
+        ) {
+            eprintln!("[client] adaptive feedback terminal event delivery failed: {emit_error}");
+        }
     }
     retire_media_feedback_generation(&app, generation).await;
 }
@@ -4673,9 +4746,16 @@ mod tests {
 
     #[test]
     fn adaptive_decision_diagnostics_are_explicitly_shadow_state() {
-        let diagnostic = adaptive_bitrate_decision_diagnostic(AdaptiveBitrateDecisionV1 {
-            decision_id: 2,
-            report_id: 1,
+        let diagnostic = adaptive_bitrate_decision_diagnostic(adaptive_decision(2, 1));
+        assert_eq!(diagnostic.state, "decrease");
+        assert_eq!(diagnostic.reasons, vec!["receiver-queue", "decode-backlog"]);
+        assert!(!diagnostic.applied);
+    }
+
+    fn adaptive_decision(decision_id: u64, report_id: u64) -> AdaptiveBitrateDecisionV1 {
+        AdaptiveBitrateDecisionV1 {
+            decision_id,
+            report_id,
             target_kbps: 8_000,
             floor_kbps: 4_000,
             ceiling_kbps: 20_000,
@@ -4683,10 +4763,72 @@ mod tests {
             reasons: AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE
                 .union(AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG),
             applied: false,
-        });
-        assert_eq!(diagnostic.state, "decrease");
-        assert_eq!(diagnostic.reasons, vec!["receiver-queue", "decode-backlog"]);
-        assert!(!diagnostic.applied);
+        }
+    }
+
+    #[test]
+    fn adaptive_decision_sequence_rejects_duplicate_or_regressing_ids() {
+        let mut sequence = AdaptiveDecisionSequence::default();
+        sequence.accept(&adaptive_decision(1, 10)).unwrap();
+        sequence.accept(&adaptive_decision(3, 12)).unwrap();
+        assert!(sequence.accept(&adaptive_decision(3, 13)).is_err());
+
+        let mut report_regression = AdaptiveDecisionSequence::default();
+        report_regression.accept(&adaptive_decision(1, 10)).unwrap();
+        assert!(report_regression.accept(&adaptive_decision(2, 10)).is_err());
+        assert!(report_regression.accept(&adaptive_decision(3, 9)).is_err());
+    }
+
+    #[tokio::test]
+    async fn adaptive_decision_delivery_is_paced_latest_value_and_emit_failure_is_terminal() {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::channel(2);
+        let delivery = tokio::spawn(emit_paced_adaptive_decisions(
+            7,
+            receiver,
+            Duration::from_millis(20),
+            move |payload| {
+                delivered_tx
+                    .try_send(payload)
+                    .map_err(|error| format!("test delivery failed: {error}"))
+            },
+        ));
+        sender.send_replace(Some(adaptive_decision(1, 1)));
+        sender.send_replace(Some(adaptive_decision(2, 2)));
+        let first = tokio::time::timeout(Duration::from_millis(100), delivered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.generation, 7);
+        assert_eq!(first.decision.decision_id, 2);
+
+        sender.send_replace(Some(adaptive_decision(3, 3)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), delivered_rx.recv())
+                .await
+                .is_err()
+        );
+        let second = tokio::time::timeout(Duration::from_millis(100), delivered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.decision.decision_id, 3);
+        delivery.abort();
+
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let terminal = tokio::spawn(emit_paced_adaptive_decisions(
+            7,
+            receiver,
+            Duration::from_millis(1),
+            |_payload| Err("webview channel closed".to_string()),
+        ));
+        sender.send_replace(Some(adaptive_decision(4, 4)));
+        let error = tokio::time::timeout(Duration::from_millis(100), terminal)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error, "webview channel closed");
     }
 
     #[test]

@@ -82,7 +82,10 @@ export function normalizeAdaptiveFeedbackSnapshot(snapshot) {
       Number.MAX_SAFE_INTEGER,
       'presenter dropped total',
     ),
-    transport_delivery_p95_ms: boundedLatency(snapshot.deliveryLatencyP95Ms, 'delivery p95'),
+    transport_delivery_p95_ms: boundedLatency(
+      snapshot.transportDeliveryP95Ms,
+      'transport delivery p95',
+    ),
     decode_p95_ms: boundedLatency(snapshot.decodeLatencyP95Ms, 'decode p95'),
     presentation_p95_ms: boundedLatency(
       snapshot.presentationLatencyP95Ms,
@@ -177,10 +180,22 @@ export class AdaptiveFeedbackPublisher {
 
     const generation = this.#generation;
     const report = intervalReport(snapshot, this.#baseline);
-    this.#baseline = counterBaseline(snapshot);
-    this.#lastStartedAt = now;
     this.#inFlight = true;
-    Promise.resolve(this.#invoke('iroh_client_send_media_feedback', { generation, report }))
+    let invocation;
+    try {
+      invocation = this.#invoke('iroh_client_send_media_feedback', { generation, report });
+    } catch (error) {
+      this.#inFlight = false;
+      console.warn('adaptive feedback failed:', error);
+      return false;
+    }
+    this.#lastStartedAt = now;
+    Promise.resolve(invocation)
+      .then((accepted) => {
+        if (generation === this.#generation && accepted === true) {
+          this.#baseline = counterBaseline(snapshot);
+        }
+      })
       .catch((error) => {
         if (generation === this.#generation) console.warn('adaptive feedback failed:', error);
       })

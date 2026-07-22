@@ -271,7 +271,14 @@ impl MotionResolutionPolicy {
             });
             self.update_motion(motion_active, observed_at);
         }
-        self.update_feedback(evaluation.pressure_severity, evaluation.fresh);
+        let resolution_severity = if evaluation.pressure_severity == FeedbackSeverity::Clean
+            && !evaluation.clean_recovery_evidence
+        {
+            FeedbackSeverity::InsufficientEvidence
+        } else {
+            evaluation.pressure_severity
+        };
+        self.update_feedback(resolution_severity, evaluation.fresh);
         self.evaluate_target(observed_at)
     }
 
@@ -523,6 +530,7 @@ struct ShadowBitrateController {
 struct AdaptiveBitrateEvaluation {
     decision: AdaptiveBitrateDecisionV1,
     pressure_severity: FeedbackSeverity,
+    clean_recovery_evidence: bool,
     fresh: bool,
 }
 
@@ -649,6 +657,7 @@ impl ShadowBitrateController {
         Ok(AdaptiveBitrateEvaluation {
             decision,
             pressure_severity,
+            clean_recovery_evidence: severity == FeedbackSeverity::Clean,
             fresh: !stale,
         })
     }
@@ -5364,6 +5373,74 @@ mod tests {
             resolution.observe_window(&stale, &stale_evaluation, now + Duration::from_secs(5));
         assert_eq!(held.tier, ResolutionTier::Reduced);
         assert!(!held.changed);
+    }
+
+    #[test]
+    fn damage_driven_no_progress_cannot_restore_native_resolution() {
+        let now = Instant::now();
+        let telemetry = MediaV3TelemetrySnapshot::default();
+        let mut bitrate = ShadowBitrateController::new(12_000, telemetry);
+        let mut resolution = MotionResolutionPolicy::new(native_dimensions()).unwrap();
+
+        let mut seed = clean_feedback(1);
+        seed.last_sequence = Some(100);
+        let seed_evaluation = bitrate.evaluate(&seed, telemetry, now).unwrap();
+        resolution.observe_window(&seed, &seed_evaluation, now);
+
+        let mut pressure = clean_feedback(2);
+        pressure.last_sequence = Some(110);
+        pressure.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+        let pressure_evaluation = bitrate
+            .evaluate(&pressure, telemetry, now + Duration::from_secs(1))
+            .unwrap();
+        let downshift = resolution.observe_window(
+            &pressure,
+            &pressure_evaluation,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(downshift.tier, ResolutionTier::Reduced);
+        assert!(downshift.changed);
+
+        for second in 2..=4 {
+            let mut no_progress = clean_feedback(second + 1);
+            no_progress.last_sequence = Some(110);
+            let evaluation = bitrate
+                .evaluate(&no_progress, telemetry, now + Duration::from_secs(second))
+                .unwrap();
+            assert_eq!(evaluation.pressure_severity, FeedbackSeverity::Clean);
+            assert!(!evaluation.clean_recovery_evidence);
+            let decision = resolution.observe_window(
+                &no_progress,
+                &evaluation,
+                now + Duration::from_secs(second),
+            );
+            assert_eq!(decision.tier, ResolutionTier::Reduced);
+            assert_eq!(decision.trigger, ResolutionTrigger::Pressure);
+            assert!(!decision.changed);
+            assert_eq!(resolution.clean_windows, 0);
+        }
+
+        for (report_id, second, sequence) in [(6, 5, 111), (7, 6, 112), (8, 7, 113)] {
+            let mut low_motion = clean_feedback(report_id);
+            low_motion.last_sequence = Some(sequence);
+            let evaluation = bitrate
+                .evaluate(&low_motion, telemetry, now + Duration::from_secs(second))
+                .unwrap();
+            assert!(evaluation.clean_recovery_evidence);
+            let decision = resolution.observe_window(
+                &low_motion,
+                &evaluation,
+                now + Duration::from_secs(second),
+            );
+            if report_id < 8 {
+                assert_eq!(decision.tier, ResolutionTier::Reduced);
+                assert!(!decision.changed);
+            } else {
+                assert_eq!(decision.tier, ResolutionTier::Native);
+                assert_eq!(decision.trigger, ResolutionTrigger::Recovery);
+                assert!(decision.changed);
+            }
+        }
     }
 
     #[test]

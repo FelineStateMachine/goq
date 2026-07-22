@@ -79,9 +79,9 @@ pub enum LockAcquireError {
 impl std::fmt::Display for LockAcquireError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Busy => {
-                formatter.write_str("another Sigil daemon already owns this state directory")
-            }
+            Self::Busy => formatter.write_str(
+                "another Sigil daemon or capture probe already owns this lifecycle scope",
+            ),
             Self::Unsafe(error) => write!(formatter, "unsafe lock storage: {error}"),
         }
     }

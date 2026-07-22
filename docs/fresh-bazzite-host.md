@@ -1344,6 +1344,17 @@ decodable H.264 keyframe, the resolved output size, and a changing sequence:
   --minimum-fps 55
 ```
 
+The Gamescope probe acquires the same per-user global lifecycle lock as the
+daemon and holds it through encoder teardown. Stop `sigil-host.service` before
+running it; a second configured Sigil daemon using the same runtime root or
+another capture probe fails before opening PipeWire. The lock cannot exclude
+arbitrary third-party consumers, so inventory non-Sigil PipeWire consumers
+before a benchmark.
+Gamescope may divide vblank delivery across simultaneous consumers, making two
+otherwise healthy 60 fps pipelines appear as roughly 30 fps each. A benchmark
+with an existing Gamescope consumer is invalid, not evidence that CQP or the
+transport is intrinsically half-rate.
+
 The probe prints `resolved_encoded_mode=<width>x<height>@<cap>` before capture
 and the dimensions observed on encoded frames afterward. Repeat with
 `--expect-size <width>x<height>` when recording a strict benchmark. The

@@ -4,7 +4,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result, bail, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::debug;
 
 use crate::clock::SessionClock;
@@ -21,6 +21,15 @@ pub(super) fn spawn_gamescope_pipewire_with_target(
     session_clock: SessionClock,
     preflight: GamescopePreflight,
 ) -> Result<EncodedSource> {
+    spawn_gamescope_pipewire_with_target_and_shutdown(config, session_clock, preflight, None)
+}
+
+pub(super) fn spawn_gamescope_pipewire_with_target_and_shutdown(
+    config: HostConfig,
+    session_clock: SessionClock,
+    preflight: GamescopePreflight,
+    shutdown: Option<oneshot::Receiver<()>>,
+) -> Result<EncodedSource> {
     let (sender, receiver) = watch::channel(None);
     let (current_gop_sender, current_gop) = watch::channel(None);
     let target_object = preflight.target_object;
@@ -33,6 +42,7 @@ pub(super) fn spawn_gamescope_pipewire_with_target(
             video_mode,
             sender,
             current_gop_sender,
+            shutdown,
         )
         .await
     });
@@ -52,6 +62,7 @@ async fn run_gamescope_pipewire(
     video_mode: CaptureVideoMode,
     sender: watch::Sender<Option<EncodedFrame>>,
     current_gop_sender: watch::Sender<Option<EncodedGop>>,
+    shutdown: Option<oneshot::Receiver<()>>,
 ) -> Result<()> {
     let pipewire = gamescope_config(&config)?;
     let args = gamescope_pipeline_args(&config, &target_object, video_mode)?;
@@ -83,16 +94,25 @@ async fn run_gamescope_pipewire(
         .context("GStreamer stderr was not piped")?;
     let stderr_task = tokio::spawn(log_stderr_chunks(stderr, "gstreamer"));
 
-    let result = forward_annex_b_stream(
-        session_clock,
-        &mut stdout,
-        &sender,
-        &current_gop_sender,
-        interactive_gop_frames(video_mode.framerate) as usize,
-        video_mode.width,
-        video_mode.height,
-    )
-    .await;
+    let result = {
+        let forward = forward_annex_b_stream(
+            session_clock,
+            &mut stdout,
+            &sender,
+            &current_gop_sender,
+            interactive_gop_frames(video_mode.framerate) as usize,
+            video_mode.width,
+            video_mode.height,
+        );
+        tokio::pin!(forward);
+        match shutdown {
+            Some(mut shutdown) => tokio::select! {
+                _ = &mut shutdown => Ok(()),
+                result = &mut forward => result,
+            },
+            None => forward.await,
+        }
+    };
     let _ = child.kill().await;
     let exit_status = child.wait().await.ok();
     stderr_task.abort();

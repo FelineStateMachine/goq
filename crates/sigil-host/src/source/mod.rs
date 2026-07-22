@@ -8,7 +8,7 @@ use serde_json::Value;
 use sigil_protocol::PointerSurfaceDimensions;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::warn;
 
 use crate::clock::SessionClock;
@@ -23,7 +23,10 @@ mod preflight;
 
 #[cfg(test)]
 use external::gamescope_pipeline_args;
-use external::{forward_annex_b_stream, spawn_gamescope_pipewire_with_target};
+use external::{
+    forward_annex_b_stream, spawn_gamescope_pipewire_with_target,
+    spawn_gamescope_pipewire_with_target_and_shutdown,
+};
 #[cfg(test)]
 pub(crate) use in_process::EncoderControlTestHarness;
 #[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
@@ -159,12 +162,52 @@ async fn resolve_gamescope_pipewire_target(config: &HostConfig) -> Result<Gamesc
     resolve_pipewire_node(&output.stdout, config)
 }
 
-pub async fn spawn_gamescope_pipewire(
+pub struct ProbeEncodedSource {
+    pub source: EncodedSource,
+    pub shutdown: Option<oneshot::Sender<()>>,
+}
+
+pub fn spawn_gamescope_pipewire_for_probe(
     config: HostConfig,
     session_clock: SessionClock,
-) -> Result<EncodedSource> {
-    let preflight = preflight_gamescope_pipewire(&config).await?;
-    spawn_gamescope_pipewire_with_preflight(config, session_clock, preflight)
+    preflight: GamescopePreflight,
+) -> Result<ProbeEncodedSource> {
+    match gamescope_config(&config)?.encoder_backend {
+        GamescopeEncoderBackend::ExternalGstLaunch => {
+            let (shutdown, shutdown_receiver) = oneshot::channel();
+            let source = spawn_gamescope_pipewire_with_target_and_shutdown(
+                config,
+                session_clock,
+                preflight,
+                Some(shutdown_receiver),
+            )?;
+            Ok(ProbeEncodedSource {
+                source,
+                shutdown: Some(shutdown),
+            })
+        }
+        GamescopeEncoderBackend::InProcessGstreamer => {
+            #[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
+            {
+                let source = spawn_gamescope_pipewire_in_process_with_target(
+                    config,
+                    session_clock,
+                    preflight,
+                )?;
+                Ok(ProbeEncodedSource {
+                    source,
+                    shutdown: None,
+                })
+            }
+            #[cfg(not(all(target_os = "linux", feature = "in-process-gstreamer")))]
+            {
+                let _ = (session_clock, preflight);
+                bail!(
+                    "gamescope_pipewire.encoder_backend=in-process-gstreamer requires a Linux Sigil build with the in-process-gstreamer feature"
+                )
+            }
+        }
+    }
 }
 
 /// Start capture after `serve` has completed the static executable/GstVA

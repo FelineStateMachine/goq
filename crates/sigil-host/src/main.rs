@@ -22,9 +22,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use iroh::endpoint::{QuicTransportConfig, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId};
+use moq_net::Origin;
 use sigil_protocol::{
-    AUDIO_ALPN_V1, INPUT_ALPN_V1, InvitationGrants, MAX_INVITATION_TTL_SECS, MEDIA_ALPN_V1,
-    MEDIA_ALPN_V2, MEDIA_ALPN_V3, SignedInvitation,
+    AUDIO_ALPN_V1, CONTROL_ALPN_V1, INPUT_ALPN_V1, InvitationGrants, MAX_INVITATION_TTL_SECS,
+    MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3, SignedInvitation,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -36,7 +37,8 @@ use crate::config::{HostConfig, InputMode, VideoSource};
 use crate::cursor::PointerPositionTracker;
 use crate::input::InputBackend;
 use crate::server::{
-    AudioHandler, InputHandler, MediaHandler, MediaV2Handler, MediaV3Handler, SessionRegistry,
+    AudioHandler, AuthorizedMoqHandler, ControlHandler, InputHandler, MediaHandler, MediaV2Handler,
+    MediaV3Handler, SessionRegistry,
 };
 
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -638,7 +640,23 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     }
 
     let sessions = Arc::new(SessionRegistry::default());
+    let moq_origin = Origin::random();
     let router = Router::builder(endpoint)
+        .accept(
+            CONTROL_ALPN_V1,
+            ControlHandler {
+                config: config.clone(),
+                sessions: Arc::clone(&sessions),
+                authorization: authorization.clone(),
+            },
+        )
+        .accept(
+            iroh_moq::ALPN,
+            AuthorizedMoqHandler {
+                sessions: Arc::clone(&sessions),
+                origin: moq_origin,
+            },
+        )
         .accept(
             MEDIA_ALPN_V3,
             MediaV3Handler {
@@ -660,7 +678,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
             MediaHandler {
                 config: config.clone(),
                 sessions: Arc::clone(&sessions),
-                authorization,
+                authorization: authorization.clone(),
             },
         )
         .accept(

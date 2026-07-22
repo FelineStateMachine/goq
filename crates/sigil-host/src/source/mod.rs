@@ -313,9 +313,7 @@ async fn run_test_pattern(
         u16::try_from(height).context("configured height exceeds encoder metadata")?,
     )
     .await;
-    if result.is_ok() {
-        let _ = child.kill().await;
-    }
+    let _ = child.kill().await;
     let status = child.wait().await.context("waiting for ffmpeg")?;
     stderr_task.abort();
     match result {

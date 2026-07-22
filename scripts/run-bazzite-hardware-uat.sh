@@ -182,6 +182,7 @@ timeout --signal=TERM --kill-after=2s 5s "$probe" --version
 host_identity="$private/host.key"
 probe_identity="$private/probe.key"
 state="$private/state"
+external_cqp_state="$private/external-cqp-state"
 fixed_config="$private/host-1280x800.toml"
 external_cqp_config="$private/host-1280x800-external-cqp.toml"
 native_config="$private/host-native.toml"
@@ -253,7 +254,7 @@ EOF
 
 cat >"$external_cqp_config" <<EOF
 identity_path = "$host_identity"
-state_path = "$state"
+state_path = "$external_cqp_state"
 source = "gamescope-pipewire"
 width = 1280
 height = 800
@@ -731,8 +732,11 @@ native_unique_sessions="$(awk -F= '$1 == "session_id" { print $2 }' \
 [[ "$fixed_unique_sessions" -eq 20 && "$native_unique_sessions" -eq 20 ]]
 total_sessions="${#all_raw_probes[@]}"
 fixed_observed_fps="$(sed -n 's/^observed_fps=//p' "$evidence/fixed-capture.log")"
+external_cqp_observed_fps="$(sed -n 's/^observed_fps=//p' \
+  "$evidence/external-cqp-capture.log")"
 native_observed_fps="$(sed -n 's/^observed_fps=//p' "$evidence/native-capture.log")"
-[[ -n "$fixed_observed_fps" && -n "$native_observed_fps" ]]
+[[ -n "$fixed_observed_fps" && -n "$external_cqp_observed_fps" \
+  && -n "$native_observed_fps" ]]
 if awk -v fps="$native_observed_fps" 'BEGIN { exit !(fps >= 55) }'; then
   native_55fps_status=met
 else
@@ -746,6 +750,9 @@ fi
   echo fixed_size=1280x800
   echo fixed_minimum_fps=55
   echo "fixed_observed_fps=$fixed_observed_fps"
+  echo external_cqp_minimum_fps=55
+  echo "external_cqp_observed_fps=$external_cqp_observed_fps"
+  echo cross_state_capture_contention=rejected
   echo "native_size=$native_size"
   echo native_performance_gate=observational
   echo "native_observed_fps=$native_observed_fps"

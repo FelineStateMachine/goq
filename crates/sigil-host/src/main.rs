@@ -622,6 +622,7 @@ async fn probe_test_pattern(args: CaptureProbeArgs) -> Result<()> {
     config.validate()?;
 
     let configured_framerate = config.framerate;
+    validate_capture_probe_args(&args, configured_framerate)?;
     let source = source::spawn_test_pattern(config, clock::SessionClock::start());
     consume_capture_probe(args, source, None, "test-pattern", configured_framerate).await
 }
@@ -659,6 +660,7 @@ async fn probe_gamescope_pipewire(args: CaptureProbeArgs) -> Result<()> {
         observed.0, observed.1, preflight.video_mode.framerate
     );
     let configured_framerate = preflight.video_mode.framerate;
+    validate_capture_probe_args(&args, configured_framerate)?;
     let source::ProbeEncodedSource { source, shutdown } =
         source::spawn_gamescope_pipewire_for_probe(
             config,
@@ -682,14 +684,7 @@ async fn consume_capture_probe(
     source_name: &str,
     configured_framerate: u32,
 ) -> Result<()> {
-    if let Some(minimum_fps) = args.minimum_fps {
-        ensure!(
-            minimum_fps.is_finite()
-                && minimum_fps > 0.0
-                && minimum_fps <= f64::from(configured_framerate),
-            "--minimum-fps must be finite, positive, and no greater than configured framerate {configured_framerate}"
-        );
-    }
+    debug_assert!(validate_capture_probe_args(&args, configured_framerate).is_ok());
     let source::EncodedSource {
         frames: mut receiver,
         current_gop,
@@ -775,6 +770,18 @@ async fn consume_capture_probe(
     println!("max_post_encode_queue_age_micros={max_post_encode_queue_age_micros}");
     println!("encoded_bytes={encoded_bytes}");
     println!("elapsed_ms={}", elapsed.as_millis());
+    Ok(())
+}
+
+fn validate_capture_probe_args(args: &CaptureProbeArgs, configured_framerate: u32) -> Result<()> {
+    if let Some(minimum_fps) = args.minimum_fps {
+        ensure!(
+            minimum_fps.is_finite()
+                && minimum_fps > 0.0
+                && minimum_fps <= f64::from(configured_framerate),
+            "--minimum-fps must be finite, positive, and no greater than configured framerate {configured_framerate}"
+        );
+    }
     Ok(())
 }
 
@@ -1127,6 +1134,22 @@ mod tests {
     fn parses_expected_size() {
         assert_eq!(parse_size("1280x800").unwrap(), (1280, 800));
         assert!(parse_size("1280").is_err());
+    }
+
+    #[test]
+    fn capture_probe_threshold_is_validated_before_source_start() {
+        let args = |minimum_fps| CaptureProbeArgs {
+            source: SourceArg::TestPattern,
+            frames: 1,
+            expect_size: None,
+            minimum_fps,
+            config: None,
+        };
+        assert!(validate_capture_probe_args(&args(None), 60).is_ok());
+        assert!(validate_capture_probe_args(&args(Some(55.0)), 60).is_ok());
+        assert!(validate_capture_probe_args(&args(Some(0.0)), 60).is_err());
+        assert!(validate_capture_probe_args(&args(Some(61.0)), 60).is_err());
+        assert!(validate_capture_probe_args(&args(Some(f64::NAN)), 60).is_err());
     }
 
     #[test]

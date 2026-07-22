@@ -5,7 +5,14 @@ import {
   constrainStreamWindowResize,
   fitInitialStreamWindow,
   fitStreamSurface,
+  streamAspectKey,
 } from './window-geometry.mjs';
+
+test('equivalent stream resolutions share one stable aspect identity', () => {
+  assert.equal(streamAspectKey(1280, 800), '8:5');
+  assert.equal(streamAspectKey(640, 400), '8:5');
+  assert.notEqual(streamAspectKey(1280, 720), streamAspectKey(1280, 800));
+});
 
 test('initial stream window fits the display while preserving the drawable aspect', () => {
   const geometry = fitInitialStreamWindow({

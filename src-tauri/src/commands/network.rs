@@ -109,6 +109,7 @@ const FRAME_CHANNEL_VERSION: u8 = 1;
 const FRAME_CHANNEL_HEADER_LEN: usize = 40;
 const FRAME_CHANNEL_FLAG_KEYFRAME: u8 = 1 << 0;
 const FRAME_CHANNEL_FLAG_DISCONTINUITY: u8 = 1 << 1;
+const FRAME_CHANNEL_FLAG_CODEC_CONFIG: u8 = 1 << 2;
 const FRAME_CHANNEL_OPTIONAL_U64_NONE: u64 = u64::MAX;
 const FRAME_CHANNEL_OPTIONAL_I64_NONE: i64 = i64::MIN;
 const AUDIO_CHANNEL_MAGIC: [u8; 4] = *b"SGAC";
@@ -572,6 +573,7 @@ struct FrameEnvelopeMetadata<'a> {
     codec: &'a str,
     keyframe: bool,
     discontinuity: bool,
+    codec_config: bool,
     sequence: Option<u64>,
     capture_timestamp_micros: Option<u64>,
     pts_micros: Option<i64>,
@@ -582,6 +584,9 @@ fn encode_frame_envelope(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     validate_legacy_media_header(metadata.width, metadata.height, payload.len())?;
+    if metadata.codec_config && !metadata.keyframe {
+        return Err("Frame codec configuration requires a keyframe".to_string());
+    }
     if metadata.sequence == Some(FRAME_CHANNEL_OPTIONAL_U64_NONE) {
         return Err("Frame sequence collides with the channel sentinel".to_string());
     }
@@ -621,6 +626,9 @@ fn encode_frame_envelope(
     }
     if metadata.discontinuity {
         flags |= FRAME_CHANNEL_FLAG_DISCONTINUITY;
+    }
+    if metadata.codec_config {
+        flags |= FRAME_CHANNEL_FLAG_CODEC_CONFIG;
     }
 
     let mut envelope = Vec::with_capacity(FRAME_CHANNEL_HEADER_LEN + payload.len());
@@ -3400,6 +3408,7 @@ pub async fn iroh_client_connect(
                 capture_timestamp_micros,
                 pts_micros,
                 discontinuity,
+                codec_config,
             ) = match media_transport {
                 MediaTransport::UpstreamMoq => {
                     let receiver = upstream_moq_media
@@ -3454,6 +3463,7 @@ pub async fn iroh_client_connect(
                                     Some(frame.header.capture_timestamp_us),
                                     Some(frame.header.pts_us),
                                     discontinuity,
+                                    frame.header.flags.contains(FrameFlags::CODEC_CONFIG),
                                 );
                             }
                         }
@@ -3534,6 +3544,7 @@ pub async fn iroh_client_connect(
                                     Some(object.header.capture_timestamp_us),
                                     Some(object.header.pts_us),
                                     discontinuity,
+                                    object.header.flags.contains(FrameFlags::CODEC_CONFIG),
                                 );
                             }
                         }
@@ -3606,6 +3617,7 @@ pub async fn iroh_client_connect(
                                     Some(frame.header.capture_timestamp_us),
                                     Some(frame.header.pts_us),
                                     discontinuity,
+                                    frame.header.flags.contains(FrameFlags::CODEC_CONFIG),
                                 );
                             }
                         }
@@ -3644,6 +3656,7 @@ pub async fn iroh_client_connect(
                         Some(frame.header.capture_timestamp_us),
                         Some(frame.header.pts_us),
                         frame.header.flags.contains(FrameFlags::DISCONTINUITY),
+                        frame.header.flags.contains(FrameFlags::CODEC_CONFIG),
                     )
                 }
                 MediaTransport::LegacyV0 => {
@@ -3693,7 +3706,18 @@ pub async fn iroh_client_connect(
                         }
                         Ok(Ok(_)) => {}
                     }
-                    (w, h, frame_buf, is_keyframe, codec, None, None, None, false)
+                    (
+                        w,
+                        h,
+                        frame_buf,
+                        is_keyframe,
+                        codec,
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                    )
                 }
             };
             lock_client_media_metrics(&metrics).observe_transport_receive(
@@ -3748,6 +3772,7 @@ pub async fn iroh_client_connect(
                         codec: &codec,
                         keyframe: is_keyframe,
                         discontinuity,
+                        codec_config,
                         sequence,
                         capture_timestamp_micros,
                         pts_micros,
@@ -4468,6 +4493,7 @@ mod tests {
                 codec: "h264",
                 keyframe: true,
                 discontinuity: true,
+                codec_config: true,
                 sequence: Some(42),
                 capture_timestamp_micros: Some(123_456),
                 pts_micros: Some(98_765),
@@ -4480,7 +4506,7 @@ mod tests {
         assert_eq!(&envelope[0..4], b"SGFR");
         assert_eq!(envelope[4], 1);
         assert_eq!(envelope[5], 1);
-        assert_eq!(envelope[6], 0b11);
+        assert_eq!(envelope[6], 0b111);
         assert_eq!(envelope[7], 0);
         assert_eq!(&envelope[8..10], &1280_u16.to_be_bytes());
         assert_eq!(&envelope[10..12], &800_u16.to_be_bytes());
@@ -4500,6 +4526,7 @@ mod tests {
                 codec: "av1",
                 keyframe: false,
                 discontinuity: false,
+                codec_config: false,
                 sequence: None,
                 capture_timestamp_micros: None,
                 pts_micros: None,
@@ -4521,12 +4548,23 @@ mod tests {
             codec,
             keyframe: false,
             discontinuity: false,
+            codec_config: false,
             sequence: None,
             capture_timestamp_micros: None,
             pts_micros: None,
         };
         assert!(encode_frame_envelope(metadata("vp9"), &[1]).is_err());
         assert!(encode_frame_envelope(metadata("h264"), &[]).is_err());
+        assert!(
+            encode_frame_envelope(
+                FrameEnvelopeMetadata {
+                    codec_config: true,
+                    ..metadata("h264")
+                },
+                &[1]
+            )
+            .is_err()
+        );
         assert!(
             encode_frame_envelope(
                 FrameEnvelopeMetadata {

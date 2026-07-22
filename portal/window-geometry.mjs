@@ -24,6 +24,18 @@ function roundedGeometry(width, height) {
   });
 }
 
+export function streamAspectKey(frameWidth, frameHeight) {
+  const width = positiveFinite(frameWidth, 'frame width');
+  const height = positiveFinite(frameHeight, 'frame height');
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height)) {
+    throw new RangeError('stream dimensions must be exact integers');
+  }
+  let a = width;
+  let b = height;
+  while (b !== 0) [a, b] = [b, a % b];
+  return `${width / a}:${height / a}`;
+}
+
 export function fitInitialStreamWindow({
   frameWidth,
   frameHeight,

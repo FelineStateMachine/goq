@@ -5,9 +5,10 @@ export const MAX_FRAME_PIXELS = 7680 * 4320;
 
 const MAGIC = [0x53, 0x47, 0x46, 0x52]; // SGFR
 const VERSION = 1;
-const KNOWN_FLAGS = 0b00000011;
+const KNOWN_FLAGS = 0b00000111;
 const KEYFRAME_FLAG = 1 << 0;
 const DISCONTINUITY_FLAG = 1 << 1;
+const CODEC_CONFIG_FLAG = 1 << 2;
 const OPTIONAL_U64_NONE = 0xffffffffffffffffn;
 const OPTIONAL_I64_NONE = -0x8000000000000000n;
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
@@ -53,6 +54,9 @@ export function parseFrameEnvelope(message) {
   if (!codec) throw new Error(`unsupported frame channel codec: ${bytes[5]}`);
   const flags = bytes[6];
   if ((flags & ~KNOWN_FLAGS) !== 0) throw new Error('frame channel has unknown flag bits');
+  if ((flags & CODEC_CONFIG_FLAG) !== 0 && (flags & KEYFRAME_FLAG) === 0) {
+    throw new Error('frame channel codec configuration requires a keyframe');
+  }
   if (bytes[7] !== 0) throw new Error('frame channel reserved byte must be zero');
 
   const width = view.getUint16(8, false);
@@ -89,6 +93,7 @@ export function parseFrameEnvelope(message) {
     codec,
     keyframe: (flags & KEYFRAME_FLAG) !== 0,
     discontinuity: (flags & DISCONTINUITY_FLAG) !== 0,
+    codecConfig: (flags & CODEC_CONFIG_FLAG) !== 0,
     sequence,
     captureTimestampMicros,
     ptsMicros,

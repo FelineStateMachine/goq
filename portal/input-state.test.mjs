@@ -10,6 +10,7 @@ import {
   RelativePointerAccumulator,
   advanceRemotePointerPosition,
   browserPointerLockLossRequiresControlExit,
+  mapCanvasPointToSurface,
   resolvePointerSurfaceSize,
   restoreRejectedPointerMotion,
   scaleRelativePointerDelta,
@@ -61,7 +62,7 @@ test('pointer surface metadata is bounded and old hosts fall back to frame size'
   );
   assert.deepEqual(
     resolvePointerSurfaceSize(native, 1280, 800, false),
-    { width: 1280, height: 800 },
+    { width: 2560, height: 1600 },
   );
   assert.equal(resolvePointerSurfaceSize(null, 0, 800, true), null);
   assert.throws(
@@ -72,6 +73,19 @@ test('pointer surface metadata is bounded and old hosts fall back to frame size'
     () => validatePointerSurfaceDimensions({ width: 2560, height: 63 }),
     /invalid pointer surface dimensions/,
   );
+});
+
+test('absolute pointer mapping always targets the negotiated native surface', () => {
+  const rect = { left: 20, top: 10, width: 640, height: 400 };
+  const surface = { width: 1280, height: 800 };
+  assert.deepEqual(mapCanvasPointToSurface({ clientX: 340, clientY: 210, rect, surface }), {
+    x: 640,
+    y: 400,
+  });
+  assert.deepEqual(mapCanvasPointToSurface({ clientX: 700, clientY: -10, rect, surface }), {
+    x: 1279,
+    y: 0,
+  });
 });
 
 test('host pointer feedback is bounded and validated against the native surface', () => {

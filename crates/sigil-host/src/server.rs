@@ -87,6 +87,7 @@ const FEEDBACK_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FeedbackSeverity {
     Clean,
+    InsufficientEvidence,
     Moderate,
     Severe,
     Stale,
@@ -102,6 +103,7 @@ struct ShadowBitrateController {
     last_report_received_at: Option<Instant>,
     previous_telemetry: MediaV3TelemetrySnapshot,
     baseline_rtt_micros: Option<u64>,
+    last_sequence: Option<u64>,
     moderate_windows: u8,
     clean_windows: u8,
     cooldown_windows: u8,
@@ -119,6 +121,7 @@ impl ShadowBitrateController {
             last_report_received_at: None,
             previous_telemetry: telemetry,
             baseline_rtt_micros: None,
+            last_sequence: None,
             moderate_windows: 0,
             clean_windows: 0,
             cooldown_windows: 0,
@@ -136,7 +139,8 @@ impl ShadowBitrateController {
                 .is_none_or(|last| report.report_id > last),
             "feedback report IDs must increase monotonically"
         );
-        let (severity, reasons) = self.classify(report, telemetry, received_at);
+        let (severity, reasons, stale, trusted_host_pressure) =
+            self.classify(report, telemetry, received_at);
         let mut state = AdaptiveBitrateStateV1::Hold;
 
         if self.cooldown_windows > 0 {
@@ -175,7 +179,8 @@ impl ShadowBitrateController {
                     && self.cooldown_windows == 0
                 {
                     self.clean_windows = 0;
-                    let maximum_step = (self.target_kbps / 20).min(500);
+                    let maximum_step =
+                        (self.target_kbps / 20).clamp(ADAPTIVE_BITRATE_QUANTUM_KBPS, 500);
                     let next = quantize_down(
                         self.target_kbps
                             .saturating_add(maximum_step)
@@ -187,7 +192,7 @@ impl ShadowBitrateController {
                     }
                 }
             }
-            FeedbackSeverity::Stale => {
+            FeedbackSeverity::InsufficientEvidence | FeedbackSeverity::Stale => {
                 self.moderate_windows = 0;
                 self.clean_windows = 0;
             }
@@ -211,7 +216,19 @@ impl ShadowBitrateController {
             .context("adaptive bitrate decision ID exhausted")?;
         self.last_report_id = Some(report.report_id);
         self.last_report_received_at = Some(received_at);
-        self.previous_telemetry = telemetry;
+        if !stale
+            || !trusted_host_pressure
+            || state == AdaptiveBitrateStateV1::Decrease
+            || self.target_kbps == self.floor_kbps
+        {
+            self.previous_telemetry = telemetry;
+        }
+        if !stale && let Some(sequence) = report.last_sequence {
+            self.last_sequence = Some(
+                self.last_sequence
+                    .map_or(sequence, |last| last.max(sequence)),
+            );
+        }
         Ok(decision)
     }
 
@@ -220,7 +237,7 @@ impl ShadowBitrateController {
         report: &MediaFeedbackReportV1,
         telemetry: MediaV3TelemetrySnapshot,
         received_at: Instant,
-    ) -> (FeedbackSeverity, AdaptiveBitrateReasonFlagsV1) {
+    ) -> (FeedbackSeverity, AdaptiveBitrateReasonFlagsV1, bool, bool) {
         let stale = !(FEEDBACK_FRESH_INTERVAL_MIN_MS..=FEEDBACK_FRESH_INTERVAL_MAX_MS)
             .contains(&report.interval_ms)
             || self.last_report_received_at.is_none()
@@ -228,12 +245,6 @@ impl ShadowBitrateController {
                 let gap = received_at.saturating_duration_since(last);
                 !(FEEDBACK_FRESH_ARRIVAL_GAP_MIN..=FEEDBACK_STALE_ARRIVAL_GAP).contains(&gap)
             });
-        if stale {
-            return (
-                FeedbackSeverity::Stale,
-                AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE,
-            );
-        }
         let mut severity = FeedbackSeverity::Clean;
         let mut reasons = AdaptiveBitrateReasonFlagsV1::NONE;
 
@@ -301,6 +312,15 @@ impl ShadowBitrateController {
                     AdaptiveBitrateReasonFlagsV1::RTT_INFLATION,
                 );
             }
+        }
+
+        let trusted_host_pressure = severity != FeedbackSeverity::Clean;
+        if stale {
+            reasons = reasons.union(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE);
+            if !trusted_host_pressure {
+                severity = FeedbackSeverity::Stale;
+            }
+            return (severity, reasons, true, trusted_host_pressure);
         }
 
         let receiver_drops = report
@@ -395,10 +415,23 @@ impl ShadowBitrateController {
             );
         }
 
-        if severity == FeedbackSeverity::Clean && self.target_kbps < self.ceiling_kbps {
-            reasons = reasons.union(AdaptiveBitrateReasonFlagsV1::CLEAN_RECOVERY);
+        if severity == FeedbackSeverity::Clean {
+            let sequence_progressed = self
+                .last_sequence
+                .zip(report.last_sequence)
+                .is_some_and(|(last, current)| current > last);
+            let complete_latency = report.transport_delivery_p95_ms.is_some()
+                && report.decode_p95_ms.is_some()
+                && report.presentation_p95_ms.is_some();
+            if sequence_progressed && complete_latency {
+                if self.target_kbps < self.ceiling_kbps {
+                    reasons = reasons.union(AdaptiveBitrateReasonFlagsV1::CLEAN_RECOVERY);
+                }
+            } else {
+                severity = FeedbackSeverity::InsufficientEvidence;
+            }
         }
-        (severity, reasons)
+        (severity, reasons, false, trusted_host_pressure)
     }
 }
 
@@ -4139,6 +4172,133 @@ mod tests {
                 .is_err()
         );
         assert_eq!(controller.next_decision_id, u64::MAX);
+    }
+
+    #[test]
+    fn stale_feedback_applies_trusted_loss_and_send_failure_pressure_once() {
+        for telemetry in [
+            MediaV3TelemetrySnapshot {
+                selected_path_lost_packets: 1,
+                ..MediaV3TelemetrySnapshot::default()
+            },
+            MediaV3TelemetrySnapshot {
+                send_failures: 1,
+                ..MediaV3TelemetrySnapshot::default()
+            },
+        ] {
+            let now = Instant::now();
+            let mut controller =
+                ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+            let decision = controller
+                .decide(&clean_feedback(1), telemetry, now)
+                .unwrap();
+            assert_eq!(decision.state, AdaptiveBitrateStateV1::Decrease);
+            assert_eq!(decision.target_kbps, 9_000);
+            assert!(
+                decision
+                    .reasons
+                    .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE)
+            );
+            assert!(
+                decision
+                    .reasons
+                    .contains(AdaptiveBitrateReasonFlagsV1::LOSS_OR_CANCELLATION)
+            );
+
+            let repeated = controller
+                .decide(
+                    &clean_feedback(2),
+                    telemetry,
+                    now + Duration::from_millis(500),
+                )
+                .unwrap();
+            assert_eq!(repeated.state, AdaptiveBitrateStateV1::Hold);
+            assert_eq!(repeated.target_kbps, 9_000);
+        }
+    }
+
+    #[test]
+    fn stale_moderate_cancellation_is_retained_until_hysteresis_reduces() {
+        let now = Instant::now();
+        let telemetry = MediaV3TelemetrySnapshot {
+            scheduler_cancellations: 1,
+            ..MediaV3TelemetrySnapshot::default()
+        };
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        let first = controller
+            .decide(&clean_feedback(1), telemetry, now)
+            .unwrap();
+        assert_eq!(first.state, AdaptiveBitrateStateV1::Hold);
+        assert_eq!(controller.previous_telemetry.scheduler_cancellations, 0);
+
+        let second = controller
+            .decide(
+                &clean_feedback(2),
+                telemetry,
+                now + Duration::from_millis(500),
+            )
+            .unwrap();
+        assert_eq!(second.state, AdaptiveBitrateStateV1::Decrease);
+        assert_eq!(second.target_kbps, 9_500);
+        assert_eq!(controller.previous_telemetry.scheduler_cancellations, 1);
+    }
+
+    #[test]
+    fn clean_recovery_below_five_mbps_advances_by_one_quantum() {
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller.target_kbps = 4_000;
+        controller_decide(&mut controller, &clean_feedback(1), 0);
+        controller_decide(&mut controller, &clean_feedback(2), 1);
+        for report_id in 3..=11 {
+            let decision =
+                controller_decide(&mut controller, &clean_feedback(report_id), report_id - 1);
+            assert_eq!(decision.state, AdaptiveBitrateStateV1::Hold);
+        }
+        let decision = controller_decide(&mut controller, &clean_feedback(12), 11);
+        assert_eq!(decision.state, AdaptiveBitrateStateV1::Increase);
+        assert_eq!(decision.target_kbps, 4_250);
+    }
+
+    #[test]
+    fn recovery_requires_latency_samples_and_sequence_progress_but_pressure_still_reduces() {
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller.target_kbps = 9_000;
+        controller_decide(&mut controller, &clean_feedback(1), 0);
+        controller_decide(&mut controller, &clean_feedback(2), 1);
+
+        for report_id in 3..=14 {
+            let mut report = clean_feedback(report_id);
+            report.last_sequence = Some(2);
+            let decision = controller_decide(&mut controller, &report, report_id - 1);
+            assert_eq!(decision.state, AdaptiveBitrateStateV1::Hold);
+            assert_eq!(decision.target_kbps, 9_000);
+        }
+        assert_eq!(controller.clean_windows, 0);
+
+        for report_id in 15..=26 {
+            let mut report = clean_feedback(report_id);
+            report.decode_p95_ms = None;
+            let decision = controller_decide(&mut controller, &report, report_id - 1);
+            assert_eq!(decision.state, AdaptiveBitrateStateV1::Hold);
+            assert_eq!(decision.target_kbps, 9_000);
+        }
+        assert_eq!(controller.clean_windows, 0);
+
+        let mut pressure = clean_feedback(27);
+        pressure.decode_p95_ms = None;
+        pressure.decode_queue_capacity = 2;
+        pressure.decode_queue_depth = 2;
+        let decision = controller_decide(&mut controller, &pressure, 26);
+        assert_eq!(decision.state, AdaptiveBitrateStateV1::Decrease);
+        assert_eq!(decision.target_kbps, 6_750);
+        assert!(
+            decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG)
+        );
     }
 
     struct DropNotify(Option<tokio::sync::oneshot::Sender<()>>);

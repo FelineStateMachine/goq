@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
+    fs,
     fs::OpenOptions,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -12,14 +13,17 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::presets};
 use iroh_moq::{Moq, MoqSession};
 use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
 use sigil_protocol::{
+    AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1,
     CONTROL_ALPN_V1, Capability, ClientHello, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN,
     GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, INVITATION_CLOCK_SKEW_SECS, InputEvent,
     InvitationGrants, KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN, MAX_MEDIA_GROUP_BYTES_V3,
-    MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3, MediaCodec,
-    MediaControlRequestV3, MediaFrame, MediaObjectV3, PointerSurfaceDimensions, ProtocolError,
-    SignedInvitation, decode_media_frame_object, media_moq_broadcast_name, read_host_hello,
-    read_input_ack, read_media_frame, read_media_object, read_media_object_v3, write_client_hello,
-    write_input_event, write_media_control_request_v3,
+    MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1,
+    MediaCodec, MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame,
+    MediaObjectV3, PointerSurfaceDimensions, ProtocolError, SignedInvitation,
+    decode_media_frame_object, media_moq_broadcast_name, read_adaptive_bitrate_decision_v1,
+    read_host_hello, read_input_ack, read_media_frame, read_media_object, read_media_object_v3,
+    write_client_hello, write_input_event, write_media_control_request_v3,
+    write_media_feedback_report_v1,
 };
 
 #[cfg(unix)]
@@ -99,6 +103,21 @@ struct Args {
     /// complete left-click. Intended for libinput/Gamescope-backed proof.
     #[arg(long)]
     pointer_smoke: bool,
+    /// Prove adaptive-resolution liveness across a controlled Gamescope stall.
+    /// GATE_DIR coordinates the external SIGSTOP/SIGCONT harness.
+    #[arg(
+        long,
+        value_name = "GATE_DIR",
+        conflicts_with_all = [
+            "media_v3",
+            "media_v2",
+            "media_v1",
+            "keyframe_smoke",
+            "slow_consumer_ms",
+            "minimum_fps"
+        ]
+    )]
+    resolution_stall_smoke: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +162,11 @@ const KEYFRAME_SMOKE_REQUEST_AFTER_FRAMES: u32 = 3;
 const KEYFRAME_SMOKE_MINIMUM_FRAMES: u32 = KEYFRAME_SMOKE_REQUEST_AFTER_FRAMES + 1;
 const SLOW_CONSUMER_MINIMUM_FRAMES: u32 = 2;
 const SLOW_CONSUMER_RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+const RESOLUTION_STALL_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
+const RESOLUTION_STALL_FRESH_REPORTS: u64 = 10;
+const RESOLUTION_STALL_FEEDBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const RESOLUTION_STALL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+const RESOLUTION_STALL_GATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_INVITATION_FILE_BYTES: u64 = (MAX_INVITATION_TOKEN_LEN + 2) as u64;
 
 #[derive(Debug)]
@@ -976,6 +1000,414 @@ impl From<MediaObjectV3> for AcceptedMedia {
     }
 }
 
+#[derive(Debug)]
+struct ResolutionStallEvidence {
+    native_dimensions: (u16, u16),
+    reduced_dimensions: (u16, u16),
+    stall_sequence: u64,
+    fresh_duration: Duration,
+    stall_input_ack_micros: u64,
+    resume_input_ack_micros: u64,
+    resume_media_micros: u64,
+    resume_sequence_advance: u64,
+}
+
+struct ResolutionStallGate {
+    ready: PathBuf,
+    stalled: PathBuf,
+    resume_ready: PathBuf,
+    resumed: PathBuf,
+}
+
+impl ResolutionStallGate {
+    fn new(directory: &Path) -> Result<Self> {
+        ensure!(
+            directory.is_dir(),
+            "resolution stall gate is not a directory"
+        );
+        let gate = Self {
+            ready: directory.join("ready"),
+            stalled: directory.join("stalled"),
+            resume_ready: directory.join("resume-ready"),
+            resumed: directory.join("resumed"),
+        };
+        for marker in [
+            &gate.ready,
+            &gate.stalled,
+            &gate.resume_ready,
+            &gate.resumed,
+        ] {
+            ensure!(
+                !marker.exists(),
+                "resolution stall gate marker already exists: {}",
+                marker.display()
+            );
+        }
+        Ok(gate)
+    }
+}
+
+fn resolution_stall_feedback(
+    report_id: u64,
+    flags: MediaFeedbackFlags,
+    last_sequence: u64,
+) -> MediaFeedbackReportV1 {
+    MediaFeedbackReportV1 {
+        report_id,
+        interval_ms: 1_000,
+        flags,
+        last_sequence: Some(last_sequence),
+        transport_dropped_delta: 0,
+        frontend_dropped_delta: 0,
+        decoder_dropped_delta: 0,
+        presenter_dropped_delta: 0,
+        frontend_queue_depth: 0,
+        frontend_queue_capacity: 4,
+        decode_queue_depth: 0,
+        decode_queue_capacity: 4,
+        presenter_queue_depth: 0,
+        presenter_queue_capacity: 2,
+        transport_delivery_p95_ms: Some(10),
+        decode_p95_ms: Some(3),
+        presentation_p95_ms: Some(5),
+    }
+}
+
+fn resolution_stall_reduced_dimensions(native: (u16, u16)) -> Result<(u16, u16)> {
+    ensure!(
+        native.0.is_multiple_of(4) && native.1.is_multiple_of(4),
+        "native dimensions must be divisible by four for an exact three-quarter tier"
+    );
+    let reduced = (native.0 / 4 * 3, native.1 / 4 * 3);
+    ensure!(
+        reduced.0 >= 64 && reduced.1 >= 64,
+        "three-quarter dimensions are below the H.264 minimum"
+    );
+    ensure!(
+        reduced.0.is_multiple_of(2) && reduced.1.is_multiple_of(2),
+        "three-quarter H.264 dimensions must be even"
+    );
+    ensure!(
+        u32::from(native.0) * u32::from(reduced.1) == u32::from(native.1) * u32::from(reduced.0),
+        "three-quarter dimensions must preserve the native aspect ratio"
+    );
+    Ok(reduced)
+}
+
+async fn exchange_resolution_stall_feedback(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    report: &MediaFeedbackReportV1,
+) -> Result<AdaptiveBitrateDecisionV1> {
+    tokio::time::timeout(
+        RESOLUTION_STALL_FEEDBACK_TIMEOUT,
+        write_media_feedback_report_v1(send, report),
+    )
+    .await
+    .context("timed out writing resolution-stall feedback")??;
+    let decision = tokio::time::timeout(
+        RESOLUTION_STALL_FEEDBACK_TIMEOUT,
+        read_adaptive_bitrate_decision_v1(recv),
+    )
+    .await
+    .context("timed out waiting for resolution-stall feedback decision")??
+    .context("host closed the resolution-stall feedback stream")?;
+    ensure!(
+        decision.report_id == report.report_id,
+        "resolution-stall decision report ID {} does not match report {}",
+        decision.report_id,
+        report.report_id
+    );
+    Ok(decision)
+}
+
+async fn next_resolution_stall_moq_frame(receiver: &mut MoqProbeReceiver) -> Result<AcceptedMedia> {
+    loop {
+        match receiver.next().await? {
+            Some(MoqProbeOutcome::Frame {
+                frame,
+                group_sequence,
+                ..
+            }) => {
+                return Ok(AcceptedMedia {
+                    flags: frame.header.flags,
+                    width: frame.header.width,
+                    height: frame.header.height,
+                    sequence: frame.header.sequence,
+                    capture_timestamp_us: frame.header.capture_timestamp_us,
+                    payload_len: frame.payload.len(),
+                    v3_group_id: Some(group_sequence),
+                });
+            }
+            Some(MoqProbeOutcome::Dropped) => {}
+            None => bail!("host closed upstream MoQ during resolution-stall smoke"),
+        }
+    }
+}
+
+fn create_resolution_stall_marker(path: &Path, contents: &str) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut marker = options
+        .open(path)
+        .with_context(|| format!("creating resolution stall marker {}", path.display()))?;
+    marker
+        .write_all(contents.as_bytes())
+        .with_context(|| format!("writing resolution stall marker {}", path.display()))?;
+    marker
+        .sync_all()
+        .with_context(|| format!("syncing resolution stall marker {}", path.display()))?;
+    Ok(())
+}
+
+async fn wait_for_resolution_stall_marker(path: &Path, timeout: Duration) -> Result<()> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            match fs::metadata(path) {
+                Ok(metadata) => {
+                    ensure!(
+                        metadata.is_file(),
+                        "resolution stall gate marker is not a file: {}",
+                        path.display()
+                    );
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(RESOLUTION_STALL_GATE_POLL_INTERVAL).await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("reading resolution stall gate marker {}", path.display())
+                    });
+                }
+            }
+        }
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "timed out waiting for resolution stall marker {}",
+            path.display()
+        )
+    })?
+}
+
+async fn send_resolution_stall_input_probe(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    expected_ack: &mut u64,
+) -> Result<u64> {
+    let started = Instant::now();
+    write_input_event(send, &InputEvent::Probe)
+        .await
+        .context("writing input probe during resolution stall")?;
+    *expected_ack = expected_ack.saturating_add(1);
+    tokio::time::timeout(
+        RESOLUTION_STALL_RECOVERY_TIMEOUT,
+        read_expected_input_ack(recv, 2, *expected_ack),
+    )
+    .await
+    .context("input acknowledgement exceeded the resolution-stall bound")??;
+    Ok(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_resolution_stall_smoke(
+    gate_directory: &Path,
+    receiver: &mut MoqProbeReceiver,
+    feedback_send: &mut iroh::endpoint::SendStream,
+    feedback_recv: &mut iroh::endpoint::RecvStream,
+    input_send: &mut iroh::endpoint::SendStream,
+    input_recv: &mut iroh::endpoint::RecvStream,
+    expected_ack: &mut u64,
+    expected_native: Option<(u16, u16)>,
+    timeout: Duration,
+) -> Result<ResolutionStallEvidence> {
+    let gate = ResolutionStallGate::new(gate_directory)?;
+    let initial = tokio::time::timeout(timeout, next_resolution_stall_moq_frame(receiver))
+        .await
+        .context("timed out waiting for initial resolution-stall media")??;
+    ensure!(
+        initial.flags.contains(FrameFlags::KEYFRAME)
+            && initial.flags.contains(FrameFlags::CODEC_CONFIG),
+        "resolution-stall smoke did not begin at a configured IDR"
+    );
+    let native_dimensions = (initial.width, initial.height);
+    if let Some(expected) = expected_native {
+        ensure!(
+            native_dimensions == expected,
+            "expected {}x{} native media but received {}x{}",
+            expected.0,
+            expected.1,
+            native_dimensions.0,
+            native_dimensions.1
+        );
+    }
+    let reduced_dimensions = resolution_stall_reduced_dimensions(native_dimensions)?;
+
+    let mut report_id = 1_u64;
+    let seed = resolution_stall_feedback(report_id, MediaFeedbackFlags::NONE, initial.sequence);
+    let _ = exchange_resolution_stall_feedback(feedback_send, feedback_recv, &seed).await?;
+    tokio::time::sleep(RESOLUTION_STALL_FEEDBACK_INTERVAL).await;
+
+    report_id += 1;
+    let pressure = resolution_stall_feedback(
+        report_id,
+        MediaFeedbackFlags::RESYNC_ACTIVE,
+        initial.sequence,
+    );
+    let pressure_decision =
+        exchange_resolution_stall_feedback(feedback_send, feedback_recv, &pressure).await?;
+    ensure!(
+        pressure_decision
+            .reasons
+            .contains(AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE),
+        "resolution-stall pressure report did not register receiver pressure"
+    );
+
+    let reduced = tokio::time::timeout(timeout, async {
+        loop {
+            let frame = next_resolution_stall_moq_frame(receiver).await?;
+            let dimensions = (frame.width, frame.height);
+            ensure!(
+                dimensions == native_dimensions || dimensions == reduced_dimensions,
+                "resolution-stall media changed to unexpected dimensions {}x{}",
+                dimensions.0,
+                dimensions.1
+            );
+            if dimensions == reduced_dimensions
+                && frame.flags.contains(FrameFlags::KEYFRAME)
+                && frame.flags.contains(FrameFlags::CODEC_CONFIG)
+            {
+                break Ok::<_, anyhow::Error>(frame);
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for pressure-triggered reduced configured IDR")??;
+    ensure!(
+        reduced.sequence > initial.sequence,
+        "reduced configured IDR did not advance media sequence"
+    );
+
+    create_resolution_stall_marker(
+        &gate.ready,
+        &format!(
+            "native={}x{}\nreduced={}x{}\nsequence={}\n",
+            native_dimensions.0,
+            native_dimensions.1,
+            reduced_dimensions.0,
+            reduced_dimensions.1,
+            reduced.sequence
+        ),
+    )?;
+    println!("resolution_stall_ready=1");
+    println!("resolution_stall_ready_sequence={}", reduced.sequence);
+    std::io::stdout()
+        .flush()
+        .context("flushing resolution-stall readiness marker")?;
+    wait_for_resolution_stall_marker(&gate.stalled, timeout).await?;
+
+    report_id += 1;
+    let reseed = resolution_stall_feedback(report_id, MediaFeedbackFlags::NONE, reduced.sequence);
+    let _ = exchange_resolution_stall_feedback(feedback_send, feedback_recv, &reseed).await?;
+    let mut last_feedback_at = Instant::now();
+    let mut fresh_started = None;
+    let mut stall_input_ack_micros = None;
+    for index in 0..RESOLUTION_STALL_FRESH_REPORTS {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            last_feedback_at + RESOLUTION_STALL_FEEDBACK_INTERVAL,
+        ))
+        .await;
+        report_id += 1;
+        let report =
+            resolution_stall_feedback(report_id, MediaFeedbackFlags::NONE, reduced.sequence);
+        let sent_at = Instant::now();
+        fresh_started.get_or_insert(sent_at);
+        let decision =
+            exchange_resolution_stall_feedback(feedback_send, feedback_recv, &report).await?;
+        ensure!(
+            decision.state != AdaptiveBitrateStateV1::Increase,
+            "no-progress feedback unexpectedly increased adaptive bitrate"
+        );
+        ensure!(
+            !decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::CLEAN_RECOVERY),
+            "no-progress feedback was incorrectly classified as clean recovery"
+        );
+        last_feedback_at = sent_at;
+        if index + 1 == RESOLUTION_STALL_FRESH_REPORTS / 2 {
+            stall_input_ack_micros = Some(
+                send_resolution_stall_input_probe(input_send, input_recv, expected_ack).await?,
+            );
+        }
+    }
+    let fresh_duration = fresh_started
+        .context("resolution-stall fresh feedback interval did not start")?
+        .elapsed();
+    ensure!(
+        fresh_duration > Duration::from_secs(8),
+        "resolution-stall fresh feedback lasted only {}ms",
+        fresh_duration.as_millis()
+    );
+
+    create_resolution_stall_marker(
+        &gate.resume_ready,
+        &format!(
+            "fresh_reports={RESOLUTION_STALL_FRESH_REPORTS}\nfresh_duration_ms={}\n",
+            fresh_duration.as_millis()
+        ),
+    )?;
+    println!("resolution_stall_resume_ready=1");
+    std::io::stdout()
+        .flush()
+        .context("flushing resolution-stall resume marker")?;
+    wait_for_resolution_stall_marker(&gate.resumed, timeout).await?;
+
+    let resume_input_ack_micros =
+        send_resolution_stall_input_probe(input_send, input_recv, expected_ack).await?;
+    let media_resumed_at = Instant::now();
+    let resumed = tokio::time::timeout(
+        RESOLUTION_STALL_RECOVERY_TIMEOUT,
+        next_resolution_stall_moq_frame(receiver),
+    )
+    .await
+    .context("media did not resume within the resolution-stall bound")??;
+    ensure!(
+        (resumed.width, resumed.height) == reduced_dimensions,
+        "media resumed at {}x{} instead of reduced {}x{}",
+        resumed.width,
+        resumed.height,
+        reduced_dimensions.0,
+        reduced_dimensions.1
+    );
+    let resume_sequence_advance = resumed
+        .sequence
+        .checked_sub(reduced.sequence)
+        .context("resumed media sequence did not advance")?;
+    ensure!(
+        resume_sequence_advance > 0,
+        "resumed media sequence did not advance"
+    );
+    let resume_media_micros =
+        u64::try_from(media_resumed_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+
+    Ok(ResolutionStallEvidence {
+        native_dimensions,
+        reduced_dimensions,
+        stall_sequence: reduced.sequence,
+        fresh_duration,
+        stall_input_ack_micros: stall_input_ack_micros
+            .context("resolution-stall input acknowledgement was not measured")?,
+        resume_input_ack_micros,
+        resume_media_micros,
+        resume_sequence_advance,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1191,6 +1623,102 @@ async fn main() -> Result<()> {
         .context("writing neutral gamepad smoke snapshot")?;
         expected_ack += 1;
         read_expected_input_ack(&mut input_recv, args.timeout_seconds, expected_ack).await?;
+    }
+
+    if let Some(gate_directory) = args.resolution_stall_smoke.as_deref() {
+        let feedback_connection = endpoint
+            .connect(address.clone(), MEDIA_FEEDBACK_ALPN_V1)
+            .await
+            .context("connecting media feedback protocol")?;
+        let (mut feedback_send, mut feedback_recv) = feedback_connection
+            .open_bi()
+            .await
+            .context("opening media feedback stream")?;
+        let feedback_negotiation = negotiate(
+            &mut feedback_send,
+            &mut feedback_recv,
+            nonce,
+            vec![Capability::VideoH264],
+            Capability::VideoH264,
+            "media feedback",
+            None,
+        )
+        .await?;
+        ensure!(
+            session_id == feedback_negotiation.session_id,
+            "media and feedback session IDs differ"
+        );
+
+        let evidence = run_resolution_stall_smoke(
+            gate_directory,
+            moq_receiver
+                .as_mut()
+                .expect("resolution-stall smoke requires upstream MoQ"),
+            &mut feedback_send,
+            &mut feedback_recv,
+            &mut input_send,
+            &mut input_recv,
+            &mut expected_ack,
+            args.expect_size,
+            Duration::from_secs(args.timeout_seconds),
+        )
+        .await?;
+
+        feedback_send
+            .finish()
+            .context("finishing media feedback stream")?;
+        input_send.finish().context("finishing input stream")?;
+        if let Some(mut media_send) = media_send {
+            media_send
+                .finish()
+                .context("finishing media request stream")?;
+        }
+        feedback_connection.close(0_u32.into(), b"probe complete");
+        input_connection.close(0_u32.into(), b"probe complete");
+        moq_receiver
+            .as_ref()
+            .expect("resolution-stall smoke requires upstream MoQ")
+            .connection()
+            .close(0_u32.into(), b"probe complete");
+        media_connection.close(0_u32.into(), b"probe complete");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        endpoint.close().await;
+
+        println!("probe=ok");
+        println!("session_id={session_id}");
+        println!("resolution_stall_smoke=ok");
+        println!("resolution_stall_session_id={session_id}");
+        println!(
+            "resolution_stall_native_dimensions={}x{}",
+            evidence.native_dimensions.0, evidence.native_dimensions.1
+        );
+        println!(
+            "resolution_stall_reduced_dimensions={}x{}",
+            evidence.reduced_dimensions.0, evidence.reduced_dimensions.1
+        );
+        println!("resolution_stall_sequence={}", evidence.stall_sequence);
+        println!("resolution_stall_fresh_reports={RESOLUTION_STALL_FRESH_REPORTS}");
+        println!(
+            "resolution_stall_fresh_duration_ms={}",
+            evidence.fresh_duration.as_millis()
+        );
+        println!(
+            "resolution_stall_input_ack_micros={}",
+            evidence.stall_input_ack_micros
+        );
+        println!(
+            "resolution_resume_input_ack_micros={}",
+            evidence.resume_input_ack_micros
+        );
+        println!(
+            "resolution_resume_media_micros={}",
+            evidence.resume_media_micros
+        );
+        println!(
+            "resolution_resume_sequence_advance={}",
+            evidence.resume_sequence_advance
+        );
+        return Ok(());
     }
 
     let started = Instant::now();
@@ -2151,6 +2679,38 @@ async fn read_expected_input_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolution_stall_feedback_is_complete_and_keeps_the_observed_sequence() {
+        let report = resolution_stall_feedback(7, MediaFeedbackFlags::NONE, 42);
+        report.validate().unwrap();
+        assert_eq!(report.report_id, 7);
+        assert_eq!(report.interval_ms, 1_000);
+        assert_eq!(report.last_sequence, Some(42));
+        assert_eq!(report.frontend_queue_depth, 0);
+        assert_eq!(report.decode_queue_depth, 0);
+        assert_eq!(report.presenter_queue_depth, 0);
+        assert_eq!(report.transport_delivery_p95_ms, Some(10));
+        assert_eq!(report.decode_p95_ms, Some(3));
+        assert_eq!(report.presentation_p95_ms, Some(5));
+
+        let later = resolution_stall_feedback(8, MediaFeedbackFlags::NONE, 42);
+        assert_eq!(later.last_sequence, report.last_sequence);
+    }
+
+    #[test]
+    fn resolution_stall_reduced_dimensions_are_exact_even_and_same_aspect() {
+        assert_eq!(
+            resolution_stall_reduced_dimensions((2_560, 1_600)).unwrap(),
+            (1_920, 1_200)
+        );
+        assert_eq!(
+            resolution_stall_reduced_dimensions((1_280, 800)).unwrap(),
+            (960, 600)
+        );
+        assert!(resolution_stall_reduced_dimensions((1_278, 800)).is_err());
+        assert!(resolution_stall_reduced_dimensions((80, 64)).is_err());
+    }
 
     #[test]
     fn sequence_checks_reject_duplicates_regressions_and_overflow() {

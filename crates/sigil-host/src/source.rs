@@ -2694,6 +2694,53 @@ mod tests {
     }
 
     #[test]
+    fn resolves_pinned_upstream_gamescope_pipewire_contract() {
+        // Sanitized from the standard interface emitted by Valve Gamescope
+        // commit 17baf4abd1ab3353fb705e4d0d023f84e870f7e8, src/pipewire.cpp
+        // blob 76b3ea8cc8ff01c6635498cbafe38130e33215f2. This fixture proves
+        // interface compatibility; it is not SteamOS hardware evidence.
+        let dump = include_bytes!("../tests/fixtures/upstream-gamescope-pipewire-contract.json");
+        let mut config = gamescope_config();
+        config.width = None;
+        config.height = None;
+        config
+            .gamescope_pipewire
+            .as_mut()
+            .unwrap()
+            .match_properties
+            .clear();
+
+        let resolved = resolve_pipewire_node(dump, &config).unwrap();
+        assert_eq!(resolved.target_object, "8842");
+        assert_eq!(
+            resolved.pointer_surface_dimensions,
+            PointerSurfaceDimensions::new(1_920, 1_080).unwrap()
+        );
+        assert_eq!(
+            resolved.video_mode,
+            CaptureVideoMode {
+                width: 1_920,
+                height: 1_080,
+                framerate: 60,
+            }
+        );
+
+        let args: Vec<String> =
+            gamescope_pipeline_args(&config, &resolved.target_object, resolved.video_mode)
+                .unwrap()
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect();
+        assert!(args.contains(&"target-object=8842".to_owned()));
+        assert!(
+            args.contains(
+                &"video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1".to_owned()
+            )
+        );
+        assert!(args.contains(&"max-rate=60".to_owned()));
+    }
+
+    #[test]
     fn rejects_ambiguous_or_unbounded_gamescope_native_size() {
         let config = gamescope_config();
         let dump = br#"[{"type":"PipeWire:Interface:Node","info":{"props":{

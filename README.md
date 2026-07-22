@@ -37,15 +37,19 @@ Steam and games.
   input messages, limits, and ALPNs.
 - The Linux host is the pure Rust `sigil` binary with no Tauri or webview
   dependency.
-- The Bazzite path captures the exact Gamescope PipeWire node, derives the
-  encoded size from its bounded native caps by default, and uses AMD GstVA
-  H.264. An explicit width/height pair remains available for downscale proofs;
-  1280×800/60 is the first measured target, not a product constraint.
+- The core host captures the standard upstream Gamescope PipeWire video source,
+  derives the encoded size from its bounded native caps by default, and uses
+  AMD GstVA H.264. An explicit width/height pair remains available for
+  downscale proofs; 1280×800/60 is the first measured target, not a product
+  constraint. Bazzite remains the only packaged and hardware-proven appliance;
+  SteamOS packaging, cold boot, encoder availability, and hardware UAT remain
+  unproven.
 - Gamescope video keeps the proven external `gst-launch` pipeline as its
   configuration default. Linux builds made explicitly with
   `in-process-gstreamer` can opt into an in-process pipeline for bounded
-  bitrate, force-keyframe, and two-tier resolution control; ordinary release
-  packages do not enable that feature yet.
+  bitrate, force-keyframe, and two-tier resolution control. Published Sigil
+  packages include that backend while keeping the external pipeline as the
+  runtime default.
 - Portal reports bounded receiver queue, drop, latency, and recovery telemetry
   over a session-authenticated feedback stream. The host combines it with
   trusted path and scheduler pressure, applies hysteresis, and commits an

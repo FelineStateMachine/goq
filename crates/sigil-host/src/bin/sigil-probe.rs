@@ -44,6 +44,9 @@ struct Args {
     /// then prove no delta history is delivered before the discontinuity.
     #[arg(long)]
     keyframe_smoke: bool,
+    /// Correlation identifier for `--keyframe-smoke` host evidence.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    keyframe_request_id: u64,
     /// Require gamepad negotiation and emit one bounded non-neutral snapshot
     /// followed by neutral. Intended for evtest-backed uinput proof.
     #[arg(long)]
@@ -302,7 +305,10 @@ impl MediaObjectReorderV3 {
         }
         let accept_index = outcome.accept_index();
         if accept_index < self.next_accept_index {
-            return Ok(Some(outcome));
+            // A discontinuity barrier may advance beyond older in-flight
+            // reads. Their eventual timeout/reset outcomes belong to the
+            // superseded GOP and must not poison the recovered sequence.
+            return Ok(None);
         }
         let fast_forward = outcome.is_fast_forward_barrier();
         ensure!(
@@ -984,7 +990,7 @@ async fn main() -> Result<()> {
             && received == KEYFRAME_SMOKE_REQUEST_AFTER_FRAMES
         {
             let request = MediaControlRequestV3::request_keyframe(
-                1,
+                args.keyframe_request_id,
                 Some(frame.sequence),
                 KeyframeRequestReasonV3::DecoderReset,
             );
@@ -1069,6 +1075,11 @@ async fn main() -> Result<()> {
             "not-requested"
         }
     );
+    if args.keyframe_smoke {
+        println!("keyframe_request_id={}", args.keyframe_request_id);
+    } else {
+        println!("keyframe_request_id=not-requested");
+    }
     match accepted_fps {
         Some(fps) => println!("accepted_fps={fps:.3}"),
         None => println!("accepted_fps=unknown"),
@@ -1397,6 +1408,7 @@ mod tests {
         let keyframe = FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG);
         let barrier = keyframe.union(FrameFlags::DISCONTINUITY);
         let mut reorder = MediaObjectReorderV3::new(0);
+        let mut sequence = MediaObjectSequenceV3::new();
 
         assert!(
             reorder
@@ -1409,14 +1421,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.accept_index(), 2);
-        assert_eq!(reorder.pending_len(), 0);
+        let MediaObjectOutcomeV3::Object { object, .. } = recovered else {
+            panic!("recovery barrier must remain an object");
+        };
         assert_eq!(
+            sequence.classify(&object),
+            MediaObjectDecisionV3::Deliver {
+                discontinuity: true
+            }
+        );
+        assert_eq!(reorder.pending_len(), 0);
+        assert!(
             reorder
-                .push(media_outcome_v3(0, 10, 0, 10, keyframe))
+                .push(MediaObjectOutcomeV3::Dropped { accept_index: 0 })
                 .unwrap()
-                .unwrap()
-                .accept_index(),
-            0
+                .is_none()
+        );
+        let next = reorder
+            .push(media_outcome_v3(3, 20, 1, 21, FrameFlags::NONE))
+            .unwrap()
+            .unwrap();
+        let MediaObjectOutcomeV3::Object { object, .. } = next else {
+            panic!("recovered-group delta must remain an object");
+        };
+        assert_eq!(
+            sequence.classify(&object),
+            MediaObjectDecisionV3::Deliver {
+                discontinuity: false
+            }
         );
     }
 

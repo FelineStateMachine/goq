@@ -1289,6 +1289,38 @@ buffer metadata through an in-process appsink before making those stronger
 claims; until then, correlate the probe with Gamescope/PipeWire statistics and
 the external sampling in the evidence section.
 
+### Validate motion-sensitive resolution
+
+This gate applies only to a Linux build with `in-process-gstreamer` and a host
+configuration whose `encoder_backend` is `in-process-gstreamer`. The external
+`gst-launch` compatibility backend intentionally remains fixed-resolution.
+
+Connect Portal, enable host debug logs, and repeat at least ten cycles of a
+high-motion 3D scene followed by a static high-frequency test card. For each
+cycle retain the host journal and Portal console. The host decision record must
+show an applied 960x600 motion/pressure target, followed by an applied 1280x800
+recovery target only after at least two seconds of stillness, three fresh clean
+feedback windows, and the three-second transition cooldown. A stale feedback
+window must never restore native resolution.
+
+At each boundary verify that the first delivered target-size frame is a
+keyframe with SPS/PPS and a discontinuity, no preceding-resolution delta is
+presented afterward, and Portal stays connected without a WebCodecs error.
+Absolute pointer tests at the canvas center and four corners must continue to
+land on the native Gamescope surface at both encoded resolutions. The Portal
+window must not resize merely because 1280x800 and 960x600 have the same aspect
+ratio.
+
+Record transition request-to-configured-IDR time and Portal
+configured-IDR-to-first-presentation time separately. These are recovery
+measurements, not glass-to-glass latency. Require ten of ten successful
+downscale/restore cycles, recovery p95 no greater than 900 ms and no individual
+recovery greater than two seconds, video/decode queue p95 no greater than two,
+and no sustained latency growth. Measure true glass-to-glass latency with a
+paired high-speed-camera run comparing fixed-native and adaptive sessions under
+the same controlled bandwidth pressure; do not substitute post-encode queue
+age for that result.
+
 Then perform the actual headless gate:
 
 1. Shut the host down.

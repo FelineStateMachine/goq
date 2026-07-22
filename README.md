@@ -42,13 +42,18 @@ Steam and games.
 - Gamescope video keeps the proven external `gst-launch` pipeline as its
   configuration default. Linux builds made explicitly with
   `in-process-gstreamer` can opt into an in-process pipeline for bounded
-  bitrate and force-keyframe control; ordinary release packages do not enable
-  that feature yet.
+  bitrate, force-keyframe, and two-tier resolution control; ordinary release
+  packages do not enable that feature yet.
 - Portal reports bounded receiver queue, drop, latency, and recovery telemetry
   over a session-authenticated feedback stream. The host combines it with
   trusted path and scheduler pressure, applies hysteresis, and commits an
   in-process CBR bitrate decision only after exact encoder readback. External
   encoder sessions remain explicitly advisory-only.
+- On the opt-in in-process backend, fresh damage-driven frame progress and
+  authenticated receiver pressure select either native 1280x800 or the exact
+  same-aspect 960x600 motion tier. A switch commits only when GStreamer emits a
+  target-size IDR with SPS/PPS; Portal then starts a new decoder epoch while
+  pointer mapping remains tied to the native Gamescope surface.
 - Portal delivers encoded frames to WebCodecs through a raw Tauri binary
   channel. The handoff is capped at four frames, the decode queue and
   presentation queue at two, and a bounded watchdog recovers a suspended
@@ -113,6 +118,14 @@ not authentication.
    and `applied=true` requires exact in-process encoder readback. Native Ubuntu
    x264 control is CI-proven; Bazzite GstVA loss/relay acceptance and product
    packaging remain in issue #8.
+10. **Motion-sensitive resolution implemented; hardware proof pending:** the
+    in-process backend lowers resolution during sustained damage-driven motion
+    or receiver pressure and restores native detail only after stillness,
+    clean feedback, and cooldown. Every transition is an exact configured-IDR
+    discontinuity with truthful per-frame dimensions. Portal reconfigures
+    WebCodecs atomically and preserves native pointer mapping. Ubuntu x264 CI
+    covers downscale and restore; repeated GstVA/Portal acceptance on Bazzite
+    remains in issue #9.
 
 ## Development
 

@@ -42,7 +42,7 @@ if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
     echo 'in-process GStreamer gate requires gst-inspect-1.0' >&2
     exit 1
   }
-  for gstreamer_element in videotestsrc queue videoconvert x264enc h264parse appsink; do
+  for gstreamer_element in videotestsrc queue videoconvert videoscale capsfilter x264enc h264parse appsink; do
     gst-inspect-1.0 "$gstreamer_element" >/dev/null || {
       printf 'in-process GStreamer gate requires the %s plugin\n' \
         "$gstreamer_element" >&2

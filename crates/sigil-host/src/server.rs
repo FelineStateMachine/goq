@@ -84,6 +84,10 @@ const FEEDBACK_STALE_ARRIVAL_GAP: Duration = Duration::from_millis(2_500);
 const FEEDBACK_MIN_READ_INTERVAL: Duration = Duration::from_millis(250);
 const FEEDBACK_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const ENCODER_CONTROL_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
+// Mirrors the fixed v1 wire bound. Aggregates clamp here so a stalled
+// consumer observes a stale 5-second window instead of a deceptively fresh
+// latest report.
+const MEDIA_FEEDBACK_INTERVAL_MAX_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FeedbackSeverity {
@@ -92,6 +96,103 @@ enum FeedbackSeverity {
     Moderate,
     Severe,
     Stale,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FeedbackIngressCursor {
+    last_report_id: Option<u64>,
+    interval_ms: u64,
+    transport_dropped: u64,
+    frontend_dropped: u64,
+    decoder_dropped: u64,
+    presenter_dropped: u64,
+    resync_reports: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CumulativeFeedbackIngress {
+    latest: Option<MediaFeedbackReportV1>,
+    interval_ms: u64,
+    transport_dropped: u64,
+    frontend_dropped: u64,
+    decoder_dropped: u64,
+    presenter_dropped: u64,
+    resync_reports: u64,
+}
+
+impl CumulativeFeedbackIngress {
+    fn observe(&mut self, report: MediaFeedbackReportV1) {
+        self.interval_ms = self.interval_ms.wrapping_add(u64::from(report.interval_ms));
+        self.transport_dropped = self
+            .transport_dropped
+            .wrapping_add(u64::from(report.transport_dropped_delta));
+        self.frontend_dropped = self
+            .frontend_dropped
+            .wrapping_add(u64::from(report.frontend_dropped_delta));
+        self.decoder_dropped = self
+            .decoder_dropped
+            .wrapping_add(u64::from(report.decoder_dropped_delta));
+        self.presenter_dropped = self
+            .presenter_dropped
+            .wrapping_add(u64::from(report.presenter_dropped_delta));
+        if report.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE) {
+            self.resync_reports = self.resync_reports.wrapping_add(1);
+        }
+        self.latest = Some(report);
+    }
+
+    fn report_since(
+        &self,
+        cursor: FeedbackIngressCursor,
+    ) -> Result<Option<(MediaFeedbackReportV1, FeedbackIngressCursor)>> {
+        let Some(latest) = self.latest else {
+            return Ok(None);
+        };
+        if cursor
+            .last_report_id
+            .is_some_and(|report_id| latest.report_id <= report_id)
+        {
+            return Ok(None);
+        }
+        let mut report = latest;
+        report.interval_ms = u16::try_from(
+            self.interval_ms
+                .wrapping_sub(cursor.interval_ms)
+                .min(MEDIA_FEEDBACK_INTERVAL_MAX_MS),
+        )
+        .expect("feedback interval is clamped to u16");
+        report.transport_dropped_delta =
+            cumulative_feedback_delta(self.transport_dropped, cursor.transport_dropped);
+        report.frontend_dropped_delta =
+            cumulative_feedback_delta(self.frontend_dropped, cursor.frontend_dropped);
+        report.decoder_dropped_delta =
+            cumulative_feedback_delta(self.decoder_dropped, cursor.decoder_dropped);
+        report.presenter_dropped_delta =
+            cumulative_feedback_delta(self.presenter_dropped, cursor.presenter_dropped);
+        report.flags = if self.resync_reports.wrapping_sub(cursor.resync_reports) > 0 {
+            MediaFeedbackFlags::RESYNC_ACTIVE
+        } else {
+            MediaFeedbackFlags::NONE
+        };
+        report.validate()?;
+        Ok(Some((
+            report,
+            FeedbackIngressCursor {
+                last_report_id: Some(latest.report_id),
+                interval_ms: self.interval_ms,
+                transport_dropped: self.transport_dropped,
+                frontend_dropped: self.frontend_dropped,
+                decoder_dropped: self.decoder_dropped,
+                presenter_dropped: self.presenter_dropped,
+                resync_reports: self.resync_reports,
+            },
+        )))
+    }
+}
+
+fn cumulative_feedback_delta(total: u64, baseline: u64) -> u32 {
+    u32::try_from(total.wrapping_sub(baseline).min(u64::from(u32::MAX)))
+        .expect("feedback delta is clamped to u32")
 }
 
 #[derive(Clone, Debug)]
@@ -2516,11 +2617,13 @@ async fn serve_media_feedback(
         "media feedback client accepted for bitrate control"
     );
 
-    let (feedback_sender, mut feedback_receiver) = tokio::sync::watch::channel(None);
+    let (feedback_sender, mut feedback_receiver) =
+        tokio::sync::watch::channel(CumulativeFeedbackIngress::default());
     let mut reader_task = tokio::spawn(forward_media_feedback_reports(recv, feedback_sender));
     let mut reader_finished = false;
     let mut receiver_open = true;
     let mut controller = ShadowBitrateController::new(ceiling_kbps, lease.telemetry.snapshot());
+    let mut feedback_cursor = FeedbackIngressCursor::default();
 
     let result: Result<()> = loop {
         let session_changed = sessions.session_changed.notified();
@@ -2553,9 +2656,14 @@ async fn serve_media_feedback(
                     }
                     continue;
                 }
-                let Some(report) = *feedback_receiver.borrow_and_update() else {
+                let ingress = *feedback_receiver.borrow_and_update();
+                let Some((report, next_cursor)) = ingress.report_since(feedback_cursor)? else {
                     continue;
                 };
+                // This branch now owns the complete aggregate. Advance the
+                // ingress baseline exactly once before evaluation; reports
+                // arriving during an encoder wait accumulate beyond it.
+                feedback_cursor = next_cursor;
                 let telemetry = lease.telemetry.snapshot();
                 let mut candidate = controller.clone();
                 let mut decision = candidate.decide(&report, telemetry, Instant::now())?;
@@ -2650,7 +2758,7 @@ async fn serve_media_feedback(
                     write_adaptive_bitrate_decision_v1(&mut send, &decision),
                 )
                 .await
-                .context("timed out writing adaptive bitrate shadow decision")??;
+                .context("timed out writing adaptive bitrate decision")??;
                 debug!(
                     %remote,
                     session_id = lease.session_id,
@@ -2697,7 +2805,7 @@ async fn serve_media_feedback(
 
 async fn forward_media_feedback_reports<R>(
     mut reader: R,
-    sender: tokio::sync::watch::Sender<Option<MediaFeedbackReportV1>>,
+    sender: tokio::sync::watch::Sender<CumulativeFeedbackIngress>,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -2714,7 +2822,10 @@ where
             "feedback report IDs must increase monotonically"
         );
         last_report_id = Some(report.report_id);
-        sender.send_replace(Some(report));
+        sender.send_modify(|ingress| ingress.observe(report));
+        if sender.is_closed() {
+            return Ok(());
+        }
         next_read_at = tokio::time::Instant::now() + FEEDBACK_MIN_READ_INTERVAL;
     }
 }
@@ -5719,6 +5830,108 @@ mod tests {
         assert!(adaptive_recovery_keyframe_required(&report, &decision));
         decision.state = AdaptiveBitrateStateV1::Hold;
         assert!(!adaptive_recovery_keyframe_required(&report, &decision));
+    }
+
+    #[tokio::test]
+    async fn stalled_adaptive_apply_coalesces_feedback_without_losing_pressure() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (sender, mut receiver) =
+            tokio::sync::watch::channel(CumulativeFeedbackIngress::default());
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let reader_task = tokio::spawn(forward_media_feedback_reports(reader, sender.clone()));
+        let mut cursor = FeedbackIngressCursor::default();
+
+        sigil_protocol::write_media_feedback_report_v1(&mut writer, &clean_feedback(1))
+            .await
+            .unwrap();
+        receiver.changed().await.unwrap();
+        let (first, next_cursor) = receiver
+            .borrow_and_update()
+            .report_since(cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.report_id, 1);
+        cursor = next_cursor;
+
+        // The consumer is now notionally stalled on an encoder commit. Two
+        // reports overwrite one watch notification, but their interval,
+        // deltas, and resync pressure must remain cumulative.
+        let mut pressured = clean_feedback(2);
+        pressured.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+        pressured.transport_dropped_delta = 2;
+        pressured.decoder_dropped_delta = 1;
+        pressured.decode_queue_depth = 3;
+        pressured.transport_delivery_p95_ms = Some(180);
+        sigil_protocol::write_media_feedback_report_v1(&mut writer, &pressured)
+            .await
+            .unwrap();
+
+        let mut latest = clean_feedback(3);
+        latest.frontend_dropped_delta = 4;
+        latest.presenter_dropped_delta = 3;
+        latest.frontend_queue_depth = 3;
+        latest.decode_queue_depth = 1;
+        latest.transport_delivery_p95_ms = Some(40);
+        latest.decode_p95_ms = Some(9);
+        sigil_protocol::write_media_feedback_report_v1(&mut writer, &latest)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        reader_task.await.unwrap().unwrap();
+
+        receiver.changed().await.unwrap();
+        let (aggregate, next_cursor) = receiver
+            .borrow_and_update()
+            .report_since(cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(aggregate.report_id, 3);
+        assert_eq!(aggregate.interval_ms, 2_000);
+        assert_eq!(aggregate.transport_dropped_delta, 2);
+        assert_eq!(aggregate.frontend_dropped_delta, 4);
+        assert_eq!(aggregate.decoder_dropped_delta, 1);
+        assert_eq!(aggregate.presenter_dropped_delta, 3);
+        assert!(aggregate.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE));
+        assert_eq!(aggregate.last_sequence, latest.last_sequence);
+        assert_eq!(aggregate.frontend_queue_depth, latest.frontend_queue_depth);
+        assert_eq!(aggregate.decode_queue_depth, latest.decode_queue_depth);
+        assert_eq!(
+            aggregate.transport_delivery_p95_ms,
+            latest.transport_delivery_p95_ms
+        );
+        assert_eq!(aggregate.decode_p95_ms, latest.decode_p95_ms);
+        cursor = next_cursor;
+        assert!(
+            receiver.borrow().report_since(cursor).unwrap().is_none(),
+            "one cumulative ingress generation must be processed only once"
+        );
+
+        for report_id in 4..=9 {
+            sender.send_modify(|ingress| ingress.observe(clean_feedback(report_id)));
+        }
+        receiver.changed().await.unwrap();
+        let (clamped, _) = receiver
+            .borrow_and_update()
+            .report_since(cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(clamped.interval_ms, 5_000);
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        let decision = controller
+            .decide(
+                &clamped,
+                MediaV3TelemetrySnapshot::default(),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE),
+            "a clamped aggregate must be stale rather than disguised as one fresh report"
+        );
     }
 
     #[test]

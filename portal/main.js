@@ -29,23 +29,12 @@ import {
 } from './frame-session.mjs';
 import { newPointerSession, parsePointerFeedbackMessage } from './pointer-feedback.mjs';
 import { newConnectionState } from './connection-state.mjs';
+import { formatSignedMilliseconds } from './av-sync.mjs';
+import { audioButtonPresentation } from './audio-ui.mjs';
 import {
-  audioMinusVideoSkewMs,
-  audioOutputTimelineFromStats,
-  exactMediaTimestampMicros,
-  formatSignedMilliseconds,
-  isCurrentAvSyncEpoch,
-  nextAvSyncEpoch,
-  projectAudioMediaPtsMicros,
-} from './av-sync.mjs';
-import {
-  isCurrentAudioDelivery,
-  isCurrentAudioGeneration,
-  parseAudioEnvelope,
-  stageAudioTerminalState,
-  takeAudioTerminalState,
-} from './audio-envelope.mjs';
-import { audioButtonPresentation, newAudioSession } from './audio-ui.mjs';
+  AUDIO_SAMPLE_RATE,
+  createAudioPipelineSession,
+} from './audio-pipeline.mjs';
 import {
   ControllerActivationGate,
   ControllerActionRepeater,
@@ -94,20 +83,12 @@ let activeFrameChannel = null;
 let activeFrameGeneration = null;
 let activeFrameSession = null;
 let activePointerSession = null;
-let activeAudioSession = newAudioSession();
 let controllerActivationInProgress = false;
 let controlTransitionInProgress = false;
 let controlTransitionGeneration = 0;
 let nativeCursorCommand = Promise.resolve();
 let browserPointerLockRequired = true;
 const controllerActivationGate = new ControllerActivationGate();
-
-const AUDIO_DECODER_CONFIG = Object.freeze({
-  codec: 'opus',
-  sampleRate: 48000,
-  numberOfChannels: 2,
-});
-const MAX_AUDIO_DECODE_QUEUE_SIZE = 3;
 
 function applyPointerPositionFeedback(message, session) {
   if (session !== activePointerSession || !connectionState.inputCapabilities.pointerPositionFeedback) return;
@@ -152,6 +133,13 @@ function handlePointerPositionFeedback(message, session) {
 
 const invoke = (...args) => window.__TAURI__.core.invoke(...args);
 const listen = (...args) => window.__TAURI__.event.listen(...args);
+let videoPipeline = null;
+const audioPipeline = createAudioPipelineSession({
+  invokeCommand: invoke,
+  onUpdate: updateAudioUI,
+  resetAvSync: (...args) => videoPipeline?.resetAvSync(...args),
+  isDisconnecting: () => connectionState.disconnecting,
+});
 const adaptiveFeedbackPublisher = new AdaptiveFeedbackPublisher({ invokeCommand: invoke });
 let adaptiveFeedbackAvailable = false;
 let adaptiveFeedbackError = null;
@@ -386,7 +374,7 @@ async function introConnect() {
 
 // ─── Client ───────────────────────────────────────────────────────────────────
 function updateAudioUI() {
-  const session = activeAudioSession;
+  const session = audioPipeline.session;
   const toggle = document.getElementById('audio-toggle');
   const status = document.getElementById('stream-audio-state');
   const webviewReceived = document.getElementById('stream-audio-webview-received-packets');
@@ -425,13 +413,13 @@ function updateAudioUI() {
     pcmHandoffDropped.textContent = `${session.messageTracker.droppedMessages} blocks`;
   }
   if (ringOverflow) {
-    ringOverflow.textContent = `${(session.workletDroppedFrames * 1000 / AUDIO_DECODER_CONFIG.sampleRate).toFixed(1)} ms`;
+    ringOverflow.textContent = `${(session.workletDroppedFrames * 1000 / AUDIO_SAMPLE_RATE).toFixed(1)} ms`;
   }
   if (ringRecoveryDiscarded) {
-    ringRecoveryDiscarded.textContent = `${(session.workletRecoveryDiscardedFrames * 1000 / AUDIO_DECODER_CONFIG.sampleRate).toFixed(1)} ms`;
+    ringRecoveryDiscarded.textContent = `${(session.workletRecoveryDiscardedFrames * 1000 / AUDIO_SAMPLE_RATE).toFixed(1)} ms`;
   }
   if (ringBuffered) {
-    ringBuffered.textContent = `${(session.bufferedFrames * 1000 / AUDIO_DECODER_CONFIG.sampleRate).toFixed(1)} ms`;
+    ringBuffered.textContent = `${(session.bufferedFrames * 1000 / AUDIO_SAMPLE_RATE).toFixed(1)} ms`;
   }
   if (underruns) {
     underruns.textContent = `${session.underflows} events / ${(session.underflowDurationMicros / 1000).toFixed(1)} ms`;
@@ -439,243 +427,8 @@ function updateAudioUI() {
   if (silence) silence.textContent = `${(session.silentDurationMicros / 1000).toFixed(1)} ms`;
 }
 
-function setAudioState(state, detail = state) {
-  activeAudioSession.state = state;
-  activeAudioSession.stateDetail = detail;
-  updateAudioUI();
-}
-
-function resetAudioTelemetry(session = activeAudioSession) {
-  session.packetsReceived = 0;
-  session.decoderDropped = 0;
-  session.bufferedFrames = 0;
-  session.underflows = 0;
-  session.underflowDurationMicros = 0;
-  session.silentDurationMicros = 0;
-  session.transportDropped = 0;
-  session.frontendDropped = 0;
-  videoPipeline.resetAvSync(session);
-  updateAudioUI();
-}
-
-function configureAudioDecoder(session = activeAudioSession) {
-  if (session.decoder) {
-    try { session.decoder.close(); } catch (_) {}
-  }
-  session.decoder = new AudioDecoder({
-    output: (audioData) => {
-      try {
-        if (session !== activeAudioSession || session.failed) return;
-        const workletNode = session?.workletNode;
-        if (!workletNode || audioData.numberOfChannels !== 2) {
-          throw new Error(`unexpected decoded audio channel count: ${audioData.numberOfChannels}`);
-        }
-        const timestampMicros = exactMediaTimestampMicros(audioData.timestamp);
-        if (timestampMicros === null) throw new Error('decoded audio has an invalid media timestamp');
-        // Reserve ownership before allocating/copying PCM. The MessagePort has
-        // no useful queue-depth API, so this makes overload latest-frame-wins
-        // at a hard ceiling of three decoded messages.
-        const messageId = session.messageTracker.reserve();
-        if (messageId === null) {
-          updateAudioUI();
-          return;
-        }
-        const channels = [];
-        const transfers = [];
-        try {
-          for (let planeIndex = 0; planeIndex < 2; planeIndex++) {
-            const channel = new Float32Array(audioData.numberOfFrames);
-            audioData.copyTo(channel, { planeIndex, format: 'f32-planar' });
-            channels.push(channel);
-            transfers.push(channel.buffer);
-          }
-          workletNode.port.postMessage({
-            type: 'samples',
-            id: messageId,
-            channels,
-            timestampMicros,
-          }, transfers);
-        } catch (error) {
-          session.messageTracker.accept(messageId);
-          throw error;
-        }
-      } catch (error) {
-        disableAudioForSession(`Decoded audio output failed: ${error}`, session);
-      } finally {
-        audioData.close();
-      }
-    },
-    error: (error) => {
-      disableAudioForSession(`Opus decoder failed: ${error}`, session);
-    },
-  });
-  session.decoder.configure(AUDIO_DECODER_CONFIG);
-}
-
-function primeAudioOutputForActivation() {
-  const session = activeAudioSession;
-  const AudioContextConstructor = window.AudioContext || window.webkitAudioContext;
-  if (typeof AudioContextConstructor !== 'function') return;
-  if (!session.context || session.context.state === 'closed') {
-    try {
-      session.context = new AudioContextConstructor({ latencyHint: 'interactive', sampleRate: 48000 });
-    } catch (_) {
-      return;
-    }
-  }
-  // This function is deliberately synchronous and is called before the first
-  // await in a click/keyboard connect handler, preserving WebKit user activation.
-  void session.context.resume().catch(() => {});
-}
-
-async function initializeAudioPipeline(session) {
-  if (session.decoder) {
-    try { session.decoder.close(); } catch (_) {}
-    session.decoder = null;
-  }
-  if (session.workletNode) {
-    try { session.workletNode.disconnect(); } catch (_) {}
-    session.workletNode = null;
-  }
-  session.messageTracker.clear();
-  if (typeof AudioDecoder !== 'function') {
-    return { supported: false, error: 'WebCodecs AudioDecoder is unavailable' };
-  }
-  if (typeof AudioWorkletNode !== 'function') {
-    return { supported: false, error: 'AudioWorklet is unavailable' };
-  }
-  let support;
-  try {
-    support = await AudioDecoder.isConfigSupported(AUDIO_DECODER_CONFIG);
-  } catch (error) {
-    return { supported: false, error: `Opus capability probe failed: ${error}` };
-  }
-  if (!support.supported) {
-    return { supported: false, error: 'WebCodecs Opus decoding is unsupported' };
-  }
-  if (!session.context) {
-    return { supported: false, error: 'Web Audio output is unavailable' };
-  }
-  try {
-    if (session.context.sampleRate !== 48000) {
-      throw new Error(`audio output opened at ${session.context.sampleRate} Hz instead of 48000 Hz`);
-    }
-    await session.context.audioWorklet.addModule(new URL('./audio-worklet.js', import.meta.url));
-    session.workletNode = new AudioWorkletNode(session.context, 'sigil-audio-processor', {
-      numberOfInputs: 0,
-      numberOfOutputs: 1,
-      outputChannelCount: [2],
-    });
-    session.workletNode.port.onmessage = (event) => {
-      if (event.data?.type === 'accepted') {
-        session.messageTracker.accept(event.data.id);
-        if (session === activeAudioSession) updateAudioUI();
-      } else if (event.data?.type === 'stats') {
-        if (!isCurrentAvSyncEpoch(event.data.avSyncEpoch, session.avSyncEpoch)) return;
-        session.workletDroppedFrames = Number.isSafeInteger(event.data.droppedFrames)
-          && event.data.droppedFrames >= 0
-          ? event.data.droppedFrames : session.workletDroppedFrames;
-        session.workletRecoveryDiscardedFrames = Number.isSafeInteger(
-          event.data.recoveryDiscardedFrames,
-        ) && event.data.recoveryDiscardedFrames >= 0
-          ? event.data.recoveryDiscardedFrames : session.workletRecoveryDiscardedFrames;
-        session.audioTimeline = audioOutputTimelineFromStats(event.data);
-        if (session !== activeAudioSession) return;
-        session.bufferedFrames = Number.isSafeInteger(event.data.bufferedFrames)
-          ? event.data.bufferedFrames : session.bufferedFrames;
-        session.underflows = Number.isSafeInteger(event.data.underflows)
-          ? event.data.underflows : session.underflows;
-        session.underflowDurationMicros = Number.isFinite(event.data.underflowDurationMicros)
-          && event.data.underflowDurationMicros >= 0
-          ? event.data.underflowDurationMicros : session.underflowDurationMicros;
-        session.silentDurationMicros = Number.isFinite(event.data.silentDurationMicros)
-          && event.data.silentDurationMicros >= 0
-          ? event.data.silentDurationMicros : session.silentDurationMicros;
-        if (session.available && !session.muted) {
-          setAudioState(event.data.started ? 'playing' : 'priming', 'bounded Opus playback');
-        } else {
-          updateAudioUI();
-        }
-      } else if (event.data?.type === 'error') {
-        disableAudioForSession(`AudioWorklet failed: ${event.data.error}`, session);
-      }
-    };
-    session.workletNode.port.onmessageerror = () => {
-      disableAudioForSession('AudioWorklet returned an unreadable message', session);
-    };
-    session.workletNode.onprocessorerror = () => {
-      disableAudioForSession('AudioWorklet processor stopped unexpectedly', session);
-    };
-    session.workletNode.connect(session.context.destination);
-    session.workletNode.port.postMessage({ type: 'mute', muted: session.muted });
-    configureAudioDecoder(session);
-    await session.context.resume();
-    setAudioState(
-      session.context.state === 'running' ? 'negotiating' : 'blocked',
-      session.context.state === 'running'
-        ? 'Opus output ready'
-        : 'WebKit suspended audio output; activate the audio button to retry',
-    );
-    return { supported: true, error: null };
-  } catch (error) {
-    await teardownAudioPipeline(false);
-    return { supported: false, error: `Audio initialization failed: ${error}` };
-  }
-}
-
-async function teardownAudioPipeline(resetStatus = true) {
-  const session = activeAudioSession;
-  videoPipeline.resetAvSync(session);
-  const decoder = session.decoder;
-  const workletNode = session.workletNode;
-  const context = session.context;
-  // Replace the active owner before closing resources so delayed callbacks
-  // cannot mutate the disconnected UI or a successor session. Seed the next
-  // dormant session with the user's mute preference across reconnects.
-  activeAudioSession = newAudioSession({ muted: session.muted });
-  session.expectedGeneration = null;
-  session.channel = null;
-  session.available = false;
-  session.messageTracker.clear();
-  session.decoder = null;
-  session.workletNode = null;
-  session.context = null;
-  if (decoder) {
-    try { decoder.close(); } catch (_) {}
-  }
-  if (workletNode) {
-    try { workletNode.port.postMessage({ type: 'clear' }); } catch (_) {}
-    try { workletNode.disconnect(); } catch (_) {}
-  }
-  if (context && context.state !== 'closed') {
-    try { await context.close(); } catch (_) {}
-  }
-  if (resetStatus) updateAudioUI();
-}
-
 async function toggleAudioMute() {
-  const session = activeAudioSession;
-  if (!session.available) return;
-  session.muted = !session.muted;
-  try {
-    if (!session.muted && session.context?.state !== 'running') await session.context?.resume();
-    session.workletNode?.port.postMessage({ type: 'mute', muted: session.muted });
-    if (!session.muted && session.context?.state !== 'running') {
-      setAudioState('blocked', 'WebKit suspended audio output; click the audio button to retry');
-    } else {
-      updateAudioUI();
-    }
-  } catch (error) {
-    setAudioState('error', `Audio output activation failed: ${error}`);
-  }
-}
-
-function prepareAudioForConnection() {
-  activeAudioSession = newAudioSession({ muted: activeAudioSession.muted });
-  activeAudioSession.acceptsNativeEvents = true;
-  // Keep this synchronous and before createConnectionAttempt's first await so
-  // WebKit observes the originating click/keyboard user activation.
-  primeAudioOutputForActivation();
+  await audioPipeline.toggleMute();
 }
 
 async function createConnectionAttempt({ createChannel: Channel }) {
@@ -690,29 +443,26 @@ async function createConnectionAttempt({ createChannel: Channel }) {
   adaptiveDecision = null;
   resetStreamTelemetry();
   if (typeof Channel !== 'function') throw new Error('Tauri binary channels are unavailable');
-  const audioSession = activeAudioSession;
-  resetAudioTelemetry(audioSession);
+  const audioSession = audioPipeline.beginAttempt();
   const frameSession = newFrameSession();
   const pointerSession = newPointerSession();
   activeFrameSession = frameSession;
   activePointerSession = pointerSession;
-  const audioSupport = await initializeAudioPipeline(audioSession);
-  if (!audioSupport.supported) setAudioState('unavailable', audioSupport.error);
+  const audioAttempt = await audioPipeline.createAttemptChannel(Channel, audioSession);
   activeFrameChannel = new Channel((message) => handleBinaryFrameMessage(message, frameSession));
-  audioSession.channel = new Channel((message) => handleBinaryAudioMessage(message, audioSession));
   pointerSession.channel = new Channel(
     (message) => handlePointerPositionFeedback(message, pointerSession),
   );
   return {
-    audioSession,
+    audioSession: audioAttempt.session,
     frameSession,
     pointerSession,
-    audioSupport,
+    audioSupport: audioAttempt.support,
     connectionArgs: {
       frameChannel: activeFrameChannel,
-      audioChannel: audioSession.channel,
+      audioChannel: audioAttempt.channel,
       pointerChannel: pointerSession.channel,
-      audioSupported: audioSupport.supported,
+      audioSupported: audioAttempt.support.supported,
     },
   };
 }
@@ -763,10 +513,8 @@ async function teardownConnectionAttempt(attempt) {
   const pointerSession = attempt?.pointerSession ?? activePointerSession;
   if (activePointerSession === pointerSession) activePointerSession = null;
   if (pointerSession) pointerSession.channel = null;
-  if (attempt?.audioSession && attempt.audioSession !== activeAudioSession) {
-    attempt.audioSession.channel = null;
-  }
-  await teardownAudioPipeline();
+  audioPipeline.releaseAttempt(attempt?.audioSession);
+  await audioPipeline.teardown();
 }
 
 function updateAcceptedConnectionState({ attempt, state }) {
@@ -783,32 +531,10 @@ function updateAcceptedConnectionState({ attempt, state }) {
 }
 
 async function showConnectedAttempt({ result, attempt }) {
-  const { audioSession, audioSupport } = attempt;
-  audioSession.expectedGeneration = Number.isSafeInteger(result.audio_generation)
-    && result.audio_generation > 0
-    ? result.audio_generation : null;
-  const pendingAudioTerminal = takeAudioTerminalState(
-    audioSession.pendingTerminalStates,
-    audioSession.expectedGeneration,
-  );
-  if (pendingAudioTerminal !== null) {
-    audioSession.failed = true;
-    audioSession.failureDetail = pendingAudioTerminal.error || 'Audio connection ended';
-  }
-  audioSession.available = result.audio_available === true;
-  if (audioSession.available && audioSession.failed) {
-    disableAudioForSession(audioSession.failureDetail || 'Audio output failed', audioSession);
-  } else if (audioSession.available) {
-    setAudioState(
-      audioSession.context?.state === 'running' ? 'priming' : 'blocked',
-      audioSession.context?.state === 'running'
-        ? 'Waiting for bounded Opus prebuffer'
-        : 'WebKit suspended audio output; activate the audio button to retry',
-    );
-  } else {
-    await teardownAudioPipeline(false);
-    setAudioState('unavailable', result.audio_error || audioSupport.error || 'host audio unavailable');
-  }
+  await audioPipeline.acceptConnectedResult(result, {
+    session: attempt.audioSession,
+    support: attempt.audioSupport,
+  });
   updatePanelVisibility();
   document.getElementById('node-id-text').textContent = result.host_node_id.substring(0, 16) + '...';
   document.getElementById('frame-canvas').style.display = 'block';
@@ -854,7 +580,7 @@ async function teardownConnectedResources() {
   const pointerSession = activePointerSession;
   activePointerSession = null;
   if (pointerSession) pointerSession.channel = null;
-  await teardownAudioPipeline();
+  await audioPipeline.teardown();
   videoPipeline.teardown();
 }
 
@@ -886,7 +612,7 @@ async function showDisconnectedState() {
 const connectionState = newConnectionState({
   invokeCommand: invoke,
   createChannel: window.__TAURI__.core.Channel,
-  beforeConnect: prepareAudioForConnection,
+  beforeConnect: audioPipeline.prepareForConnection,
   createAttempt: createConnectionAttempt,
   validateConnectedResult: validateConnectedAttempt,
   activateAttempt: activateConnectedAttempt,
@@ -982,54 +708,16 @@ function requestDecoderKeyframe(reason) {
   });
 }
 
-function resetAudioSyncTelemetry(session = activeAudioSession, { recoverRing = false } = {}) {
-  if (!session) return;
-  session.audioTimeline = null;
-  session.avSyncEpoch = nextAvSyncEpoch(session.avSyncEpoch);
-  try {
-    session.workletNode?.port.postMessage({
-      type: recoverRing ? 'recover' : 'av-sync-epoch',
-      avSyncEpoch: session.avSyncEpoch,
-    });
-  } catch (_) {}
-}
-
-function sampleAvSkew(videoPtsMicros, presentationTimeMs) {
-  const session = activeAudioSession;
-  if (
-    exactMediaTimestampMicros(videoPtsMicros) === null
-    || !session
-    || session.failed
-    || !session.audioTimeline
-    || !session.available
-    || session.context?.state !== 'running'
-    || typeof session.context.getOutputTimestamp !== 'function'
-  ) return null;
-
-  let outputTimestamp;
-  try {
-    outputTimestamp = session.context.getOutputTimestamp();
-  } catch (_) {
-    return null;
-  }
-  const audioPtsMicros = projectAudioMediaPtsMicros(
-    session.audioTimeline,
-    outputTimestamp,
-    presentationTimeMs,
-  );
-  return audioMinusVideoSkewMs(audioPtsMicros, videoPtsMicros);
-}
-
 const canvas = document.getElementById('frame-canvas');
 const remotePointer = document.getElementById('remote-pointer');
 const ctx = canvas.getContext('2d');
-const videoPipeline = createVideoPipelineSession({
+videoPipeline = createVideoPipelineSession({
   hasWebCodecs,
   canvas,
   context: ctx,
   requestKeyframe: requestDecoderKeyframe,
-  resetAudioSync: resetAudioSyncTelemetry,
-  sampleAudioSkew: sampleAvSkew,
+  resetAudioSync: audioPipeline.resetSyncTelemetry,
+  sampleAudioSkew: audioPipeline.sampleSkew,
   onFormatChanged: () => {
     sizeCanvasToIncomingStream();
     if (connectionState.connected) void fitWindowToIncomingStream();
@@ -1352,84 +1040,6 @@ function handleBinaryFrameMessage(message, session) {
   }
 }
 
-function acknowledgeAudio(generation, deliveryId) {
-  void invoke('iroh_client_ack_audio', { generation, deliveryId }).catch((error) => {
-    console.warn('audio acknowledgment failed:', error);
-  });
-}
-
-function requestNativeAudioStop(session) {
-  const generation = session?.expectedGeneration;
-  if (session !== activeAudioSession
-    || !Number.isSafeInteger(generation)
-    || generation < 0
-    || session.stopRequested) return;
-  session.stopRequested = true;
-  void invoke('iroh_client_stop_audio', { expectedGeneration: generation }).catch((error) => {
-    console.warn('audio stop failed:', error);
-  });
-}
-
-function disableAudioForSession(detail, session = activeAudioSession) {
-  if (!session || session !== activeAudioSession) return;
-  videoPipeline.resetAvSync(session);
-  session.failed = true;
-  session.failureDetail = detail;
-  session.available = false;
-  if (session.decoder) {
-    try { session.decoder.close(); } catch (_) {}
-    session.decoder = null;
-  }
-  session.messageTracker.clear();
-  try { session.workletNode?.port.postMessage({ type: 'clear' }); } catch (_) {}
-  requestNativeAudioStop(session);
-  setAudioState('error', detail);
-}
-
-function handleBinaryAudioMessage(message, session) {
-  let packet;
-  try {
-    packet = parseAudioEnvelope(message);
-  } catch (error) {
-    console.error('invalid audio packet:', error);
-    disableAudioForSession(`Audio packet failed: ${error}`, session);
-    return;
-  }
-
-  // Every valid delivery is released using the token embedded in that exact
-  // message. A delayed delivery from an old connection is acknowledged but
-  // cannot enter the current decoder.
-  acknowledgeAudio(packet.generation, packet.deliveryId);
-  if (session !== activeAudioSession
-    || session.failed
-    || !isCurrentAudioDelivery(packet, session.expectedGeneration)) return;
-
-  try {
-    session.packetsReceived++;
-    if (!session.decoder || session.decoder.state === 'closed') {
-      session.decoderDropped++;
-      updateAudioUI();
-      return;
-    }
-    const queuedAudioPackets = session.decoder.decodeQueueSize;
-    if (packet.discontinuity || queuedAudioPackets >= MAX_AUDIO_DECODE_QUEUE_SIZE) {
-      videoPipeline.resetAvSync(session, { recoverRing: true });
-      session.decoderDropped += queuedAudioPackets;
-      configureAudioDecoder(session);
-    }
-    session.decoder.decode(new EncodedAudioChunk({
-      type: 'key',
-      timestamp: packet.ptsMicros,
-      duration: (packet.frameSamples * 1_000_000) / packet.sampleRate,
-      data: packet.data,
-    }));
-    updateAudioUI();
-  } catch (error) {
-    console.error('undecodable audio packet:', error);
-    disableAudioForSession(`Audio packet failed: ${error}`, session);
-  }
-}
-
 // The software decoder/JPEG compatibility path intentionally remains an event:
 // it is only selected when WebCodecs is unavailable and is not latency-critical.
 listen('frame', (event) => {
@@ -1519,30 +1129,11 @@ listen('frame-error', (event) => {
 });
 
 listen('audio-state', (event) => {
-  const session = activeAudioSession;
-  if (connectionState.disconnecting
-    || !session.acceptsNativeEvents
-    || event.payload?.available !== false) return;
-  if (session.expectedGeneration === null) {
-    try {
-      stageAudioTerminalState(session.pendingTerminalStates, event.payload);
-    } catch (error) {
-      console.error('invalid pre-connect audio terminal state:', error);
-    }
-    return;
-  }
-  if (!isCurrentAudioGeneration(event.payload?.generation, session.expectedGeneration)) return;
-  disableAudioForSession(event.payload.error || 'Audio connection ended', session);
+  audioPipeline.handleNativeState(event.payload);
 });
 
 listen('audio-stats', (event) => {
-  const session = activeAudioSession;
-  if (!isCurrentAudioGeneration(event.payload?.generation, session.expectedGeneration)) return;
-  session.transportDropped = Number.isSafeInteger(event.payload?.sequence_dropped_total)
-    ? event.payload.sequence_dropped_total : session.transportDropped;
-  session.frontendDropped = Number.isSafeInteger(event.payload?.frontend_dropped_total)
-    ? event.payload.frontend_dropped_total : session.frontendDropped;
-  updateAudioUI();
+  audioPipeline.handleNativeStats(event.payload);
 });
 
 // ─── Input ────────────────────────────────────────────────────────────────────

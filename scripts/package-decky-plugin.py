@@ -147,7 +147,7 @@ def main() -> int:
             "schema_version": 1,
             "repository": REPOSITORY,
             "source_commit": commit,
-            "source_tree_clean": True,
+            "package_inputs_clean": True,
             "plugin_version": version,
             "compatibility": compatibility["sigil"],
             "files": content_digests,

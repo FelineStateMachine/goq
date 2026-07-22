@@ -51,8 +51,12 @@ class DeckyPackageTests(unittest.TestCase):
                     archive.read("goq-sigil/provenance.json").decode("utf-8")
                 )
                 self.assertEqual(provenance["source_commit"], COMMIT)
+                self.assertEqual(
+                    provenance["compatibility"]["compatibility_basis"], "schema_probe"
+                )
                 self.assertEqual(provenance["compatibility"]["appliance_status_schema"], 2)
-                self.assertTrue(provenance["source_tree_clean"])
+                self.assertTrue(provenance["package_inputs_clean"])
+                self.assertNotIn("source_tree_clean", provenance)
                 self.assertEqual(
                     provenance["files"]["dist/index.js"],
                     hashlib.sha256(archive.read("goq-sigil/dist/index.js")).hexdigest(),

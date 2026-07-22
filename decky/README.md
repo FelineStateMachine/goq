@@ -5,8 +5,10 @@ daemon. It supervises the existing `sigil-host.service`; Decky never owns the
 streaming process and reloading or uninstalling the plugin does not stop Sigil.
 
 The initial compatibility target is Bazzite with a separately installed,
-compatible Sigil release. SteamOS remains unproven until its hardware
-acceptance milestone is complete.
+compatible Sigil build. Until the signed Sigil channel publishes immutable
+release tags, compatibility is proven from the required appliance schemas,
+not the non-unique development version string. SteamOS remains unproven until
+its hardware acceptance milestone is complete.
 
 ## Supported management
 

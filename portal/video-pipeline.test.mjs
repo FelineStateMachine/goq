@@ -18,6 +18,20 @@ const h264Delta = () => new Uint8Array([
   0, 0, 0, 1, 0x41, 0x9a,
 ]);
 
+const h265Keyframe = () => new Uint8Array([
+  0, 0, 0, 1, 0x40, 0x01, 0x0c,
+  0, 0, 0, 1, 0x42, 0x01, 0x01, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x5d, 0x78,
+  0, 0, 0, 1, 0x44, 0x01, 0xc0,
+  0, 0, 0, 1, 0x46, 0x01,
+  0, 0, 0, 1, 0x26, 0x01, 0xaa,
+]);
+
+const av1Keyframe = () => new Uint8Array([
+  0x62, 0x02, 0x20, 0x00,
+  0x12, 0x00,
+  0x32, 0x02, 0xaa, 0xbb,
+]);
+
 function harness({ hasWebCodecs = true } = {}) {
   let clock = 10;
   const decoders = [];
@@ -135,6 +149,75 @@ test('configured H.264 keyframes commit format only after decode enqueue', () =>
   assert.equal(stats.droppedFrames, 0);
   assert.equal(stats.recovering, false);
   assert.equal(stats.decoderQueueCapacity, MAX_DECODE_QUEUE_SIZE);
+});
+
+test('configured H.265 keyframes keep parameter sets out of the decoded chunk', () => {
+  const subject = harness();
+  subject.pipeline.processFramePayload({
+    width: 1920,
+    height: 1080,
+    codec: 'h265',
+    keyframe: true,
+    codecConfig: true,
+    sequence: 1,
+    pts_micros: 2_000,
+    discontinuity: false,
+    data: null,
+  }, h265Keyframe());
+
+  assert.equal(subject.decoders.length, 1);
+  assert.deepEqual(subject.decoders[0].configureCalls[0], {
+    codec: 'hvc1.01.4.L120.B0',
+    codedWidth: 1920,
+    codedHeight: 1080,
+    description: subject.decoders[0].configureCalls[0].description,
+    optimizeForLatency: true,
+  });
+  assert.equal(subject.decoders[0].configureCalls[0].description.byteLength, 58);
+  assert.deepEqual(subject.pipeline.format, {
+    codec: 'h265', width: 1920, height: 1080, epoch: 1,
+  });
+  assert.deepEqual(subject.formats, [subject.pipeline.format]);
+  assert.equal(subject.chunks.length, 1);
+  assert.equal(subject.chunks[0].type, 'key');
+  assert.equal(subject.chunks[0].timestamp, 2_000);
+  assert.deepEqual([...subject.chunks[0].data], [0, 0, 0, 3, 0x26, 0x01, 0xaa]);
+});
+
+test('configured AV1 keyframes keep sequence and temporal headers out of the decoded chunk', () => {
+  const subject = harness();
+  subject.pipeline.processFramePayload({
+    width: 1280,
+    height: 720,
+    codec: 'av1',
+    keyframe: true,
+    codecConfig: true,
+    sequence: 1,
+    pts_micros: 3_000,
+    discontinuity: false,
+    data: null,
+  }, av1Keyframe());
+
+  assert.equal(subject.decoders.length, 1);
+  assert.deepEqual(subject.decoders[0].configureCalls[0], {
+    codec: 'av01.1.00M.08',
+    codedWidth: 1280,
+    codedHeight: 720,
+    description: subject.decoders[0].configureCalls[0].description,
+    optimizeForLatency: true,
+  });
+  assert.deepEqual(
+    [...new Uint8Array(subject.decoders[0].configureCalls[0].description)],
+    [0x62, 0x02, 0x20, 0x00],
+  );
+  assert.deepEqual(subject.pipeline.format, {
+    codec: 'av1', width: 1280, height: 720, epoch: 1,
+  });
+  assert.deepEqual(subject.formats, [subject.pipeline.format]);
+  assert.equal(subject.chunks.length, 1);
+  assert.equal(subject.chunks[0].type, 'key');
+  assert.equal(subject.chunks[0].timestamp, 3_000);
+  assert.deepEqual([...subject.chunks[0].data], [0x32, 0x02, 0xaa, 0xbb]);
 });
 
 test('stale decoder callbacks cannot mutate a replacement decoder session', () => {

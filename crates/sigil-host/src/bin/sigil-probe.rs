@@ -2785,29 +2785,79 @@ struct Negotiated {
     pointer_surface_dimensions: Option<PointerSurfaceDimensions>,
 }
 
-async fn read_expected_input_ack(
-    recv: &mut iroh::endpoint::RecvStream,
+async fn read_expected_input_ack<R>(
+    recv: &mut R,
     timeout_seconds: u64,
     expected_sequence: u64,
-) -> Result<sigil_protocol::InputAck> {
-    let input_ack = tokio::time::timeout(
-        Duration::from_secs(timeout_seconds.min(5)),
-        read_input_ack(recv),
-    )
+) -> Result<sigil_protocol::InputAck>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let input_ack = tokio::time::timeout(Duration::from_secs(timeout_seconds.min(5)), async {
+        loop {
+            let input_ack = read_input_ack(recv)
+                .await?
+                .context("host closed before input acknowledgment")?;
+            ensure!(
+                input_ack.sequence <= expected_sequence,
+                "unexpected input acknowledgment sequence {}; expected at most {expected_sequence}",
+                input_ack.sequence
+            );
+            if input_ack.sequence == expected_sequence {
+                break Ok(input_ack);
+            }
+        }
+    })
     .await
-    .context("timed out waiting for input acknowledgment")??
-    .context("host closed before input acknowledgment")?;
-    ensure!(
-        input_ack.sequence == expected_sequence,
-        "unexpected input acknowledgment sequence {}; expected {expected_sequence}",
-        input_ack.sequence
-    );
+    .context("timed out waiting for input acknowledgment")??;
     Ok(input_ack)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expected_input_ack_skips_older_feedback_under_one_deadline() {
+        let (mut sender, mut receiver) = tokio::io::duplex(512);
+        for sequence in [0, 0, 1] {
+            sigil_protocol::write_input_ack(
+                &mut sender,
+                &sigil_protocol::InputAck {
+                    sequence,
+                    pointer_position: None,
+                    pointer_visible: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let input_ack = read_expected_input_ack(&mut receiver, 1, 1).await.unwrap();
+
+        assert_eq!(input_ack.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn expected_input_ack_rejects_future_feedback() {
+        let (mut sender, mut receiver) = tokio::io::duplex(256);
+        sigil_protocol::write_input_ack(
+            &mut sender,
+            &sigil_protocol::InputAck {
+                sequence: 2,
+                pointer_position: None,
+                pointer_visible: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = read_expected_input_ack(&mut receiver, 1, 1)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("expected at most 1"));
+    }
 
     #[test]
     fn feedback_report_is_complete_and_keeps_the_observed_sequence() {

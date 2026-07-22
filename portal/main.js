@@ -28,10 +28,7 @@ import {
   stageLegacyFrame,
 } from './frame-session.mjs';
 import { parsePointerFeedbackMessage } from './pointer-feedback.mjs';
-import {
-  committedRustConnection,
-  disconnectRejectedRustConnection,
-} from './connection-attempt.mjs';
+import { newConnectionState } from './connection-state.mjs';
 import {
   audioMinusVideoSkewMs,
   audioOutputTimelineFromStats,
@@ -87,22 +84,9 @@ import {
 import { mapKey } from './keyboard-map.mjs';
 
 let controlMode = false;
-let connected = false;
-let connecting = false;
-let developmentConnectionMode = false;
 let enrollmentReady = false;
 let pendingInvitationSummary = null;
 let currentEnrollmentStatus = null;
-let disconnecting = false;
-let inputCapabilities = {
-  relativePointer: false,
-  pointerPositionFeedback: false,
-  absolutePointer: false,
-  keyboard: false,
-  text: false,
-  gamepad: false,
-  control: false,
-};
 let fittedStreamAspect = null;
 let pendingStreamFit = null;
 let lastObservedWindowSize = null;
@@ -173,7 +157,7 @@ function newPointerSession() {
 }
 
 function applyPointerPositionFeedback(message, session) {
-  if (session !== activePointerSession || !inputCapabilities.pointerPositionFeedback) return;
+  if (session !== activePointerSession || !connectionState.inputCapabilities.pointerPositionFeedback) return;
   const surface = currentPointerSurfaceSize();
   if (surface === null) return;
   const feedback = validatePointerPositionFeedback(message, surface);
@@ -195,13 +179,13 @@ function handlePointerPositionFeedback(message, session) {
       remotePointerVisible = false;
       renderRemotePointer();
       console.error(session.failureDetail);
-      if (connected) void disconnect();
+      if (connectionState.connected) void disconnect();
       return;
     }
     const feedback = envelope.feedback;
     session.received = true;
     session.latest = feedback;
-    if (connected) applyPointerPositionFeedback(feedback, session);
+    if (connectionState.connected) applyPointerPositionFeedback(feedback, session);
   } catch (error) {
     session.failed = true;
     session.failureDetail = `Pointer feedback failed: ${error}`;
@@ -209,7 +193,7 @@ function handlePointerPositionFeedback(message, session) {
     remotePointerVisible = false;
     renderRemotePointer();
     console.error('invalid pointer-position feedback:', error);
-    if (connected) void disconnect();
+    if (connectionState.connected) void disconnect();
   }
 }
 
@@ -222,7 +206,7 @@ let adaptiveDecision = null;
 
 function updatePanelVisibility() {
   const streamSection = document.getElementById('stream-section');
-  streamSection.style.display = connected ? '' : 'none';
+  streamSection.style.display = connectionState.connected ? '' : 'none';
 }
 
 // ─── Status ──────────────────────────────────────────────────────────────────
@@ -238,7 +222,7 @@ function setStatus(state, text) {
 function showIntro() {
   document.getElementById('intro').classList.remove('hidden');
   setTimeout(() => {
-    const target = developmentConnectionMode
+    const target = connectionState.developmentMode
       ? document.getElementById('intro-connect')
       : document.getElementById('intro-pin');
     target?.focus();
@@ -275,7 +259,7 @@ function showInvitationSummary(value) {
 }
 
 async function refreshEnrollment() {
-  if (developmentConnectionMode) {
+  if (connectionState.developmentMode) {
     enrollmentReady = true;
     hideEnrollment();
     showIntro();
@@ -401,7 +385,7 @@ async function cancelInvitation() {
 
 async function checkDevelopmentConnectionMode() {
   const mode = await invoke('development_connection_mode');
-  developmentConnectionMode = mode.enabled;
+  connectionState.setDevelopmentMode(mode.enabled);
   if (!mode.enabled) return;
 
   const badge = document.getElementById('dev-connect-badge');
@@ -423,24 +407,24 @@ async function checkDevelopmentConnectionMode() {
 
 // ─── Intro actions ────────────────────────────────────────────────────────────
 async function introConnect() {
-  if (connecting || connected) return;
-  if (!developmentConnectionMode && !enrollmentReady) {
+  if (connectionState.connecting || connectionState.connected) return;
+  if (!connectionState.developmentMode && !enrollmentReady) {
     showEnrollment();
     return;
   }
   const pin = document.getElementById('intro-pin').value.trim();
   const status = document.getElementById('intro-status');
-  if (!developmentConnectionMode && !pin) {
+  if (!connectionState.developmentMode && !pin) {
     status.className = 'overlay-status err';
     status.textContent = 'enter pin';
     return;
   }
   hideIntro();
-  if (!developmentConnectionMode) showTap();
+  if (!connectionState.developmentMode) showTap();
   document.getElementById('pin-input').value = pin;
   await connectHost();
-  if (!developmentConnectionMode) hideTap();
-  if (!connected) {
+  if (!connectionState.developmentMode) hideTap();
+  if (!connectionState.connected) {
     showIntro();
     status.className = 'overlay-status err';
     status.textContent = 'connection failed';
@@ -733,217 +717,154 @@ async function toggleAudioMute() {
   }
 }
 
-async function connectHost() {
-  if (connecting || connected) return;
-  connecting = true;
-  let rustConnectionCommitted = false;
-  let pointerSession = null;
-  let frameSession = null;
-  try {
-    const pin = document.getElementById('pin-input').value.trim();
-    if (!developmentConnectionMode && !pin) {
-      setStatus('err', 'enter pin');
-      return;
-    }
-    primeAudioOutputForActivation();
-    setStatus('pending', 'connecting...');
-    // Reset before opening the channel so early frames cannot race a
-    // post-connect reset and disappear from the live diagnostics.
-    if (activeFrameSession) activeFrameSession.closing = true;
-    activeFrameSession = null;
-    activeFrameGeneration = null;
-    adaptiveFeedbackPublisher.stop();
-    adaptiveFeedbackAvailable = false;
-    adaptiveFeedbackError = null;
-    adaptiveDecision = null;
-    resetStreamTelemetry();
-    pointerSurfaceDimensions = null;
-    remotePointerPosition = null;
-    remotePointerVisible = false;
-    const Channel = window.__TAURI__.core.Channel;
-    if (typeof Channel !== 'function') throw new Error('Tauri binary channels are unavailable');
-    resetAudioTelemetry();
-    const audioSession = newAudioSession();
-    frameSession = newFrameSession();
-    pointerSession = newPointerSession();
-    activeAudioSession = audioSession;
-    activeFrameSession = frameSession;
-    activePointerSession = pointerSession;
-    const audioSupport = await initializeAudioPipeline(audioSession);
-    if (!audioSupport.supported) setAudioState('unavailable', audioSupport.error);
-    activeFrameChannel = new Channel((message) => handleBinaryFrameMessage(message, frameSession));
-    activeAudioChannel = new Channel((message) => handleBinaryAudioMessage(message, audioSession));
-    activePointerChannel = new Channel(
-      (message) => handlePointerPositionFeedback(message, pointerSession),
-    );
-    const result = await invoke('iroh_client_connect', {
-      pin,
+async function createConnectionAttempt({ createChannel: Channel }) {
+  // Reset before opening the channel so early frames cannot race a
+  // post-connect reset and disappear from the live diagnostics.
+  if (activeFrameSession) activeFrameSession.closing = true;
+  activeFrameSession = null;
+  activeFrameGeneration = null;
+  adaptiveFeedbackPublisher.stop();
+  adaptiveFeedbackAvailable = false;
+  adaptiveFeedbackError = null;
+  adaptiveDecision = null;
+  resetStreamTelemetry();
+  pointerSurfaceDimensions = null;
+  remotePointerPosition = null;
+  remotePointerVisible = false;
+  if (typeof Channel !== 'function') throw new Error('Tauri binary channels are unavailable');
+  resetAudioTelemetry();
+  const audioSession = newAudioSession();
+  const frameSession = newFrameSession();
+  const pointerSession = newPointerSession();
+  activeAudioSession = audioSession;
+  activeFrameSession = frameSession;
+  activePointerSession = pointerSession;
+  const audioSupport = await initializeAudioPipeline(audioSession);
+  if (!audioSupport.supported) setAudioState('unavailable', audioSupport.error);
+  activeFrameChannel = new Channel((message) => handleBinaryFrameMessage(message, frameSession));
+  activeAudioChannel = new Channel((message) => handleBinaryAudioMessage(message, audioSession));
+  activePointerChannel = new Channel(
+    (message) => handlePointerPositionFeedback(message, pointerSession),
+  );
+  return {
+    audioSession,
+    frameSession,
+    pointerSession,
+    audioSupport,
+    connectionArgs: {
       frameChannel: activeFrameChannel,
       audioChannel: activeAudioChannel,
       pointerChannel: activePointerChannel,
       audioSupported: audioSupport.supported,
-    });
-    rustConnectionCommitted = committedRustConnection(result);
-    if (result.connected
-      && (!Number.isSafeInteger(result.media_generation) || result.media_generation <= 0)) {
-      throw new Error('host returned an invalid media generation');
-    }
-    if (result.connected
-      && result.audio_available === true
-      && (!Number.isSafeInteger(result.audio_generation) || result.audio_generation <= 0)) {
-      throw new Error('host returned an invalid audio generation');
-    }
-    if (pointerSession.failed) {
-      throw new Error(pointerSession.failureDetail || 'host returned invalid pointer-position feedback');
-    }
-    if (frameSession.failed) {
-      throw new Error(frameSession.failureDetail || 'host returned invalid frame data');
-    }
-    const connectedPointerSurfaceDimensions = result.connected
-      ? validatePointerSurfaceDimensions(result.pointer_surface_dimensions)
-      : null;
-    const pointerFeedbackAvailable = result.connected
-      && result.pointer_position_feedback_available === true;
-    if (pointerFeedbackAvailable && connectedPointerSurfaceDimensions === null) {
-      throw new Error('host offered pointer feedback without a native pointer surface');
-    }
-    const initialPointerFeedback = pointerFeedbackAvailable && pointerSession.received
-      ? validatePointerPositionFeedback(pointerSession.latest, connectedPointerSurfaceDimensions)
-      : null;
-    if (result.connected) {
-      activateConnectedFrameSession(frameSession, result.media_generation);
-      adaptiveFeedbackAvailable = result.adaptive_feedback_available === true;
-      adaptiveFeedbackError = typeof result.adaptive_feedback_error === 'string'
-        ? result.adaptive_feedback_error : null;
-      adaptiveFeedbackPublisher.start(result.media_generation, adaptiveFeedbackAvailable);
-      connected = true;
-      disconnecting = false;
-      inputCapabilities = {
-        relativePointer: result.relative_pointer_available === true,
-        pointerPositionFeedback: pointerFeedbackAvailable,
-        absolutePointer: result.absolute_pointer_available === true,
-        keyboard: result.keyboard_available === true,
-        text: result.text_available === true,
-        gamepad: result.gamepad_available === true,
-        control: result.control_available === true,
-      };
-      streamTransportMode = [
-        'grouped-v3',
-        'independent-v2',
-        'reliable-v1',
-        'reliable-v0',
-      ].includes(result.media_transport)
-        ? result.media_transport
-        : 'unknown';
-      pointerSurfaceDimensions = connectedPointerSurfaceDimensions;
-      if (!inputCapabilities.pointerPositionFeedback) {
-        remotePointerPosition = null;
-        remotePointerVisible = false;
-      } else if (initialPointerFeedback !== null) {
-        remotePointerPosition = initialPointerFeedback.position;
-        remotePointerVisible = initialPointerFeedback.pointer_visible;
-      }
-      // Treat inconsistent metadata as view-only. Rust reports every
-      // fields explicitly; this keeps the webview fail-closed as well.
-      inputCapabilities.control = inputCapabilities.control
-        && (inputCapabilities.relativePointer
-          || inputCapabilities.absolutePointer
-          || inputCapabilities.keyboard
-          || inputCapabilities.text
-          || inputCapabilities.gamepad);
-      controlMode = false;
-      clearPendingInput();
-      const connectionStatus = [
-        'connected',
-        inputCapabilities.control ? null : 'view only',
-        result.development_mode ? 'dev direct-node' : null,
-      ].filter(Boolean).join(' · ');
-      setStatus('ok', connectionStatus);
-      audioSession.expectedGeneration = Number.isSafeInteger(result.audio_generation)
-        && result.audio_generation > 0
-        ? result.audio_generation : null;
-      const pendingAudioTerminal = takeAudioTerminalState(
-        audioSession.pendingTerminalStates,
-        audioSession.expectedGeneration,
-      );
-      if (pendingAudioTerminal !== null) {
-        audioSession.failed = true;
-        audioSession.failureDetail = pendingAudioTerminal.error || 'Audio connection ended';
-      }
-      audioAvailable = result.audio_available === true;
-      if (audioAvailable && audioSession.failed) {
-        disableAudioForSession(audioSession.failureDetail || 'Audio output failed', audioSession);
-      } else if (audioAvailable) {
-        setAudioState(
-          audioContext?.state === 'running' ? 'priming' : 'blocked',
-          audioContext?.state === 'running'
-            ? 'Waiting for bounded Opus prebuffer'
-            : 'WebKit suspended audio output; activate the audio button to retry',
-        );
-      } else {
-        await teardownAudioPipeline(false);
-        setAudioState('unavailable', result.audio_error || audioSupport.error || 'host audio unavailable');
-      }
-      updatePanelVisibility();
-      document.getElementById('node-id-text').textContent = result.host_node_id.substring(0, 16) + '...';
-      document.getElementById('frame-canvas').style.display = 'block';
-      document.getElementById('placeholder').classList.add('hidden');
-      document.getElementById('control-bar').classList.add('visible');
-      void fitWindowToIncomingStream();
-      updateControlUI();
-      // Land controller users on the deliberate view-only/control boundary.
-      // The connect button is hidden at this point, so retaining its focus
-      // would make the next A press fall back to an unrelated top-bar action.
-      setTimeout(() => setControllerFocus(document.getElementById('control-toggle')), 0);
-      document.getElementById('action-connect').style.display = 'none';
-      document.getElementById('action-disconnect').textContent = 'disconnect';
-      document.getElementById('action-disconnect').classList.remove('hidden');
-      document.getElementById('pin-label').style.display = 'none';
-      document.getElementById('pin-input').style.display = 'none';
-      document.getElementById('controller-pin-main').style.display = 'none';
-      rustConnectionCommitted = false;
-    } else {
-      frameSession.closing = true;
-      activeFrameSession = null;
-      activeFrameGeneration = null;
-      activeFrameChannel = null;
-      activePointerChannel = null;
-      activePointerSession = null;
-      await teardownAudioPipeline();
-      setStatus('err', 'failed');
-    }
-  } catch (e) {
-    if (frameSession) frameSession.closing = true;
-    if (activeFrameSession === frameSession) activeFrameSession = null;
-    activeFrameGeneration = null;
-    adaptiveFeedbackPublisher.stop();
-    adaptiveFeedbackAvailable = false;
-    adaptiveDecision = null;
-    if (rustConnectionCommitted) {
-      // Rust commits its active-connection guard before returning. A client-side
-      // validation failure must close that exact committed attempt directly;
-      // calling disconnect() here would race its UI teardown recursively.
-      if (pointerSession) pointerSession.closing = true;
-      try {
-        await disconnectRejectedRustConnection(invoke, rustConnectionCommitted);
-      } catch (disconnectError) {
-        console.error('failed to close rejected connection:', disconnectError);
-      }
-    }
-    activeFrameChannel = null;
-    activePointerChannel = null;
-    activePointerSession = null;
-    await teardownAudioPipeline();
-    console.error('connection failed:', e);
-    setStatus('err', 'error');
-  } finally {
-    connecting = false;
-  }
+    },
+  };
 }
 
-async function disconnect() {
-  if (disconnecting) return;
-  disconnecting = true;
+function validateConnectedAttempt(result, attempt) {
+  if (attempt.pointerSession.failed) {
+    throw new Error(attempt.pointerSession.failureDetail || 'host returned invalid pointer-position feedback');
+  }
+  if (attempt.frameSession.failed) {
+    throw new Error(attempt.frameSession.failureDetail || 'host returned invalid frame data');
+  }
+  attempt.pointerSurface = result.connected
+    ? validatePointerSurfaceDimensions(result.pointer_surface_dimensions)
+    : null;
+  attempt.pointerFeedbackAvailable = result.connected
+    && result.pointer_position_feedback_available === true;
+  if (attempt.pointerFeedbackAvailable && attempt.pointerSurface === null) {
+    throw new Error('host offered pointer feedback without a native pointer surface');
+  }
+  attempt.initialPointerFeedback = attempt.pointerFeedbackAvailable && attempt.pointerSession.received
+    ? validatePointerPositionFeedback(attempt.pointerSession.latest, attempt.pointerSurface)
+    : null;
+}
+
+function activateConnectedAttempt(result, attempt) {
+  activateConnectedFrameSession(attempt.frameSession, result.media_generation);
+  adaptiveFeedbackAvailable = result.adaptive_feedback_available === true;
+  adaptiveFeedbackError = typeof result.adaptive_feedback_error === 'string'
+    ? result.adaptive_feedback_error : null;
+  adaptiveFeedbackPublisher.start(result.media_generation, adaptiveFeedbackAvailable);
+}
+
+function closeConnectionAttempt(attempt, { committed = false } = {}) {
+  if (attempt?.frameSession) attempt.frameSession.closing = true;
+  if (activeFrameSession === attempt?.frameSession) activeFrameSession = null;
+  activeFrameGeneration = null;
+  adaptiveFeedbackPublisher.stop();
+  adaptiveFeedbackAvailable = false;
+  adaptiveDecision = null;
+  if (committed && attempt?.pointerSession) attempt.pointerSession.closing = true;
+}
+
+async function teardownConnectionAttempt() {
+  activeFrameChannel = null;
+  activePointerChannel = null;
+  activePointerSession = null;
+  await teardownAudioPipeline();
+}
+
+function updateAcceptedConnectionState({ attempt, state }) {
+  pointerSurfaceDimensions = attempt.pointerSurface;
+  if (!state.inputCapabilities.pointerPositionFeedback) {
+    remotePointerPosition = null;
+    remotePointerVisible = false;
+  } else if (attempt.initialPointerFeedback !== null) {
+    remotePointerPosition = attempt.initialPointerFeedback.position;
+    remotePointerVisible = attempt.initialPointerFeedback.pointer_visible;
+  }
+  controlMode = false;
+  clearPendingInput();
+}
+
+async function showConnectedAttempt({ result, attempt }) {
+  const { audioSession, audioSupport } = attempt;
+  audioSession.expectedGeneration = Number.isSafeInteger(result.audio_generation)
+    && result.audio_generation > 0
+    ? result.audio_generation : null;
+  const pendingAudioTerminal = takeAudioTerminalState(
+    audioSession.pendingTerminalStates,
+    audioSession.expectedGeneration,
+  );
+  if (pendingAudioTerminal !== null) {
+    audioSession.failed = true;
+    audioSession.failureDetail = pendingAudioTerminal.error || 'Audio connection ended';
+  }
+  audioAvailable = result.audio_available === true;
+  if (audioAvailable && audioSession.failed) {
+    disableAudioForSession(audioSession.failureDetail || 'Audio output failed', audioSession);
+  } else if (audioAvailable) {
+    setAudioState(
+      audioContext?.state === 'running' ? 'priming' : 'blocked',
+      audioContext?.state === 'running'
+        ? 'Waiting for bounded Opus prebuffer'
+        : 'WebKit suspended audio output; activate the audio button to retry',
+    );
+  } else {
+    await teardownAudioPipeline(false);
+    setAudioState('unavailable', result.audio_error || audioSupport.error || 'host audio unavailable');
+  }
+  updatePanelVisibility();
+  document.getElementById('node-id-text').textContent = result.host_node_id.substring(0, 16) + '...';
+  document.getElementById('frame-canvas').style.display = 'block';
+  document.getElementById('placeholder').classList.add('hidden');
+  document.getElementById('control-bar').classList.add('visible');
+  void fitWindowToIncomingStream();
+  updateControlUI();
+  // Land controller users on the deliberate view-only/control boundary.
+  // The connect button is hidden at this point, so retaining its focus
+  // would make the next A press fall back to an unrelated top-bar action.
+  setTimeout(() => setControllerFocus(document.getElementById('control-toggle')), 0);
+  document.getElementById('action-connect').style.display = 'none';
+  document.getElementById('action-disconnect').textContent = 'disconnect';
+  document.getElementById('action-disconnect').classList.remove('hidden');
+  document.getElementById('pin-label').style.display = 'none';
+  document.getElementById('pin-input').style.display = 'none';
+  document.getElementById('controller-pin-main').style.display = 'none';
+}
+
+async function prepareDisconnect() {
   if (activeFrameSession) activeFrameSession.closing = true;
   activeFrameSession = null;
   activeFrameGeneration = null;
@@ -962,25 +883,18 @@ async function disconnect() {
   // Give release commands a short, finite opportunity to cross the bounded
   // Tauri queue before closing it. A broken stream cannot stall disconnect.
   await waitForInputDrain(250);
-  try {
-    await invoke('iroh_client_disconnect');
-  } catch (e) { console.error(e); }
+}
+
+async function teardownConnectedResources() {
   activeFrameChannel = null;
   activePointerChannel = null;
   activePointerSession = null;
   await teardownAudioPipeline();
   videoPipeline.teardown();
-  connected = false;
+}
+
+async function showDisconnectedState() {
   controlMode = false;
-  inputCapabilities = {
-    relativePointer: false,
-    pointerPositionFeedback: false,
-    absolutePointer: false,
-    keyboard: false,
-    text: false,
-    gamepad: false,
-    control: false,
-  };
   pointerSurfaceDimensions = null;
   fittedStreamAspect = null;
   pendingStreamFit = null;
@@ -999,13 +913,42 @@ async function disconnect() {
   document.getElementById('control-bar').classList.remove('visible');
   document.getElementById('action-connect').style.display = '';
   document.getElementById('action-disconnect').classList.add('hidden');
-  if (!developmentConnectionMode) {
+  if (!connectionState.developmentMode) {
     document.getElementById('pin-label').style.display = '';
     document.getElementById('pin-input').style.display = '';
     document.getElementById('controller-pin-main').style.display = '';
   }
   document.getElementById('intro-status').textContent = '';
-  disconnecting = false;
+}
+
+const connectionState = newConnectionState({
+  invokeCommand: invoke,
+  createChannel: window.__TAURI__.core.Channel,
+  beforeConnect: primeAudioOutputForActivation,
+  createAttempt: createConnectionAttempt,
+  validateConnectedResult: validateConnectedAttempt,
+  activateAttempt: activateConnectedAttempt,
+  closeAttempt: closeConnectionAttempt,
+  teardownAttempt: teardownConnectionAttempt,
+  beforeDisconnect: prepareDisconnect,
+  teardownConnection: teardownConnectedResources,
+  onStatus: (state, detail, context) => {
+    if (state === 'ok') updateAcceptedConnectionState(context);
+    setStatus(state, detail);
+  },
+  onConnected: showConnectedAttempt,
+  onDisconnected: showDisconnectedState,
+  onFailure: ({ error }) => console.error('connection failed:', error),
+  onDisconnectError: (error) => console.error(error),
+  onNativeDisconnectError: (error) => console.error('failed to close rejected connection:', error),
+});
+
+async function connectHost() {
+  await connectionState.connect({ pin: document.getElementById('pin-input').value });
+}
+
+async function disconnect() {
+  await connectionState.disconnect();
 }
 
 // ─── FIDO scan ────────────────────────────────────────────────────────────────
@@ -1064,7 +1007,6 @@ let networkDiagnostics = null;
 let lastTransportFps = 0;
 let lastFrontendSendFps = 0;
 let streamPathMode = 'unknown';
-let streamTransportMode = 'unknown';
 let streamRttMs = null;
 let lastMediaSequence = null;
 
@@ -1128,7 +1070,7 @@ const videoPipeline = createVideoPipelineSession({
   sampleAudioSkew: sampleAvSkew,
   onFormatChanged: () => {
     sizeCanvasToIncomingStream();
-    if (connected) void fitWindowToIncomingStream();
+    if (connectionState.connected) void fitWindowToIncomingStream();
   },
 });
 
@@ -1149,7 +1091,6 @@ function resetStreamTelemetry() {
   lastTransportFps = 0;
   lastFrontendSendFps = 0;
   streamPathMode = 'unknown';
-  streamTransportMode = 'unknown';
   streamRttMs = null;
   lastMediaSequence = null;
   adaptiveDecision = null;
@@ -1230,7 +1171,7 @@ function updateStreamStats() {
   document.getElementById('stream-decoder-output-cadence').textContent = formatCadence(video.decoderOutputIntervals);
   document.getElementById('stream-present-cadence').textContent = formatCadence(video.presentationIntervals);
   document.getElementById('stream-codec').textContent = video.activeCodec;
-  document.getElementById('stream-transport').textContent = streamTransportMode;
+  document.getElementById('stream-transport').textContent = connectionState.mediaTransport;
   document.getElementById('stream-path').textContent = streamPathMode;
   document.getElementById('stream-rtt').textContent = Number.isFinite(streamRttMs)
     ? `${streamRttMs.toFixed(1)} ms`
@@ -1270,7 +1211,7 @@ function updateStreamStats() {
 }
 
 setInterval(() => {
-  if (connected) updateStreamStats();
+  if (connectionState.connected) updateStreamStats();
 }, 250);
 
 function clientChromeHeight() {
@@ -1317,7 +1258,7 @@ async function fitWindowToIncomingStream() {
     height: frameHeight,
     epoch: activeVideoFormatEpoch,
   } = videoPipeline.format;
-  if (!connected || frameWidth < 1 || frameHeight < 1) return false;
+  if (!connectionState.connected || frameWidth < 1 || frameHeight < 1) return false;
   const aspect = streamAspectKey(frameWidth, frameHeight);
   if (fittedStreamAspect === aspect || pendingStreamFit?.aspect === aspect) return false;
   const request = { aspect, generation: activeFrameGeneration, epoch: activeVideoFormatEpoch };
@@ -1335,7 +1276,7 @@ async function fitWindowToIncomingStream() {
     ? streamAspectKey(currentFormat.width, currentFormat.height)
     : null;
   const current = pendingStreamFit === request
-    && connected
+    && connectionState.connected
     && activeFrameGeneration === request.generation
     && currentFormat.epoch === request.epoch
     && currentAspect === request.aspect;
@@ -1352,7 +1293,7 @@ function scheduleStreamWindowAspectCorrection() {
   streamWindowResizeTimer = setTimeout(() => {
     streamWindowResizeTimer = null;
     const { width: frameWidth, height: frameHeight } = videoPipeline.format;
-    if (!connected || frameWidth < 1 || frameHeight < 1) return;
+    if (!connectionState.connected || frameWidth < 1 || frameHeight < 1) return;
     const current = { width: window.innerWidth, height: window.innerHeight };
     let geometry;
     try {
@@ -1409,7 +1350,7 @@ function failFrameSession(session, error) {
   session.failed = true;
   session.failureDetail = `Frame delivery failed: ${error}`;
   console.error(session.failureDetail);
-  if (connected) void disconnect();
+  if (connectionState.connected) void disconnect();
 }
 
 function handleBinaryFrameMessage(message, session) {
@@ -1617,7 +1558,7 @@ listen('frame-error', (event) => {
 
 listen('audio-state', (event) => {
   const session = activeAudioSession;
-  if (disconnecting || !session || event.payload?.available !== false) return;
+  if (connectionState.disconnecting || !session || event.payload?.available !== false) return;
   if (session.expectedGeneration === null) {
     try {
       stageAudioTerminalState(session.pendingTerminalStates, event.payload);
@@ -1644,7 +1585,9 @@ listen('audio-stats', (event) => {
 
 // ─── Input ────────────────────────────────────────────────────────────────────
 async function toggleControl() {
-  if (!connected || !inputCapabilities.control || controlTransitionInProgress) return;
+  if (!connectionState.connected
+    || !connectionState.inputCapabilities.control
+    || controlTransitionInProgress) return;
   // Capture synchronous controller provenance before cursor acquisition yields.
   // The DOM click dispatcher does not await this async handler.
   const controllerInitiated = controllerActivationInProgress;
@@ -1673,7 +1616,10 @@ async function toggleControl() {
       }
       return;
     }
-    if (!acquired || disconnecting || !connected || !inputCapabilities.control) {
+    if (!acquired
+      || connectionState.disconnecting
+      || !connectionState.connected
+      || !connectionState.inputCapabilities.control) {
       exitControlAfterBrowserPointerLockFailure();
       return;
     }
@@ -1697,26 +1643,28 @@ async function toggleControl() {
 }
 
 function queueNeutralControllerState() {
-  if (!connected || !inputCapabilities.gamepad) return false;
+  if (!connectionState.connected || !connectionState.inputCapabilities.gamepad) return false;
   return sendInput({ t: 'gp', state: neutralGamepadInputState() });
 }
 
 function describeInputCapabilities() {
   const accepted = [];
-  if (inputCapabilities.relativePointer) accepted.push('relative pointer');
-  else if (inputCapabilities.absolutePointer) accepted.push('pointer');
-  if (inputCapabilities.keyboard) accepted.push('keyboard');
-  if (inputCapabilities.text) accepted.push('text');
-  if (inputCapabilities.gamepad) accepted.push('gamepad');
+  const capabilities = connectionState.inputCapabilities;
+  if (capabilities.relativePointer) accepted.push('relative pointer');
+  else if (capabilities.absolutePointer) accepted.push('pointer');
+  if (capabilities.keyboard) accepted.push('keyboard');
+  if (capabilities.text) accepted.push('text');
+  if (capabilities.gamepad) accepted.push('gamepad');
   return accepted.length > 0 ? accepted.join(' + ') : 'view only';
 }
 
 function pointerInputAvailable() {
-  return inputCapabilities.relativePointer || inputCapabilities.absolutePointer;
+  const capabilities = connectionState.inputCapabilities;
+  return capabilities.relativePointer || capabilities.absolutePointer;
 }
 
 async function requestRelativePointerLock() {
-  if (!inputCapabilities.relativePointer) return true;
+  if (!connectionState.inputCapabilities.relativePointer) return true;
   try {
     const nativeResult = await setNativeCursorGrab(true);
     // Older commands returned no value, so only an explicit false disables
@@ -1846,15 +1794,15 @@ function currentPointerSurfaceSize() {
     pointerSurfaceDimensions,
     frameWidth,
     frameHeight,
-    inputCapabilities.relativePointer,
+    connectionState.inputCapabilities.relativePointer,
   );
 }
 
 function renderRemotePointer() {
   const surface = currentPointerSurfaceSize();
   const visible = controlMode
-    && inputCapabilities.relativePointer
-    && inputCapabilities.pointerPositionFeedback
+    && connectionState.inputCapabilities.relativePointer
+    && connectionState.inputCapabilities.pointerPositionFeedback
     && remotePointerPosition !== null
     && remotePointerVisible
     && surface !== null;
@@ -1877,21 +1825,22 @@ function releasePointerLock() {
 
 function updateControlUI() {
   const el = document.getElementById('control-toggle');
-  const available = connected && inputCapabilities.control;
+  const capabilities = connectionState.inputCapabilities;
+  const available = connectionState.connected && capabilities.control;
   if (!available) controlMode = false;
   el.textContent = available
-    ? `${controlMode ? 'controlling' : 'take control'} · ${describeInputCapabilities()}${controlMode && inputCapabilities.relativePointer ? ' · Ctrl+Alt+Esc to exit' : controlMode && inputCapabilities.gamepad ? ' · hold Back+Start to exit' : ''}`
+    ? `${controlMode ? 'controlling' : 'take control'} · ${describeInputCapabilities()}${controlMode && capabilities.relativePointer ? ' · Ctrl+Alt+Esc to exit' : controlMode && capabilities.gamepad ? ' · hold Back+Start to exit' : ''}`
     : 'view only · input unavailable';
   el.classList.toggle('active', controlMode);
   el.classList.toggle('disabled', !available);
   el.setAttribute('aria-disabled', available ? 'false' : 'true');
   document.body.classList.toggle(
     'native-pointer-control',
-    controlMode && inputCapabilities.relativePointer,
+    controlMode && capabilities.relativePointer,
   );
   canvas.classList.toggle(
     'relative-control',
-    controlMode && inputCapabilities.relativePointer,
+    controlMode && capabilities.relativePointer,
   );
   renderRemotePointer();
   const streamControl = document.getElementById('stream-control');
@@ -1936,14 +1885,15 @@ function clearPendingInput() {
 }
 
 function inputEventAvailable(event) {
-  if (!inputCapabilities.control) return false;
-  if (event.t === 'mm') return inputCapabilities.absolutePointer;
-  if (event.t === 'mr') return inputCapabilities.relativePointer;
-  if (event.t === 'mp') return inputCapabilities.relativePointer;
+  const capabilities = connectionState.inputCapabilities;
+  if (!capabilities.control) return false;
+  if (event.t === 'mm') return capabilities.absolutePointer;
+  if (event.t === 'mr') return capabilities.relativePointer;
+  if (event.t === 'mp') return capabilities.relativePointer;
   if (['mc', 'md', 'mu', 'ms'].includes(event.t)) return pointerInputAvailable();
-  if (['kd', 'ku', 'kt'].includes(event.t)) return inputCapabilities.keyboard;
-  if (event.t === 'tx') return inputCapabilities.text;
-  if (event.t === 'gp') return inputCapabilities.gamepad;
+  if (['kd', 'ku', 'kt'].includes(event.t)) return capabilities.keyboard;
+  if (event.t === 'tx') return capabilities.text;
+  if (event.t === 'gp') return capabilities.gamepad;
   return false;
 }
 
@@ -1991,7 +1941,7 @@ function sendInput(event, { release = false } = {}) {
       // Defer teardown until the caller has removed any transition it could
       // not enqueue from held-state tracking.
       queueMicrotask(() => {
-        if (connected) void disconnect();
+        if (connectionState.connected) void disconnect();
       });
       return false;
     }
@@ -2082,7 +2032,7 @@ async function pumpInputQueue() {
         } catch (error) {
           console.error('input restore failed:', error);
           clearPendingInput();
-          if (connected) void disconnect();
+          if (connectionState.connected) void disconnect();
           return;
         }
         await new Promise((resolve) => setTimeout(resolve, INPUT_RETRY_MS));
@@ -2096,7 +2046,7 @@ async function pumpInputQueue() {
 
 window.addEventListener('mousemove', (e) => {
   if (!controlMode || !pointerInputAvailable()) return;
-  if (inputCapabilities.relativePointer) {
+  if (connectionState.inputCapabilities.relativePointer) {
     const movement = scaleRelativePointerDelta(
       e.movementX,
       e.movementY,
@@ -2107,19 +2057,21 @@ window.addEventListener('mousemove', (e) => {
 }, { capture: true });
 
 canvas.addEventListener('mousemove', (e) => {
-  if (!controlMode || !inputCapabilities.absolutePointer || inputCapabilities.relativePointer) return;
+  if (!controlMode
+    || !connectionState.inputCapabilities.absolutePointer
+    || connectionState.inputCapabilities.relativePointer) return;
   const { x, y } = scaleCoords(e.clientX, e.clientY);
   sendInput({ t: 'mm', x, y });
 });
 
 function handleMouseDown(e) {
   if (!controlMode || !pointerInputAvailable()) return;
-  if (inputCapabilities.relativePointer) e.stopPropagation();
+  if (connectionState.inputCapabilities.relativePointer) e.stopPropagation();
   else if (e.target !== canvas) return;
   const btn = browserMouseButtonCode(e.button);
   if (btn === null) return;
   e.preventDefault();
-  if (inputCapabilities.relativePointer && document.pointerLockElement !== canvas) {
+  if (connectionState.inputCapabilities.relativePointer && document.pointerLockElement !== canvas) {
     void requestBrowserPointerLock().catch((error) => {
       console.warn('browser pointer lock retry failed:', error);
     });
@@ -2131,7 +2083,7 @@ function handleMouseDown(e) {
 window.addEventListener('mousedown', handleMouseDown, { capture: true });
 
 function releaseMouseButton(e) {
-  if (!connected || !pointerInputAvailable()) return;
+  if (!connectionState.connected || !pointerInputAvailable()) return;
   const btn = browserMouseButtonCode(e.button);
   if (btn === null) return;
   const release = heldInputs.takeMouseButtonRelease(btn);
@@ -2141,21 +2093,21 @@ function releaseMouseButton(e) {
 }
 
 window.addEventListener('mouseup', (e) => {
-  if (controlMode && inputCapabilities.relativePointer) e.stopPropagation();
+  if (controlMode && connectionState.inputCapabilities.relativePointer) e.stopPropagation();
   releaseMouseButton(e);
 }, { capture: true });
 
 window.addEventListener('contextmenu', (e) => {
   if (!controlMode || !pointerInputAvailable()) return;
-  if (!inputCapabilities.relativePointer && e.target !== canvas) return;
+  if (!connectionState.inputCapabilities.relativePointer && e.target !== canvas) return;
   e.preventDefault();
 }, { capture: true });
 
 window.addEventListener('wheel', (e) => {
   if (!controlMode || !pointerInputAvailable()) return;
-  if (!inputCapabilities.relativePointer && e.target !== canvas) return;
+  if (!connectionState.inputCapabilities.relativePointer && e.target !== canvas) return;
   e.preventDefault();
-  if (inputCapabilities.relativePointer) e.stopPropagation();
+  if (connectionState.inputCapabilities.relativePointer) e.stopPropagation();
   sendInput({ t: 'ms', dx: Math.round(e.deltaX), dy: Math.round(e.deltaY) });
 }, { passive: false, capture: true });
 
@@ -2172,12 +2124,12 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   const printableText = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
-  if (printableText && inputCapabilities.text) {
+  if (printableText && connectionState.inputCapabilities.text) {
     e.preventDefault();
     sendInput({ t: 'tx', s: e.key });
     return;
   }
-  if (!inputCapabilities.keyboard) return;
+  if (!connectionState.inputCapabilities.keyboard) return;
   const k = mapKey(e);
   if (k) {
     e.preventDefault();
@@ -2224,7 +2176,7 @@ function renderPinPad() {
 }
 
 function openPinPad(targetId, returnFocus = document.activeElement) {
-  if (developmentConnectionMode) return;
+  if (connectionState.developmentMode) return;
   const target = document.getElementById(targetId);
   if (!(target instanceof HTMLInputElement) || target.disabled) return;
   activePinInput = target;
@@ -2289,7 +2241,9 @@ controllerPublisher.setHandler((state) => {
   if (externalControllerObserver) {
     try { externalControllerObserver(state); } catch (error) { console.warn('controller observer failed:', error); }
   }
-  if (!connected || !controlMode || !inputCapabilities.gamepad) return;
+  if (!connectionState.connected
+    || !controlMode
+    || !connectionState.inputCapabilities.gamepad) return;
   const inputState = maskGamepadEscapeChord(toGamepadInputState(state));
   if (!controllerActivationGate.accepts(inputState)) return;
   sendInput({ t: 'gp', state: inputState });
@@ -2409,9 +2363,9 @@ function pollControllers(nowMs) {
     updateControllerStatus(currentControllerState);
   }
 
-  const remoteRoute = connected
+  const remoteRoute = connectionState.connected
     && controlMode
-    && inputCapabilities.gamepad
+    && connectionState.inputCapabilities.gamepad
     && currentControllerState.connected
     && currentControllerState.mapping === 'standard';
   if (remoteRoute) {
@@ -2447,12 +2401,12 @@ window.addEventListener('resize', () => {
 });
 
 window.addEventListener('focus', () => {
-  if (!controlMode || !inputCapabilities.relativePointer) return;
+  if (!controlMode || !connectionState.inputCapabilities.relativePointer) return;
   // WebKit rebuilds its native cursor rectangles after the window-level focus
   // event. Reassert from the webview on the next frame so the final rectangle
   // is the transparent one used during relative control.
   requestAnimationFrame(() => {
-    if (!controlMode || !inputCapabilities.relativePointer) return;
+    if (!controlMode || !connectionState.inputCapabilities.relativePointer) return;
     void setNativeCursorGrab(true).catch((error) => {
       console.warn('native cursor re-hide after focus failed:', error);
     });
@@ -2512,7 +2466,7 @@ async function initialize() {
     status.className = 'overlay-status err';
     status.textContent = 'could not load enrollment';
   }
-  if (!developmentConnectionMode) scanFido();
+  if (!connectionState.developmentMode) scanFido();
   requestAnimationFrame(pollControllers);
 }
 

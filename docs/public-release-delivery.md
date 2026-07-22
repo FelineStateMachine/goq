@@ -36,7 +36,7 @@ general deployment environment.
 The bootstrap:
 
 1. Refuses root, non-Bazzite systems, unsupported architectures, and missing
-   verification tools.
+   bootstrap tools.
 2. Uses the exact immutable release tag pinned beside the publisher key in the
    reviewed bootstrap source.
 3. Downloads the versioned archive, checksum, and detached signature from that
@@ -53,10 +53,16 @@ sentinels are present. Once opened, it requires the bootstrap's embedded key to
 exactly match `release/sigil-minisign.pub` and rejects partial configuration or
 a malformed immutable release tag before the website can deploy.
 
-A clean Bazzite image may not include Minisign. The public-alpha gate must
-either provision a pinned verifier with its own hard-coded digest or make the
-verifier prerequisite explicit; it must never silently downgrade to SHA-only
-verification.
+A clean Bazzite image does not need a preinstalled Minisign package. The
+bootstrap downloads the exact official Minisign 0.12 Linux archive and checks
+its hard-coded SHA-256 before archive inspection, extraction, or execution. It
+accepts only the reviewed archive layout (including its inert AppleDouble
+metadata members), extracts only the x86_64 verifier into private temporary
+state, and invokes that verifier by absolute path rather than trusting `PATH`.
+Changing the verifier version, URL, or independently computed content digest
+requires a reviewed website commit. The Sigil publisher key and release tag
+remain separate pins and keep the release channel closed while either is
+`unconfigured`.
 
 ## Sigil candidate and offline signing ceremony
 

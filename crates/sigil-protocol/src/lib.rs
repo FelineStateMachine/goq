@@ -32,8 +32,9 @@ pub use invitation::{
     MAX_INVITATION_TOKEN_LEN, MAX_INVITATION_TTL_SECS, SignedInvitation,
 };
 pub use media::{
-    FrameFlags, MEDIA_HEADER_LEN, MediaCodec, MediaFrame, MediaFrameHeader, read_media_frame,
-    read_media_object, write_media_frame,
+    FrameFlags, MEDIA_HEADER_LEN, MediaCodec, MediaFrame, MediaFrameHeader,
+    decode_media_frame_object, encode_media_frame_object, read_media_frame, read_media_object,
+    write_media_frame,
 };
 pub use media_v3::{
     KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,
@@ -58,6 +59,8 @@ pub const MEDIA_ALPN_V3: &[u8] = b"sigil/media/3";
 pub const INPUT_ALPN_V1: &[u8] = b"sigil/input/1";
 /// ALPN for the v1 session-control stream.
 pub const CONTROL_ALPN_V1: &[u8] = b"sigil/control/1";
+/// Static upstream MoQ track carrying bounded H.264 access-unit objects.
+pub const MOQ_VIDEO_H264_TRACK: &str = "video/h264";
 /// ALPN for the v1 low-latency Opus datagram connection.
 pub const AUDIO_ALPN_V1: &[u8] = b"sigil/audio/1";
 
@@ -85,6 +88,21 @@ pub const OPUS_SAMPLE_RATE: u32 = 48_000;
 pub const OPUS_CHANNELS: u8 = 2;
 pub const OPUS_FRAME_SAMPLES: u16 = 960;
 
+/// Derive the session-scoped upstream MoQ broadcast name advertised by Sigil.
+///
+/// The authenticated control handshake supplies the non-zero session id, so
+/// Portal can derive this application namespace without accepting a
+/// peer-controlled path.
+pub fn media_moq_broadcast_name(session_id: u64) -> Result<String> {
+    if session_id == 0 {
+        return Err(ProtocolError::InvalidMessage {
+            message_type: "MoQ broadcast name",
+            reason: "session id must be non-zero",
+        });
+    }
+    Ok(format!("sigil/session/{session_id}/video"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +117,15 @@ mod tests {
         assert_eq!(AUDIO_ALPN_V1, b"sigil/audio/1");
         assert_eq!(LEGACY_FRAME_ALPN_V0, b"sigil/frame-stream/0");
         assert_eq!(LEGACY_INPUT_ALPN_V0, b"sigil/input-stream/0");
+    }
+
+    #[test]
+    fn moq_media_namespace_is_session_scoped_and_stable() {
+        assert_eq!(MOQ_VIDEO_H264_TRACK, "video/h264");
+        assert_eq!(
+            media_moq_broadcast_name(42).unwrap(),
+            "sigil/session/42/video"
+        );
+        assert!(media_moq_broadcast_name(0).is_err());
     }
 }

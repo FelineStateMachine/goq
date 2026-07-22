@@ -8,14 +8,19 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, SendStream};
 use iroh::protocol::ProtocolHandler;
+use moq_net::{
+    Broadcast, BroadcastConsumer, BroadcastProducer, Error as MoqError, GroupProducer, Origin,
+    Track, TrackProducer,
+};
 use sigil_protocol::{
     AUDIO_HEADER_LEN, AudioFlags, AudioPacket, AudioPacketHeader, Capability, ClientHello,
     FrameFlags, HostHello, InputAck, InvitationGrants, KeyframeRequestReasonV3,
     MAX_AUDIO_PAYLOAD_LEN, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,
-    MAX_MEDIA_OBJECT_ID_V3, MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MediaControlRequestV3,
-    MediaFrame, MediaFrameHeader, MediaObjectHeaderV3, MediaObjectV3, read_client_hello,
-    read_input_event, read_media_control_request_v3, write_host_hello, write_input_ack,
-    write_media_frame, write_media_object_v3,
+    MAX_MEDIA_OBJECT_ID_V3, MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MOQ_VIDEO_H264_TRACK,
+    MediaControlRequestV3, MediaFrame, MediaFrameHeader, MediaObjectHeaderV3, MediaObjectV3,
+    encode_media_frame_object, media_moq_broadcast_name, read_client_hello, read_input_event,
+    read_media_control_request_v3, write_host_hello, write_input_ack, write_media_frame,
+    write_media_object_v3,
 };
 use tracing::{debug, error, info, warn};
 
@@ -61,13 +66,50 @@ const GAMESCOPE_STARTUP_MIN_OBSERVATION_SPAN: Duration = Duration::from_millis(1
 const GAMESCOPE_STARTUP_TARGET_MIN_FRAMES: u64 = 8;
 const GAMESCOPE_STARTUP_TARGET_MIN_FPS: f64 = 45.0;
 const SOURCE_REAP_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
+const MOQ_ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(10);
+const MOQ_VIDEO_TRACK_PRIORITY: u8 = u8::MAX;
+const MOQ_REJECT_CODE: u32 = 0x534d;
 
 #[derive(Debug)]
 pub struct SessionRegistry {
     active: Mutex<Option<ActiveSession>>,
+    pending_moq: Mutex<Option<PendingMoqAttachment>>,
     next_session_id: AtomicU64,
     session_changed: tokio::sync::Notify,
     pending_handshakes: tokio::sync::Semaphore,
+}
+
+struct PendingMoqAttachment {
+    remote: EndpointId,
+    session_id: u64,
+    broadcast_name: String,
+    broadcast: BroadcastConsumer,
+    attached: tokio::sync::oneshot::Sender<()>,
+    closed: tokio::sync::oneshot::Sender<()>,
+}
+
+impl std::fmt::Debug for PendingMoqAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingMoqAttachment")
+            .field("remote", &self.remote)
+            .field("session_id", &self.session_id)
+            .field("broadcast_name", &self.broadcast_name)
+            .finish_non_exhaustive()
+    }
+}
+
+struct ClaimedMoqAttachment {
+    session_id: u64,
+    broadcast_name: String,
+    broadcast: BroadcastConsumer,
+    attached: tokio::sync::oneshot::Sender<()>,
+    closed: tokio::sync::oneshot::Sender<()>,
+}
+
+struct MoqAttachmentWait {
+    attached: tokio::sync::oneshot::Receiver<()>,
+    closed: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,6 +128,7 @@ impl Default for SessionRegistry {
     fn default() -> Self {
         Self {
             active: Mutex::new(None),
+            pending_moq: Mutex::new(None),
             next_session_id: AtomicU64::new(0),
             session_changed: tokio::sync::Notify::new(),
             pending_handshakes: tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES),
@@ -167,12 +210,79 @@ impl SessionRegistry {
         })
     }
 
+    fn expect_moq(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        broadcast_name: String,
+        broadcast: BroadcastConsumer,
+    ) -> Result<MoqAttachmentWait> {
+        let active = self.active.lock().expect("session registry poisoned");
+        ensure!(
+            active.is_some_and(|session| {
+                session.media_active && session.remote == remote && session.session_id == session_id
+            }),
+            "MoQ expectation does not match the active control session"
+        );
+        let mut pending = self.pending_moq.lock().expect("MoQ registry poisoned");
+        ensure!(
+            pending.is_none(),
+            "active control session already expects MoQ"
+        );
+        let (attached, attached_rx) = tokio::sync::oneshot::channel();
+        let (closed, closed_rx) = tokio::sync::oneshot::channel();
+        *pending = Some(PendingMoqAttachment {
+            remote,
+            session_id,
+            broadcast_name,
+            broadcast,
+            attached,
+            closed,
+        });
+        Ok(MoqAttachmentWait {
+            attached: attached_rx,
+            closed: closed_rx,
+        })
+    }
+
+    fn claim_moq(&self, remote: EndpointId) -> Result<ClaimedMoqAttachment> {
+        let active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_ref()
+            .filter(|session| session.media_active && session.remote == remote)
+            .context("MoQ connection does not match the active control session")?;
+        let mut pending = self.pending_moq.lock().expect("MoQ registry poisoned");
+        let attachment = pending
+            .as_ref()
+            .filter(|attachment| {
+                attachment.remote == remote && attachment.session_id == session.session_id
+            })
+            .context("active control session is not expecting a MoQ connection")?;
+        debug_assert_eq!(attachment.remote, session.remote);
+        let attachment = pending
+            .take()
+            .expect("validated pending MoQ attachment disappeared");
+        Ok(ClaimedMoqAttachment {
+            session_id: attachment.session_id,
+            broadcast_name: attachment.broadcast_name,
+            broadcast: attachment.broadcast,
+            attached: attachment.attached,
+            closed: attachment.closed,
+        })
+    }
+
     fn release(&self, remote: EndpointId, session_id: u64) {
         let mut active = self.active.lock().expect("session registry poisoned");
         if let Some(session) = active.as_mut()
             && session.remote == remote
             && session.session_id == session_id
         {
+            let mut pending = self.pending_moq.lock().expect("MoQ registry poisoned");
+            if pending.as_ref().is_some_and(|attachment| {
+                attachment.remote == remote && attachment.session_id == session_id
+            }) {
+                *pending = None;
+            }
             // Keep the registry occupied until the input handler has observed
             // media shutdown and released all held uinput transitions. This
             // prevents a reconnect from sharing the device with a draining
@@ -701,6 +811,128 @@ impl MediaV3GroupCursor {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoqGroupDecision {
+    Published {
+        group_id: u64,
+        frame_id: u32,
+        cancelled_previous: bool,
+    },
+    SkipUntilKeyframe,
+    EnterResync,
+}
+
+/// Owns the single bounded live MoQ track. One configured H.264 GOP maps to
+/// one native MoQ group; its application frame sequence remains inside the
+/// encoded object envelope and is never reused as the transport group id.
+struct MoqGroupPublisher {
+    track: TrackProducer,
+    current_group: Option<GroupProducer>,
+    cursor: MediaV3GroupCursor,
+    object_bytes: usize,
+}
+
+impl MoqGroupPublisher {
+    fn new(track: TrackProducer) -> Self {
+        Self {
+            track,
+            current_group: None,
+            cursor: MediaV3GroupCursor::default(),
+            object_bytes: 0,
+        }
+    }
+
+    fn publish(
+        &mut self,
+        config: &HostConfig,
+        frame: &EncodedFrame,
+        replay_discontinuity: bool,
+    ) -> Result<MoqGroupDecision> {
+        let position = match self.cursor.classify(frame) {
+            MediaV3GroupDecision::Send(position) => position,
+            MediaV3GroupDecision::SkipUntilKeyframe => {
+                return Ok(MoqGroupDecision::SkipUntilKeyframe);
+            }
+            MediaV3GroupDecision::EnterResync => {
+                self.abort_current();
+                return Ok(MoqGroupDecision::EnterResync);
+            }
+        };
+        let object = encode_media_frame_object(&media_frame_for_encoded(
+            config,
+            frame,
+            replay_discontinuity || position.discontinuity,
+        )?)?;
+        let next_object_bytes = if position.object_id == 0 {
+            Some(object.len())
+        } else {
+            self.object_bytes.checked_add(object.len())
+        };
+        let Some(next_object_bytes) =
+            next_object_bytes.filter(|bytes| *bytes <= MAX_MEDIA_GROUP_BYTES_V3)
+        else {
+            self.cursor.request_keyframe();
+            self.abort_current();
+            return Ok(MoqGroupDecision::EnterResync);
+        };
+
+        if position.object_id == 0 {
+            // A new independently-decodable GOP supersedes the previous one.
+            // Actively aborting it cancels a slow subscriber rather than
+            // retaining a playable history behind the live edge.
+            let cancelled_previous = self.abort_current().is_some();
+            let mut group = self
+                .track
+                .append_group()
+                .context("creating sequential MoQ video group")?;
+            let group_id = group.sequence;
+            group
+                .write_frame(object)
+                .context("writing configured keyframe to MoQ group")?;
+            self.object_bytes = next_object_bytes;
+            self.current_group = Some(group);
+            return Ok(MoqGroupDecision::Published {
+                group_id,
+                frame_id: 0,
+                cancelled_previous,
+            });
+        }
+
+        let group = self
+            .current_group
+            .as_mut()
+            .context("MoQ delta frame has no active configured-keyframe group")?;
+        let group_id = group.sequence;
+        group
+            .write_frame(object)
+            .context("writing delta access unit to MoQ group")?;
+        self.object_bytes = next_object_bytes;
+        Ok(MoqGroupDecision::Published {
+            group_id,
+            frame_id: position.object_id,
+            cancelled_previous: false,
+        })
+    }
+
+    fn request_keyframe(&mut self) -> Option<u64> {
+        self.cursor.request_keyframe();
+        self.abort_current()
+    }
+
+    fn abort_current(&mut self) -> Option<u64> {
+        self.object_bytes = 0;
+        let mut group = self.current_group.take()?;
+        let group_id = group.sequence;
+        let _ = group.abort(MoqError::Cancel);
+        Some(group_id)
+    }
+
+    fn abort(mut self) {
+        self.abort_current();
+        let _ = self.track.abort(MoqError::Cancel);
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum MediaV3ScheduleDecision {
     Send {
@@ -1096,6 +1328,25 @@ pub struct MediaV3Handler {
     pub authorization: AuthorizationPolicy,
 }
 
+#[derive(Clone, Debug)]
+pub struct ControlHandler {
+    pub config: HostConfig,
+    pub sessions: Arc<SessionRegistry>,
+    pub authorization: AuthorizationPolicy,
+}
+
+/// Upstream MoQ admission guarded by an already-authenticated control lease.
+///
+/// This deliberately does not use `iroh_moq::Moq::protocol_handler`: that
+/// actor makes a completed session globally visible before application-level
+/// acceptance. Consuming the exact pending attachment first prevents MoQ from
+/// bypassing Sigil's invitation, enrollment, and one-client gate.
+#[derive(Clone, Debug)]
+pub struct AuthorizedMoqHandler {
+    pub sessions: Arc<SessionRegistry>,
+    pub origin: Origin,
+}
+
 impl ProtocolHandler for MediaHandler {
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
         let remote = connection.remote_id();
@@ -1147,6 +1398,41 @@ impl ProtocolHandler for MediaV3Handler {
     }
 }
 
+impl ProtocolHandler for ControlHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let remote = connection.remote_id();
+        if let Err(error) = serve_control_moq(
+            connection,
+            self.config.clone(),
+            &self.sessions,
+            &self.authorization,
+        )
+        .await
+        {
+            warn!(%remote, %error, "MoQ control connection ended");
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolHandler for AuthorizedMoqHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let remote = connection.remote_id();
+        let attachment = match self.sessions.claim_moq(remote) {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                connection.close(MOQ_REJECT_CODE.into(), b"unauthorized MoQ attachment");
+                warn!(%remote, %error, "rejected unsolicited MoQ connection");
+                return Ok(());
+            }
+        };
+        if let Err(error) = serve_authorized_moq(connection, self.origin, attachment).await {
+            warn!(%remote, %error, "authorized MoQ connection ended");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct InputHandler {
     pub backend: InputBackend,
@@ -1185,6 +1471,344 @@ impl ProtocolHandler for InputHandler {
         }
         Ok(())
     }
+}
+
+async fn serve_authorized_moq(
+    connection: Connection,
+    origin: Origin,
+    attachment: ClaimedMoqAttachment,
+) -> Result<()> {
+    let ClaimedMoqAttachment {
+        session_id,
+        broadcast_name,
+        broadcast,
+        attached,
+        closed,
+    } = attachment;
+    let result: Result<()> = async {
+        let web_transport = web_transport_iroh::Session::raw(connection);
+        let session = tokio::time::timeout(
+            MOQ_ATTACHMENT_TIMEOUT,
+            iroh_moq::MoqSession::session_accept(web_transport, origin),
+        )
+        .await
+        .context("timed out completing authorized MoQ handshake")?
+        .context("completing authorized MoQ handshake")?;
+        let broadcast_closed = broadcast.clone();
+        session.publish(&broadcast_name, broadcast);
+        ensure!(
+            attached.send(()).is_ok(),
+            "control session ended before MoQ attachment completed"
+        );
+        info!(
+            remote = %session.remote_id(),
+            session_id,
+            %broadcast_name,
+            track = MOQ_VIDEO_H264_TRACK,
+            "authorized MoQ media attachment accepted"
+        );
+        tokio::select! {
+            reason = session.closed() => {
+                debug!(remote = %session.remote_id(), ?reason, "MoQ media session closed");
+            }
+            reason = broadcast_closed.closed() => {
+                debug!(remote = %session.remote_id(), ?reason, "control-owned MoQ broadcast closed");
+                session.close(0, b"control session ended");
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let _ = closed.send(());
+    result
+}
+
+async fn serve_control_moq(
+    connection: Connection,
+    config: HostConfig,
+    sessions: &Arc<SessionRegistry>,
+    authorization: &AuthorizationPolicy,
+) -> Result<()> {
+    let remote = connection.remote_id();
+    let handshake_permit = sessions
+        .pending_handshakes
+        .try_acquire()
+        .context("too many pending handshakes")?;
+    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
+        .await
+        .context("timed out accepting MoQ control stream")?
+        .context("accepting MoQ control stream")?;
+    let hello = receive_hello(&mut recv, Capability::VideoH264).await?;
+    drop(handshake_permit);
+    debug!(%remote, agent = %hello.agent, "MoQ control hello received");
+
+    let grants = match authorization.authorize_or_redeem(
+        remote,
+        hello.invitation.as_deref(),
+        unix_timestamp_now()?,
+    ) {
+        Ok(grants) => grants,
+        Err(error) => {
+            send_rejection(&mut send, "Portal peer is not authorized").await?;
+            return Err(error.context("authorizing MoQ control peer"));
+        }
+    };
+    ensure!(
+        grants.contains(InvitationGrants::VIEW),
+        "authorized MoQ control peer lacks view permission"
+    );
+    let lease = match sessions.claim(remote, hello.nonce, grants) {
+        Ok(lease) => lease,
+        Err(error) => {
+            send_rejection(&mut send, "host already has an active client").await?;
+            return Err(error);
+        }
+    };
+
+    let source = match config.source {
+        VideoSource::TestPattern => Ok(spawn_test_pattern(config.clone(), lease.session_clock)),
+        VideoSource::GamescopePipewire => {
+            let primary = spawn_gamescope_pipewire_after_static_preflight(
+                config.clone(),
+                lease.session_clock,
+            )
+            .await?;
+            select_gamescope_startup_source(config.clone(), lease.session_clock, primary).await
+        }
+    };
+    let EncodedSource {
+        frames: frame_receiver,
+        current_gop: mut current_gop_receiver,
+        task: source_task,
+        pointer_surface_dimensions,
+    } = match source {
+        Ok(source) => source,
+        Err(error) => {
+            send_rejection(&mut send, "video source is unavailable").await?;
+            return Err(error);
+        }
+    };
+    let source_task = SourceTaskGuard::new(source_task);
+
+    let mut broadcast = Broadcast::new().produce();
+    let track = broadcast
+        .create_track(Track {
+            name: MOQ_VIDEO_H264_TRACK.to_owned(),
+            priority: MOQ_VIDEO_TRACK_PRIORITY,
+        })
+        .context("creating static MoQ H.264 track")?;
+    let broadcast_name = media_moq_broadcast_name(lease.session_id)?;
+    let attachment = sessions.expect_moq(
+        remote,
+        lease.session_id,
+        broadcast_name.clone(),
+        broadcast.consume(),
+    )?;
+
+    let mut control_hello = HostHello::accepted(
+        lease.session_id,
+        negotiated_capabilities(&hello, MEDIA_CAPABILITIES),
+    );
+    if let Some(dimensions) = pointer_surface_dimensions {
+        control_hello = control_hello.with_pointer_surface_dimensions(dimensions);
+    }
+    write_host_hello(&mut send, &control_hello).await?;
+    send.finish().context("finishing MoQ control response")?;
+    drop(send);
+    info!(
+        %remote,
+        session_id = lease.session_id,
+        %broadcast_name,
+        "MoQ control client accepted; awaiting authorized media attachment"
+    );
+
+    let MoqAttachmentWait {
+        mut attached,
+        closed,
+    } = attachment;
+    tokio::time::timeout(MOQ_ATTACHMENT_TIMEOUT, async {
+        tokio::select! {
+            result = &mut attached => {
+                result.context("authorized MoQ handler ended before attachment")
+            }
+            reason = connection.closed() => {
+                Err(anyhow::anyhow!("control connection closed before MoQ attachment: {reason:?}"))
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for authorized MoQ attachment")??;
+
+    let session_result = run_control_moq_session(
+        &connection,
+        &config,
+        &mut current_gop_receiver,
+        recv,
+        remote,
+        closed,
+        track,
+        &mut broadcast,
+    )
+    .await;
+
+    drop(current_gop_receiver);
+    drop(frame_receiver);
+    source_task.wait_or_abort(SOURCE_REAP_GRACE_TIMEOUT).await;
+    drop(lease);
+    info!(%remote, "MoQ control client released");
+    session_result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_control_moq_session(
+    connection: &Connection,
+    config: &HostConfig,
+    current_gop_receiver: &mut tokio::sync::watch::Receiver<Option<EncodedGop>>,
+    control_recv: iroh::endpoint::RecvStream,
+    remote: EndpointId,
+    mut moq_closed: tokio::sync::oneshot::Receiver<()>,
+    track: TrackProducer,
+    broadcast: &mut BroadcastProducer,
+) -> Result<()> {
+    let maximum_replay_age = maximum_media_replay_age(config.framerate);
+    let mut replay_cursor = MediaReplayCursor::default();
+    let mut publisher = MoqGroupPublisher::new(track);
+    let (control_sender, mut control_requests) = tokio::sync::watch::channel(None);
+    let mut control_task = tokio::spawn(forward_media_v3_control_requests(
+        control_recv,
+        control_sender,
+    ));
+    let mut control_task_finished = false;
+    let mut control_receiver_open = true;
+
+    let result = async {
+        loop {
+            tokio::select! {
+                biased;
+                control_result = &mut control_task, if !control_task_finished => {
+                    control_task_finished = true;
+                    match control_result {
+                        Ok(Ok(())) => {
+                            debug!(%remote, "MoQ keyframe-control stream closed");
+                        }
+                        Ok(Err(error)) => {
+                            return Err(error).context("reading MoQ keyframe-control stream");
+                        }
+                        Err(error) => {
+                            return Err(error).context("MoQ keyframe-control task failed");
+                        }
+                    }
+                }
+                changed = control_requests.changed(), if control_receiver_open => {
+                    if changed.is_err() {
+                        control_receiver_open = false;
+                        continue;
+                    }
+                    let Some(request) = *control_requests.borrow_and_update() else {
+                        continue;
+                    };
+                    let through_sequence = current_gop_receiver
+                        .borrow()
+                        .as_ref()
+                        .and_then(|gop| gop.frames.last())
+                        .map(|frame| frame.sequence);
+                    let cancelled_group = publisher.request_keyframe();
+                    replay_cursor.enter_resync_through(through_sequence);
+                    debug!(
+                        %remote,
+                        request_id = request.request_id,
+                        ?request.reason,
+                        advisory_last_sequence = ?request.last_sequence,
+                        coalesced = cancelled_group.is_none(),
+                        ?cancelled_group,
+                        "accepted MoQ keyframe request"
+                    );
+                }
+                reason = connection.closed() => {
+                    debug!(%remote, ?reason, "MoQ control connection closed");
+                    return Ok(());
+                }
+                result = &mut moq_closed => {
+                    debug!(%remote, ?result, "authorized MoQ media attachment closed");
+                    return Ok(());
+                }
+                changed = current_gop_receiver.changed() => {
+                    if let Err(error) = changed {
+                        return Err(error).context("encoded source stopped");
+                    }
+                    let Some(current_gop) = current_gop_receiver.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    let initial_replay_started_at =
+                        replay_cursor.last_sequence.is_none().then(Instant::now);
+                    let replay_through_sequence = current_gop
+                        .frames
+                        .last()
+                        .map(|frame| frame.sequence)
+                        .context("current GOP snapshot is empty")?;
+                    for frame in new_current_gop_frames(current_gop, replay_cursor.last_sequence) {
+                        let replay_discontinuity = match replay_cursor.classify(
+                            &frame,
+                            replay_through_sequence,
+                            initial_replay_started_at,
+                            Instant::now(),
+                            maximum_replay_age,
+                        ) {
+                            MediaReplayDecision::Send { discontinuity } => discontinuity,
+                            MediaReplayDecision::SkipUntilKeyframe => {
+                                publisher.request_keyframe();
+                                replay_cursor.enter_resync_through(Some(replay_through_sequence));
+                                break;
+                            }
+                            MediaReplayDecision::DiscardStaleSuffix { through_sequence } => {
+                                let cancelled_group = publisher.request_keyframe();
+                                debug!(
+                                    %remote,
+                                    through_sequence,
+                                    ?cancelled_group,
+                                    "cancelled stale MoQ media suffix"
+                                );
+                                break;
+                            }
+                        };
+                        match publisher.publish(config, &frame, replay_discontinuity)? {
+                            MoqGroupDecision::Published {
+                                group_id,
+                                frame_id,
+                                cancelled_previous,
+                            } => {
+                                debug!(
+                                    sequence = frame.sequence,
+                                    group_id,
+                                    frame_id,
+                                    cancelled_previous,
+                                    "published upstream MoQ video frame"
+                                );
+                                replay_cursor.commit_sent(&frame);
+                            }
+                            MoqGroupDecision::SkipUntilKeyframe => {
+                                replay_cursor.enter_resync_through(Some(replay_through_sequence));
+                                break;
+                            }
+                            MoqGroupDecision::EnterResync => {
+                                replay_cursor.enter_resync_through(Some(replay_through_sequence));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    .await;
+
+    publisher.abort();
+    let _ = broadcast.abort(MoqError::Cancel);
+    if !control_task_finished {
+        control_task.abort();
+        let _ = control_task.await;
+    }
+    result
 }
 
 async fn serve_media(
@@ -2746,6 +3370,150 @@ mod tests {
         );
     }
 
+    fn moq_test_config() -> HostConfig {
+        HostConfig {
+            identity_path: "identity".into(),
+            state_path: "state".into(),
+            source: VideoSource::TestPattern,
+            width: 1280,
+            height: 800,
+            framerate: 60,
+            codec: "h264".to_owned(),
+            input_mode: crate::config::InputMode::Disabled,
+            uinput: None,
+            ffmpeg_path: "ffmpeg".into(),
+            gamescope_pipewire: None,
+            audio: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_moq_groups_are_sequential_and_cancel_the_superseded_gop() {
+        let track_info = Track {
+            name: MOQ_VIDEO_H264_TRACK.to_owned(),
+            priority: MOQ_VIDEO_TRACK_PRIORITY,
+        };
+        let mut broadcast = Broadcast::new().produce();
+        let track = broadcast.create_track(track_info.clone()).unwrap();
+        let mut consumer = broadcast.consume().subscribe_track(&track_info).unwrap();
+        let mut publisher = MoqGroupPublisher::new(track);
+        let config = moq_test_config();
+
+        assert_eq!(
+            publisher
+                .publish(&config, &media_v3_encoded_frame(100, true, true, 4), false)
+                .unwrap(),
+            MoqGroupDecision::Published {
+                group_id: 0,
+                frame_id: 0,
+                cancelled_previous: false,
+            }
+        );
+        let mut first_group = consumer.recv_group().await.unwrap().unwrap();
+        assert_eq!(first_group.sequence, 0);
+        assert!(first_group.read_frame().await.unwrap().is_some());
+
+        assert_eq!(
+            publisher
+                .publish(
+                    &config,
+                    &media_v3_encoded_frame(101, false, false, 4),
+                    false,
+                )
+                .unwrap(),
+            MoqGroupDecision::Published {
+                group_id: 0,
+                frame_id: 1,
+                cancelled_previous: false,
+            }
+        );
+        assert!(first_group.read_frame().await.unwrap().is_some());
+
+        assert_eq!(
+            publisher
+                .publish(&config, &media_v3_encoded_frame(200, true, true, 4), false)
+                .unwrap(),
+            MoqGroupDecision::Published {
+                group_id: 1,
+                frame_id: 0,
+                cancelled_previous: true,
+            }
+        );
+        assert!(first_group.finished().await.is_err());
+        let mut second_group = consumer.recv_group().await.unwrap().unwrap();
+        assert_eq!(second_group.sequence, 1);
+        let object = second_group.read_frame().await.unwrap().unwrap();
+        let frame = sigil_protocol::decode_media_frame_object(&object).unwrap();
+        assert_eq!(frame.header.sequence, 200);
+        assert!(frame.header.flags.contains(FrameFlags::DISCONTINUITY));
+    }
+
+    #[tokio::test]
+    async fn upstream_moq_resync_aborts_current_group_and_waits_for_configured_idr() {
+        let track_info = Track {
+            name: MOQ_VIDEO_H264_TRACK.to_owned(),
+            priority: MOQ_VIDEO_TRACK_PRIORITY,
+        };
+        let mut broadcast = Broadcast::new().produce();
+        let track = broadcast.create_track(track_info.clone()).unwrap();
+        let mut consumer = broadcast.consume().subscribe_track(&track_info).unwrap();
+        let mut publisher = MoqGroupPublisher::new(track);
+        let config = moq_test_config();
+
+        publisher
+            .publish(&config, &media_v3_encoded_frame(10, true, true, 1), false)
+            .unwrap();
+        let mut cancelled = consumer.recv_group().await.unwrap().unwrap();
+        assert_eq!(publisher.request_keyframe(), Some(0));
+        assert!(cancelled.finished().await.is_err());
+        assert_eq!(
+            publisher
+                .publish(&config, &media_v3_encoded_frame(11, false, false, 1), false,)
+                .unwrap(),
+            MoqGroupDecision::SkipUntilKeyframe
+        );
+        assert_eq!(
+            publisher
+                .publish(&config, &media_v3_encoded_frame(20, true, true, 1), false)
+                .unwrap(),
+            MoqGroupDecision::Published {
+                group_id: 1,
+                frame_id: 0,
+                cancelled_previous: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_moq_group_counts_envelope_bytes_before_upstream_cache_eviction() {
+        let track_info = Track {
+            name: MOQ_VIDEO_H264_TRACK.to_owned(),
+            priority: MOQ_VIDEO_TRACK_PRIORITY,
+        };
+        let mut broadcast = Broadcast::new().produce();
+        let track = broadcast.create_track(track_info.clone()).unwrap();
+        let mut consumer = broadcast.consume().subscribe_track(&track_info).unwrap();
+        let mut publisher = MoqGroupPublisher::new(track);
+        let config = moq_test_config();
+        publisher
+            .publish(&config, &media_v3_encoded_frame(10, true, true, 1), false)
+            .unwrap();
+        let mut cancelled = consumer.recv_group().await.unwrap().unwrap();
+
+        // Payload-only accounting would accept this next one-byte access unit,
+        // but its fixed application envelope would overflow moq-net's 32 MiB
+        // group cache and silently evict the keyframe.
+        publisher.object_bytes = MAX_MEDIA_GROUP_BYTES_V3 - 1;
+        assert_eq!(
+            publisher
+                .publish(&config, &media_v3_encoded_frame(11, false, false, 1), false,)
+                .unwrap(),
+            MoqGroupDecision::EnterResync
+        );
+        assert!(cancelled.finished().await.is_err());
+        assert_eq!(publisher.object_bytes, 0);
+    }
+
     #[test]
     fn media_v3_group_rejects_noncontiguous_or_unconfigured_frames() {
         let mut cursor = MediaV3GroupCursor::default();
@@ -3283,6 +4051,96 @@ mod tests {
                 .claim(endpoint(2), nonce, InvitationGrants::ALL)
                 .is_ok()
         );
+    }
+
+    fn test_moq_broadcast() -> (BroadcastProducer, BroadcastConsumer) {
+        let producer = Broadcast::new().produce();
+        let consumer = producer.consume();
+        (producer, consumer)
+    }
+
+    #[test]
+    fn moq_attachment_requires_exact_active_control_remote_and_is_single_use() {
+        let sessions = Arc::new(SessionRegistry::default());
+        assert!(sessions.claim_moq(endpoint(1)).is_err());
+        let lease = sessions
+            .claim(endpoint(1), [1; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let (_producer, consumer) = test_moq_broadcast();
+        let _wait = sessions
+            .expect_moq(
+                endpoint(1),
+                lease.session_id,
+                media_moq_broadcast_name(lease.session_id).unwrap(),
+                consumer,
+            )
+            .unwrap();
+
+        // A wrong peer cannot consume the exact pending attachment.
+        assert!(sessions.claim_moq(endpoint(2)).is_err());
+        let attachment = sessions.claim_moq(endpoint(1)).unwrap();
+        assert_eq!(attachment.session_id, lease.session_id);
+        assert_eq!(
+            attachment.broadcast_name,
+            media_moq_broadcast_name(lease.session_id).unwrap()
+        );
+        // The pending token was atomically consumed before the MoQ handshake.
+        assert!(sessions.claim_moq(endpoint(1)).is_err());
+    }
+
+    #[test]
+    fn competing_moq_connections_cannot_both_claim_one_control_attachment() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let lease = sessions
+            .claim(endpoint(1), [1; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let (_producer, consumer) = test_moq_broadcast();
+        let _wait = sessions
+            .expect_moq(
+                endpoint(1),
+                lease.session_id,
+                media_moq_broadcast_name(lease.session_id).unwrap(),
+                consumer,
+            )
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let contenders = (0..2)
+            .map(|_| {
+                let sessions = Arc::clone(&sessions);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    sessions.claim_moq(endpoint(1)).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let claimed = contenders
+            .into_iter()
+            .map(|thread| usize::from(thread.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(claimed, 1);
+    }
+
+    #[tokio::test]
+    async fn releasing_control_clears_an_unclaimed_moq_attachment() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let lease = sessions
+            .claim(endpoint(1), [1; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let (_producer, consumer) = test_moq_broadcast();
+        let wait = sessions
+            .expect_moq(
+                endpoint(1),
+                lease.session_id,
+                media_moq_broadcast_name(lease.session_id).unwrap(),
+                consumer,
+            )
+            .unwrap();
+        drop(lease);
+        assert!(sessions.claim_moq(endpoint(1)).is_err());
+        assert!(wait.attached.await.is_err());
+        assert!(wait.closed.await.is_err());
     }
 
     #[test]

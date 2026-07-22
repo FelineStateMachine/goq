@@ -2,6 +2,13 @@
 members = ["crates/sigil-host", "crates/sigil-protocol", "src-tauri"]
 resolver = "2"
 
+[workspace.dependencies]
+bytes = "1.11"
+iroh = { version = "=1.0.3", default-features = false, features = ["metrics", "portmapper", "fast-apple-datapath", "tls-aws-lc-rs"] }
+iroh-moq = { version = "=0.1.0", git = "https://github.com/n0-computer/iroh-live", rev = "5f95758fcd1450e443a9134c9d9342bcc3957b85" }
+moq-net = "=0.1.11"
+web-transport-iroh = "=0.6.0"
+
 [profile.release]
 codegen-units = 1
 lto = "thin"

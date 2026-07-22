@@ -13,10 +13,14 @@ probe_timeout_seconds=15
 command_timeout_seconds=45
 readiness_timeout_seconds=30
 host_runtime_seconds=120
-media_transport="grouped-v3"
-media_accept_log="media v3 client accepted"
-media_release_log="media v3 client released"
+media_transport="iroh-moq"
+media_alpn="moq-lite-04"
+media_accept_log="authorized MoQ media attachment accepted"
+media_release_log="MoQ control client released"
+keyframe_request_log="accepted MoQ keyframe request"
+session_gate_name="control"
 keyframe_recovery="ok"
+media_v3=false
 media_v2=false
 media_v1=false
 
@@ -24,9 +28,10 @@ usage() {
   cat <<'EOF'
 Usage: scripts/loopback-proof.sh [options]
 
-Build and exercise the exact sigil and sigil-probe binaries over a real
-loopback Iroh connection. The proof covers the decodable first media frame,
-input acknowledgment, single-active-client rejection, and clean reconnects.
+Build and exercise the exact sigil and sigil-probe binaries over real loopback
+Iroh and upstream MoQ connections. The ordinary proof covers a configured IDR,
+native group bounds and recovery, input acknowledgment, single-active-client
+rejection, and clean reconnects.
 
 Options:
   --profile debug|release       Cargo profile to build (default: debug)
@@ -34,10 +39,12 @@ Options:
   --reconnect-cycles COUNT      Fresh sessions after the primary (default: 3)
   --reconnect-frames COUNT      Frames per reconnect session (default: 30)
   --probe-timeout-seconds SEC   Probe per-operation timeout (default: 15)
+  --media-v3                    Exercise custom grouped media v3 compatibility
+                                instead of upstream MoQ
   --media-v2                    Exercise independent media v2 compatibility
-                                instead of grouped media v3
+                                instead of upstream MoQ
   --media-v1                    Exercise ordered media v1 compatibility
-                                instead of grouped media v3
+                                instead of upstream MoQ
   --help                        Show this help
 EOF
 }
@@ -86,21 +93,39 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --media-v1)
-      [[ "$media_v2" == false ]] || die "--media-v1 and --media-v2 cannot be combined"
+      [[ "$media_v2" == false && "$media_v3" == false ]] \
+        || die "media compatibility flags cannot be combined"
       media_transport="reliable-v1"
+      media_alpn="sigil/media/1"
       media_accept_log="media client accepted"
       media_release_log="media client released"
+      session_gate_name="media"
       keyframe_recovery="not-requested"
       media_v1=true
       shift
       ;;
     --media-v2)
-      [[ "$media_v1" == false ]] || die "--media-v1 and --media-v2 cannot be combined"
+      [[ "$media_v1" == false && "$media_v3" == false ]] \
+        || die "media compatibility flags cannot be combined"
       media_transport="independent-v2"
+      media_alpn="sigil/media/2"
       media_accept_log="media v2 client accepted"
       media_release_log="media v2 client released"
+      session_gate_name="media"
       keyframe_recovery="not-requested"
       media_v2=true
+      shift
+      ;;
+    --media-v3)
+      [[ "$media_v1" == false && "$media_v2" == false ]] \
+        || die "media compatibility flags cannot be combined"
+      media_transport="grouped-v3"
+      media_alpn="sigil/media/3"
+      media_accept_log="media v3 client accepted"
+      media_release_log="media v3 client released"
+      keyframe_request_log="accepted media v3 keyframe request"
+      session_gate_name="media"
+      media_v3=true
       shift
       ;;
     --help|-h)
@@ -128,9 +153,9 @@ require_positive_integer "--reconnect-frames" "$reconnect_frames"
 require_positive_integer "--probe-timeout-seconds" "$probe_timeout_seconds"
 if [[ "$media_v1" == false && "$media_v2" == false ]]; then
   [[ "$primary_frames" -ge 4 ]] \
-    || die "--primary-frames must be at least 4 for grouped v3 keyframe recovery"
+    || die "--primary-frames must be at least 4 for keyframe recovery"
   [[ "$reconnect_frames" -ge 4 ]] \
-    || die "--reconnect-frames must be at least 4 for grouped v3 keyframe recovery"
+    || die "--reconnect-frames must be at least 4 for keyframe recovery"
 fi
 
 # A fresh Iroh endpoint performs relay discovery and path establishment on
@@ -279,12 +304,24 @@ host_accepted_keyframe_request() {
   local log_path="$1"
   local request_id="$2"
   sed $'s/\033\\[[0-9;]*m//g' "$log_path" 2>/dev/null \
-    | awk -v request_id="$request_id" '
-      index($0, "accepted media v3 keyframe request") \
-        && $0 ~ ("request_id=" request_id "([^[:digit:]]|$)") \
-        && index($0, "coalesced=false") { found=1 }
-      END { exit !found }
-    '
+    | awk -v request_id="$request_id" -v request_log="$keyframe_request_log" '
+    index($0, request_log) \
+      && $0 ~ ("request_id=" request_id "([^[:digit:]]|$)") \
+      && index($0, "coalesced=false") { found=1 }
+    END { exit !found }
+  '
+}
+
+host_keyframe_request_count() {
+  local log_path="$1"
+  local request_id="$2"
+  sed $'s/\033\\[[0-9;]*m//g' "$log_path" 2>/dev/null \
+    | awk -v request_id="$request_id" -v request_log="$keyframe_request_log" '
+    index($0, request_log) \
+      && $0 ~ ("request_id=" request_id "([^[:digit:]]|$)") \
+      && index($0, "coalesced=false") { count++ }
+    END { print count + 0 }
+  '
 }
 
 wait_for_keyframe_request() {
@@ -374,6 +411,9 @@ validate_probe_log() {
   grep -Fxq 'dimensions=1280x800' "$log_path" || return 1
   grep -Fxq 'sequence_gaps=0' "$log_path" || return 1
   grep -Fxq "transport=${media_transport}" "$log_path" || return 1
+  grep -Fxq "transport_alpn=${media_alpn}" "$log_path" || return 1
+  grep -Fxq 'first_configured_idr=ok' "$log_path" || return 1
+  grep -Fxq 'frame_sequence=monotonic' "$log_path" || return 1
   grep -Fxq "keyframe_recovery=${keyframe_recovery}" "$log_path" || return 1
   grep -Fxq "keyframe_request_id=${expected_request_id}" "$log_path" || return 1
   awk -F= '$1 == "media_objects_dropped" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
@@ -383,7 +423,24 @@ validate_probe_log() {
   awk -F= '$1 == "keyframes" && $2 ~ /^[0-9]+$/ && $2 > 0 { found=1 } END { exit !found }' \
     "$log_path" || return 1
   awk -F= '$1 == "input_ack_micros" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
-    "$log_path"
+    "$log_path" || return 1
+  grep -Fxq 'path_mode=direct' "$log_path" || return 1
+  if [[ "$media_transport" == "iroh-moq" ]]; then
+    grep -Fxq 'control_alpn=sigil/control/1' "$log_path" || return 1
+    grep -Fxq 'group_sequence=monotonic' "$log_path" || return 1
+    grep -Fxq 'moq_group_capacity=1' "$log_path" || return 1
+    grep -Fxq 'moq_unrecovered_group_gaps=0' "$log_path" || return 1
+    grep -Fxq 'moq_historical_suffix_frames=0' "$log_path" || return 1
+    grep -Fxq 'recovery_barrier=configured-idr' "$log_path" || return 1
+    awk -F= '$1 == "moq_group_gaps" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+    awk -F= '$1 == "moq_cancelled_groups" && $2 ~ /^[0-9]+$/ && $2 > 0 { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+    awk -F= '$1 == "moq_maximum_group_objects" && $2 ~ /^[0-9]+$/ && $2 > 0 && $2 <= 256 { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+    awk -F= '$1 == "moq_maximum_group_bytes" && $2 ~ /^[0-9]+$/ && $2 > 0 && $2 <= 33554432 { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+  fi
 }
 
 run_probe() {
@@ -391,6 +448,8 @@ run_probe() {
     "$probe_bin" --media-v1 "$@"
   elif [[ "$media_v2" == true ]]; then
     "$probe_bin" --media-v2 "$@"
+  elif [[ "$media_v3" == true ]]; then
+    "$probe_bin" --media-v3 "$@"
   else
     "$probe_bin" "$@"
   fi
@@ -471,7 +530,7 @@ fi
 if [[ -e "${secondary_log}.timeout" ]]; then
   die "secondary client timed out instead of receiving the active-client rejection"
 fi
-if ! grep -Fxq 'Error: host rejected media stream: host already has an active client' "$secondary_log"; then
+if ! grep -Fxq "Error: host rejected ${session_gate_name} stream: host already has an active client" "$secondary_log"; then
   printf 'secondary probe did not return the expected rejection. Log follows:\n' >&2
   sed -n '1,120p' "$secondary_log" >&2 || true
   die "unexpected secondary-client failure"
@@ -529,6 +588,16 @@ while [[ "$cycle" -le "$reconnect_cycles" ]]; do
   cycle=$((cycle + 1))
 done
 
+if [[ "$media_v1" == false && "$media_v2" == false ]]; then
+  request_id=1
+  while [[ "$request_id" -le $((reconnect_cycles + 1)) ]]; do
+    request_count="$(host_keyframe_request_count "$host_log" "$request_id")"
+    [[ "$request_count" -eq 1 ]] \
+      || die "keyframe request $request_id was accepted $request_count times; expected exactly once"
+    request_id=$((request_id + 1))
+  done
+fi
+
 kill -TERM "$host_pid" 2>/dev/null || true
 if wait "$host_pid"; then
   host_status=0
@@ -553,7 +622,9 @@ printf 'probe_binary=%s\n' "$probe_bin"
 printf 'probe_sha256=%s\n' "$(sha256_file "$probe_bin")"
 printf 'node_id=%s\n' "$node_id"
 printf 'primary_frames=%s\n' "$primary_frames"
-grep -E '^(transport|keyframe_recovery|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
+grep -E '^(transport|control_alpn|transport_alpn|first_configured_idr|frame_sequence|group_sequence|keyframe_recovery|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|moq_group_capacity|moq_cancelled_groups|moq_group_gaps|moq_unrecovered_group_gaps|moq_maximum_group_objects|moq_maximum_group_bytes|moq_historical_suffix_frames|recovery_barrier|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
+printf 'keyframe_request_correlation=%s\n' \
+  "$([[ "$media_v1" == false && "$media_v2" == false ]] && printf unique || printf not-requested)"
 printf 'active_client_rejection=ok\n'
 printf 'reconnect_cycles=%s\n' "$reconnect_cycles"
 printf 'cleanup=ok\n'

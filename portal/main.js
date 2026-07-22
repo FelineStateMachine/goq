@@ -10,7 +10,10 @@ import { createInputRuntime } from './input-runtime.mjs';
 import { createControlRuntime } from './control-runtime.mjs';
 import { formatVideoDiscardTelemetry } from './frame-stats.mjs';
 import { networkDiagnosticsPresentation } from './network-diagnostics.mjs';
-import { newPointerSession, parsePointerFeedbackMessage } from './pointer-feedback.mjs';
+import {
+  createPointerFeedbackRuntime,
+  newPointerSession,
+} from './pointer-feedback.mjs';
 import { newConnectionState } from './connection-state.mjs';
 import { formatSignedMilliseconds } from './av-sync.mjs';
 import { audioButtonPresentation } from './audio-ui.mjs';
@@ -55,49 +58,19 @@ let controllerActivationInProgress = false;
 let controlRuntime = null;
 let controllerRuntime = null;
 
-function applyPointerPositionFeedback(message, session) {
-  if (session !== activePointerSession || !connectionState.inputCapabilities.pointerPositionFeedback) return;
-  const surface = currentPointerSurfaceSize();
-  if (surface === null) return;
-  const feedback = validatePointerPositionFeedback(message, surface);
-  session.remotePosition = feedback.position;
-  session.remoteVisible = feedback.pointer_visible;
-  renderRemotePointer();
-}
-
-function handlePointerPositionFeedback(message, session) {
-  if (session !== activePointerSession || session.failed || session.closing) return;
-  try {
-    const envelope = parsePointerFeedbackMessage(message);
-    if (envelope.type === 'terminal') {
-      session.failed = true;
-      session.failureDetail = envelope.reason === 'eof'
-        ? 'Pointer feedback ended'
-        : 'Pointer feedback was malformed';
-      session.remotePosition = null;
-      session.remoteVisible = false;
-      renderRemotePointer();
-      console.error(session.failureDetail);
-      if (connectionState.connected) void disconnect();
-      return;
-    }
-    const feedback = envelope.feedback;
-    session.received = true;
-    session.latest = feedback;
-    if (connectionState.connected) applyPointerPositionFeedback(feedback, session);
-  } catch (error) {
-    session.failed = true;
-    session.failureDetail = `Pointer feedback failed: ${error}`;
-    session.remotePosition = null;
-    session.remoteVisible = false;
-    renderRemotePointer();
-    console.error('invalid pointer-position feedback:', error);
-    if (connectionState.connected) void disconnect();
-  }
-}
-
 const invoke = (...args) => window.__TAURI__.core.invoke(...args);
 const listen = (...args) => window.__TAURI__.event.listen(...args);
+const pointerFeedbackRuntime = createPointerFeedbackRuntime({
+  getActiveSession: () => activePointerSession,
+  getCapabilities: () => ({
+    connected: connectionState.connected,
+    pointerPositionFeedback: connectionState.inputCapabilities.pointerPositionFeedback,
+  }),
+  getSurface: currentPointerSurfaceSize,
+  render: renderRemotePointer,
+  disconnect,
+  logger: console,
+});
 const inputRuntime = createInputRuntime({
   invokeCommand: invoke,
   getCapabilities: () => connectionState.inputCapabilities,
@@ -414,7 +387,7 @@ async function createConnectionAttempt({ createChannel: Channel }) {
     (message) => streamRuntime.handleBinaryFrame(message, frameSession),
   );
   pointerSession.channel = new Channel(
-    (message) => handlePointerPositionFeedback(message, pointerSession),
+    (message) => pointerFeedbackRuntime.handleMessage(message, pointerSession),
   );
   return {
     audioSession: audioAttempt.session,

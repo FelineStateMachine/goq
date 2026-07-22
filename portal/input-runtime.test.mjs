@@ -295,7 +295,7 @@ test('Portal delegates queue ownership while retaining DOM input wiring', () => 
   assert.match(main, /const inputRuntime = createInputRuntime\(\{/);
   assert.match(
     main,
-    /resetControllerActivation: \(\) => controllerActivationGate\.reset\(\)/,
+    /resetControllerActivation: \(\) => controlRuntime\?\.resetControllerActivation\(\)/,
   );
   assert.match(main, /window\.addEventListener\('mousedown', handleMouseDown/);
   assert.match(main, /inputRuntime\.trackMouseButton\(btn\)/);

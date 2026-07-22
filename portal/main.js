@@ -1,5 +1,4 @@
 import {
-  browserPointerLockLossRequiresControlExit,
   mapCanvasPointToSurface,
   resolvePointerSurfaceSize,
   scaleRelativePointerDelta,
@@ -8,6 +7,7 @@ import {
   browserMouseButtonCode,
 } from './input-state.mjs';
 import { createInputRuntime } from './input-runtime.mjs';
+import { createControlRuntime } from './control-runtime.mjs';
 import { formatVideoDiscardTelemetry } from './frame-stats.mjs';
 import { networkDiagnosticsPresentation } from './network-diagnostics.mjs';
 import { newPointerSession, parsePointerFeedbackMessage } from './pointer-feedback.mjs';
@@ -19,7 +19,6 @@ import {
   createAudioPipelineSession,
 } from './audio-pipeline.mjs';
 import {
-  ControllerActivationGate,
   ControllerActionRepeater,
   GamepadEscapeHold,
   LatestControllerStatePublisher,
@@ -27,7 +26,6 @@ import {
   controllerStateSignature,
   disconnectedControllerState,
   maskGamepadEscapeChord,
-  neutralGamepadInputState,
   normalizeGamepad,
   selectPreferredController,
   toGamepadInputState,
@@ -53,7 +51,6 @@ import {
 } from './enrollment.mjs';
 import { mapKey } from './keyboard-map.mjs';
 
-let controlMode = false;
 let enrollmentReady = false;
 let pendingInvitationSummary = null;
 let currentEnrollmentStatus = null;
@@ -63,11 +60,7 @@ let lastObservedWindowSize = null;
 let streamWindowResizeTimer = null;
 let activePointerSession = null;
 let controllerActivationInProgress = false;
-let controlTransitionInProgress = false;
-let controlTransitionGeneration = 0;
-let nativeCursorCommand = Promise.resolve();
-let browserPointerLockRequired = true;
-const controllerActivationGate = new ControllerActivationGate();
+let controlRuntime = null;
 
 function applyPointerPositionFeedback(message, session) {
   if (session !== activePointerSession || !connectionState.inputCapabilities.pointerPositionFeedback) return;
@@ -117,7 +110,7 @@ const inputRuntime = createInputRuntime({
   getCapabilities: () => connectionState.inputCapabilities,
   isConnected: () => connectionState.connected,
   onFatal: () => { void disconnect(); },
-  resetControllerActivation: () => controllerActivationGate.reset(),
+  resetControllerActivation: () => controlRuntime?.resetControllerActivation(),
 });
 let videoPipeline = null;
 let streamRuntime = null;
@@ -497,8 +490,7 @@ function updateAcceptedConnectionState({ attempt, state }) {
     session.remotePosition = attempt.initialPointerFeedback.position;
     session.remoteVisible = attempt.initialPointerFeedback.pointer_visible;
   }
-  controlMode = false;
-  inputRuntime.clear();
+  controlRuntime.resetAcceptedConnection();
 }
 
 async function showConnectedAttempt({ result, attempt }) {
@@ -527,17 +519,9 @@ async function showConnectedAttempt({ result, attempt }) {
 
 async function prepareDisconnect() {
   streamRuntime.prepareDisconnect();
-  controlTransitionGeneration += 1;
-  controlTransitionInProgress = false;
-  controllerActivationGate.reset();
-  queueNeutralControllerState();
-  inputRuntime.releaseHeld();
-  controlMode = false;
-  releasePointerLock();
-  updateControlUI();
   // Give release commands a short, finite opportunity to cross the bounded
   // Tauri queue before closing it. A broken stream cannot stall disconnect.
-  await inputRuntime.drain(250);
+  await controlRuntime.prepareDisconnect(250);
 }
 
 async function teardownConnectedResources() {
@@ -549,14 +533,12 @@ async function teardownConnectedResources() {
 }
 
 async function showDisconnectedState() {
-  controlMode = false;
   fittedStreamAspect = null;
   pendingStreamFit = null;
   lastObservedWindowSize = null;
   if (streamWindowResizeTimer !== null) clearTimeout(streamWindowResizeTimer);
   streamWindowResizeTimer = null;
-  inputRuntime.clear();
-  updateControlUI();
+  controlRuntime.resetDisconnected();
   updatePanelVisibility();
   setStatus('', 'idle');
   document.getElementById('frame-canvas').style.display = 'none';
@@ -647,6 +629,33 @@ let hasWebCodecs = ('VideoDecoder' in window);
 const canvas = document.getElementById('frame-canvas');
 const remotePointer = document.getElementById('remote-pointer');
 const ctx = canvas.getContext('2d');
+controlRuntime = createControlRuntime({
+  getConnection: () => ({
+    connected: connectionState.connected,
+    disconnecting: connectionState.disconnecting,
+    capabilities: connectionState.inputCapabilities,
+  }),
+  inputRuntime,
+  invokeCursorGrab: (grab) => invoke('set_client_cursor_grab', { grab }),
+  pointerLock: {
+    target: canvas,
+    getOwner: () => document.pointerLockElement,
+    request: () => {
+      if (typeof canvas.requestPointerLock !== 'function') {
+        throw new Error('browser Pointer Lock is unavailable');
+      }
+      return canvas.requestPointerLock();
+    },
+    exit: () => {
+      if (typeof document.exitPointerLock === 'function') document.exitPointerLock();
+    },
+    eventTarget: document,
+  },
+  publishController: () => publishCurrentControllerState(),
+  resetControllerEscape: () => controllerEscape.reset(),
+  onChange: () => updateControlUI(),
+  onReleaseFailure: () => setStatus('err', 'cursor release failed · quit app'),
+});
 videoPipeline = createVideoPipelineSession({
   hasWebCodecs,
   canvas,
@@ -919,66 +928,9 @@ listen('audio-stats', (event) => {
 
 // ─── Input ────────────────────────────────────────────────────────────────────
 async function toggleControl() {
-  if (!connectionState.connected
-    || !connectionState.inputCapabilities.control
-    || controlTransitionInProgress) return;
   // Capture synchronous controller provenance before cursor acquisition yields.
   // The DOM click dispatcher does not await this async handler.
-  const controllerInitiated = controllerActivationInProgress;
-  if (controlMode) {
-    controlTransitionGeneration += 1;
-    controllerActivationGate.reset();
-    queueNeutralControllerState();
-    inputRuntime.releaseHeld();
-    controlMode = false;
-    releasePointerLock();
-  } else {
-    const transitionGeneration = controlTransitionGeneration + 1;
-    controlTransitionGeneration = transitionGeneration;
-    controlTransitionInProgress = true;
-    if (controllerInitiated) controllerActivationGate.arm();
-    const acquired = await requestRelativePointerLock();
-    const ownsTransition = transitionGeneration === controlTransitionGeneration;
-    if (!ownsTransition) {
-      // A cancellation may have released before a late browser request took
-      // ownership. Do not disturb a newer transition, but do not leave an
-      // orphaned lock behind when control is otherwise idle.
-      if (!controlMode
-        && !controlTransitionInProgress
-        && document.pointerLockElement === canvas) {
-        releasePointerLock();
-      }
-      return;
-    }
-    if (!acquired
-      || connectionState.disconnecting
-      || !connectionState.connected
-      || !connectionState.inputCapabilities.control) {
-      exitControlAfterBrowserPointerLockFailure();
-      return;
-    }
-    controlTransitionInProgress = false;
-    controlMode = true;
-    // A used to cross the local control boundary must not also become an
-    // accidental remote A press. Its release forwards the current snapshot,
-    // without requiring noisy analog axes to be exactly zero.
-    if (controllerInitiated) {
-      queueNeutralControllerState();
-      // A may have been released while native cursor acquisition was pending,
-      // when controller publications were still local-only. Re-submit the
-      // latest snapshot through the gate so that release takes effect now;
-      // a still-held A remains suppressed and leaves the queued neutral state.
-      publishCurrentControllerState();
-    } else {
-      publishCurrentControllerState();
-    }
-  }
-  updateControlUI();
-}
-
-function queueNeutralControllerState() {
-  if (!connectionState.connected || !connectionState.inputCapabilities.gamepad) return false;
-  return inputRuntime.send({ t: 'gp', state: neutralGamepadInputState() });
+  await controlRuntime.toggle({ controllerInitiated: controllerActivationInProgress });
 }
 
 function describeInputCapabilities() {
@@ -997,130 +949,11 @@ function pointerInputAvailable() {
   return capabilities.relativePointer || capabilities.absolutePointer;
 }
 
-async function requestRelativePointerLock() {
-  if (!connectionState.inputCapabilities.relativePointer) return true;
-  try {
-    const nativeResult = await setNativeCursorGrab(true);
-    // Older commands returned no value, so only an explicit false disables
-    // the browser fallback. Current macOS builds return false because
-    // CoreGraphics owns relative capture and cursor visibility there.
-    browserPointerLockRequired = nativeResult !== false;
-    await requestBrowserPointerLock();
-    return true;
-  } catch (error) {
-    console.warn('relative pointer lock unavailable:', error);
-    return false;
-  }
-}
-
-async function requestBrowserPointerLock() {
-  if (!browserPointerLockRequired) return;
-  try {
-    if (typeof canvas.requestPointerLock !== 'function') {
-      throw new Error('browser Pointer Lock is unavailable');
-    }
-    const request = canvas.requestPointerLock();
-    if (request && typeof request.then === 'function') await request;
-    await waitForBrowserPointerLockOwnership();
-    // Pointer Lock and the native window grab are separate on Linux. Reassert
-    // the native state only after the browser proves canvas ownership.
-    await setNativeCursorGrab(true);
-  } catch (error) {
-    exitControlAfterBrowserPointerLockFailure();
-    throw error;
-  }
-}
-
-function waitForBrowserPointerLockOwnership(timeoutMs = 500) {
-  if (document.pointerLockElement === canvas) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    let timeoutId;
-    const cleanup = () => {
-      clearTimeout(timeoutId);
-      document.removeEventListener('pointerlockchange', handleChange);
-      document.removeEventListener('pointerlockerror', handleError);
-    };
-    const settle = (callback, value) => {
-      cleanup();
-      callback(value);
-    };
-    const handleChange = () => {
-      if (document.pointerLockElement === canvas) {
-        settle(resolve);
-      } else {
-        settle(reject, new Error('browser Pointer Lock ownership was lost'));
-      }
-    };
-    const handleError = () => {
-      settle(reject, new Error('browser Pointer Lock request was rejected'));
-    };
-    document.addEventListener('pointerlockchange', handleChange);
-    document.addEventListener('pointerlockerror', handleError);
-    timeoutId = setTimeout(() => {
-      settle(reject, new Error('browser Pointer Lock ownership timed out'));
-    }, timeoutMs);
-  });
-}
-
-function exitControlAfterBrowserPointerLockFailure() {
-  if (!browserPointerLockRequired || (!controlMode && !controlTransitionInProgress)) {
-    return false;
-  }
-  controlTransitionGeneration += 1;
-  controlTransitionInProgress = false;
-  controllerActivationGate.reset();
-  controllerEscape.reset();
-  queueNeutralControllerState();
-  inputRuntime.releaseHeld();
-  controlMode = false;
-  releasePointerLock();
-  updateControlUI();
-  return true;
-}
-
 function handleBrowserPointerLockChange() {
-  if (!browserPointerLockLossRequiresControlExit({
-    browserPointerLockRequired,
-    pointerLockElement: document.pointerLockElement,
-    expectedElement: canvas,
-    controlMode,
-    controlTransitionInProgress,
-  })) return;
-  exitControlAfterBrowserPointerLockFailure();
+  controlRuntime.handleBrowserPointerLockChange();
 }
 
 document.addEventListener('pointerlockchange', handleBrowserPointerLockChange);
-
-function setNativeCursorGrab(grab) {
-  const command = nativeCursorCommand.then(
-    () => invoke('set_client_cursor_grab', { grab }),
-  );
-  nativeCursorCommand = command.catch(() => {});
-  return command;
-}
-
-async function releaseNativeCursorGrab(releaseGeneration) {
-  const retryDelaysMs = [0, 16, 50];
-  let lastError = null;
-  for (const delayMs of retryDelaysMs) {
-    if (releaseGeneration !== controlTransitionGeneration || controlMode) return false;
-    if (delayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-      if (releaseGeneration !== controlTransitionGeneration || controlMode) return false;
-    }
-    try {
-      await setNativeCursorGrab(false);
-      return true;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  console.error('native cursor release failed after bounded retries:', lastError);
-  if (!controlMode && releaseGeneration === controlTransitionGeneration) {
-    setStatus('err', 'cursor release failed · quit app');
-  }
-  return false;
-}
 
 function currentPointerSurfaceSize() {
   const { width: frameWidth, height: frameHeight } = videoPipeline.format;
@@ -1135,7 +968,7 @@ function currentPointerSurfaceSize() {
 function renderRemotePointer() {
   const session = activePointerSession;
   const surface = currentPointerSurfaceSize();
-  const visible = controlMode
+  const visible = controlRuntime.active
     && connectionState.inputCapabilities.relativePointer
     && connectionState.inputCapabilities.pointerPositionFeedback
     && session?.remotePosition !== null
@@ -1151,31 +984,24 @@ function renderRemotePointer() {
     + (session.remotePosition.y / surface.height) * canvasRect.height}px`;
 }
 
-function releasePointerLock() {
-  const releaseGeneration = controlTransitionGeneration;
-  void releaseNativeCursorGrab(releaseGeneration);
-  if (document.pointerLockElement !== canvas || typeof document.exitPointerLock !== 'function') return;
-  try { document.exitPointerLock(); } catch (_) {}
-}
-
 function updateControlUI() {
   const el = document.getElementById('control-toggle');
   const capabilities = connectionState.inputCapabilities;
   const available = connectionState.connected && capabilities.control;
-  if (!available) controlMode = false;
+  const controlling = controlRuntime.setInactiveIfUnavailable(available);
   el.textContent = available
-    ? `${controlMode ? 'controlling' : 'take control'} · ${describeInputCapabilities()}${controlMode && capabilities.relativePointer ? ' · Ctrl+Alt+Esc to exit' : controlMode && capabilities.gamepad ? ' · hold Back+Start to exit' : ''}`
+    ? `${controlling ? 'controlling' : 'take control'} · ${describeInputCapabilities()}${controlling && capabilities.relativePointer ? ' · Ctrl+Alt+Esc to exit' : controlling && capabilities.gamepad ? ' · hold Back+Start to exit' : ''}`
     : 'view only · input unavailable';
-  el.classList.toggle('active', controlMode);
+  el.classList.toggle('active', controlling);
   el.classList.toggle('disabled', !available);
   el.setAttribute('aria-disabled', available ? 'false' : 'true');
   document.body.classList.toggle(
     'native-pointer-control',
-    controlMode && capabilities.relativePointer,
+    controlling && capabilities.relativePointer,
   );
   canvas.classList.toggle(
     'relative-control',
-    controlMode && capabilities.relativePointer,
+    controlling && capabilities.relativePointer,
   );
   renderRemotePointer();
   const streamControl = document.getElementById('stream-control');
@@ -1195,7 +1021,7 @@ function scaleCoords(clientX, clientY) {
 }
 
 window.addEventListener('mousemove', (e) => {
-  if (!controlMode || !pointerInputAvailable()) return;
+  if (!controlRuntime.active || !pointerInputAvailable()) return;
   if (connectionState.inputCapabilities.relativePointer) {
     const movement = scaleRelativePointerDelta(
       e.movementX,
@@ -1207,7 +1033,7 @@ window.addEventListener('mousemove', (e) => {
 }, { capture: true });
 
 canvas.addEventListener('mousemove', (e) => {
-  if (!controlMode
+  if (!controlRuntime.active
     || !connectionState.inputCapabilities.absolutePointer
     || connectionState.inputCapabilities.relativePointer) return;
   const { x, y } = scaleCoords(e.clientX, e.clientY);
@@ -1215,14 +1041,14 @@ canvas.addEventListener('mousemove', (e) => {
 });
 
 function handleMouseDown(e) {
-  if (!controlMode || !pointerInputAvailable()) return;
+  if (!controlRuntime.active || !pointerInputAvailable()) return;
   if (connectionState.inputCapabilities.relativePointer) e.stopPropagation();
   else if (e.target !== canvas) return;
   const btn = browserMouseButtonCode(e.button);
   if (btn === null) return;
   e.preventDefault();
   if (connectionState.inputCapabilities.relativePointer && document.pointerLockElement !== canvas) {
-    void requestBrowserPointerLock().catch((error) => {
+    void controlRuntime.requestBrowserPointerLock().catch((error) => {
       console.warn('browser pointer lock retry failed:', error);
     });
   }
@@ -1243,18 +1069,18 @@ function releaseMouseButton(e) {
 }
 
 window.addEventListener('mouseup', (e) => {
-  if (controlMode && connectionState.inputCapabilities.relativePointer) e.stopPropagation();
+  if (controlRuntime.active && connectionState.inputCapabilities.relativePointer) e.stopPropagation();
   releaseMouseButton(e);
 }, { capture: true });
 
 window.addEventListener('contextmenu', (e) => {
-  if (!controlMode || !pointerInputAvailable()) return;
+  if (!controlRuntime.active || !pointerInputAvailable()) return;
   if (!connectionState.inputCapabilities.relativePointer && e.target !== canvas) return;
   e.preventDefault();
 }, { capture: true });
 
 window.addEventListener('wheel', (e) => {
-  if (!controlMode || !pointerInputAvailable()) return;
+  if (!controlRuntime.active || !pointerInputAvailable()) return;
   if (!connectionState.inputCapabilities.relativePointer && e.target !== canvas) return;
   e.preventDefault();
   if (connectionState.inputCapabilities.relativePointer) e.stopPropagation();
@@ -1262,15 +1088,10 @@ window.addEventListener('wheel', (e) => {
 }, { passive: false, capture: true });
 
 window.addEventListener('keydown', (e) => {
-  if (!controlMode) return;
+  if (!controlRuntime.active) return;
   if (e.key === 'Escape' && e.ctrlKey && e.altKey) {
     e.preventDefault();
-    controllerActivationGate.reset();
-    queueNeutralControllerState();
-    inputRuntime.releaseHeld();
-    controlMode = false;
-    releasePointerLock();
-    updateControlUI();
+    controlRuntime.exit();
     return;
   }
   const printableText = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
@@ -1303,15 +1124,8 @@ window.addEventListener('keyup', (e) => {
 });
 
 window.addEventListener('blur', () => {
-  if (!controlMode && !controlTransitionInProgress) return;
-  controlTransitionGeneration += 1;
-  controlTransitionInProgress = false;
-  controllerActivationGate.reset();
-  queueNeutralControllerState();
-  inputRuntime.releaseHeld();
-  controlMode = false;
-  releasePointerLock();
-  updateControlUI();
+  if (!controlRuntime.active && !controlRuntime.transitioning) return;
+  controlRuntime.exit();
 });
 
 // ─── Controller PIN entry ─────────────────────────────────────────────────────
@@ -1392,10 +1206,10 @@ controllerPublisher.setHandler((state) => {
     try { externalControllerObserver(state); } catch (error) { console.warn('controller observer failed:', error); }
   }
   if (!connectionState.connected
-    || !controlMode
+    || !controlRuntime.active
     || !connectionState.inputCapabilities.gamepad) return;
   const inputState = maskGamepadEscapeChord(toGamepadInputState(state));
-  if (!controllerActivationGate.accepts(inputState)) return;
+  if (!controlRuntime.acceptsControllerInput(inputState)) return;
   inputRuntime.send({ t: 'gp', state: inputState });
 });
 
@@ -1514,18 +1328,13 @@ function pollControllers(nowMs) {
   }
 
   const remoteRoute = connectionState.connected
-    && controlMode
+    && controlRuntime.active
     && connectionState.inputCapabilities.gamepad
     && currentControllerState.connected
     && currentControllerState.mapping === 'standard';
   if (remoteRoute) {
     if (controllerEscape.update(currentControllerState, nowMs)) {
-      controllerActivationGate.reset();
-      queueNeutralControllerState();
-      inputRuntime.releaseHeld();
-      controlMode = false;
-      releasePointerLock();
-      updateControlUI();
+      controlRuntime.exit();
       controllerActions.reset();
       setControllerFocus(document.getElementById('control-toggle'));
     }
@@ -1551,13 +1360,13 @@ window.addEventListener('resize', () => {
 });
 
 window.addEventListener('focus', () => {
-  if (!controlMode || !connectionState.inputCapabilities.relativePointer) return;
+  if (!controlRuntime.active || !connectionState.inputCapabilities.relativePointer) return;
   // WebKit rebuilds its native cursor rectangles after the window-level focus
   // event. Reassert from the webview on the next frame so the final rectangle
   // is the transparent one used during relative control.
   requestAnimationFrame(() => {
-    if (!controlMode || !connectionState.inputCapabilities.relativePointer) return;
-    void setNativeCursorGrab(true).catch((error) => {
+    if (!controlRuntime.active || !connectionState.inputCapabilities.relativePointer) return;
+    void controlRuntime.reassertNativeGrab().catch((error) => {
       console.warn('native cursor re-hide after focus failed:', error);
     });
   });

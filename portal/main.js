@@ -12,21 +12,8 @@ import {
   validatePointerPositionFeedback,
   browserMouseButtonCode,
 } from './input-state.mjs';
-import { parseFrameEnvelope } from './frame-envelope.mjs';
-import {
-  formatVideoDiscardTelemetry,
-  isCurrentFrameGeneration,
-  normalizeFrameStatsPayload,
-} from './frame-stats.mjs';
+import { formatVideoDiscardTelemetry } from './frame-stats.mjs';
 import { networkDiagnosticsPresentation } from './network-diagnostics.mjs';
-import {
-  FRAME_CHANNEL_CAPACITY,
-  activateFrameSession,
-  isActiveFrameSession,
-  newFrameSession,
-  stageFrameAcknowledgment,
-  stageLegacyFrame,
-} from './frame-session.mjs';
 import { newPointerSession, parsePointerFeedbackMessage } from './pointer-feedback.mjs';
 import { newConnectionState } from './connection-state.mjs';
 import { formatSignedMilliseconds } from './av-sync.mjs';
@@ -59,10 +46,9 @@ import {
   createVideoPipelineSession,
 } from './video-pipeline.mjs';
 import {
-  AdaptiveFeedbackPublisher,
   formatAdaptiveDecision,
-  normalizeAdaptiveDecisionEnvelope,
 } from './adaptive-feedback.mjs';
+import { createStreamRuntime } from './stream-runtime.mjs';
 import {
   formatInvitationExpiry,
   grantLabel,
@@ -79,9 +65,6 @@ let fittedStreamAspect = null;
 let pendingStreamFit = null;
 let lastObservedWindowSize = null;
 let streamWindowResizeTimer = null;
-let activeFrameChannel = null;
-let activeFrameGeneration = null;
-let activeFrameSession = null;
 let activePointerSession = null;
 let controllerActivationInProgress = false;
 let controlTransitionInProgress = false;
@@ -134,16 +117,13 @@ function handlePointerPositionFeedback(message, session) {
 const invoke = (...args) => window.__TAURI__.core.invoke(...args);
 const listen = (...args) => window.__TAURI__.event.listen(...args);
 let videoPipeline = null;
+let streamRuntime = null;
 const audioPipeline = createAudioPipelineSession({
   invokeCommand: invoke,
   onUpdate: updateAudioUI,
   resetAvSync: (...args) => videoPipeline?.resetAvSync(...args),
   isDisconnecting: () => connectionState.disconnecting,
 });
-const adaptiveFeedbackPublisher = new AdaptiveFeedbackPublisher({ invokeCommand: invoke });
-let adaptiveFeedbackAvailable = false;
-let adaptiveFeedbackError = null;
-let adaptiveDecision = null;
 
 function updatePanelVisibility() {
   const streamSection = document.getElementById('stream-section');
@@ -434,22 +414,16 @@ async function toggleAudioMute() {
 async function createConnectionAttempt({ createChannel: Channel }) {
   // Reset before opening the channel so early frames cannot race a
   // post-connect reset and disappear from the live diagnostics.
-  if (activeFrameSession) activeFrameSession.closing = true;
-  activeFrameSession = null;
-  activeFrameGeneration = null;
-  adaptiveFeedbackPublisher.stop();
-  adaptiveFeedbackAvailable = false;
-  adaptiveFeedbackError = null;
-  adaptiveDecision = null;
-  resetStreamTelemetry();
+  streamRuntime.prepareConnection();
   if (typeof Channel !== 'function') throw new Error('Tauri binary channels are unavailable');
   const audioSession = audioPipeline.beginAttempt();
-  const frameSession = newFrameSession();
+  const frameSession = streamRuntime.openFrameSession();
   const pointerSession = newPointerSession();
-  activeFrameSession = frameSession;
   activePointerSession = pointerSession;
   const audioAttempt = await audioPipeline.createAttemptChannel(Channel, audioSession);
-  activeFrameChannel = new Channel((message) => handleBinaryFrameMessage(message, frameSession));
+  const frameChannel = new Channel(
+    (message) => streamRuntime.handleBinaryFrame(message, frameSession),
+  );
   pointerSession.channel = new Channel(
     (message) => handlePointerPositionFeedback(message, pointerSession),
   );
@@ -459,7 +433,7 @@ async function createConnectionAttempt({ createChannel: Channel }) {
     pointerSession,
     audioSupport: audioAttempt.support,
     connectionArgs: {
-      frameChannel: activeFrameChannel,
+      frameChannel,
       audioChannel: audioAttempt.channel,
       pointerChannel: pointerSession.channel,
       audioSupported: audioAttempt.support.supported,
@@ -491,25 +465,19 @@ function validateConnectedAttempt(result, attempt) {
 }
 
 function activateConnectedAttempt(result, attempt) {
-  activateConnectedFrameSession(attempt.frameSession, result.media_generation);
-  adaptiveFeedbackAvailable = result.adaptive_feedback_available === true;
-  adaptiveFeedbackError = typeof result.adaptive_feedback_error === 'string'
-    ? result.adaptive_feedback_error : null;
-  adaptiveFeedbackPublisher.start(result.media_generation, adaptiveFeedbackAvailable);
+  streamRuntime.activateFrameSession(attempt.frameSession, {
+    generation: result.media_generation,
+    adaptiveFeedbackAvailable: result.adaptive_feedback_available === true,
+    adaptiveFeedbackError: result.adaptive_feedback_error,
+  });
 }
 
 function closeConnectionAttempt(attempt, { committed = false } = {}) {
-  if (attempt?.frameSession) attempt.frameSession.closing = true;
-  if (activeFrameSession === attempt?.frameSession) activeFrameSession = null;
-  activeFrameGeneration = null;
-  adaptiveFeedbackPublisher.stop();
-  adaptiveFeedbackAvailable = false;
-  adaptiveDecision = null;
+  streamRuntime.closeFrameSession(attempt?.frameSession);
   if (committed && attempt?.pointerSession) attempt.pointerSession.closing = true;
 }
 
 async function teardownConnectionAttempt(attempt) {
-  activeFrameChannel = null;
   const pointerSession = attempt?.pointerSession ?? activePointerSession;
   if (activePointerSession === pointerSession) activePointerSession = null;
   if (pointerSession) pointerSession.channel = null;
@@ -555,13 +523,7 @@ async function showConnectedAttempt({ result, attempt }) {
 }
 
 async function prepareDisconnect() {
-  if (activeFrameSession) activeFrameSession.closing = true;
-  activeFrameSession = null;
-  activeFrameGeneration = null;
-  adaptiveFeedbackPublisher.stop();
-  adaptiveFeedbackAvailable = false;
-  adaptiveFeedbackError = null;
-  adaptiveDecision = null;
+  streamRuntime.prepareDisconnect();
   controlTransitionGeneration += 1;
   controlTransitionInProgress = false;
   controllerActivationGate.reset();
@@ -576,12 +538,11 @@ async function prepareDisconnect() {
 }
 
 async function teardownConnectedResources() {
-  activeFrameChannel = null;
   const pointerSession = activePointerSession;
   activePointerSession = null;
   if (pointerSession) pointerSession.channel = null;
   await audioPipeline.teardown();
-  videoPipeline.teardown();
+  streamRuntime.teardown();
 }
 
 async function showDisconnectedState() {
@@ -680,34 +641,6 @@ let hasWebCodecs = ('VideoDecoder' in window);
 })();
 
 // ─── Frame decoding ───────────────────────────────────────────────────────────
-let transportDroppedFrames = 0;
-let transportObjectDroppedFrames = null;
-let transportLateObjectDroppedFrames = null;
-let frontendDroppedFrames = 0;
-let frontendQueueDroppedFrames = null;
-let frontendResyncDroppedFrames = null;
-let frontendQueueStats = null;
-let frontendResyncStats = null;
-let transportIntervalStats = null;
-let frontendIpcSendDurationStats = null;
-let rustTimingWindow = null;
-let networkDiagnostics = null;
-let lastTransportFps = 0;
-let lastFrontendSendFps = 0;
-let streamPathMode = 'unknown';
-let streamRttMs = null;
-let lastMediaSequence = null;
-
-function requestDecoderKeyframe(reason) {
-  if (!Number.isSafeInteger(activeFrameGeneration) || activeFrameGeneration < 1) return;
-  void invoke('iroh_client_request_keyframe', {
-    generation: activeFrameGeneration,
-    reason,
-  }).catch((error) => {
-    console.warn(`keyframe request failed (${reason}):`, error);
-  });
-}
-
 const canvas = document.getElementById('frame-canvas');
 const remotePointer = document.getElementById('remote-pointer');
 const ctx = canvas.getContext('2d');
@@ -715,7 +648,7 @@ videoPipeline = createVideoPipelineSession({
   hasWebCodecs,
   canvas,
   context: ctx,
-  requestKeyframe: requestDecoderKeyframe,
+  requestKeyframe: (reason) => streamRuntime?.requestKeyframe(reason),
   resetAudioSync: audioPipeline.resetSyncTelemetry,
   sampleAudioSkew: audioPipeline.sampleSkew,
   onFormatChanged: () => {
@@ -723,28 +656,12 @@ videoPipeline = createVideoPipelineSession({
     if (connectionState.connected) void fitWindowToIncomingStream();
   },
 });
-
-function resetStreamTelemetry() {
-  videoPipeline.reset();
-  transportDroppedFrames = 0;
-  transportObjectDroppedFrames = null;
-  transportLateObjectDroppedFrames = null;
-  frontendDroppedFrames = 0;
-  frontendQueueDroppedFrames = null;
-  frontendResyncDroppedFrames = null;
-  frontendQueueStats = null;
-  frontendResyncStats = null;
-  transportIntervalStats = null;
-  frontendIpcSendDurationStats = null;
-  rustTimingWindow = null;
-  networkDiagnostics = null;
-  lastTransportFps = 0;
-  lastFrontendSendFps = 0;
-  streamPathMode = 'unknown';
-  streamRttMs = null;
-  lastMediaSequence = null;
-  adaptiveDecision = null;
-}
+streamRuntime = createStreamRuntime({
+  invokeCommand: invoke,
+  videoPipeline,
+  isConnected: () => connectionState.connected,
+  disconnect,
+});
 
 function formatCadence(summary) {
   if (!summary.count) return '—';
@@ -759,7 +676,28 @@ function formatRustDurationSummary(summary) {
 
 function updateStreamStats() {
   const now = performance.now();
-  const video = videoPipeline.snapshot(now);
+  const {
+    video,
+    transportDroppedFrames,
+    transportObjectDroppedFrames,
+    transportLateObjectDroppedFrames,
+    frontendDroppedFrames,
+    frontendQueueDroppedFrames,
+    frontendResyncDroppedFrames,
+    frontendQueueStats,
+    frontendResyncStats,
+    transportIntervalStats,
+    frontendIpcSendDurationStats,
+    rustTimingWindow,
+    networkDiagnostics,
+    lastTransportFps,
+    lastFrontendSendFps,
+    streamPathMode,
+    streamRttMs,
+    adaptiveFeedbackAvailable,
+    adaptiveFeedbackError,
+    adaptiveDecision,
+  } = streamRuntime.snapshot(now);
   const networkPresentation = networkDiagnosticsPresentation(networkDiagnostics);
   document.getElementById('stream-received').textContent = video.receivedFrames;
   document.getElementById('stream-decoder-input').textContent = video.decoderInputFrames;
@@ -839,25 +777,7 @@ function updateStreamStats() {
     adaptiveFeedbackAvailable,
   );
 
-  adaptiveFeedbackPublisher.publish({
-    lastSequence: lastMediaSequence,
-    frontendQueueDepth: frontendQueueStats?.depth ?? 0,
-    frontendQueueCapacity: frontendQueueStats?.capacity ?? 4,
-    decoderQueueDepth: video.decoderQueueDepth,
-    decoderQueueCapacity: video.decoderQueueCapacity,
-    presenterQueueDepth: video.presenterQueueDepth,
-    presenterQueueCapacity: video.presenterQueueCapacity,
-    transportDroppedTotal: transportDroppedFrames,
-    frontendDroppedTotal: frontendDroppedFrames,
-    decoderDroppedTotal: video.droppedFrames,
-    presenterDroppedTotal: video.presentationDroppedFrames,
-    // Portal has no clock-synchronized capture-to-delivery measurement yet.
-    // IPC send duration is a different boundary and must not be mislabeled.
-    transportDeliveryP95Ms: null,
-    decodeLatencyP95Ms: video.decodePercentiles.p95,
-    presentationLatencyP95Ms: video.presentPercentiles.p95,
-    resyncActive: video.recovering || frontendResyncStats?.active === true,
-  });
+  streamRuntime.publishAdaptiveFeedback(video);
 }
 
 setInterval(() => {
@@ -911,7 +831,7 @@ async function fitWindowToIncomingStream() {
   if (!connectionState.connected || frameWidth < 1 || frameHeight < 1) return false;
   const aspect = streamAspectKey(frameWidth, frameHeight);
   if (fittedStreamAspect === aspect || pendingStreamFit?.aspect === aspect) return false;
-  const request = { aspect, generation: activeFrameGeneration, epoch: activeVideoFormatEpoch };
+  const request = { aspect, generation: streamRuntime.generation, epoch: activeVideoFormatEpoch };
   pendingStreamFit = request;
   const geometry = fitInitialStreamWindow({
     frameWidth,
@@ -927,7 +847,7 @@ async function fitWindowToIncomingStream() {
     : null;
   const current = pendingStreamFit === request
     && connectionState.connected
-    && activeFrameGeneration === request.generation
+    && streamRuntime.generation === request.generation
     && currentFormat.epoch === request.epoch
     && currentAspect === request.aspect;
   if (pendingStreamFit === request) pendingStreamFit = null;
@@ -964,168 +884,26 @@ function scheduleStreamWindowAspectCorrection() {
   }, 80);
 }
 
-function sendFrameAcknowledgment(generation) {
-  void invoke('iroh_client_ack_frame', { generation }).catch((error) => {
-    console.warn('frame acknowledgment failed:', error);
-  });
-}
-
-function acknowledgeFrame(session, generation = null) {
-  const readyGeneration = stageFrameAcknowledgment(session, generation);
-  if (readyGeneration !== null) sendFrameAcknowledgment(readyGeneration);
-}
-
-function activateConnectedFrameSession(session, generation) {
-  if (!isActiveFrameSession(session, activeFrameSession)) {
-    throw new Error('frame session was superseded during connect');
-  }
-  const activation = activateFrameSession(session, generation);
-  activeFrameGeneration = generation;
-  for (const pendingGeneration of activation.acknowledgments) {
-    sendFrameAcknowledgment(pendingGeneration);
-  }
-  const pendingError = session.pendingFrameErrors.splice(0).find(
-    (payload) => isCurrentFrameGeneration(payload?.generation, generation),
-  );
-  if (pendingError) throw new Error(pendingError.error || 'Media connection failed');
-  for (const payload of activation.legacyFrames) {
-    if (isCurrentFrameGeneration(payload?.generation, generation)) {
-      videoPipeline.processFramePayload(payload);
-    }
-  }
-}
-
-function failFrameSession(session, error) {
-  if (!isActiveFrameSession(session, activeFrameSession)) return;
-  session.failed = true;
-  session.failureDetail = `Frame delivery failed: ${error}`;
-  console.error(session.failureDetail);
-  if (connectionState.connected) void disconnect();
-}
-
-function handleBinaryFrameMessage(message, session) {
-  if (!isActiveFrameSession(session, activeFrameSession)) return;
-  let acknowledged = false;
-  try {
-    const frame = parseFrameEnvelope(message);
-    // Parsing establishes the exact envelope and payload bounds. Release the
-    // Rust-side delivery permit before codec parsing/decode enqueue so a slow
-    // invoke round trip cannot turn one scheduling hiccup into a full-GOP
-    // discard. WebCodecs remains independently bounded by decodeQueueSize.
-    acknowledgeFrame(session);
-    acknowledged = true;
-    videoPipeline.processFramePayload({
-      width: frame.width,
-      height: frame.height,
-      data: null,
-      codec: frame.codec,
-      keyframe: frame.keyframe,
-      codecConfig: frame.codecConfig,
-      sequence: frame.sequence,
-      pts_micros: frame.ptsMicros,
-      discontinuity: frame.discontinuity,
-    }, frame.data);
-  } catch (error) {
-    failFrameSession(session, error);
-  } finally {
-    if (!acknowledged) {
-      // A malformed envelope disconnects above, but must never deadlock the
-      // bounded sender while teardown reaches Rust.
-      try {
-        acknowledgeFrame(session);
-      } catch (error) {
-        failFrameSession(session, error);
-      }
-    }
-  }
-}
-
 // The software decoder/JPEG compatibility path intentionally remains an event:
 // it is only selected when WebCodecs is unavailable and is not latency-critical.
 listen('frame', (event) => {
-  const session = activeFrameSession;
-  if (!isActiveFrameSession(session, activeFrameSession)) return;
-  try {
-    const delivery = stageLegacyFrame(session, event.payload);
-    for (const generation of delivery.acknowledgments) {
-      sendFrameAcknowledgment(generation);
-    }
-    if (delivery.accepted) videoPipeline.processFramePayload(event.payload);
-  } catch (error) {
-    failFrameSession(session, error);
-  }
+  streamRuntime.handleLegacyFrame(event.payload);
 });
 
 listen('frame-stats', (event) => {
-  if (!isCurrentFrameGeneration(event.payload?.generation, activeFrameGeneration)) return;
-  const diagnostics = normalizeFrameStatsPayload(event.payload);
-  transportDroppedFrames = diagnostics.transportDroppedFrames ?? transportDroppedFrames;
-  transportObjectDroppedFrames = diagnostics.objectDroppedFrames;
-  transportLateObjectDroppedFrames = diagnostics.lateObjectDroppedFrames;
-  frontendDroppedFrames = diagnostics.frontendDroppedFrames ?? frontendDroppedFrames;
-  frontendQueueDroppedFrames = diagnostics.queueDroppedFrames;
-  frontendResyncDroppedFrames = diagnostics.resyncDroppedFrames;
-  frontendQueueStats = diagnostics.queue;
-  frontendResyncStats = diagnostics.resync;
-  transportIntervalStats = diagnostics.transportIntervals;
-  frontendIpcSendDurationStats = diagnostics.ipcSendDurations;
-  rustTimingWindow = diagnostics.timingWindow;
-  networkDiagnostics = diagnostics.networkDiagnostics;
-  streamPathMode = typeof event.payload.path_mode === 'string'
-    ? event.payload.path_mode
-    : streamPathMode;
-  streamRttMs = Number.isFinite(event.payload.path_rtt_ms)
-    ? event.payload.path_rtt_ms
-    : streamRttMs;
-  lastMediaSequence = Number.isSafeInteger(event.payload.sequence) && event.payload.sequence >= 0
-    ? event.payload.sequence : lastMediaSequence;
-  lastTransportFps = Number.isFinite(event.payload.transport_receive_fps)
-    ? event.payload.transport_receive_fps
-    : Number.isFinite(event.payload.transport_fps)
-      ? event.payload.transport_fps
-      : event.payload.fps;
-  lastFrontendSendFps = Number.isFinite(event.payload.frontend_send_fps)
-    ? event.payload.frontend_send_fps
-    : Number.isFinite(event.payload.frontend_fps)
-      ? event.payload.frontend_fps
-      : event.payload.fps;
-  updateStreamStats();
+  if (streamRuntime.handleFrameStats(event.payload)) updateStreamStats();
 });
 
 listen('adaptive-bitrate-decision', (event) => {
-  try {
-    const decision = normalizeAdaptiveDecisionEnvelope(event.payload, activeFrameGeneration);
-    if (decision === null) return;
-    adaptiveDecision = decision;
-    updateStreamStats();
-  } catch (error) {
-    console.warn('invalid adaptive bitrate diagnostic:', error);
-  }
+  if (streamRuntime.handleAdaptiveDecision(event.payload)) updateStreamStats();
 });
 
 listen('adaptive-feedback-state', (event) => {
-  if (!isCurrentFrameGeneration(event.payload?.generation, activeFrameGeneration)) return;
-  if (event.payload?.available !== false) return;
-  adaptiveFeedbackAvailable = false;
-  adaptiveFeedbackError = typeof event.payload.error === 'string'
-    ? event.payload.error : 'feedback stream closed';
-  adaptiveFeedbackPublisher.stop();
-  updateStreamStats();
+  if (streamRuntime.handleAdaptiveFeedbackState(event.payload)) updateStreamStats();
 });
 
 listen('frame-error', (event) => {
-  const session = activeFrameSession;
-  if (!isActiveFrameSession(session, activeFrameSession)) return;
-  if (session.expectedGeneration === null) {
-    if (session.pendingFrameErrors.length < FRAME_CHANNEL_CAPACITY) {
-      session.pendingFrameErrors.push(event.payload);
-    } else {
-      failFrameSession(session, 'pre-connect frame error capacity exceeded');
-    }
-    return;
-  }
-  if (!isCurrentFrameGeneration(event.payload?.generation, session.expectedGeneration)) return;
-  failFrameSession(session, event.payload?.error || 'Media connection failed');
+  streamRuntime.handleFrameError(event.payload);
 });
 
 listen('audio-state', (event) => {

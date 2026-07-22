@@ -382,6 +382,17 @@ impl HostConfig {
     }
 
     pub fn load_document(path: &Path) -> Result<LoadedHostConfig> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        crate::secure_state::validate_integrity_protected_directory(parent).with_context(|| {
+            format!(
+                "validating config directory {} before loading {}",
+                parent.display(),
+                path.display()
+            )
+        })?;
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -601,6 +612,33 @@ mod tests {
 
         fs::write(&path, vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
         assert!(HostConfig::load_document(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_directory_protects_integrity_without_requiring_confidentiality() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().unwrap();
+        let directory = outer.path().join("config");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = directory.join("host.toml");
+        fs::write(
+            &path,
+            b"identity_path = \"/tmp/host.key\"\nstate_path = \"/tmp/state\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        HostConfig::load_document(&path).unwrap();
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(HostConfig::load_document(&path).is_err());
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let linked_directory = outer.path().join("linked-config");
+        symlink(&directory, &linked_directory).unwrap();
+        assert!(HostConfig::load_document(&linked_directory.join("host.toml")).is_err());
     }
 
     #[test]

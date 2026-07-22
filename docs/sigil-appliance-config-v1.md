@@ -17,6 +17,14 @@ sigil appliance config rollback --config ~/.config/sigil-spark/host.toml \
   --transaction <id> --json
 ```
 
+The configuration file must be owned by the effective user and not writable by
+group or other users. Its immediate directory must also be owned by that user,
+must retain owner write and search permission, must not be a symlink, and must
+not be writable by group or other users. A mode-`0755` configuration directory
+is supported; mode `0700` remains the recommended appliance layout because it
+also keeps filenames private. The daemon, `config check`, and every managed
+write enforce this same integrity boundary before doing work.
+
 `set` and `commit` use the service's XDG runtime root to share its global
 lifecycle lock and to bind baseline and candidate evidence to one exact runtime
 directory. When `XDG_RUNTIME_DIR` is unavailable (for example, from a recovery

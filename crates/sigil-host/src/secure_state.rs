@@ -25,25 +25,49 @@ pub fn ensure_private_directory(path: &Path) -> Result<()> {
 }
 
 pub fn validate_private_directory(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspecting private state directory {}", path.display()))?;
-    ensure!(
-        !metadata.file_type().is_symlink(),
-        "private state directory must not be a symlink"
-    );
-    ensure!(metadata.is_dir(), "private state path must be a directory");
+    let metadata = validate_owned_directory(path)?;
     #[cfg(unix)]
     {
         ensure!(
             metadata.mode() & 0o077 == 0,
             "private state directory is accessible by group or others"
         );
+    }
+    Ok(())
+}
+
+pub fn validate_integrity_protected_directory(path: &Path) -> Result<()> {
+    let metadata = validate_owned_directory(path)?;
+    #[cfg(unix)]
+    {
         ensure!(
-            metadata.uid() == unsafe { libc::geteuid() },
-            "private state directory has the wrong owner"
+            metadata.mode() & 0o300 == 0o300,
+            "protected directory must be writable and searchable by its owner"
+        );
+        ensure!(
+            metadata.mode() & 0o022 == 0,
+            "protected directory is writable by group or others"
         );
     }
     Ok(())
+}
+
+fn validate_owned_directory(path: &Path) -> Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting owned directory {}", path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink(),
+        "owned directory must not be a symlink"
+    );
+    ensure!(metadata.is_dir(), "owned path must be a directory");
+    #[cfg(unix)]
+    {
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() },
+            "owned directory has the wrong owner"
+        );
+    }
+    Ok(metadata)
 }
 
 #[derive(Debug)]
@@ -162,6 +186,25 @@ pub fn atomic_write_exact(
     maximum_bytes: u64,
 ) -> Result<()> {
     validate_private_directory(directory)?;
+    atomic_write_exact_in_validated_directory(directory, file_name, bytes, maximum_bytes)
+}
+
+pub fn atomic_write_exact_in_integrity_protected_directory(
+    directory: &Path,
+    file_name: &str,
+    bytes: &[u8],
+    maximum_bytes: u64,
+) -> Result<()> {
+    validate_integrity_protected_directory(directory)?;
+    atomic_write_exact_in_validated_directory(directory, file_name, bytes, maximum_bytes)
+}
+
+fn atomic_write_exact_in_validated_directory(
+    directory: &Path,
+    file_name: &str,
+    bytes: &[u8],
+    maximum_bytes: u64,
+) -> Result<()> {
     ensure!(
         bytes.len() as u64 <= maximum_bytes,
         "private state file exceeds its fixed size bound"
@@ -313,6 +356,60 @@ mod tests {
         );
         assert!(remove_file_if_exists(directory.path(), "config.toml").unwrap());
         assert!(!remove_file_if_exists(directory.path(), "config.toml").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn integrity_protected_atomic_write_accepts_readable_but_not_writable_directory() {
+        let directory = private_directory();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            atomic_write_exact(directory.path(), "private.toml", b"framerate = 60\n", 64,).is_err()
+        );
+        atomic_write_exact_in_integrity_protected_directory(
+            directory.path(),
+            "host.toml",
+            b"framerate = 60\n",
+            64,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(directory.path().join("host.toml")).unwrap(),
+            b"framerate = 60\n"
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join("host.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            atomic_write_exact_in_integrity_protected_directory(
+                directory.path(),
+                "host.toml",
+                b"framerate = 72\n",
+                64,
+            )
+            .is_err()
+        );
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            atomic_write_exact_in_integrity_protected_directory(
+                directory.path(),
+                "host.toml",
+                b"framerate = 72\n",
+                64,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(directory.path().join("host.toml")).unwrap(),
+            b"framerate = 60\n"
+        );
     }
 
     #[cfg(unix)]

@@ -405,6 +405,7 @@ validate_probe() {
   local size="$3"
   local request_id="$4"
   local slow_consumer_ms="${5:-}"
+  local expected_path_mode="${6:-direct}"
   grep -Fxq probe=ok "$log"
   grep -Fxq "dimensions=$size" "$log"
   grep -Fxq "transport=$transport" "$log"
@@ -414,10 +415,14 @@ validate_probe() {
   grep -Fxq recovery_barrier=configured-idr "$log"
   grep -Fxq keyframe_recovery=ok "$log"
   grep -Fxq "keyframe_request_id=$request_id" "$log"
-  grep -Fxq path_mode=direct "$log"
+  grep -Fxq "path_mode=$expected_path_mode" "$log"
+  grep -Fxq "media_path_mode=$expected_path_mode" "$log"
+  grep -Fxq "input_path_mode=$expected_path_mode" "$log"
+  grep -Fxq "forced_relay=$([[ "$expected_path_mode" == relay ]] && printf ok || printf not-requested)" "$log"
   awk -F= '$1 == "keyframe_recovery_micros" && $2 ~ /^[0-9]+$/ && $2 <= 2000000 { ok=1 } END { exit !ok }' "$log"
   awk -F= '$1 == "input_ack_micros" && $2 ~ /^[0-9]+$/ { ok=1 } END { exit !ok }' "$log"
   if [[ "$transport" == iroh-moq ]]; then
+    grep -Fxq "control_path_mode=$expected_path_mode" "$log"
     grep -Fxq control_alpn=sigil/control/1 "$log"
     grep -Fxq moq_group_capacity=1 "$log"
     grep -Fxq moq_unrecovered_group_gaps=0 "$log"
@@ -463,6 +468,7 @@ run_probe_cycle() {
   local request_id="$4"
   local invitation_path="${5:-}"
   local slow_consumer_ms="${6:-}"
+  local expected_path_mode="${7:-direct}"
   local log="$raw/$mode-$transport-$request_id.log"
   local command=(
     "$probe"
@@ -477,8 +483,9 @@ run_probe_cycle() {
   [[ "$transport" == grouped-v3 ]] && command+=(--media-v3)
   [[ -n "$invitation_path" ]] && command+=(--invitation "$invitation_path")
   [[ -n "$slow_consumer_ms" ]] && command+=(--slow-consumer-ms "$slow_consumer_ms")
+  [[ "$expected_path_mode" != relay ]] || command+=(--relay-only)
   timeout --signal=TERM --kill-after=5s 45s "${command[@]}" >"$log" 2>&1
-  validate_probe "$log" "$transport" "$size" "$request_id" "$slow_consumer_ms"
+  validate_probe "$log" "$transport" "$size" "$request_id" "$slow_consumer_ms" "$expected_path_mode"
 }
 
 validate_host_recovery() {
@@ -516,7 +523,7 @@ grep -Fxq probe=ok "$evidence/fixed-capture.log"
 grep -Fxq dropped_after_encode_before_probe_consumer=0 "$evidence/fixed-capture.log"
 
 start_candidate fixed "$fixed_config"
-run_probe_cycle fixed iroh-moq 1280x800 1001 "$invitation" 1500
+run_probe_cycle fixed iroh-moq 1280x800 1001 "$invitation" 1500 relay
 wait_for_count "$raw/fixed-host.log" 'MoQ control client released' 1
 wait_for_count "$raw/fixed-host.log" 'input client released' 1
 enrollment="$("$sigil" enrollment show --config "$fixed_config")"
@@ -644,6 +651,8 @@ fi
   echo "total_sessions=$total_sessions"
   echo slow_media_consumer=pass
   echo slow_media_consumer_resolutions=1280x800,"$native_size"
+  echo forced_relay=pass
+  echo forced_relay_scope=probe-control-media-input
   summarize_group fixed-iroh-moq
   summarize_group fixed-grouped-v3
   summarize_group native-iroh-moq

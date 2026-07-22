@@ -1,3 +1,4 @@
+pub(crate) mod audio_delivery;
 pub(crate) mod frame_channel;
 pub(crate) mod metrics;
 pub(crate) mod moq_catalog;

@@ -278,12 +278,13 @@ wait_for_log_count() {
 host_accepted_keyframe_request() {
   local log_path="$1"
   local request_id="$2"
-  awk -v request_id="$request_id" '
-    index($0, "accepted media v3 keyframe request") \
-      && $0 ~ ("request_id=" request_id "([^[:digit:]]|$)") \
-      && index($0, "coalesced=false") { found=1 }
-    END { exit !found }
-  ' "$log_path" 2>/dev/null
+  sed $'s/\033\\[[0-9;]*m//g' "$log_path" 2>/dev/null \
+    | awk -v request_id="$request_id" '
+      index($0, "accepted media v3 keyframe request") \
+        && $0 ~ ("request_id=" request_id "([^[:digit:]]|$)") \
+        && index($0, "coalesced=false") { found=1 }
+      END { exit !found }
+    '
 }
 
 wait_for_keyframe_request() {

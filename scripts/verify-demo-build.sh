@@ -74,8 +74,12 @@ if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
 fi
 if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
   if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
-    PKG_CONFIG_ALLOW_CROSS=1 cargo zigbuild --locked -p sigil-host --bins \
-      --target x86_64-unknown-linux-gnu.2.17 --features in-process-gstreamer
+    # Zig intentionally omits the host's default system-library paths for an
+    # explicit target. Preserve pkg-config's system -L entries so the dynamic
+    # GStreamer/GLib development libraries remain linkable without an rpath.
+    PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 \
+      cargo zigbuild --locked -p sigil-host --bins \
+        --target x86_64-unknown-linux-gnu.2.17 --features in-process-gstreamer
   else
     cargo zigbuild --locked -p sigil-host --bins \
       --target x86_64-unknown-linux-gnu.2.17

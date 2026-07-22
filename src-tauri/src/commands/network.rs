@@ -6,7 +6,7 @@ pub use crate::media::connect::ConnectResult;
 use crate::media::connect::{connect_client, disconnect_client};
 #[allow(unused_imports)]
 pub use crate::media::frame_channel::FramePayload;
-use crate::media::frame_channel::release_frame_channel_slot_for_generation;
+use crate::media::frame_channel::acknowledge_frame_delivery;
 use crate::media::input_delivery::send_input;
 #[allow(unused_imports)]
 pub use crate::media::input_delivery::{PointerFeedbackPayload, PointerFeedbackTerminalReason};
@@ -72,19 +72,7 @@ pub async fn iroh_client_ack_frame(
     state: State<'_, AppState>,
     generation: u64,
 ) -> Result<bool, String> {
-    // Serialize selection of the generation-owned counter against connect and
-    // disconnect. Each media task keeps its own counter, so an old callback can
-    // never consume a permit reserved by a replacement session.
-    let _connection_serial = state.client_connection_serial.lock().await;
-    let delivery = state.frame_delivery.lock().await;
-    let Some((current_generation, in_flight)) = delivery.as_ref() else {
-        return Ok(false);
-    };
-    Ok(release_frame_channel_slot_for_generation(
-        in_flight,
-        *current_generation,
-        generation,
-    ))
+    acknowledge_frame_delivery(&state, generation).await
 }
 
 #[tauri::command]

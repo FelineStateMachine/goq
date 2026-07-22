@@ -4,6 +4,8 @@ use serde::Serialize;
 use sigil_protocol::{MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS};
 use tauri::{AppHandle, Emitter};
 
+use crate::commands::state::AppState;
+
 pub(crate) fn byte_to_codec(value: u8) -> &'static str {
     match value {
         1 => "h264",
@@ -204,7 +206,7 @@ pub(crate) fn release_frame_channel_slot(in_flight: &AtomicUsize) {
     });
 }
 
-pub(crate) fn release_frame_channel_slot_for_generation(
+fn release_frame_channel_slot_for_generation(
     in_flight: &AtomicUsize,
     current_generation: u64,
     generation: u64,
@@ -214,6 +216,25 @@ pub(crate) fn release_frame_channel_slot_for_generation(
     }
     release_frame_channel_slot(in_flight);
     true
+}
+
+pub(crate) async fn acknowledge_frame_delivery(
+    state: &AppState,
+    generation: u64,
+) -> Result<bool, String> {
+    // Serialize selection of the generation-owned counter against connect and
+    // disconnect. Each media task keeps its own counter, so an old callback can
+    // never consume a permit reserved by a replacement session.
+    let _connection_serial = state.client_connection_serial.lock().await;
+    let delivery = state.frame_delivery.lock().await;
+    let Some((current_generation, in_flight)) = delivery.as_ref() else {
+        return Ok(false);
+    };
+    Ok(release_frame_channel_slot_for_generation(
+        in_flight,
+        *current_generation,
+        generation,
+    ))
 }
 
 pub(crate) fn next_media_generation(counter: &AtomicU64) -> Result<u64, String> {

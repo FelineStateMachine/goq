@@ -100,10 +100,16 @@ class Runner:
             stderr=asyncio.subprocess.PIPE,
             env=self.environment(),
         )
-        if stdin is not None and process.stdin is not None:
-            process.stdin.write(stdin)
-            await process.stdin.drain()
-            process.stdin.close()
+
+        async def stop_child() -> None:
+            if process.returncode is not None:
+                return
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
 
         async def read_bounded(stream: asyncio.StreamReader | None) -> bytes:
             if stream is None:
@@ -120,6 +126,10 @@ class Runner:
                     raise ControllerError("output_limit")
 
         try:
+            if stdin is not None and process.stdin is not None:
+                process.stdin.write(stdin)
+                await process.stdin.drain()
+                process.stdin.close()
             stdout, stderr, _ = await asyncio.wait_for(
                 asyncio.gather(
                     read_bounded(process.stdout),
@@ -129,11 +139,13 @@ class Runner:
                 timeout=timeout,
             )
         except (TimeoutError, ControllerError) as error:
-            process.kill()
-            await process.wait()
+            await stop_child()
             if isinstance(error, ControllerError):
                 raise
             raise ControllerError("command_timeout") from error
+        except BaseException:
+            await stop_child()
+            raise
 
         result = CommandResult(process.returncode or 0, stdout, stderr)
         if check and result.returncode != 0:

@@ -24,6 +24,7 @@ import {
 } from "./api";
 import {
   buildConfigRequest,
+  isValidHostFingerprint,
   normalizeConfig,
   normalizeSnapshot,
   transactionId,
@@ -100,6 +101,9 @@ function Content() {
       setDraft(config.draft);
       setConfigPending(config.pendingTransaction);
     } catch (error) {
+      setRevision("");
+      setDraft(null);
+      setConfigPending(null);
       setLoadError(errorMessage(error));
     } finally {
       setBusy(null);
@@ -115,6 +119,10 @@ function Content() {
     [configPending, snapshot],
   );
   const controlsDisabled = busy !== null || draft === null || snapshot?.compatible === false;
+  const resetAllowed =
+    busy === null &&
+    snapshot?.compatible === true &&
+    isValidHostFingerprint(snapshot.hostFingerprint);
 
   const run = useCallback(
     async (label: string, action: () => Promise<RpcEnvelope<unknown>>, success: string) => {
@@ -173,8 +181,31 @@ function Content() {
     );
   };
 
+  const confirmApply = (parent?: EventTarget) => {
+    if (!snapshot?.sessionActive) {
+      void apply();
+      return;
+    }
+    showModal(
+      <ConfirmModal
+        strTitle="Apply while streaming?"
+        strDescription="Applying this configuration will disconnect the active Portal session while Sigil validates and restarts."
+        strOKButtonText="Apply and disconnect"
+        strCancelButtonText="Cancel"
+        onOK={() => void apply()}
+      />,
+      parent,
+    );
+  };
+
   const confirmEnrollmentReset = (parent?: EventTarget) => {
-    if (!snapshot) return;
+    if (
+      !snapshot ||
+      snapshot.compatible !== true ||
+      !isValidHostFingerprint(snapshot.hostFingerprint)
+    ) {
+      return;
+    }
     showModal(
       <ConfirmModal
         strTitle="Reset Portal pairing?"
@@ -296,7 +327,11 @@ function Content() {
             </>
           )}
           <PanelSectionRow>
-            <ButtonItem layout="below" disabled={controlsDisabled} onClick={() => void apply()}>
+            <ButtonItem
+              layout="below"
+              disabled={controlsDisabled}
+              onClick={(event) => confirmApply(event.currentTarget ?? undefined)}
+            >
               Validate and apply
             </ButtonItem>
           </PanelSectionRow>
@@ -333,7 +368,7 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            disabled={busy !== null || !snapshot}
+            disabled={!resetAllowed}
             onClick={(event) => confirmEnrollmentReset(event.currentTarget ?? undefined)}
           >
             Reset Portal pairing…

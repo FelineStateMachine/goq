@@ -5,10 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from goq_sigil.controller import Controller
 from goq_sigil.errors import ControllerError
-from goq_sigil.runner import CommandResult, strict_json
+from goq_sigil.runner import CommandResult, Runner, strict_json
 
 
 REVISION_A = "sha256:" + "a" * 64
@@ -43,6 +44,11 @@ class FakeRunner:
         self.next_instance = 2
         self.calls: list[tuple[str, Any]] = []
         self.fail_ready = False
+        self.keep_stale_instance = False
+        self.fail_start_number: int | None = None
+        self.start_count = 0
+        self.pending: dict[str, Any] | None = None
+        self.fail_rollback = False
 
     async def systemctl_command(
         self, action: str, *, check: bool = True, timeout: float = 15.0
@@ -58,9 +64,13 @@ class FakeRunner:
             ).encode()
             return CommandResult(0, output, b"")
         if action in {"start", "restart"}:
+            self.start_count += 1
+            if self.fail_start_number == self.start_count:
+                raise ControllerError("command_failed")
             self.active = True
-            self.next_instance += 1
-            self.instance = f"{self.next_instance:032x}"
+            if not self.keep_stale_instance:
+                self.next_instance += 1
+                self.instance = f"{self.next_instance:032x}"
         elif action == "stop":
             self.active = False
         return CommandResult(0, b"", b"")
@@ -99,7 +109,7 @@ class FakeRunner:
                 "schema_version": 1,
                 "revision": self.revision,
                 "settings": request()["settings"],
-                "pending_transaction": None,
+                "pending_transaction": self.pending,
             }
         if operation == ("appliance", "config", "validate"):
             return {
@@ -111,6 +121,12 @@ class FakeRunner:
             }
         if operation == ("appliance", "config", "set"):
             self.revision = REVISION_B
+            self.pending = {
+                "transaction": TRANSACTION,
+                "base_revision": REVISION_A,
+                "candidate_revision": REVISION_B,
+                "state": "pending_validation",
+            }
             return {
                 "schema_version": 1,
                 "transaction": TRANSACTION,
@@ -119,6 +135,7 @@ class FakeRunner:
                 "restart_required": True,
             }
         if operation == ("appliance", "config", "commit"):
+            self.pending = None
             return {
                 "schema_version": 1,
                 "operation": "config_commit",
@@ -126,7 +143,10 @@ class FakeRunner:
                 "revision": REVISION_B,
             }
         if operation == ("appliance", "config", "rollback"):
+            if self.fail_rollback:
+                raise ControllerError("command_failed")
             self.revision = REVISION_A
+            self.pending = None
             return {
                 "schema_version": 1,
                 "operation": "config_rollback",
@@ -149,6 +169,11 @@ class FakeRunner:
 class FastController(Controller):
     async def _wait_ready(self, **kwargs):
         if self.runner.fail_ready and self.runner.revision == REVISION_B:
+            raise ControllerError("service_ready_timeout")
+        if (
+            self.runner.keep_stale_instance
+            and kwargs.get("previous_instance") == self.runner.instance
+        ):
             raise ControllerError("service_ready_timeout")
         return await super()._wait_ready(**kwargs)
 
@@ -199,6 +224,34 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             ("sigil", ("appliance", "config", "rollback")), self.runner.calls
         )
 
+    async def test_stale_snapshot_cannot_prove_restart(self):
+        self.runner.keep_stale_instance = True
+        with self.assertRaisesRegex(ControllerError, "service_ready_timeout"):
+            await self.controller.restart_service()
+
+    async def test_post_commit_start_failure_does_not_attempt_impossible_rollback(self):
+        self.runner.fail_start_number = 2
+        with self.assertRaisesRegex(ControllerError, "post_commit_service_unhealthy"):
+            await self.controller.apply_config(request())
+        self.assertEqual(self.runner.revision, REVISION_B)
+        self.assertNotIn(
+            ("sigil", ("appliance", "config", "rollback")), self.runner.calls
+        )
+        self.assertTrue(self.runner.active)
+
+    async def test_failed_explicit_rollback_leaves_unproven_candidate_stopped(self):
+        self.runner.revision = REVISION_B
+        self.runner.pending = {
+            "transaction": TRANSACTION,
+            "base_revision": REVISION_A,
+            "candidate_revision": REVISION_B,
+            "state": "pending_validation",
+        }
+        self.runner.fail_rollback = True
+        with self.assertRaisesRegex(ControllerError, "rollback_failed_safe"):
+            await self.controller.rollback_pending(TRANSACTION)
+        self.assertFalse(self.runner.active)
+
     async def test_reset_stops_before_mutation_and_restores_prior_state(self):
         result = await self.controller.reset_enrollment(FINGERPRINT)
         self.assertEqual(result["current_epoch"], 5)
@@ -247,6 +300,57 @@ class JsonTests(unittest.TestCase):
     def test_wrong_schema_is_rejected(self):
         with self.assertRaisesRegex(ControllerError, "incompatible_sigil"):
             strict_json(b'{"schema_version":2}', 1)
+
+
+class HangingStream:
+    async def read(self, _size):
+        await asyncio.Future()
+
+
+class FakeProcess:
+    def __init__(self):
+        self.returncode = None
+        self.stdin = None
+        self.stdout = HangingStream()
+        self.stderr = HangingStream()
+        self.terminated = False
+        self._done = asyncio.Event()
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+        self._done.set()
+
+    def kill(self):
+        self.returncode = -9
+        self._done.set()
+
+    async def wait(self):
+        await self._done.wait()
+        return self.returncode
+
+
+class TestRunner(Runner):
+    def environment(self):
+        return {}
+
+
+class RunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancellation_terminates_and_reaps_child(self):
+        process = FakeProcess()
+
+        async def create(*_args, **_kwargs):
+            return process
+
+        runner = TestRunner("/fixture", uid=1000)
+        with mock.patch("asyncio.create_subprocess_exec", create):
+            task = asyncio.create_task(runner.run(["/fixed-command"], timeout=60))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(process.terminated)
+        self.assertIsNotNone(process.returncode)
 
 
 if __name__ == "__main__":

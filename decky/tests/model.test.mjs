@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildConfigRequest,
   formatUptime,
+  isValidHostFingerprint,
   normalizeConfig,
   normalizeSnapshot,
   transactionId,
@@ -109,4 +110,12 @@ test("rejects unsafe or invalid local edits before backend validation", () => {
 test("formats short and absent uptime safely", () => {
   assert.equal(formatUptime(59_999), "0m");
   assert.equal(formatUptime(undefined), "Unavailable");
+});
+
+test("accepts only the redacted lowercase host fingerprint interlock", () => {
+  assert.equal(isValidHostFingerprint("12345678…90abcdef"), true);
+  assert.equal(isValidHostFingerprint("12345678...90abcdef"), false);
+  assert.equal(isValidHostFingerprint("12345678…90abcdeF"), false);
+  assert.equal(isValidHostFingerprint("Unavailable"), false);
+  assert.equal(isValidHostFingerprint(undefined), false);
 });

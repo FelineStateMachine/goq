@@ -172,3 +172,7 @@ export function buildConfigRequest(revision, draft) {
 export function transactionId(pending) {
   return text(record(pending).transaction) || null;
 }
+
+export function isValidHostFingerprint(fingerprint) {
+  return typeof fingerprint === "string" && /^[0-9a-f]{8}…[0-9a-f]{8}$/.test(fingerprint);
+}

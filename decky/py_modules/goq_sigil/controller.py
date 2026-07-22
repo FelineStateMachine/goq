@@ -145,7 +145,10 @@ class Controller:
                 }
 
             was_active = (await self._service())["active"]
+            baseline_instance = await self._current_instance()
             transaction: str | None = None
+            candidate_instance: str | None = None
+            candidate_revision: str | None = None
             try:
                 await self._stop_and_wait()
                 installed = await self.runner.sigil_json(
@@ -162,12 +165,16 @@ class Controller:
                 transaction = installed.get("transaction")
                 if not isinstance(transaction, str) or not TRANSACTION.fullmatch(transaction):
                     raise ControllerError("invalid_response")
-                candidate_revision = installed.get("candidate_revision")
+                candidate_revision = self._revision(installed.get("candidate_revision"))
                 await self.runner.systemctl_command("start")
-                ready = await self._wait_ready(expected_revision=candidate_revision)
+                ready = await self._wait_ready(
+                    expected_revision=candidate_revision,
+                    previous_instance=baseline_instance,
+                )
                 instance = ready.get("runtime", {}).get("instance_id")
                 if not isinstance(instance, str) or not TRANSACTION.fullmatch(instance):
                     raise ControllerError("health_not_proven")
+                candidate_instance = instance
                 await self._stop_and_wait()
                 committed = await self.runner.sigil_json(
                     [
@@ -183,44 +190,92 @@ class Controller:
                         "--json",
                     ]
                 )
-                if was_active:
-                    await self.runner.systemctl_command("start")
-                    await self._wait_ready(expected_revision=committed.get("revision"))
-                return {
-                    "schema_version": 1,
-                    "operation": "config_apply",
-                    "changed": True,
-                    "revision": committed.get("revision"),
-                }
-            except Exception as failure:
-                rollback_ok = await self._recover_apply(transaction, was_active)
-                if isinstance(failure, ControllerError) and not rollback_ok:
-                    raise ControllerError("rollback_failed") from failure
+                committed_revision = self._revision(committed.get("revision"))
+                if committed_revision != candidate_revision:
+                    raise ControllerError("invalid_response")
+            except BaseException as failure:
+                rollback_ok = await asyncio.shield(
+                    self._recover_apply(
+                        transaction,
+                        was_active,
+                        baseline_instance,
+                        request["expected_revision"],
+                    )
+                )
+                if isinstance(failure, asyncio.CancelledError):
+                    raise
                 if not rollback_ok:
                     raise ControllerError("rollback_failed") from failure
                 raise ControllerError("apply_rolled_back") from failure
+
+            if was_active:
+                try:
+                    await self._start_and_wait(candidate_instance, committed_revision)
+                except BaseException as failure:
+                    # The transaction is already committed. Never claim that it rolled back
+                    # or stop the proven candidate after a UI/service-health failure.
+                    try:
+                        await asyncio.shield(self.runner.systemctl_command("start"))
+                    except Exception:
+                        pass
+                    if isinstance(failure, asyncio.CancelledError):
+                        raise
+                    raise ControllerError("post_commit_service_unhealthy") from failure
+            return {
+                "schema_version": 1,
+                "operation": "config_apply",
+                "changed": True,
+                "revision": committed_revision,
+            }
 
     async def rollback_pending(self, transaction: str) -> dict[str, Any]:
         if not TRANSACTION.fullmatch(transaction):
             raise ControllerError("invalid_request")
         async with self._mutation_lock:
             was_active = (await self._service())["active"]
+            previous_instance = await self._current_instance()
+            before = await self.get_config()
+            pending = before.get("pending_transaction")
+            if not isinstance(pending, dict) or pending.get("transaction") != transaction:
+                raise ControllerError("transaction_not_found")
+            base_revision = self._revision(pending.get("base_revision"))
             await self._stop_and_wait()
-            result = await self.runner.sigil_json(
-                [
-                    "appliance",
-                    "config",
-                    "rollback",
-                    "--config",
-                    str(self.runner.config),
-                    "--transaction",
-                    transaction,
-                    "--json",
-                ]
-            )
+            try:
+                result = await self.runner.sigil_json(
+                    [
+                        "appliance",
+                        "config",
+                        "rollback",
+                        "--config",
+                        str(self.runner.config),
+                        "--transaction",
+                        transaction,
+                        "--json",
+                    ]
+                )
+                restored_revision = self._revision(result.get("restored_revision"))
+                if restored_revision != base_revision:
+                    raise ControllerError("invalid_response")
+            except BaseException as failure:
+                completed = await asyncio.shield(
+                    self._rollback_completed(transaction, base_revision)
+                )
+                if completed and was_active:
+                    try:
+                        await asyncio.shield(
+                            self._start_and_wait(previous_instance, base_revision)
+                        )
+                    except Exception as recovery_error:
+                        raise ControllerError("rollback_service_unhealthy") from recovery_error
+                if isinstance(failure, asyncio.CancelledError):
+                    raise
+                if completed:
+                    raise ControllerError("rollback_response_lost") from failure
+                # The candidate may still be live in the config file. Staying stopped is
+                # the only fail-closed outcome until the user retries explicit rollback.
+                raise ControllerError("rollback_failed_safe") from failure
             if was_active:
-                await self.runner.systemctl_command("start")
-                await self._wait_ready(expected_revision=result.get("restored_revision"))
+                await self._start_and_wait(previous_instance, restored_revision)
             return result
 
     async def reset_enrollment(self, expected_host_fingerprint: str) -> dict[str, Any]:
@@ -228,6 +283,9 @@ class Controller:
             raise ControllerError("invalid_request")
         async with self._mutation_lock:
             was_active = (await self._service())["active"]
+            previous_instance = await self._current_instance()
+            failure: BaseException | None = None
+            result: dict[str, Any] | None = None
             try:
                 await self._stop_and_wait()
                 result = await self.runner.sigil_json(
@@ -241,17 +299,46 @@ class Controller:
                         "--json",
                     ]
                 )
-            finally:
-                if was_active:
-                    await self.runner.systemctl_command("start")
-                    await self._wait_ready()
+            except BaseException as error:
+                failure = error
+            restore_ok = True
+            if was_active:
+                try:
+                    await asyncio.shield(
+                        self._start_and_wait(previous_instance, None)
+                    )
+                except Exception:
+                    restore_ok = False
+            if failure is not None:
+                if isinstance(failure, asyncio.CancelledError):
+                    raise failure
+                if not restore_ok:
+                    raise ControllerError("reset_restore_failed") from failure
+                raise failure
+            if not restore_ok:
+                raise ControllerError("reset_restore_failed")
+            if result is None:
+                raise ControllerError("invalid_response")
             return result
 
-    async def _recover_apply(self, transaction: str | None, was_active: bool) -> bool:
+    async def _recover_apply(
+        self,
+        transaction: str | None,
+        was_active: bool,
+        previous_instance: str | None,
+        base_revision: str,
+    ) -> bool:
         try:
             await self._stop_and_wait()
+            if transaction is None:
+                shown = await self.get_config()
+                pending = shown.get("pending_transaction")
+                if isinstance(pending, dict):
+                    candidate = pending.get("transaction")
+                    if isinstance(candidate, str) and TRANSACTION.fullmatch(candidate):
+                        transaction = candidate
             if transaction is not None:
-                await self.runner.sigil_json(
+                rolled_back = await self.runner.sigil_json(
                     [
                         "appliance",
                         "config",
@@ -263,12 +350,46 @@ class Controller:
                         "--json",
                     ]
                 )
+                base_revision = self._revision(rolled_back.get("restored_revision"))
             if was_active:
-                await self.runner.systemctl_command("start")
-                await self._wait_ready()
+                await self._start_and_wait(previous_instance, base_revision)
             return True
-        except Exception:
+        except BaseException:
             return False
+
+    async def _rollback_completed(self, transaction: str, base_revision: str) -> bool:
+        try:
+            shown = await self.get_config()
+            return (
+                shown.get("revision") == base_revision
+                and shown.get("pending_transaction") is None
+            )
+        except ControllerError:
+            return False
+
+    async def _current_instance(self) -> str | None:
+        try:
+            instance = (await self._status()).get("runtime", {}).get("instance_id")
+            if instance is None:
+                # A successful status read with no instance proves there is no stale
+                # daemon snapshot to confuse with the process about to start.
+                return ""
+            return (
+                instance
+                if isinstance(instance, str) and TRANSACTION.fullmatch(instance)
+                else None
+            )
+        except ControllerError:
+            return None
+
+    async def _start_and_wait(
+        self, previous_instance: str | None, expected_revision: str | None
+    ) -> dict[str, Any]:
+        await self.runner.systemctl_command("start")
+        return await self._wait_ready(
+            expected_revision=expected_revision,
+            previous_instance=previous_instance,
+        )
 
     async def _stop_and_wait(self) -> None:
         await self.runner.systemctl_command("stop")
@@ -295,7 +416,9 @@ class Controller:
                     expected_revision is None
                     or runtime.get("loaded_config_revision") == expected_revision
                 )
-                instance_ok = previous_instance is None or instance != previous_instance
+                instance_ok = (
+                    isinstance(previous_instance, str) and instance != previous_instance
+                )
                 if (
                     status.get("overall") in {"ready", "active"}
                     and runtime.get("state") == "fresh"
@@ -309,6 +432,12 @@ class Controller:
                 pass
             await asyncio.sleep(POLL_SECONDS)
         raise ControllerError("service_ready_timeout")
+
+    @staticmethod
+    def _revision(value: Any) -> str:
+        if not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise ControllerError("invalid_response")
+        return value
 
     @staticmethod
     def _validate_config_request(request: dict[str, Any]) -> None:
@@ -333,7 +462,11 @@ class Controller:
         }:
             raise ControllerError("invalid_request")
         framerate = settings["framerate"]
-        if not isinstance(framerate, int) or isinstance(framerate, bool) or not 1 <= framerate <= 240:
+        if (
+            not isinstance(framerate, int)
+            or isinstance(framerate, bool)
+            or not 1 <= framerate <= 240
+        ):
             raise ControllerError("invalid_request")
         resolution = settings["resolution"]
         if not isinstance(resolution, dict) or resolution.get("mode") not in {

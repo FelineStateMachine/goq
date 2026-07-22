@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "plugin_version": "0.1.0",
+  "sigil": {
+    "minimum_version": "0.1.0",
+    "appliance_status_schema": 2,
+    "config_schema": 1,
+    "enrollment_reset_schema": 1
+  }
+}

@@ -56,3 +56,4 @@ export function normalizeConfig(rawValue: unknown): {
 };
 export function buildConfigRequest(revision: string, draft: ConfigDraft): ConfigRequest;
 export function transactionId(pending: unknown): string | null;
+export function isValidHostFingerprint(fingerprint: unknown): fingerprint is string;

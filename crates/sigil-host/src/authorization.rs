@@ -665,4 +665,90 @@ mod tests {
         );
         assert!(!snapshot.grants.unwrap().contains(InvitationGrants::GAMEPAD));
     }
+
+    #[test]
+    fn consumed_nonce_replay_survives_revoke_and_store_reopen() {
+        let (_directory, host, peer, store) = store();
+        let nonce = [6; 32];
+        let first = token(
+            &store,
+            &host,
+            peer.public(),
+            1_000,
+            nonce,
+            InvitationGrants::VIEW,
+        );
+        store
+            .authorize_or_redeem(peer.public(), Some(&first), 1_001)
+            .unwrap();
+        assert!(store.revoke(1_002).unwrap());
+
+        let reopened =
+            AuthorizationStore::open(store.state_directory.clone(), host.public()).unwrap();
+        let replay = token(
+            &reopened,
+            &host,
+            peer.public(),
+            1_003,
+            nonce,
+            InvitationGrants::VIEW,
+        );
+        let state_before = fs::read(reopened.state_path()).unwrap();
+        let error = reopened
+            .authorize_or_redeem(peer.public(), Some(&replay), 1_004)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already been consumed"));
+        assert_eq!(fs::read(reopened.state_path()).unwrap(), state_before);
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(snapshot.epoch, 2);
+        assert!(snapshot.peer.is_none());
+    }
+
+    #[test]
+    fn invitation_clock_boundaries_are_inclusive_and_fail_closed_outside_skew() {
+        let (_directory, host, peer, expiry_store) = store();
+        let expires_at = token(
+            &expiry_store,
+            &host,
+            peer.public(),
+            1_000,
+            [7; 32],
+            InvitationGrants::VIEW,
+        );
+        assert!(
+            expiry_store
+                .authorize_or_redeem(peer.public(), Some(&expires_at), 1_600)
+                .is_ok()
+        );
+
+        let (_directory, host, peer, skew_store) = store();
+        let exact_skew = token(
+            &skew_store,
+            &host,
+            peer.public(),
+            1_060,
+            [8; 32],
+            InvitationGrants::VIEW,
+        );
+        assert!(
+            skew_store
+                .authorize_or_redeem(peer.public(), Some(&exact_skew), 1_000)
+                .is_ok()
+        );
+
+        let (_directory, host, peer, outside_store) = store();
+        let outside_skew = token(
+            &outside_store,
+            &host,
+            peer.public(),
+            1_061,
+            [9; 32],
+            InvitationGrants::VIEW,
+        );
+        let error = outside_store
+            .authorize_or_redeem(peer.public(), Some(&outside_skew), 1_000)
+            .unwrap_err();
+        assert!(error.to_string().contains("too far in the future"));
+    }
 }

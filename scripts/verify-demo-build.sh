@@ -99,6 +99,10 @@ cargo test --locked -p portal --release \
   commands::state::tests::rejects_direct_node_when_debug_mode_is_disabled \
   -- --exact
 
+cargo test --locked -p portal --release \
+  commands::state::tests::ordinary_release_excludes_direct_node_bypass \
+  -- --exact
+
 cargo test --locked -p portal --release --features demo-direct-node \
   commands::state::tests::app_state_accepts_direct_node_only_in_debug_builds \
   -- --exact

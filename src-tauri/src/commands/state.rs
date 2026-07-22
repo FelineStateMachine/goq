@@ -724,6 +724,13 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_release_excludes_direct_node_bypass() {
+        if cfg!(not(debug_assertions)) && cfg!(not(feature = "demo-direct-node")) {
+            assert!(!development_direct_node_available());
+        }
+    }
+
+    #[test]
     fn app_state_accepts_direct_node_only_in_debug_builds() {
         let node_id = test_node_id();
         let result = AppState::from_args(["portal", "--dev-connect", &node_id]);

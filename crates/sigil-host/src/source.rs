@@ -29,6 +29,8 @@ const MAX_INSPECT_OUTPUT: usize = 1024 * 1024;
 const MAX_DIAGNOSTIC_OUTPUT: usize = 512 * 1024;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ENCODER_BITRATE_KBPS: u32 = 100_000;
+#[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
+const RESOLUTION_APPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RevisedBitrate {
@@ -37,9 +39,17 @@ struct RevisedBitrate {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RevisedResolution {
+    revision: u64,
+    width: u16,
+    height: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct EncoderControlDesired {
     revision: u64,
     bitrate: Option<RevisedBitrate>,
+    resolution: Option<RevisedResolution>,
     force_keyframe_revision: Option<u64>,
 }
 
@@ -48,6 +58,10 @@ pub struct EncoderControlStatus {
     pub latest_revision: u64,
     pub applied_bitrate_revision: Option<u64>,
     pub applied_bitrate_kbps: Option<u32>,
+    pub requested_resolution_revision: Option<u64>,
+    pub applied_resolution_revision: Option<u64>,
+    pub applied_width: Option<u16>,
+    pub applied_height: Option<u16>,
     pub requested_force_keyframe_revision: Option<u64>,
     pub acknowledged_force_keyframe_revision: Option<u64>,
 }
@@ -114,6 +128,27 @@ impl EncoderControl {
         self.desired.send_modify(|desired| {
             desired.revision = revision;
             desired.force_keyframe_revision = Some(revision);
+        });
+        Ok(revision)
+    }
+
+    pub fn request_resolution(&self, width: u16, height: u16) -> Result<u64> {
+        ensure!(
+            width >= 64 && height >= 64,
+            "encoder dimensions must be at least 64x64"
+        );
+        ensure!(
+            width.is_multiple_of(2) && height.is_multiple_of(2),
+            "H.264 encoder dimensions must be even"
+        );
+        let revision = self.next_revision()?;
+        self.desired.send_modify(|desired| {
+            desired.revision = revision;
+            desired.resolution = Some(RevisedResolution {
+                revision,
+                width,
+                height,
+            });
         });
         Ok(revision)
     }
@@ -186,6 +221,55 @@ impl EncoderControl {
             .await
             .with_context(|| format!("timed out waiting for force-keyframe revision {revision}"))?
     }
+
+    /// Wait until the exact target dimensions emerge from the encoder on an
+    /// independently decodable access unit. A property write or caps event is
+    /// not an application acknowledgement.
+    pub async fn wait_for_resolution_applied(
+        &self,
+        revision: u64,
+        width: u16,
+        height: u16,
+        timeout: Duration,
+    ) -> Result<EncoderControlStatus> {
+        let mut status = self.status.clone();
+        let wait = async {
+            loop {
+                let snapshot = *status.borrow_and_update();
+                match snapshot.applied_resolution_revision {
+                    Some(applied) if applied == revision => {
+                        ensure!(
+                            snapshot.applied_width == Some(width)
+                                && snapshot.applied_height == Some(height),
+                            "encoder resolution revision {revision} acknowledged {:?}x{:?}, expected {width}x{height}",
+                            snapshot.applied_width,
+                            snapshot.applied_height
+                        );
+                        return Ok(snapshot);
+                    }
+                    Some(applied) if applied > revision => bail!(
+                        "encoder resolution revision {revision} was superseded by revision {applied}"
+                    ),
+                    _ => {}
+                }
+                if snapshot
+                    .requested_resolution_revision
+                    .is_some_and(|requested| requested > revision)
+                {
+                    bail!(
+                        "encoder resolution revision {revision} was coalesced before application"
+                    );
+                }
+                status
+                    .changed()
+                    .await
+                    .context("encoder control status closed before resolution was applied")?;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.with_context(|| {
+            format!("timed out waiting for encoder resolution revision {revision}")
+        })?
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +294,8 @@ impl EncoderControlTestHarness {
 #[derive(Clone, Debug)]
 pub struct EncodedFrame {
     pub sequence: u64,
+    pub width: u16,
+    pub height: u16,
     /// Session-monotonic timestamp when the complete encoded access unit became
     /// observable to the daemon, using the same epoch as audio. Raw PipeWire
     /// capture PTS is not preserved by the current stdout bridge, so this must
@@ -221,6 +307,9 @@ pub struct EncodedFrame {
     pub observed_at: Instant,
     pub keyframe: bool,
     pub codec_config: bool,
+    /// This configured keyframe begins a decoder generation that must not use
+    /// reference state from the preceding encoded resolution.
+    pub discontinuity: bool,
     pub data: Arc<[u8]>,
 }
 
@@ -294,6 +383,7 @@ async fn preflight_gamescope_static(config: &HostConfig) -> Result<()> {
         "videoconvert",
         "videoscale",
         "videorate",
+        "capsfilter",
         pipewire.vaapi_encoder.as_str(),
         "h264parse",
         terminal_sink,
@@ -419,6 +509,8 @@ fn spawn_gamescope_pipewire_in_process_with_target(
         max_gop_frames,
         Some(preflight.pointer_surface_dimensions),
         expected_device_path,
+        u16::try_from(config.width).context("configured width exceeds encoder metadata")?,
+        u16::try_from(config.height).context("configured height exceeds encoder metadata")?,
     )
 }
 
@@ -429,6 +521,8 @@ fn spawn_in_process_pipeline(
     max_gop_frames: usize,
     pointer_surface_dimensions: Option<PointerSurfaceDimensions>,
     expected_device_path: Option<String>,
+    initial_width: u16,
+    initial_height: u16,
 ) -> Result<EncodedSource> {
     let (sender, receiver) = watch::channel(None);
     let (current_gop_sender, current_gop) = watch::channel(None);
@@ -444,6 +538,8 @@ fn spawn_in_process_pipeline(
                 desired,
                 status,
                 expected_device_path.as_deref(),
+                initial_width,
+                initial_height,
             )
         })
         .await
@@ -480,7 +576,8 @@ fn gamescope_in_process_pipeline_description(
         "pipewiresrc do-timestamp=true min-buffers=1 max-buffers=4 use-bufferpool=false target-object={target_object} \
          ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
          ! videorate drop-only=true max-rate={} \
-         ! videoconvert ! videoscale ! {raw_caps} \
+         ! videoconvert ! videoscale \
+         ! capsfilter name=sigil_scale_caps caps={raw_caps} caps-change-mode=delayed \
          ! {} name=sigil_encoder rate-control=cbr bitrate={bitrate} target-usage=7 key-int-max={} b-frames=0 ref-frames=1 aud=true \
          ! h264parse config-interval=-1 \
          ! video/x-h264,stream-format=byte-stream,alignment=au \
@@ -545,6 +642,8 @@ async fn run_gamescope_pipewire(
         &sender,
         &current_gop_sender,
         interactive_gop_frames(config.framerate) as usize,
+        u16::try_from(config.width).context("configured width exceeds encoder metadata")?,
+        u16::try_from(config.height).context("configured height exceeds encoder metadata")?,
     )
     .await;
     let _ = child.kill().await;
@@ -625,6 +724,8 @@ async fn run_test_pattern(
         &sender,
         &current_gop_sender,
         interactive_gop_frames(config.framerate) as usize,
+        u16::try_from(config.width).context("configured width exceeds encoder metadata")?,
+        u16::try_from(config.height).context("configured height exceeds encoder metadata")?,
     )
     .await;
     if result.is_ok() {
@@ -644,12 +745,20 @@ async fn forward_annex_b_stream<R>(
     sender: &watch::Sender<Option<EncodedFrame>>,
     current_gop_sender: &watch::Sender<Option<EncodedGop>>,
     max_gop_frames: usize,
+    width: u16,
+    height: u16,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let mut publisher =
-        AccessUnitPublisher::new(session_clock, sender, current_gop_sender, max_gop_frames);
+    let mut publisher = AccessUnitPublisher::new(
+        session_clock,
+        sender,
+        current_gop_sender,
+        max_gop_frames,
+        width,
+        height,
+    );
     let mut parser = AnnexBAccessUnitParser::default();
     let mut chunk = [0_u8; 16 * 1024];
 
@@ -677,7 +786,40 @@ struct AccessUnitPublisher<'a> {
     sender: &'a watch::Sender<Option<EncodedFrame>>,
     current_gop_sender: &'a watch::Sender<Option<EncodedGop>>,
     max_gop_frames: usize,
+    width: u16,
+    height: u16,
     sequence: u64,
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "in-process-gstreamer")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingResolutionTransition {
+    target: RevisedResolution,
+    deadline: Instant,
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "in-process-gstreamer")))]
+fn classify_resolution_sample(
+    current: (u16, u16),
+    pending: Option<PendingResolutionTransition>,
+    sample: (u16, u16),
+    configured_idr: bool,
+) -> Result<Option<bool>> {
+    if let Some(pending) = pending {
+        if sample != (pending.target.width, pending.target.height) || !configured_idr {
+            return Ok(None);
+        }
+        return Ok(Some(true));
+    }
+    ensure!(
+        sample == current,
+        "encoder changed resolution from {}x{} to {}x{} without a pending control revision",
+        current.0,
+        current.1,
+        sample.0,
+        sample.1
+    );
+    Ok(Some(false))
 }
 
 impl<'a> AccessUnitPublisher<'a> {
@@ -686,17 +828,31 @@ impl<'a> AccessUnitPublisher<'a> {
         sender: &'a watch::Sender<Option<EncodedFrame>>,
         current_gop_sender: &'a watch::Sender<Option<EncodedGop>>,
         max_gop_frames: usize,
+        width: u16,
+        height: u16,
     ) -> Self {
         Self {
             session_clock,
             sender,
             current_gop_sender,
             max_gop_frames,
+            width,
+            height,
             sequence: 0,
         }
     }
 
     fn publish(&mut self, access_unit: Vec<u8>) -> Result<bool> {
+        self.publish_with_metadata(access_unit, self.width, self.height, false)
+    }
+
+    fn publish_with_metadata(
+        &mut self,
+        access_unit: Vec<u8>,
+        width: u16,
+        height: u16,
+        discontinuity: bool,
+    ) -> Result<bool> {
         ensure!(!access_unit.is_empty(), "encoded access unit is empty");
         ensure!(
             access_unit.len() <= MAX_ENCODE_BUFFER,
@@ -710,11 +866,14 @@ impl<'a> AccessUnitPublisher<'a> {
         let codec_config = has_h264_codec_config(&access_unit);
         let frame = EncodedFrame {
             sequence: self.sequence,
+            width,
+            height,
             capture_timestamp_micros,
             presentation_timestamp_micros,
             observed_at,
             keyframe,
             codec_config,
+            discontinuity,
             data: Arc::from(access_unit),
         };
         self.sequence = self
@@ -728,6 +887,8 @@ impl<'a> AccessUnitPublisher<'a> {
             self.max_gop_frames,
             MAX_CURRENT_GOP_BYTES,
         );
+        self.width = width;
+        self.height = height;
         Ok(keyframe && codec_config)
     }
 
@@ -746,6 +907,8 @@ fn run_in_process_pipeline(
     mut desired: watch::Receiver<EncoderControlDesired>,
     status: watch::Sender<EncoderControlStatus>,
     expected_device_path: Option<&str>,
+    initial_width: u16,
+    initial_height: u16,
 ) -> Result<()> {
     use gstreamer as gst;
     use gstreamer::prelude::*;
@@ -760,6 +923,9 @@ fn run_in_process_pipeline(
     let encoder = pipeline
         .by_name("sigil_encoder")
         .context("in-process GStreamer pipeline has no named encoder")?;
+    let scale_caps = pipeline
+        .by_name("sigil_scale_caps")
+        .context("in-process GStreamer pipeline has no named scale capsfilter")?;
     let sink = pipeline
         .by_name("sigil_sink")
         .context("in-process GStreamer pipeline has no named appsink")?
@@ -772,6 +938,7 @@ fn run_in_process_pipeline(
     sink.set_drop(false);
     sink.set_sync(false);
     validate_mutable_playing_bitrate(&encoder)?;
+    validate_resolution_capsfilter(&scale_caps)?;
 
     pipeline
         .set_state(gst::State::Playing)
@@ -789,10 +956,21 @@ fn run_in_process_pipeline(
         let bus = pipeline
             .bus()
             .context("in-process GStreamer pipeline has no bus")?;
-        let mut publisher =
-            AccessUnitPublisher::new(session_clock, &sender, &current_gop_sender, max_gop_frames);
+        let mut publisher = AccessUnitPublisher::new(
+            session_clock,
+            &sender,
+            &current_gop_sender,
+            max_gop_frames,
+            initial_width,
+            initial_height,
+        );
         let mut applied_desired_revision = 0_u64;
         let mut pending_force_keyframe_revision = None;
+        let mut pending_resolution = None;
+        status.send_modify(|status| {
+            status.applied_width = Some(initial_width);
+            status.applied_height = Some(initial_height);
+        });
 
         loop {
             if let Some(message) = bus.timed_pop(gst::ClockTime::ZERO) {
@@ -816,15 +994,32 @@ fn run_in_process_pipeline(
             if desired_state.revision > applied_desired_revision {
                 apply_encoder_control(
                     &encoder,
+                    &scale_caps,
                     &sink,
                     desired_state,
                     &status,
+                    &current_gop_sender,
                     &mut pending_force_keyframe_revision,
+                    &mut pending_resolution,
                 )?;
                 applied_desired_revision = desired_state.revision;
             }
 
+            if pending_resolution.is_some_and(|pending: PendingResolutionTransition| {
+                Instant::now() >= pending.deadline
+            }) {
+                let pending = pending_resolution.expect("checked as present");
+                bail!(
+                    "encoder resolution revision {} did not produce a configured {}x{} IDR within {:?}",
+                    pending.target.revision,
+                    pending.target.width,
+                    pending.target.height,
+                    RESOLUTION_APPLY_TIMEOUT
+                );
+            }
+
             if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(50)) {
+                let (width, height) = encoded_sample_dimensions(&sample)?;
                 let buffer = sample
                     .buffer()
                     .context("in-process appsink sample has no buffer")?;
@@ -835,7 +1030,34 @@ fn run_in_process_pipeline(
                     map.as_slice().len() <= MAX_ENCODE_BUFFER,
                     "in-process encoded access unit exceeds {MAX_ENCODE_BUFFER} bytes"
                 );
-                let configured_idr = publisher.publish(map.as_slice().to_vec())?;
+                let access_unit = map.as_slice();
+                let configured_idr =
+                    is_h264_keyframe(access_unit) && has_h264_codec_config(access_unit);
+                let Some(discontinuity) = classify_resolution_sample(
+                    (publisher.width, publisher.height),
+                    pending_resolution,
+                    (width, height),
+                    configured_idr,
+                )?
+                else {
+                    continue;
+                };
+                let configured_idr = publisher.publish_with_metadata(
+                    access_unit.to_vec(),
+                    width,
+                    height,
+                    discontinuity,
+                )?;
+                if discontinuity {
+                    let applied = pending_resolution
+                        .take()
+                        .expect("discontinuity requires a pending resolution");
+                    status.send_modify(|status| {
+                        status.applied_resolution_revision = Some(applied.target.revision);
+                        status.applied_width = Some(width);
+                        status.applied_height = Some(height);
+                    });
+                }
                 acknowledge_force_keyframe_if_configured_idr(
                     configured_idr,
                     &mut pending_force_keyframe_revision,
@@ -900,17 +1122,101 @@ fn validate_mutable_playing_bitrate(encoder: &gstreamer::Element) -> Result<()> 
 }
 
 #[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
+fn validate_resolution_capsfilter(capsfilter: &gstreamer::Element) -> Result<()> {
+    use gstreamer::prelude::*;
+
+    let property = capsfilter
+        .find_property("caps")
+        .context("configured scale capsfilter has no caps property")?;
+    ensure!(
+        property
+            .flags()
+            .contains(gstreamer::glib::ParamFlags::WRITABLE),
+        "configured scale capsfilter caps property is not writable"
+    );
+    let caps = capsfilter.property::<gstreamer::Caps>("caps");
+    let _ = dimensions_from_caps(&caps)?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
+fn dimensions_from_caps(caps: &gstreamer::CapsRef) -> Result<(u16, u16)> {
+    let structure = caps
+        .structure(0)
+        .context("configured video caps have no structure")?;
+    let width = structure
+        .get::<i32>("width")
+        .context("configured video caps have no integer width")?;
+    let height = structure
+        .get::<i32>("height")
+        .context("configured video caps have no integer height")?;
+    Ok((
+        u16::try_from(width).context("configured video caps width is outside u16")?,
+        u16::try_from(height).context("configured video caps height is outside u16")?,
+    ))
+}
+
+#[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
+fn encoded_sample_dimensions(sample: &gstreamer::Sample) -> Result<(u16, u16)> {
+    let caps = sample
+        .caps()
+        .context("in-process encoded sample has no negotiated caps")?;
+    dimensions_from_caps(caps)
+}
+
+#[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
+fn apply_resolution_caps(
+    capsfilter: &gstreamer::Element,
+    resolution: RevisedResolution,
+) -> Result<()> {
+    use gstreamer::prelude::*;
+
+    let mut caps = capsfilter.property::<gstreamer::Caps>("caps");
+    let caps_mut = caps.make_mut();
+    let structure = caps_mut
+        .structure_mut(0)
+        .context("configured scale capsfilter has no caps structure")?;
+    structure.set("width", i32::from(resolution.width));
+    structure.set("height", i32::from(resolution.height));
+    capsfilter.set_property("caps", caps);
+    let readback = capsfilter.property::<gstreamer::Caps>("caps");
+    ensure!(
+        dimensions_from_caps(&readback)? == (resolution.width, resolution.height),
+        "scale capsfilter resolution readback does not match requested {}x{}",
+        resolution.width,
+        resolution.height
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
+fn push_configured_keyframe_request(sink: &gstreamer_app::AppSink) -> Result<()> {
+    use gstreamer::prelude::*;
+
+    let event = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
+        .all_headers(true)
+        .build();
+    let sink_pad = sink
+        .static_pad("sink")
+        .context("configured in-process appsink has no sink pad")?;
+    ensure!(
+        sink_pad.push_event(event),
+        "in-process encoder rejected upstream ForceKeyUnit"
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
 fn apply_encoder_control(
     encoder: &gstreamer::Element,
+    scale_caps: &gstreamer::Element,
     sink: &gstreamer_app::AppSink,
     desired: EncoderControlDesired,
     status: &watch::Sender<EncoderControlStatus>,
+    current_gop_sender: &watch::Sender<Option<EncodedGop>>,
     pending_force_keyframe_revision: &mut Option<u64>,
+    pending_resolution: &mut Option<PendingResolutionTransition>,
 ) -> Result<()> {
-    use gstreamer as gst;
-    use gstreamer::prelude::*;
-    use gstreamer_video as gst_video;
-
     let current = *status.borrow();
     if let Some(bitrate) = desired.bitrate
         && current
@@ -930,21 +1236,33 @@ fn apply_encoder_control(
         });
     }
 
+    let mut keyframe_requested = false;
+    if let Some(resolution) = desired.resolution
+        && current
+            .requested_resolution_revision
+            .is_none_or(|requested| resolution.revision > requested)
+    {
+        apply_resolution_caps(scale_caps, resolution)?;
+        current_gop_sender.send_replace(None);
+        push_configured_keyframe_request(sink)?;
+        keyframe_requested = true;
+        *pending_resolution = Some(PendingResolutionTransition {
+            target: resolution,
+            deadline: Instant::now() + RESOLUTION_APPLY_TIMEOUT,
+        });
+        status.send_modify(|status| {
+            status.requested_resolution_revision = Some(resolution.revision);
+        });
+    }
+
     if let Some(revision) = desired.force_keyframe_revision
         && current
             .requested_force_keyframe_revision
             .is_none_or(|requested| revision > requested)
     {
-        let event = gst_video::UpstreamForceKeyUnitEvent::builder()
-            .all_headers(true)
-            .build();
-        let sink_pad = sink
-            .static_pad("sink")
-            .context("configured in-process appsink has no sink pad")?;
-        ensure!(
-            sink_pad.push_event(event),
-            "in-process encoder rejected upstream ForceKeyUnit"
-        );
+        if !keyframe_requested {
+            push_configured_keyframe_request(sink)?;
+        }
         *pending_force_keyframe_revision = Some(revision);
         status.send_modify(|status| {
             status.requested_force_keyframe_revision = Some(revision);
@@ -1718,10 +2036,14 @@ mod tests {
 
         let superseded_bitrate_revision = control.request_bitrate_kbps(4_000).unwrap();
         let bitrate_revision = control.request_bitrate_kbps(8_000).unwrap();
+        let superseded_resolution_revision = control.request_resolution(960, 600).unwrap();
+        let resolution_revision = control.request_resolution(640, 400).unwrap();
         let force_keyframe_revision = control.request_force_keyframe().unwrap();
 
         assert!(superseded_bitrate_revision < bitrate_revision);
-        assert!(bitrate_revision < force_keyframe_revision);
+        assert!(bitrate_revision < superseded_resolution_revision);
+        assert!(superseded_resolution_revision < resolution_revision);
+        assert!(resolution_revision < force_keyframe_revision);
         let latest = *desired.borrow_and_update();
         assert_eq!(latest.revision, force_keyframe_revision);
         assert_eq!(
@@ -1729,6 +2051,14 @@ mod tests {
             Some(RevisedBitrate {
                 revision: bitrate_revision,
                 kbps: 8_000,
+            })
+        );
+        assert_eq!(
+            latest.resolution,
+            Some(RevisedResolution {
+                revision: resolution_revision,
+                width: 640,
+                height: 400,
             })
         );
         assert_eq!(
@@ -1740,6 +2070,10 @@ mod tests {
             status.latest_revision = latest.revision;
             status.applied_bitrate_revision = Some(bitrate_revision);
             status.applied_bitrate_kbps = Some(8_000);
+            status.requested_resolution_revision = Some(resolution_revision);
+            status.applied_resolution_revision = Some(resolution_revision);
+            status.applied_width = Some(640);
+            status.applied_height = Some(400);
             status.requested_force_keyframe_revision = Some(force_keyframe_revision);
         });
         let mut pending = Some(force_keyframe_revision);
@@ -1754,6 +2088,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(applied.applied_bitrate_kbps, Some(8_000));
+        let applied_resolution = control
+            .wait_for_resolution_applied(resolution_revision, 640, 400, Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(applied_resolution.applied_width, Some(640));
+        assert_eq!(applied_resolution.applied_height, Some(400));
+        assert!(
+            control
+                .wait_for_resolution_applied(
+                    superseded_resolution_revision,
+                    960,
+                    600,
+                    Duration::from_millis(10),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("superseded")
+        );
         let acknowledged = control
             .wait_for_force_keyframe_acknowledged(
                 force_keyframe_revision,
@@ -1766,6 +2119,8 @@ mod tests {
             Some(force_keyframe_revision)
         );
         assert!(control.request_bitrate_kbps(0).is_err());
+        assert!(control.request_resolution(0, 400).is_err());
+        assert!(control.request_resolution(641, 400).is_err());
         assert!(
             control
                 .request_bitrate_kbps(MAX_ENCODER_BITRATE_KBPS + 1)
@@ -1790,16 +2145,17 @@ mod tests {
     #[ignore = "requires GStreamer x264 and app plugins"]
     async fn in_process_gstreamer_x264_smoke() {
         let description = "videotestsrc is-live=true pattern=ball \
-            ! video/x-raw,width=320,height=180,framerate=30/1 \
             ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
-            ! videoconvert \
+            ! videoconvert ! videoscale \
+            ! capsfilter name=sigil_scale_caps caps=video/x-raw,width=320,height=180,framerate=30/1 caps-change-mode=delayed \
             ! x264enc name=sigil_encoder bitrate=2000 tune=zerolatency speed-preset=ultrafast key-int-max=15 bframes=0 byte-stream=true aud=true \
             ! h264parse config-interval=-1 \
             ! video/x-h264,stream-format=byte-stream,alignment=au \
             ! appsink name=sigil_sink max-buffers=1 drop=false sync=false"
             .to_owned();
         let mut source =
-            spawn_in_process_pipeline(description, SessionClock::start(), 15, None, None).unwrap();
+            spawn_in_process_pipeline(description, SessionClock::start(), 15, None, None, 320, 180)
+                .unwrap();
         let control = source
             .encoder_control
             .clone()
@@ -1832,6 +2188,45 @@ mod tests {
             .wait_for_force_keyframe_acknowledged(force_keyframe_revision, Duration::from_secs(10))
             .await
             .expect("x264 did not acknowledge a configured forced IDR");
+        let before_resolution_sequence = source
+            .current_gop
+            .borrow()
+            .as_ref()
+            .and_then(|gop| gop.frames.first())
+            .map(|frame| frame.sequence)
+            .expect("x264 has no configured GOP before resolution transition");
+
+        let reduced_revision = control.request_resolution(256, 144).unwrap();
+        control
+            .wait_for_resolution_applied(reduced_revision, 256, 144, Duration::from_secs(10))
+            .await
+            .expect("x264 did not apply the reduced resolution");
+        let reduced = source
+            .current_gop
+            .borrow()
+            .as_ref()
+            .and_then(|gop| gop.frames.first())
+            .cloned()
+            .expect("x264 has no reduced configured GOP");
+        assert_eq!((reduced.width, reduced.height), (256, 144));
+        assert!(reduced.keyframe && reduced.codec_config && reduced.discontinuity);
+        assert!(reduced.sequence > before_resolution_sequence);
+
+        let restored_revision = control.request_resolution(320, 180).unwrap();
+        control
+            .wait_for_resolution_applied(restored_revision, 320, 180, Duration::from_secs(10))
+            .await
+            .expect("x264 did not restore the native resolution");
+        let restored = source
+            .current_gop
+            .borrow()
+            .as_ref()
+            .and_then(|gop| gop.frames.first())
+            .cloned()
+            .expect("x264 has no restored configured GOP");
+        assert_eq!((restored.width, restored.height), (320, 180));
+        assert!(restored.keyframe && restored.codec_config && restored.discontinuity);
+        assert!(restored.sequence > reduced.sequence);
 
         {
             let current_gop = source.current_gop.borrow();
@@ -1866,6 +2261,9 @@ mod tests {
 
         assert!(description.contains(
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream"
+        ));
+        assert!(description.contains(
+            "capsfilter name=sigil_scale_caps caps=video/x-raw,format=NV12,width=1280,height=800,framerate=60/1 caps-change-mode=delayed"
         ));
         assert!(
             description.contains("appsink name=sigil_sink max-buffers=1 drop=false sync=false")
@@ -1906,16 +2304,77 @@ mod tests {
     }
 
     #[test]
+    fn resolution_transition_suppresses_until_exact_configured_target_idr() {
+        let transition = PendingResolutionTransition {
+            target: RevisedResolution {
+                revision: 7,
+                width: 960,
+                height: 600,
+            },
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        assert!(transition.deadline > Instant::now());
+        assert_eq!(
+            classify_resolution_sample((1280, 800), Some(transition), (1280, 800), true).unwrap(),
+            None
+        );
+        assert_eq!(
+            classify_resolution_sample((1280, 800), Some(transition), (960, 600), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            classify_resolution_sample((1280, 800), Some(transition), (960, 600), true).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            classify_resolution_sample((960, 600), None, (960, 600), false).unwrap(),
+            Some(false)
+        );
+        assert!(classify_resolution_sample((960, 600), None, (1280, 800), true).is_err());
+    }
+
+    #[test]
+    fn publisher_carries_exact_resolution_and_discontinuity_into_new_gop() {
+        let (frame_sender, frame_receiver) = watch::channel(None);
+        let (current_gop_sender, current_gop_receiver) = watch::channel(None);
+        let mut publisher = AccessUnitPublisher::new(
+            SessionClock::start(),
+            &frame_sender,
+            &current_gop_sender,
+            30,
+            1280,
+            800,
+        );
+        let configured_idr = vec![0, 0, 0, 1, 7, 1, 0, 0, 0, 1, 8, 1, 0, 0, 0, 1, 5, 1];
+
+        assert!(
+            publisher
+                .publish_with_metadata(configured_idr, 960, 600, true)
+                .unwrap()
+        );
+        let frame = frame_receiver.borrow().as_ref().unwrap().clone();
+        assert_eq!((frame.width, frame.height), (960, 600));
+        assert!(frame.discontinuity);
+        let current_gop = current_gop_receiver.borrow();
+        let first = &current_gop.as_ref().unwrap().frames[0];
+        assert_eq!((first.width, first.height), (960, 600));
+        assert!(first.keyframe && first.codec_config && first.discontinuity);
+    }
+
+    #[test]
     fn current_gop_retains_only_a_bounded_contiguous_decodable_chain() {
         let (frame_sender, frame_receiver) = watch::channel(None);
         let (current_gop_sender, current_gop_receiver) = watch::channel(None);
         let frame = |sequence, keyframe, codec_config, payload_len| EncodedFrame {
             sequence,
+            width: 1280,
+            height: 800,
             capture_timestamp_micros: sequence,
             presentation_timestamp_micros: sequence as i64,
             observed_at: Instant::now(),
             keyframe,
             codec_config,
+            discontinuity: false,
             data: Arc::from(vec![sequence as u8; payload_len]),
         };
 

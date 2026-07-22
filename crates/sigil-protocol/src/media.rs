@@ -208,6 +208,59 @@ pub struct MediaFrame {
     pub payload: Vec<u8>,
 }
 
+/// Encode one complete application media frame for an object transport such
+/// as MoQ. The MoQ group and frame boundaries carry delivery semantics; this
+/// envelope carries only Sigil's bounded codec metadata and compressed access
+/// unit.
+pub fn encode_media_frame_object(frame: &MediaFrame) -> Result<Vec<u8>> {
+    frame.header.validate()?;
+    if frame.payload.len() != frame.header.payload_len as usize {
+        return Err(ProtocolError::InvalidMessage {
+            message_type: "media frame object",
+            reason: "payload does not match declared length",
+        });
+    }
+    let object_len = MEDIA_HEADER_LEN.checked_add(frame.payload.len()).ok_or(
+        ProtocolError::InvalidMediaPayloadLength {
+            actual: frame.payload.len(),
+            maximum: MAX_MEDIA_PAYLOAD_LEN,
+        },
+    )?;
+    let mut object = Vec::with_capacity(object_len);
+    object.extend_from_slice(&frame.header.encode()?);
+    object.extend_from_slice(&frame.payload);
+    Ok(object)
+}
+
+/// Decode exactly one application media frame from an object transport.
+/// Header validation, including the declared payload bound, occurs before the
+/// payload is copied into its owned buffer.
+pub fn decode_media_frame_object(object: &[u8]) -> Result<MediaFrame> {
+    if object.len() < MEDIA_HEADER_LEN {
+        return Err(ProtocolError::InvalidMessage {
+            message_type: "media frame object",
+            reason: "object ended before the media header",
+        });
+    }
+    let wire: &[u8; MEDIA_HEADER_LEN] = object[..MEDIA_HEADER_LEN]
+        .try_into()
+        .expect("fixed media header slice");
+    let header = MediaFrameHeader::decode(wire)?;
+    let expected_len = MEDIA_HEADER_LEN
+        .checked_add(header.payload_len as usize)
+        .ok_or(ProtocolError::InvalidMediaPayloadLength {
+            actual: header.payload_len as usize,
+            maximum: MAX_MEDIA_PAYLOAD_LEN,
+        })?;
+    if object.len() != expected_len {
+        return Err(ProtocolError::InvalidMessage {
+            message_type: "media frame object",
+            reason: "object length does not match declared payload",
+        });
+    }
+    MediaFrame::new(header, object[MEDIA_HEADER_LEN..].to_vec())
+}
+
 impl MediaFrame {
     pub fn new(header: MediaFrameHeader, payload: Vec<u8>) -> Result<Self> {
         header.validate()?;
@@ -384,6 +437,19 @@ mod tests {
         sender.shutdown().await.unwrap();
 
         assert_eq!(read_media_object(&mut receiver).await.unwrap(), expected);
+    }
+
+    #[test]
+    fn object_transport_envelope_round_trips_exactly() {
+        let frame = MediaFrame::new(header(), vec![0, 0, 0, 1]).unwrap();
+        let object = encode_media_frame_object(&frame).unwrap();
+        assert_eq!(object.len(), MEDIA_HEADER_LEN + frame.payload.len());
+        assert_eq!(decode_media_frame_object(&object).unwrap(), frame);
+
+        let mut trailing = object.clone();
+        trailing.push(0);
+        assert!(decode_media_frame_object(&trailing).is_err());
+        assert!(decode_media_frame_object(&object[..MEDIA_HEADER_LEN - 1]).is_err());
     }
 
     #[tokio::test]

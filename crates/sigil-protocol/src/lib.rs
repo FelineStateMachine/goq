@@ -32,8 +32,9 @@ pub use invitation::{
     MAX_INVITATION_TOKEN_LEN, MAX_INVITATION_TTL_SECS, SignedInvitation,
 };
 pub use media::{
-    FrameFlags, MEDIA_HEADER_LEN, MediaCodec, MediaFrame, MediaFrameHeader, read_media_frame,
-    read_media_object, write_media_frame,
+    FrameFlags, MEDIA_HEADER_LEN, MediaCodec, MediaFrame, MediaFrameHeader,
+    decode_media_frame_object, encode_media_frame_object, read_media_frame, read_media_object,
+    write_media_frame,
 };
 pub use media_v3::{
     KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,

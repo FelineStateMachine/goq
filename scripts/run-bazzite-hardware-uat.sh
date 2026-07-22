@@ -404,6 +404,7 @@ validate_probe() {
   local transport="$2"
   local size="$3"
   local request_id="$4"
+  local slow_consumer_ms="${5:-}"
   grep -Fxq probe=ok "$log"
   grep -Fxq "dimensions=$size" "$log"
   grep -Fxq "transport=$transport" "$log"
@@ -421,6 +422,20 @@ validate_probe() {
     grep -Fxq moq_group_capacity=1 "$log"
     grep -Fxq moq_unrecovered_group_gaps=0 "$log"
     grep -Fxq moq_historical_suffix_frames=0 "$log"
+  fi
+  if [[ -n "$slow_consumer_ms" ]]; then
+    grep -Fxq slow_consumer=ok "$log"
+    grep -Fxq "slow_consumer_stall_ms=$slow_consumer_ms" "$log"
+    grep -Fxq slow_consumer_first_post_stall=configured-idr "$log"
+    grep -Fxq slow_consumer_historical_suffix_frames=0 "$log"
+    awk -F= '$1 == "slow_consumer_recovery_micros" && $2 ~ /^[0-9]+$/ && $2 <= 2000000 { ok=1 } END { exit !ok }' "$log"
+    awk -F= '$1 == "slow_consumer_cancellation_delta" && $2 ~ /^[0-9]+$/ && $2 > 0 { ok=1 } END { exit !ok }' "$log"
+    awk -F= '$1 == "slow_consumer_group_advance" && $2 ~ /^[0-9]+$/ && $2 > 0 { ok=1 } END { exit !ok }' "$log"
+    awk -F= '$1 == "slow_consumer_sequence_advance" && $2 ~ /^[0-9]+$/ && $2 > 0 { ok=1 } END { exit !ok }' "$log"
+    awk -F= -v minimum="$((slow_consumer_ms * 500))" '$1 == "slow_consumer_capture_advance_micros" && $2 ~ /^[0-9]+$/ && $2 >= minimum { ok=1 } END { exit !ok }' "$log"
+    awk -F= '$1 == "slow_consumer_input_ack_micros" && $2 ~ /^[0-9]+$/ && $2 <= 2000000 { ok=1 } END { exit !ok }' "$log"
+  else
+    grep -Fxq slow_consumer=not-requested "$log"
   fi
 }
 
@@ -447,6 +462,7 @@ run_probe_cycle() {
   local size="$3"
   local request_id="$4"
   local invitation_path="${5:-}"
+  local slow_consumer_ms="${6:-}"
   local log="$raw/$mode-$transport-$request_id.log"
   local command=(
     "$probe"
@@ -460,8 +476,9 @@ run_probe_cycle() {
   )
   [[ "$transport" == grouped-v3 ]] && command+=(--media-v3)
   [[ -n "$invitation_path" ]] && command+=(--invitation "$invitation_path")
+  [[ -n "$slow_consumer_ms" ]] && command+=(--slow-consumer-ms "$slow_consumer_ms")
   timeout --signal=TERM --kill-after=5s 45s "${command[@]}" >"$log" 2>&1
-  validate_probe "$log" "$transport" "$size" "$request_id"
+  validate_probe "$log" "$transport" "$size" "$request_id" "$slow_consumer_ms"
 }
 
 validate_host_recovery() {
@@ -499,7 +516,7 @@ grep -Fxq probe=ok "$evidence/fixed-capture.log"
 grep -Fxq dropped_after_encode_before_probe_consumer=0 "$evidence/fixed-capture.log"
 
 start_candidate fixed "$fixed_config"
-run_probe_cycle fixed iroh-moq 1280x800 1001 "$invitation"
+run_probe_cycle fixed iroh-moq 1280x800 1001 "$invitation" 1500
 wait_for_count "$raw/fixed-host.log" 'MoQ control client released' 1
 wait_for_count "$raw/fixed-host.log" 'input client released' 1
 enrollment="$("$sigil" enrollment show --config "$fixed_config")"
@@ -535,7 +552,8 @@ grep -Fxq probe=ok "$evidence/native-capture.log"
 grep -Fxq dropped_after_encode_before_probe_consumer=0 "$evidence/native-capture.log"
 
 start_candidate native "$native_config"
-for cycle in $(seq 1 10); do
+run_probe_cycle native iroh-moq "$native_size" 2001 "" 1500
+for cycle in $(seq 2 10); do
   run_probe_cycle native iroh-moq "$native_size" "$((2000 + cycle))"
 done
 for cycle in $(seq 1 10); do
@@ -624,6 +642,8 @@ fi
   echo "fixed_daemon_unique_sessions=$fixed_unique_sessions"
   echo "native_daemon_unique_sessions=$native_unique_sessions"
   echo "total_sessions=$total_sessions"
+  echo slow_media_consumer=pass
+  echo slow_media_consumer_resolutions=1280x800,"$native_size"
   summarize_group fixed-iroh-moq
   summarize_group fixed-grouped-v3
   summarize_group native-iroh-moq

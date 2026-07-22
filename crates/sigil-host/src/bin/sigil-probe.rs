@@ -78,6 +78,15 @@ struct Args {
     /// Correlation identifier for `--keyframe-smoke` host evidence.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     keyframe_request_id: u64,
+    /// Stop reading upstream MoQ after the first configured IDR, then require
+    /// the transport to cancel that stale GOP and resume at a newer configured
+    /// IDR within a bounded interval. Intended for latency-growth proofs.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(250..=5_000),
+        conflicts_with_all = ["media_v3", "media_v2", "media_v1"]
+    )]
+    slow_consumer_ms: Option<u64>,
     /// Require gamepad negotiation and emit one bounded non-neutral snapshot
     /// followed by neutral. Intended for evtest-backed uinput proof.
     #[arg(long)]
@@ -128,6 +137,8 @@ impl MediaTransport {
 
 const KEYFRAME_SMOKE_REQUEST_AFTER_FRAMES: u32 = 3;
 const KEYFRAME_SMOKE_MINIMUM_FRAMES: u32 = KEYFRAME_SMOKE_REQUEST_AFTER_FRAMES + 1;
+const SLOW_CONSUMER_MINIMUM_FRAMES: u32 = 2;
+const SLOW_CONSUMER_RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_INVITATION_FILE_BYTES: u64 = (MAX_INVITATION_TOKEN_LEN + 2) as u64;
 
 #[derive(Debug)]
@@ -928,6 +939,7 @@ struct AcceptedMedia {
     width: u16,
     height: u16,
     sequence: u64,
+    capture_timestamp_us: u64,
     payload_len: usize,
     v3_group_id: Option<u64>,
 }
@@ -939,6 +951,7 @@ impl From<MediaFrame> for AcceptedMedia {
             width: frame.header.width,
             height: frame.header.height,
             sequence: frame.header.sequence,
+            capture_timestamp_us: frame.header.capture_timestamp_us,
             payload_len: frame.payload.len(),
             v3_group_id: None,
         }
@@ -952,6 +965,7 @@ impl From<MediaObjectV3> for AcceptedMedia {
             width: object.header.width,
             height: object.header.height,
             sequence: object.header.sequence,
+            capture_timestamp_us: object.header.capture_timestamp_us,
             payload_len: object.payload.len(),
             v3_group_id: Some(object.header.group_id),
         }
@@ -972,6 +986,10 @@ async fn main() -> Result<()> {
     ensure!(
         !args.keyframe_smoke || args.frames >= KEYFRAME_SMOKE_MINIMUM_FRAMES,
         "--keyframe-smoke requires at least {KEYFRAME_SMOKE_MINIMUM_FRAMES} accepted frames"
+    );
+    ensure!(
+        args.slow_consumer_ms.is_none() || args.frames >= SLOW_CONSUMER_MINIMUM_FRAMES,
+        "--slow-consumer-ms requires at least {SLOW_CONSUMER_MINIMUM_FRAMES} accepted frames"
     );
 
     let secret = match args.identity.as_deref() {
@@ -1199,13 +1217,31 @@ async fn main() -> Result<()> {
     let mut keyframe_recovery_micros = None;
     let mut keyframe_request_group_id = None;
     let mut keyframe_request_last_sequence = None;
+    let mut slow_consumer_stalled = false;
+    let mut slow_consumer_pending_recovery = false;
+    let mut slow_consumer_verified = false;
+    let mut slow_consumer_group_id = None;
+    let mut slow_consumer_last_sequence = None;
+    let mut slow_consumer_capture_timestamp_us = None;
+    let mut slow_consumer_cancelled_groups_before = None;
+    let mut slow_consumer_resumed_at: Option<Instant> = None;
+    let mut slow_consumer_recovery_micros = None;
+    let mut slow_consumer_cancellation_delta = None;
+    let mut slow_consumer_group_advance = None;
+    let mut slow_consumer_sequence_advance = None;
+    let mut slow_consumer_capture_advance_micros = None;
+    let mut slow_consumer_input_ack_micros = None;
 
     while received < args.frames {
         let (frame, recovery_frame): (AcceptedMedia, bool) = match media_transport {
             MediaTransport::UpstreamMoq => loop {
+                let media_wait = if slow_consumer_pending_recovery {
+                    SLOW_CONSUMER_RECOVERY_TIMEOUT
+                } else {
+                    Duration::from_secs(args.timeout_seconds).saturating_add(Duration::from_secs(1))
+                };
                 let outcome = tokio::time::timeout(
-                    Duration::from_secs(args.timeout_seconds)
-                        .saturating_add(Duration::from_secs(1)),
+                    media_wait,
                     moq_receiver
                         .as_mut()
                         .expect("upstream MoQ receiver is present")
@@ -1223,9 +1259,9 @@ async fn main() -> Result<()> {
                         group_sequence,
                         recovery,
                     } => {
-                        let requested_recovery =
+                        let requested_keyframe_recovery =
                             keyframe_request_sent && !keyframe_recovery_verified;
-                        if requested_recovery {
+                        if requested_keyframe_recovery {
                             ensure!(
                                 recovery
                                     && frame.header.flags.contains(FrameFlags::KEYFRAME)
@@ -1247,16 +1283,101 @@ async fn main() -> Result<()> {
                             });
                             keyframe_recovery_verified = true;
                         }
+                        let slow_consumer_recovery = slow_consumer_pending_recovery;
+                        if slow_consumer_recovery {
+                            ensure!(
+                                recovery
+                                    && frame.header.flags.contains(FrameFlags::KEYFRAME)
+                                    && frame.header.flags.contains(FrameFlags::CODEC_CONFIG),
+                                "MoQ slow-consumer recovery did not begin at a configured IDR barrier"
+                            );
+                            let prior_group = slow_consumer_group_id
+                                .context("slow-consumer group was not recorded")?;
+                            let group_advance = group_sequence.checked_sub(prior_group).context(
+                                "MoQ slow-consumer recovery did not advance the native group",
+                            )?;
+                            ensure!(
+                                group_advance > 0,
+                                "MoQ slow-consumer recovery did not advance the native group"
+                            );
+                            let prior_sequence = slow_consumer_last_sequence
+                                .context("slow-consumer sequence was not recorded")?;
+                            let sequence_advance =
+                                frame.header.sequence.checked_sub(prior_sequence).context(
+                                    "MoQ slow-consumer recovery did not advance media sequence",
+                                )?;
+                            ensure!(
+                                sequence_advance > 0,
+                                "MoQ slow-consumer recovery did not advance media sequence"
+                            );
+                            let prior_capture_timestamp = slow_consumer_capture_timestamp_us
+                                .context("slow-consumer capture timestamp was not recorded")?;
+                            let capture_advance = frame
+                                .header
+                                .capture_timestamp_us
+                                .checked_sub(prior_capture_timestamp)
+                                .context(
+                                    "MoQ slow-consumer recovery capture timestamp moved backward",
+                                )?;
+                            let minimum_capture_advance = args
+                                .slow_consumer_ms
+                                .expect("slow-consumer duration is configured")
+                                .saturating_mul(1_000)
+                                / 2;
+                            ensure!(
+                                capture_advance >= minimum_capture_advance,
+                                "MoQ slow-consumer recovery advanced capture time by only {capture_advance}us; required at least {minimum_capture_advance}us"
+                            );
+                            let cancelled_before = slow_consumer_cancelled_groups_before
+                                .context("slow-consumer cancellation count was not recorded")?;
+                            let cancelled_after = moq_receiver
+                                .as_ref()
+                                .expect("upstream MoQ receiver is present")
+                                .cancelled_groups;
+                            let cancellation_delta = cancelled_after
+                                .checked_sub(cancelled_before)
+                                .context("MoQ slow-consumer cancellation count moved backward")?;
+                            ensure!(
+                                cancellation_delta > 0,
+                                "MoQ slow-consumer recovery did not observe a cancelled stale group"
+                            );
+                            ensure!(
+                                moq_receiver
+                                    .as_ref()
+                                    .expect("upstream MoQ receiver is present")
+                                    .historical_suffix_frames
+                                    == 0,
+                                "MoQ slow-consumer recovery accepted historical delta suffix frames"
+                            );
+                            let recovery_micros = slow_consumer_resumed_at
+                                .context("slow-consumer resume instant was not recorded")?
+                                .elapsed()
+                                .as_micros();
+                            ensure!(
+                                recovery_micros <= SLOW_CONSUMER_RECOVERY_TIMEOUT.as_micros(),
+                                "MoQ slow-consumer recovery exceeded {}us",
+                                SLOW_CONSUMER_RECOVERY_TIMEOUT.as_micros()
+                            );
+                            slow_consumer_recovery_micros =
+                                Some(u64::try_from(recovery_micros).unwrap_or(u64::MAX));
+                            slow_consumer_cancellation_delta = Some(cancellation_delta);
+                            slow_consumer_group_advance = Some(group_advance);
+                            slow_consumer_sequence_advance = Some(sequence_advance);
+                            slow_consumer_capture_advance_micros = Some(capture_advance);
+                            slow_consumer_pending_recovery = false;
+                            slow_consumer_verified = true;
+                        }
                         break (
                             AcceptedMedia {
                                 flags: frame.header.flags,
                                 width: frame.header.width,
                                 height: frame.header.height,
                                 sequence: frame.header.sequence,
+                                capture_timestamp_us: frame.header.capture_timestamp_us,
                                 payload_len: frame.payload.len(),
                                 v3_group_id: Some(group_sequence),
                             },
-                            requested_recovery,
+                            requested_keyframe_recovery || slow_consumer_recovery,
                         );
                     }
                 }
@@ -1422,6 +1543,40 @@ async fn main() -> Result<()> {
         bytes = bytes.saturating_add(frame.payload_len as u64);
         received += 1;
 
+        if let Some(stall_ms) = args.slow_consumer_ms
+            && !slow_consumer_stalled
+        {
+            slow_consumer_group_id = frame.v3_group_id;
+            slow_consumer_last_sequence = Some(frame.sequence);
+            slow_consumer_capture_timestamp_us = Some(frame.capture_timestamp_us);
+            slow_consumer_cancelled_groups_before = Some(
+                moq_receiver
+                    .as_ref()
+                    .expect("upstream MoQ receiver is present")
+                    .cancelled_groups,
+            );
+            let first_half = Duration::from_millis(stall_ms / 2);
+            let second_half = Duration::from_millis(stall_ms).saturating_sub(first_half);
+            tokio::time::sleep(first_half).await;
+            let input_probe_started = Instant::now();
+            write_input_event(&mut input_send, &InputEvent::Probe)
+                .await
+                .context("writing input probe during slow-consumer media stall")?;
+            expected_ack = expected_ack.saturating_add(1);
+            tokio::time::timeout(
+                SLOW_CONSUMER_RECOVERY_TIMEOUT,
+                read_expected_input_ack(&mut input_recv, args.timeout_seconds, expected_ack),
+            )
+            .await
+            .context("input acknowledgement was blocked by the slow media consumer")??;
+            slow_consumer_input_ack_micros =
+                Some(u64::try_from(input_probe_started.elapsed().as_micros()).unwrap_or(u64::MAX));
+            tokio::time::sleep(second_half).await;
+            slow_consumer_resumed_at = Some(Instant::now());
+            slow_consumer_pending_recovery = true;
+            slow_consumer_stalled = true;
+        }
+
         if args.keyframe_smoke
             && !keyframe_request_sent
             && received == KEYFRAME_SMOKE_REQUEST_AFTER_FRAMES
@@ -1479,6 +1634,10 @@ async fn main() -> Result<()> {
     ensure!(
         !args.keyframe_smoke || keyframe_recovery_verified,
         "probe did not verify requested keyframe recovery"
+    );
+    ensure!(
+        args.slow_consumer_ms.is_none() || slow_consumer_verified,
+        "probe did not verify bounded slow-consumer recovery"
     );
     let accepted_span = first_accepted_at
         .zip(last_accepted_at)
@@ -1615,6 +1774,56 @@ async fn main() -> Result<()> {
     } else {
         println!("keyframe_request_id=not-requested");
         println!("keyframe_recovery_micros=not-requested");
+    }
+    if let Some(stall_ms) = args.slow_consumer_ms {
+        println!("slow_consumer=ok");
+        println!("slow_consumer_stall_ms={stall_ms}");
+        println!("slow_consumer_first_post_stall=configured-idr");
+        println!("slow_consumer_historical_suffix_frames=0");
+        println!(
+            "slow_consumer_recovery_micros={}",
+            slow_consumer_recovery_micros
+                .context("slow-consumer recovery latency was not measured")?
+        );
+        println!(
+            "slow_consumer_cancellation_delta={}",
+            slow_consumer_cancellation_delta
+                .context("slow-consumer cancellation delta was not measured")?
+        );
+        println!(
+            "slow_consumer_group_advance={}",
+            slow_consumer_group_advance.context("slow-consumer group advance was not measured")?
+        );
+        println!(
+            "slow_consumer_sequence_advance={}",
+            slow_consumer_sequence_advance
+                .context("slow-consumer sequence advance was not measured")?
+        );
+        println!(
+            "slow_consumer_capture_advance_micros={}",
+            slow_consumer_capture_advance_micros
+                .context("slow-consumer capture advance was not measured")?
+        );
+        println!(
+            "slow_consumer_input_ack_micros={}",
+            slow_consumer_input_ack_micros
+                .context("slow-consumer input acknowledgement was not measured")?
+        );
+    } else {
+        for field in [
+            "slow_consumer",
+            "slow_consumer_stall_ms",
+            "slow_consumer_first_post_stall",
+            "slow_consumer_historical_suffix_frames",
+            "slow_consumer_recovery_micros",
+            "slow_consumer_cancellation_delta",
+            "slow_consumer_group_advance",
+            "slow_consumer_sequence_advance",
+            "slow_consumer_capture_advance_micros",
+            "slow_consumer_input_ack_micros",
+        ] {
+            println!("{field}=not-requested");
+        }
     }
     match accepted_fps {
         Some(fps) => println!("accepted_fps={fps:.3}"),

@@ -89,6 +89,7 @@ while IFS= read -r frontend_source; do
 done < <(find portal -maxdepth 1 -type f \( -name '*.js' -o -name '*.mjs' \) -print | sort)
 node --test portal/*.test.mjs
 
+cargo build --locked -p sigil-host --bin sigil
 find scripts -type f -name '*.sh' -exec shellcheck {} +
 while IFS= read -r script_test; do
   "$script_test"

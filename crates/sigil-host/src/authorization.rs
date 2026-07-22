@@ -39,6 +39,13 @@ pub struct AuthorizationSnapshot {
     pub epoch: u64,
     pub peer: Option<EndpointId>,
     pub grants: Option<InvitationGrants>,
+    pub enrolled_at_unix: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorizationInspection {
+    pub snapshot: AuthorizationSnapshot,
+    pub storage_present: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -273,17 +280,123 @@ impl AuthorizationStore {
         self.lock_exclusive(&lock)?;
         let state = self.load_state()?;
         state.validate(self.host)?;
-        let (peer, grants) = match state.enrollment {
+        let (peer, grants, enrolled_at_unix) = match state.enrollment {
             Some(enrollment) => (
                 Some(enrollment.peer_node_id.parse::<EndpointId>()?),
                 Some(enrollment.grants),
+                Some(enrollment.enrolled_at_unix),
             ),
-            None => (None, None),
+            None => (None, None, None),
         };
         Ok(AuthorizationSnapshot {
             epoch: state.enrollment_epoch,
             peer,
             grants,
+            enrolled_at_unix,
+        })
+    }
+
+    /// Inspect durable enrollment without creating the state directory or lock.
+    /// The authorization writer uses atomic replacement, so an unlocked reader
+    /// observes either the previous complete document or the next one.
+    pub fn inspect_existing(
+        state_directory: impl Into<PathBuf>,
+        host: EndpointId,
+    ) -> Result<AuthorizationInspection> {
+        let store = Self {
+            state_directory: state_directory.into(),
+            host,
+        };
+        let directory_metadata = match fs::symlink_metadata(&store.state_directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AuthorizationInspection {
+                    snapshot: AuthorizationSnapshot {
+                        epoch: 1,
+                        peer: None,
+                        grants: None,
+                        enrolled_at_unix: None,
+                    },
+                    storage_present: false,
+                });
+            }
+            Err(error) => return Err(error).context("inspecting authorization state directory"),
+        };
+        ensure!(
+            !directory_metadata.file_type().is_symlink(),
+            "authorization state directory is a symlink"
+        );
+        ensure!(
+            directory_metadata.is_dir(),
+            "authorization state path is not a directory"
+        );
+        #[cfg(unix)]
+        {
+            ensure!(
+                directory_metadata.mode() & 0o077 == 0,
+                "authorization state directory is accessible by group or others"
+            );
+            ensure!(
+                directory_metadata.uid() == unsafe { libc::geteuid() },
+                "authorization state directory has the wrong owner"
+            );
+        }
+
+        let path = store.state_path();
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AuthorizationInspection {
+                    snapshot: AuthorizationSnapshot {
+                        epoch: 1,
+                        peer: None,
+                        grants: None,
+                        enrolled_at_unix: None,
+                    },
+                    storage_present: false,
+                });
+            }
+            Err(error) => return Err(error).context("opening authorization state"),
+        };
+        store.validate_secure_file(&file, &path)?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.len() <= MAX_STATE_FILE_LEN,
+            "authorization state exceeds its fixed size bound"
+        );
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        Read::by_ref(&mut file)
+            .take(MAX_STATE_FILE_LEN.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_STATE_FILE_LEN,
+            "authorization state exceeds its fixed size bound"
+        );
+        ensure!(!bytes.is_empty(), "authorization state is empty");
+        let state: AuthorizationState =
+            serde_json::from_slice(&bytes).context("parsing authorization state")?;
+        state.validate(host)?;
+        let snapshot = match state.enrollment {
+            Some(enrollment) => AuthorizationSnapshot {
+                epoch: state.enrollment_epoch,
+                peer: Some(enrollment.peer_node_id.parse::<EndpointId>()?),
+                grants: Some(enrollment.grants),
+                enrolled_at_unix: Some(enrollment.enrolled_at_unix),
+            },
+            None => AuthorizationSnapshot {
+                epoch: state.enrollment_epoch,
+                peer: None,
+                grants: None,
+                enrolled_at_unix: None,
+            },
+        };
+        Ok(AuthorizationInspection {
+            snapshot,
+            storage_present: true,
         })
     }
 
@@ -395,7 +508,13 @@ impl AuthorizationStore {
             "authorization state exceeds its fixed size bound"
         );
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.read_to_end(&mut bytes)?;
+        Read::by_ref(&mut file)
+            .take(MAX_STATE_FILE_LEN.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_STATE_FILE_LEN,
+            "authorization state exceeds its fixed size bound"
+        );
         ensure!(!bytes.is_empty(), "authorization state is empty");
         serde_json::from_slice(&bytes).context("parsing authorization state")
     }
@@ -564,6 +683,38 @@ mod tests {
                 .unwrap(),
             grants
         );
+    }
+
+    #[test]
+    fn read_only_inspection_never_creates_state_and_retains_enrollment_time() {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let missing = root.path().join("missing-state");
+        let host = SecretKey::from_bytes(&[7; 32]);
+        let inspection = AuthorizationStore::inspect_existing(&missing, host.public()).unwrap();
+        assert!(!inspection.storage_present);
+        assert_eq!(inspection.snapshot.epoch, 1);
+        assert!(inspection.snapshot.peer.is_none());
+        assert!(!missing.exists());
+
+        let (directory, host, peer, store) = store();
+        let token = token(
+            &store,
+            &host,
+            peer.public(),
+            1_000,
+            [11; 32],
+            InvitationGrants::ALL,
+        );
+        store
+            .authorize_or_redeem(peer.public(), Some(&token), 1_001)
+            .unwrap();
+        let inspection =
+            AuthorizationStore::inspect_existing(directory.path(), host.public()).unwrap();
+        assert!(inspection.storage_present);
+        assert_eq!(inspection.snapshot.peer, Some(peer.public()));
+        assert_eq!(inspection.snapshot.enrolled_at_unix, Some(1_001));
     }
 
     #[test]

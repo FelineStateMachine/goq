@@ -44,6 +44,11 @@ Steam and games.
   `in-process-gstreamer` can opt into an in-process pipeline for bounded
   bitrate and force-keyframe control; ordinary release packages do not enable
   that feature yet.
+- Portal reports bounded receiver queue, drop, latency, and recovery telemetry
+  over a session-authenticated feedback stream. The host combines it with
+  trusted path and scheduler pressure, applies hysteresis, and commits an
+  in-process CBR bitrate decision only after exact encoder readback. External
+  encoder sessions remain explicitly advisory-only.
 - Portal delivers encoded frames to WebCodecs through a raw Tauri binary
   channel. The handoff is capped at four frames, the decode queue and
   presentation queue at two, and a bounded watchdog recovers a suspended
@@ -103,6 +108,11 @@ not authentication.
    Opus delivery, and client playback. Quantify longer-run A/V synchronization.
 8. **Done:** add signed, peer-bound, one-time capability enrollment with
    durable replay protection and controller-usable Portal onboarding.
+9. **Adaptive control implemented; hardware proof pending:** feedback remains
+   constant-size and generation-scoped, coalescing retains cumulative pressure,
+   and `applied=true` requires exact in-process encoder readback. Native Ubuntu
+   x264 control is CI-proven; Bazzite GstVA loss/relay acceptance and product
+   packaging remain in issue #8.
 
 ## Development
 

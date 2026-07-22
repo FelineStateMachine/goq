@@ -1,25 +1,29 @@
 use super::auth::derive_iroh_secret_from_key;
 use super::enrollment::{connection_enrollment, mark_invitation_redeemed};
 use super::state::{
-    AUDIO_DELIVERY_CAPACITY, AppState, AudioDeliveryState, CLIENT_INPUT_QUEUE_CAPACITY, FRAME_ALPN,
-    INPUT_ALPN, development_direct_node_available,
+    AUDIO_DELIVERY_CAPACITY, AccumulatedMediaFeedback, AppState, AudioDeliveryState,
+    CLIENT_INPUT_QUEUE_CAPACITY, FRAME_ALPN, INPUT_ALPN, MediaFeedbackSender,
+    development_direct_node_available,
 };
 use base64::Engine;
 use iroh::{Endpoint, SecretKey, endpoint::presets};
 use iroh_moq::{Moq, MoqSession};
 use moq_net::{BroadcastConsumer, GroupConsumer, Track, TrackConsumer};
 use openh264::{formats::YUVSource, nal_units};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sigil_protocol::{
-    AUDIO_ALPN_V1, AudioFlags, AudioPacket, AudioPacketHeader, CONTROL_ALPN_V1, Capability,
-    ClientHello, FrameFlags, INPUT_ALPN_V1, InputEvent, InvitationGrants, KeyframeRequestReasonV3,
+    AUDIO_ALPN_V1, AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1,
+    AudioFlags, AudioPacket, AudioPacketHeader, CONTROL_ALPN_V1, Capability, ClientHello,
+    FrameFlags, INPUT_ALPN_V1, InputEvent, InvitationGrants, KeyframeRequestReasonV3,
     MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MAX_MEDIA_OBJECT_ID_V3,
     MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS, MEDIA_ALPN_V1, MEDIA_ALPN_V2,
-    MEDIA_ALPN_V3, MOQ_VIDEO_H264_TRACK, MediaCodec, MediaControlRequestV3, MediaFrame,
-    MediaObjectV3, PointerPosition, PointerSurfaceDimensions, ProtocolError,
-    RELATIVE_POINTER_DELTA_MAX, RELATIVE_POINTER_DELTA_MIN, decode_media_frame_object,
-    media_moq_broadcast_name, read_host_hello, read_input_ack, read_media_frame, read_media_object,
-    read_media_object_v3, write_client_hello, write_input_event, write_media_control_request_v3,
+    MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, MOQ_VIDEO_H264_TRACK, MediaCodec, MediaControlRequestV3,
+    MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame, MediaObjectV3, PointerPosition,
+    PointerSurfaceDimensions, ProtocolError, RELATIVE_POINTER_DELTA_MAX,
+    RELATIVE_POINTER_DELTA_MIN, decode_media_frame_object, media_moq_broadcast_name,
+    read_adaptive_bitrate_decision_v1, read_host_hello, read_input_ack, read_media_frame,
+    read_media_object, read_media_object_v3, write_client_hello, write_input_event,
+    write_media_control_request_v3, write_media_feedback_report_v1,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Cursor;
@@ -91,6 +95,9 @@ const CLIENT_FRAME_CHANNEL_CAPACITY: usize = 4;
 // AudioWorklet owns a separate fixed ring and never feeds back into transport.
 const CLIENT_FRAME_STATS_INTERVAL: Duration = Duration::from_millis(250);
 const CLIENT_ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const CLIENT_MEDIA_FEEDBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const CLIENT_MEDIA_FEEDBACK_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_ADAPTIVE_DECISION_DELIVERY_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_FRAME_RATE_WINDOW: Duration = Duration::from_secs(1);
 const CLIENT_FRAME_TIMING_WINDOW: Duration = Duration::from_secs(5);
 // Host configuration permits at most 240 fps. Leave a little headroom for
@@ -413,6 +420,34 @@ fn take_generation_owned<T>(slot: &mut Option<(u64, T)>, expected_generation: u6
     }
 }
 
+fn take_generation_owned_triple<T, U>(
+    slot: &mut Option<(u64, T, U)>,
+    expected_generation: u64,
+) -> Option<(T, U)> {
+    if slot
+        .as_ref()
+        .is_some_and(|(generation, _, _)| *generation == expected_generation)
+    {
+        slot.take().map(|(_, value, companion)| (value, companion))
+    } else {
+        None
+    }
+}
+
+async fn retire_media_feedback_generation(app: &AppHandle, generation: u64) -> bool {
+    let state = app.state::<AppState>();
+    let connection = {
+        let _connection_serial = state.client_connection_serial.lock().await;
+        let mut slot = state.media_feedback.lock().await;
+        take_generation_owned_triple(&mut slot, generation).map(|(connection, _)| connection)
+    };
+    let Some(connection) = connection else {
+        return false;
+    };
+    connection.close(0_u32.into(), b"adaptive feedback ended");
+    true
+}
+
 async fn retire_upstream_moq_generation(
     app: &AppHandle,
     media_generation: u64,
@@ -440,6 +475,11 @@ async fn retire_upstream_moq_generation(
             let mut delivery = state.frame_delivery.lock().await;
             let _ = take_generation_owned(&mut delivery, media_generation);
         }
+        let feedback_connection = {
+            let mut feedback = state.media_feedback.lock().await;
+            take_generation_owned_triple(&mut feedback, media_generation)
+                .map(|(connection, _)| connection)
+        };
         *state.input_send.lock().await = None;
 
         let audio_connection = if let Some(audio_generation) = audio_generation {
@@ -460,6 +500,9 @@ async fn retire_upstream_moq_generation(
 
         let endpoint = state.client_endpoint.lock().await.take();
         media_connection.close(0_u32.into(), b"upstream MoQ media ended");
+        if let Some(feedback_connection) = feedback_connection {
+            feedback_connection.close(0_u32.into(), b"upstream MoQ media ended");
+        }
         if let Some(audio_connection) = audio_connection {
             audio_connection.close(0_u32.into(), b"upstream MoQ media ended");
         }
@@ -733,7 +776,47 @@ pub struct ConnectResult {
     pub audio_generation: Option<u64>,
     pub audio_error: Option<String>,
     pub media_generation: u64,
+    pub adaptive_feedback_available: bool,
+    pub adaptive_feedback_error: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClientMediaFeedbackReport {
+    pub interval_ms: u16,
+    pub last_sequence: Option<u64>,
+    pub transport_dropped_delta: u32,
+    pub frontend_dropped_delta: u32,
+    pub decoder_dropped_delta: u32,
+    pub presenter_dropped_delta: u32,
+    pub frontend_queue_depth: u8,
+    pub frontend_queue_capacity: u8,
+    pub decode_queue_depth: u8,
+    pub decode_queue_capacity: u8,
+    pub presenter_queue_depth: u8,
+    pub presenter_queue_capacity: u8,
+    pub transport_delivery_p95_ms: Option<f64>,
+    pub decode_p95_ms: Option<f64>,
+    pub presentation_p95_ms: Option<f64>,
+    pub resync_active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct AdaptiveBitrateDecisionPayload {
+    generation: u64,
+    decision: AdaptiveBitrateDecisionDiagnostic,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct AdaptiveBitrateDecisionDiagnostic {
+    decision_id: u64,
+    report_id: u64,
+    target_kbps: u32,
+    floor_kbps: u32,
+    ceiling_kbps: u32,
+    state: &'static str,
+    reasons: Vec<&'static str>,
+    applied: bool,
 }
 
 struct NegotiatedV1Stream {
@@ -760,6 +843,10 @@ impl MediaTransport {
             Self::IndependentObjectsV2 => "independent-v2",
             Self::GroupedObjectsV3 => "grouped-v3",
         }
+    }
+
+    const fn supports_adaptive_feedback(self) -> bool {
+        matches!(self, Self::UpstreamMoq | Self::GroupedObjectsV3)
     }
 }
 
@@ -1826,6 +1913,249 @@ fn connect_error_is_unsupported_alpn(error: &iroh::endpoint::ConnectError) -> bo
     }
 }
 
+async fn open_negotiated_feedback_stream(
+    endpoint: &Endpoint,
+    address: &iroh::EndpointAddr,
+    nonce: [u8; 16],
+    media_session_id: u64,
+) -> Result<
+    Option<(
+        iroh::endpoint::Connection,
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+    )>,
+    String,
+> {
+    let connection = match endpoint
+        .connect(address.clone(), MEDIA_FEEDBACK_ALPN_V1)
+        .await
+    {
+        Ok(connection) => connection,
+        Err(error) if connect_error_is_unsupported_alpn(&error) => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to connect adaptive feedback stream: {error}"
+            ));
+        }
+    };
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| format!("Failed to open adaptive feedback handshake: {error}"))?;
+    let negotiation = negotiate_v1(
+        &mut send,
+        &mut recv,
+        nonce,
+        vec![Capability::VideoH264],
+        Some(Capability::VideoH264),
+        "adaptive feedback",
+        None,
+    )
+    .await?;
+    if negotiation.session_id != media_session_id {
+        return Err("Host returned mismatched media and adaptive feedback sessions".to_string());
+    }
+    Ok(Some((connection, send, recv)))
+}
+
+fn adaptive_bitrate_state_name(state: AdaptiveBitrateStateV1) -> &'static str {
+    match state {
+        AdaptiveBitrateStateV1::Hold => "hold",
+        AdaptiveBitrateStateV1::Decrease => "decrease",
+        AdaptiveBitrateStateV1::Increase => "increase",
+    }
+}
+
+fn adaptive_bitrate_reason_names(reasons: AdaptiveBitrateReasonFlagsV1) -> Vec<&'static str> {
+    [
+        (AdaptiveBitrateReasonFlagsV1::RTT_INFLATION, "rtt-inflation"),
+        (
+            AdaptiveBitrateReasonFlagsV1::LOSS_OR_CANCELLATION,
+            "loss-or-cancellation",
+        ),
+        (
+            AdaptiveBitrateReasonFlagsV1::SENDER_BACKPRESSURE,
+            "sender-backpressure",
+        ),
+        (
+            AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE,
+            "receiver-queue",
+        ),
+        (
+            AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG,
+            "decode-backlog",
+        ),
+        (
+            AdaptiveBitrateReasonFlagsV1::DELIVERY_LATENCY,
+            "delivery-latency",
+        ),
+        (
+            AdaptiveBitrateReasonFlagsV1::CLEAN_RECOVERY,
+            "clean-recovery",
+        ),
+        (
+            AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE,
+            "feedback-stale",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(flag, name)| reasons.contains(flag).then_some(name))
+    .collect()
+}
+
+fn adaptive_bitrate_decision_diagnostic(
+    decision: AdaptiveBitrateDecisionV1,
+) -> AdaptiveBitrateDecisionDiagnostic {
+    AdaptiveBitrateDecisionDiagnostic {
+        decision_id: decision.decision_id,
+        report_id: decision.report_id,
+        target_kbps: decision.target_kbps,
+        floor_kbps: decision.floor_kbps,
+        ceiling_kbps: decision.ceiling_kbps,
+        state: adaptive_bitrate_state_name(decision.state),
+        reasons: adaptive_bitrate_reason_names(decision.reasons),
+        applied: decision.applied,
+    }
+}
+
+#[derive(Debug, Default)]
+struct AdaptiveDecisionSequence {
+    last_decision_id: Option<u64>,
+    last_report_id: Option<u64>,
+}
+
+impl AdaptiveDecisionSequence {
+    fn accept(&mut self, decision: &AdaptiveBitrateDecisionV1) -> Result<(), String> {
+        if self
+            .last_decision_id
+            .is_some_and(|previous| decision.decision_id <= previous)
+        {
+            return Err(format!(
+                "adaptive decision ID did not increase: previous={:?}, current={}",
+                self.last_decision_id, decision.decision_id
+            ));
+        }
+        if self
+            .last_report_id
+            .is_some_and(|previous| decision.report_id <= previous)
+        {
+            return Err(format!(
+                "adaptive decision report ID did not increase: previous={:?}, current={}",
+                self.last_report_id, decision.report_id
+            ));
+        }
+        self.last_decision_id = Some(decision.decision_id);
+        self.last_report_id = Some(decision.report_id);
+        Ok(())
+    }
+}
+
+async fn emit_paced_adaptive_decisions<F>(
+    generation: u64,
+    mut decisions: tokio::sync::watch::Receiver<Option<AdaptiveBitrateDecisionV1>>,
+    delivery_interval: Duration,
+    mut emit: F,
+) -> Result<(), String>
+where
+    F: FnMut(AdaptiveBitrateDecisionPayload) -> Result<(), String>,
+{
+    let mut delivery = tokio::time::interval(delivery_interval);
+    delivery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        decisions
+            .changed()
+            .await
+            .map_err(|_| "adaptive decision receiver closed".to_string())?;
+        // The first tick is immediate. Later ticks pace the webview boundary;
+        // any host burst replaces the watch value while this task waits.
+        delivery.tick().await;
+        let Some(decision) = *decisions.borrow_and_update() else {
+            continue;
+        };
+        emit(AdaptiveBitrateDecisionPayload {
+            generation,
+            decision: adaptive_bitrate_decision_diagnostic(decision),
+        })?;
+    }
+}
+
+async fn run_media_feedback_session(
+    app: AppHandle,
+    generation: u64,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    mut reports: tokio::sync::watch::Receiver<Option<AccumulatedMediaFeedback>>,
+) {
+    let (decision_tx, decision_rx) = tokio::sync::watch::channel(None);
+    let writer = async {
+        let mut last_written = None;
+        loop {
+            reports
+                .changed()
+                .await
+                .map_err(|_| "adaptive feedback sender closed".to_string())?;
+            let accumulated = *reports.borrow_and_update();
+            let Some(accumulated) = accumulated else {
+                continue;
+            };
+            let report = accumulated.report_since(last_written);
+            tokio::time::timeout(
+                CLIENT_MEDIA_FEEDBACK_IO_TIMEOUT,
+                write_media_feedback_report_v1(&mut send, &report),
+            )
+            .await
+            .map_err(|_| "adaptive feedback write timed out".to_string())?
+            .map_err(|error| format!("adaptive feedback write failed: {error}"))?;
+            last_written = Some(accumulated);
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), String>(())
+    };
+    let reader = async {
+        let mut sequence = AdaptiveDecisionSequence::default();
+        loop {
+            let decision = read_adaptive_bitrate_decision_v1(&mut recv)
+                .await
+                .map_err(|error| format!("adaptive decision read failed: {error}"))?
+                .ok_or_else(|| "adaptive decision stream closed".to_string())?;
+            sequence.accept(&decision)?;
+            decision_tx.send_replace(Some(decision));
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), String>(())
+    };
+    let decision_app = app.clone();
+    let decision_emitter = emit_paced_adaptive_decisions(
+        generation,
+        decision_rx,
+        CLIENT_ADAPTIVE_DECISION_DELIVERY_INTERVAL,
+        move |payload| {
+            decision_app
+                .emit("adaptive-bitrate-decision", payload)
+                .map_err(|error| format!("adaptive decision event delivery failed: {error}"))
+        },
+    );
+    let terminal = tokio::select! {
+        terminal = writer => terminal,
+        terminal = reader => terminal,
+        terminal = decision_emitter => terminal,
+    };
+    if let Err(error) = terminal {
+        eprintln!("[client] {error}");
+        if let Err(emit_error) = app.emit(
+            "adaptive-feedback-state",
+            serde_json::json!({
+                "generation": generation,
+                "available": false,
+                "error": error,
+            }),
+        ) {
+            eprintln!("[client] adaptive feedback terminal event delivery failed: {emit_error}");
+        }
+    }
+    retire_media_feedback_generation(&app, generation).await;
+}
+
 async fn open_legacy_negotiated_media_stream(
     endpoint: &Endpoint,
     address: &iroh::EndpointAddr,
@@ -2651,6 +2981,39 @@ pub async fn iroh_client_connect(
         mark_invitation_redeemed(&app, expected_invitation)?;
     }
 
+    // Feedback is a v3 sidecar for both the preferred upstream-MoQ transport
+    // and the grouped-v3 compatibility path. Unsupported ALPN is normal
+    // compatibility with older Sigil hosts; all other failures remain visible
+    // diagnostics but never downgrade the authenticated media session.
+    let (adaptive_feedback_stream, adaptive_feedback_error) = if media_transport
+        .supports_adaptive_feedback()
+    {
+        match tokio::time::timeout(
+            CLIENT_MEDIA_FEEDBACK_CONNECT_TIMEOUT,
+            open_negotiated_feedback_stream(
+                &endpoint,
+                &addr,
+                handshake_nonce,
+                media_session_id.ok_or_else(|| "Media v3 omitted its session ID".to_string())?,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => (stream, None),
+            Ok(Err(error)) => {
+                eprintln!("[client] adaptive feedback unavailable: {error}");
+                (None, Some(error))
+            }
+            Err(_) => {
+                let error = "Adaptive feedback negotiation timed out".to_string();
+                eprintln!("[client] adaptive feedback unavailable: {error}");
+                (None, Some(error))
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     let (input_send, input_recv, input_capabilities) = if use_v1 {
         let [
             visibility_capabilities,
@@ -2781,7 +3144,7 @@ pub async fn iroh_client_connect(
         app.clone(),
         &endpoint,
         AudioStartRequest {
-            address: addr,
+            address: addr.clone(),
             handshake_nonce,
             media_session_id,
             audio_supported,
@@ -2815,6 +3178,22 @@ pub async fn iroh_client_connect(
         *ce = Some(endpoint.clone());
     }
     *state.media_connection.lock().await = Some((media_generation, frame_conn.clone()));
+    let adaptive_feedback_available = adaptive_feedback_stream.is_some();
+    if let Some((connection, send, recv)) = adaptive_feedback_stream {
+        let (feedback_tx, feedback_rx) = tokio::sync::watch::channel(None);
+        let feedback_sender: MediaFeedbackSender = feedback_tx;
+        *state.media_feedback.lock().await =
+            Some((media_generation, connection, feedback_sender.clone()));
+        tokio::spawn(run_media_feedback_session(
+            app.clone(),
+            media_generation,
+            send,
+            recv,
+            feedback_rx,
+        ));
+    } else {
+        *state.media_feedback.lock().await = None;
+    }
     let media_control_requests = if let Some(control_stream) = media_control_stream {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
         *state.media_control.lock().await = Some((media_generation, control_tx.clone()));
@@ -3488,6 +3867,8 @@ pub async fn iroh_client_connect(
         audio_generation: connected_audio_generation,
         audio_error,
         media_generation,
+        adaptive_feedback_available,
+        adaptive_feedback_error,
         error: None,
     };
     connect_guard.commit();
@@ -3793,6 +4174,9 @@ mod tests {
     #[test]
     fn upstream_moq_transport_is_distinct_from_legacy_compatibility() {
         assert_eq!(MediaTransport::UpstreamMoq.diagnostic_name(), "iroh-moq");
+        assert!(MediaTransport::UpstreamMoq.supports_adaptive_feedback());
+        assert!(MediaTransport::GroupedObjectsV3.supports_adaptive_feedback());
+        assert!(!MediaTransport::IndependentObjectsV2.supports_adaptive_feedback());
         assert_ne!(
             MediaTransport::UpstreamMoq,
             MediaTransport::GroupedObjectsV3
@@ -4309,6 +4693,175 @@ mod tests {
         assert!(next_media_generation(&exhausted).is_err());
     }
 
+    fn client_feedback() -> ClientMediaFeedbackReport {
+        ClientMediaFeedbackReport {
+            interval_ms: 1_000,
+            last_sequence: Some(99),
+            transport_dropped_delta: 1,
+            frontend_dropped_delta: 2,
+            decoder_dropped_delta: 3,
+            presenter_dropped_delta: 4,
+            frontend_queue_depth: 1,
+            frontend_queue_capacity: 4,
+            decode_queue_depth: 1,
+            decode_queue_capacity: 2,
+            presenter_queue_depth: 0,
+            presenter_queue_capacity: 2,
+            transport_delivery_p95_ms: Some(17.4),
+            decode_p95_ms: Some(4.6),
+            presentation_p95_ms: None,
+            resync_active: true,
+        }
+    }
+
+    #[test]
+    fn adaptive_feedback_conversion_is_bounded_and_protocol_valid() {
+        let report = media_feedback_report(7, client_feedback()).unwrap();
+        assert_eq!(report.report_id, 7);
+        assert_eq!(report.interval_ms, 1_000);
+        assert_eq!(report.last_sequence, Some(99));
+        assert_eq!(report.transport_delivery_p95_ms, Some(17));
+        assert_eq!(report.decode_p95_ms, Some(5));
+        assert!(report.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE));
+        report.validate().unwrap();
+
+        let mut invalid = client_feedback();
+        invalid.decode_queue_depth = 3;
+        assert!(media_feedback_report(8, invalid).is_err());
+        let mut invalid_interval = client_feedback();
+        invalid_interval.interval_ms = 249;
+        assert!(media_feedback_report(9, invalid_interval).is_err());
+        assert!(feedback_latency_ms(Some(f64::INFINITY), "decode").is_err());
+        assert!(feedback_latency_ms(Some(60_001.0), "decode").is_err());
+    }
+
+    #[test]
+    fn feedback_report_ids_are_nonzero_monotonic_and_checked() {
+        let counter = AtomicU64::new(0);
+        assert_eq!(next_feedback_report_id(&counter).unwrap(), 1);
+        assert_eq!(next_feedback_report_id(&counter).unwrap(), 2);
+        assert!(next_feedback_report_id(&AtomicU64::new(u64::MAX)).is_err());
+    }
+
+    #[tokio::test]
+    async fn adaptive_feedback_watch_coalesces_latest_state_without_losing_pressure() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(None);
+        let first = media_feedback_report(1, client_feedback()).unwrap();
+        sender.send_replace(Some(AccumulatedMediaFeedback::new(first)));
+        receiver.changed().await.unwrap();
+        let stalled_write = receiver.borrow_and_update().unwrap();
+
+        let mut latest = client_feedback();
+        latest.interval_ms = 1_250;
+        latest.transport_dropped_delta = 9;
+        let second = media_feedback_report(2, latest).unwrap();
+        sender.send_modify(|pending| pending.as_mut().unwrap().merge(second));
+        let mut newest = client_feedback();
+        newest.interval_ms = 1_500;
+        newest.transport_dropped_delta = 11;
+        newest.frontend_queue_depth = 3;
+        let third = media_feedback_report(3, newest).unwrap();
+        sender.send_modify(|pending| pending.as_mut().unwrap().merge(third));
+
+        assert_eq!(stalled_write.report_since(None), first);
+        receiver.changed().await.unwrap();
+        let coalesced = receiver
+            .borrow_and_update()
+            .unwrap()
+            .report_since(Some(stalled_write));
+        assert_eq!(coalesced.report_id, 3);
+        assert_eq!(coalesced.interval_ms, 2_750);
+        assert_eq!(coalesced.transport_dropped_delta, 20);
+        assert_eq!(coalesced.frontend_queue_depth, 3);
+    }
+
+    #[test]
+    fn adaptive_decision_diagnostics_are_explicitly_shadow_state() {
+        let diagnostic = adaptive_bitrate_decision_diagnostic(adaptive_decision(2, 1));
+        assert_eq!(diagnostic.state, "decrease");
+        assert_eq!(diagnostic.reasons, vec!["receiver-queue", "decode-backlog"]);
+        assert!(!diagnostic.applied);
+    }
+
+    fn adaptive_decision(decision_id: u64, report_id: u64) -> AdaptiveBitrateDecisionV1 {
+        AdaptiveBitrateDecisionV1 {
+            decision_id,
+            report_id,
+            target_kbps: 8_000,
+            floor_kbps: 4_000,
+            ceiling_kbps: 20_000,
+            state: AdaptiveBitrateStateV1::Decrease,
+            reasons: AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE
+                .union(AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG),
+            applied: false,
+        }
+    }
+
+    #[test]
+    fn adaptive_decision_sequence_rejects_duplicate_or_regressing_ids() {
+        let mut sequence = AdaptiveDecisionSequence::default();
+        sequence.accept(&adaptive_decision(1, 10)).unwrap();
+        sequence.accept(&adaptive_decision(3, 12)).unwrap();
+        assert!(sequence.accept(&adaptive_decision(3, 13)).is_err());
+
+        let mut report_regression = AdaptiveDecisionSequence::default();
+        report_regression.accept(&adaptive_decision(1, 10)).unwrap();
+        assert!(report_regression.accept(&adaptive_decision(2, 10)).is_err());
+        assert!(report_regression.accept(&adaptive_decision(3, 9)).is_err());
+    }
+
+    #[tokio::test]
+    async fn adaptive_decision_delivery_is_paced_latest_value_and_emit_failure_is_terminal() {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::channel(2);
+        let delivery = tokio::spawn(emit_paced_adaptive_decisions(
+            7,
+            receiver,
+            Duration::from_millis(20),
+            move |payload| {
+                delivered_tx
+                    .try_send(payload)
+                    .map_err(|error| format!("test delivery failed: {error}"))
+            },
+        ));
+        sender.send_replace(Some(adaptive_decision(1, 1)));
+        sender.send_replace(Some(adaptive_decision(2, 2)));
+        let first = tokio::time::timeout(Duration::from_millis(100), delivered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.generation, 7);
+        assert_eq!(first.decision.decision_id, 2);
+
+        sender.send_replace(Some(adaptive_decision(3, 3)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), delivered_rx.recv())
+                .await
+                .is_err()
+        );
+        let second = tokio::time::timeout(Duration::from_millis(100), delivered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.decision.decision_id, 3);
+        delivery.abort();
+
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let terminal = tokio::spawn(emit_paced_adaptive_decisions(
+            7,
+            receiver,
+            Duration::from_millis(1),
+            |_payload| Err("webview channel closed".to_string()),
+        ));
+        sender.send_replace(Some(adaptive_decision(4, 4)));
+        let error = tokio::time::timeout(Duration::from_millis(100), terminal)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error, "webview channel closed");
+    }
+
     #[test]
     fn audio_reorder_window_is_bounded_and_marks_skipped_packets() {
         let mut reorder = AudioReorderBuffer::default();
@@ -4401,6 +4954,18 @@ mod tests {
         assert_eq!(slot, Some((12, "replacement")));
         assert_eq!(take_generation_owned(&mut slot, 12), Some("replacement"));
         assert_eq!(slot, None);
+
+        let mut feedback = Some((22, "replacement connection", "replacement sender"));
+        assert_eq!(take_generation_owned_triple(&mut feedback, 21), None);
+        assert_eq!(
+            feedback,
+            Some((22, "replacement connection", "replacement sender"))
+        );
+        assert_eq!(
+            take_generation_owned_triple(&mut feedback, 22),
+            Some(("replacement connection", "replacement sender"))
+        );
+        assert_eq!(feedback, None);
     }
 
     #[test]
@@ -5015,6 +5580,88 @@ pub async fn iroh_client_request_keyframe(
     }
 }
 
+fn feedback_latency_ms(value: Option<f64>, name: &str) -> Result<Option<u16>, String> {
+    value
+        .map(|value| {
+            if !value.is_finite() || !(0.0..=60_000.0).contains(&value) {
+                return Err(format!("{name} must be finite and between 0 and 60000 ms"));
+            }
+            Ok(value.round() as u16)
+        })
+        .transpose()
+}
+
+fn next_feedback_report_id(counter: &AtomicU64) -> Result<u64, String> {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .map_err(|_| "Adaptive feedback report ID overflowed".to_string())
+}
+
+fn media_feedback_report(
+    report_id: u64,
+    input: ClientMediaFeedbackReport,
+) -> Result<MediaFeedbackReportV1, String> {
+    let flags = if input.resync_active {
+        MediaFeedbackFlags::RESYNC_ACTIVE
+    } else {
+        MediaFeedbackFlags::NONE
+    };
+    let report = MediaFeedbackReportV1 {
+        report_id,
+        interval_ms: input.interval_ms,
+        flags,
+        last_sequence: input.last_sequence,
+        transport_dropped_delta: input.transport_dropped_delta,
+        frontend_dropped_delta: input.frontend_dropped_delta,
+        decoder_dropped_delta: input.decoder_dropped_delta,
+        presenter_dropped_delta: input.presenter_dropped_delta,
+        frontend_queue_depth: input.frontend_queue_depth,
+        frontend_queue_capacity: input.frontend_queue_capacity,
+        decode_queue_depth: input.decode_queue_depth,
+        decode_queue_capacity: input.decode_queue_capacity,
+        presenter_queue_depth: input.presenter_queue_depth,
+        presenter_queue_capacity: input.presenter_queue_capacity,
+        transport_delivery_p95_ms: feedback_latency_ms(
+            input.transport_delivery_p95_ms,
+            "delivery p95",
+        )?,
+        decode_p95_ms: feedback_latency_ms(input.decode_p95_ms, "decode p95")?,
+        presentation_p95_ms: feedback_latency_ms(input.presentation_p95_ms, "presentation p95")?,
+    };
+    report
+        .validate()
+        .map_err(|error| format!("Invalid adaptive feedback report: {error}"))?;
+    Ok(report)
+}
+
+#[tauri::command]
+pub async fn iroh_client_send_media_feedback(
+    state: State<'_, AppState>,
+    generation: u64,
+    report: ClientMediaFeedbackReport,
+) -> Result<bool, String> {
+    let feedback = state.media_feedback.lock().await;
+    let Some((current_generation, _connection, sender)) = feedback.as_ref() else {
+        return Ok(false);
+    };
+    if *current_generation != generation {
+        return Ok(false);
+    }
+    if sender.receiver_count() == 0 {
+        return Err("Adaptive feedback channel closed".to_string());
+    }
+    let report_id = next_feedback_report_id(&state.media_feedback_report_id)?;
+    let report = media_feedback_report(report_id, report)?;
+    sender.send_modify(|pending| match pending {
+        Some(pending) => pending.merge(report),
+        None => *pending = Some(AccumulatedMediaFeedback::new(report)),
+    });
+    Ok(true)
+}
+
 #[tauri::command]
 pub async fn iroh_client_ack_frame(
     state: State<'_, AppState>,
@@ -5112,6 +5759,9 @@ pub async fn iroh_client_disconnect(state: State<'_, AppState>) -> Result<bool, 
     next_audio_generation(&state.audio_connection_generation)?;
     lock_audio_deliveries(&state.audio_deliveries).clear();
     *state.media_control.lock().await = None;
+    if let Some((_generation, connection, _sender)) = state.media_feedback.lock().await.take() {
+        connection.close(0_u32.into(), b"client disconnected");
+    }
     // Do not rely on endpoint shutdown alone to retire the session. The frame
     // reader and diagnostics task both own connection clones, and a surviving
     // media connection keeps the host's encoder and one-client lease alive.

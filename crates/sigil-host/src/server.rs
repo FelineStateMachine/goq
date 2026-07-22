@@ -13,26 +13,28 @@ use moq_net::{
     Track, TrackProducer,
 };
 use sigil_protocol::{
-    AUDIO_HEADER_LEN, AudioFlags, AudioPacket, AudioPacketHeader, Capability, ClientHello,
+    AUDIO_HEADER_LEN, AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1,
+    AdaptiveBitrateStateV1, AudioFlags, AudioPacket, AudioPacketHeader, Capability, ClientHello,
     FrameFlags, HostHello, InputAck, InvitationGrants, KeyframeRequestReasonV3,
     MAX_AUDIO_PAYLOAD_LEN, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,
     MAX_MEDIA_OBJECT_ID_V3, MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MOQ_VIDEO_H264_TRACK,
-    MediaControlRequestV3, MediaFrame, MediaFrameHeader, MediaObjectHeaderV3, MediaObjectV3,
-    encode_media_frame_object, media_moq_broadcast_name, read_client_hello, read_input_event,
-    read_media_control_request_v3, write_host_hello, write_input_ack, write_media_frame,
-    write_media_object_v3,
+    MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame, MediaFrameHeader,
+    MediaObjectHeaderV3, MediaObjectV3, encode_media_frame_object, media_moq_broadcast_name,
+    read_client_hello, read_input_event, read_media_control_request_v3,
+    read_media_feedback_report_v1, write_adaptive_bitrate_decision_v1, write_host_hello,
+    write_input_ack, write_media_frame, write_media_object_v3,
 };
 use tracing::{debug, error, info, warn};
 
 use crate::audio::spawn_pipewire_audio;
 use crate::authorization::{AuthorizationPolicy, unix_timestamp_now};
 use crate::clock::SessionClock;
-use crate::config::{HostConfig, VideoSource};
+use crate::config::{GamescopeEncoderBackend, HostConfig, VaapiRateControl, VideoSource};
 use crate::cursor::{PointerPositionTracker, PointerState};
 use crate::input::{InputBackend, InputDisposition};
 use crate::source::{
-    EncodedFrame, EncodedGop, EncodedSource, spawn_gamescope_pipewire_after_static_preflight,
-    spawn_test_pattern,
+    EncodedFrame, EncodedGop, EncodedSource, EncoderControl,
+    spawn_gamescope_pipewire_after_static_preflight, spawn_test_pattern,
 };
 
 const MEDIA_CAPABILITIES: &[Capability] = &[Capability::VideoH264];
@@ -69,6 +71,504 @@ const SOURCE_REAP_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 const MOQ_ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const MOQ_VIDEO_TRACK_PRIORITY: u8 = u8::MAX;
 const MOQ_REJECT_CODE: u32 = 0x534d;
+const ADAPTIVE_BITRATE_FLOOR_KBPS: u32 = 1_000;
+const TEST_PATTERN_BITRATE_CEILING_KBPS: u32 = 12_000;
+const ADAPTIVE_BITRATE_QUANTUM_KBPS: u32 = 250;
+const ADAPTIVE_BITRATE_CLEAN_WINDOWS: u8 = 10;
+const ADAPTIVE_BITRATE_MODERATE_WINDOWS: u8 = 2;
+const ADAPTIVE_BITRATE_COOLDOWN_WINDOWS: u8 = 10;
+const FEEDBACK_FRESH_INTERVAL_MIN_MS: u16 = 750;
+const FEEDBACK_FRESH_INTERVAL_MAX_MS: u16 = 1_500;
+const FEEDBACK_FRESH_ARRIVAL_GAP_MIN: Duration = Duration::from_millis(750);
+const FEEDBACK_STALE_ARRIVAL_GAP: Duration = Duration::from_millis(2_500);
+const FEEDBACK_MIN_READ_INTERVAL: Duration = Duration::from_millis(250);
+const FEEDBACK_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const ENCODER_CONTROL_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
+// Mirrors the fixed v1 wire bound. Aggregates clamp here so a stalled
+// consumer observes a stale 5-second window instead of a deceptively fresh
+// latest report.
+const MEDIA_FEEDBACK_INTERVAL_MAX_MS: u64 = 5_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedbackSeverity {
+    Clean,
+    InsufficientEvidence,
+    Moderate,
+    Severe,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FeedbackIngressCursor {
+    last_report_id: Option<u64>,
+    interval_ms: u64,
+    transport_dropped: u64,
+    frontend_dropped: u64,
+    decoder_dropped: u64,
+    presenter_dropped: u64,
+    resync_reports: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CumulativeFeedbackIngress {
+    latest: Option<MediaFeedbackReportV1>,
+    interval_ms: u64,
+    transport_dropped: u64,
+    frontend_dropped: u64,
+    decoder_dropped: u64,
+    presenter_dropped: u64,
+    resync_reports: u64,
+}
+
+impl CumulativeFeedbackIngress {
+    fn observe(&mut self, report: MediaFeedbackReportV1) {
+        self.interval_ms = self.interval_ms.wrapping_add(u64::from(report.interval_ms));
+        self.transport_dropped = self
+            .transport_dropped
+            .wrapping_add(u64::from(report.transport_dropped_delta));
+        self.frontend_dropped = self
+            .frontend_dropped
+            .wrapping_add(u64::from(report.frontend_dropped_delta));
+        self.decoder_dropped = self
+            .decoder_dropped
+            .wrapping_add(u64::from(report.decoder_dropped_delta));
+        self.presenter_dropped = self
+            .presenter_dropped
+            .wrapping_add(u64::from(report.presenter_dropped_delta));
+        if report.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE) {
+            self.resync_reports = self.resync_reports.wrapping_add(1);
+        }
+        self.latest = Some(report);
+    }
+
+    fn report_since(
+        &self,
+        cursor: FeedbackIngressCursor,
+    ) -> Result<Option<(MediaFeedbackReportV1, FeedbackIngressCursor)>> {
+        let Some(latest) = self.latest else {
+            return Ok(None);
+        };
+        if cursor
+            .last_report_id
+            .is_some_and(|report_id| latest.report_id <= report_id)
+        {
+            return Ok(None);
+        }
+        let mut report = latest;
+        report.interval_ms = u16::try_from(
+            self.interval_ms
+                .wrapping_sub(cursor.interval_ms)
+                .min(MEDIA_FEEDBACK_INTERVAL_MAX_MS),
+        )
+        .expect("feedback interval is clamped to u16");
+        report.transport_dropped_delta =
+            cumulative_feedback_delta(self.transport_dropped, cursor.transport_dropped);
+        report.frontend_dropped_delta =
+            cumulative_feedback_delta(self.frontend_dropped, cursor.frontend_dropped);
+        report.decoder_dropped_delta =
+            cumulative_feedback_delta(self.decoder_dropped, cursor.decoder_dropped);
+        report.presenter_dropped_delta =
+            cumulative_feedback_delta(self.presenter_dropped, cursor.presenter_dropped);
+        report.flags = if self.resync_reports.wrapping_sub(cursor.resync_reports) > 0 {
+            MediaFeedbackFlags::RESYNC_ACTIVE
+        } else {
+            MediaFeedbackFlags::NONE
+        };
+        report.validate()?;
+        Ok(Some((
+            report,
+            FeedbackIngressCursor {
+                last_report_id: Some(latest.report_id),
+                interval_ms: self.interval_ms,
+                transport_dropped: self.transport_dropped,
+                frontend_dropped: self.frontend_dropped,
+                decoder_dropped: self.decoder_dropped,
+                presenter_dropped: self.presenter_dropped,
+                resync_reports: self.resync_reports,
+            },
+        )))
+    }
+}
+
+fn cumulative_feedback_delta(total: u64, baseline: u64) -> u32 {
+    u32::try_from(total.wrapping_sub(baseline).min(u64::from(u32::MAX)))
+        .expect("feedback delta is clamped to u32")
+}
+
+#[derive(Clone, Debug)]
+struct ShadowBitrateController {
+    floor_kbps: u32,
+    ceiling_kbps: u32,
+    target_kbps: u32,
+    next_decision_id: u64,
+    last_report_id: Option<u64>,
+    last_report_received_at: Option<Instant>,
+    previous_telemetry: MediaV3TelemetrySnapshot,
+    baseline_rtt_micros: Option<u64>,
+    last_sequence: Option<u64>,
+    moderate_windows: u8,
+    clean_windows: u8,
+    cooldown_windows: u8,
+}
+
+impl ShadowBitrateController {
+    fn new(configured_ceiling_kbps: u32, telemetry: MediaV3TelemetrySnapshot) -> Self {
+        let ceiling_kbps = quantize_down(configured_ceiling_kbps).max(ADAPTIVE_BITRATE_FLOOR_KBPS);
+        Self {
+            floor_kbps: ADAPTIVE_BITRATE_FLOOR_KBPS,
+            ceiling_kbps,
+            target_kbps: ceiling_kbps,
+            next_decision_id: 1,
+            last_report_id: None,
+            last_report_received_at: None,
+            previous_telemetry: telemetry,
+            baseline_rtt_micros: None,
+            last_sequence: None,
+            moderate_windows: 0,
+            clean_windows: 0,
+            cooldown_windows: 0,
+        }
+    }
+
+    fn decide(
+        &mut self,
+        report: &MediaFeedbackReportV1,
+        telemetry: MediaV3TelemetrySnapshot,
+        received_at: Instant,
+    ) -> Result<AdaptiveBitrateDecisionV1> {
+        ensure!(
+            self.last_report_id
+                .is_none_or(|last| report.report_id > last),
+            "feedback report IDs must increase monotonically"
+        );
+        let (severity, reasons, stale, trusted_host_pressure) =
+            self.classify(report, telemetry, received_at);
+        let mut state = AdaptiveBitrateStateV1::Hold;
+
+        if self.cooldown_windows > 0 {
+            self.cooldown_windows -= 1;
+        }
+        match severity {
+            FeedbackSeverity::Severe => {
+                self.moderate_windows = 0;
+                self.clean_windows = 0;
+                self.cooldown_windows = ADAPTIVE_BITRATE_COOLDOWN_WINDOWS;
+                let next =
+                    quantize_down(self.target_kbps.saturating_mul(3) / 4).max(self.floor_kbps);
+                if next < self.target_kbps {
+                    self.target_kbps = next;
+                    state = AdaptiveBitrateStateV1::Decrease;
+                }
+            }
+            FeedbackSeverity::Moderate => {
+                self.moderate_windows = self.moderate_windows.saturating_add(1);
+                self.clean_windows = 0;
+                if self.moderate_windows >= ADAPTIVE_BITRATE_MODERATE_WINDOWS {
+                    self.moderate_windows = 0;
+                    self.cooldown_windows = ADAPTIVE_BITRATE_COOLDOWN_WINDOWS;
+                    let next =
+                        quantize_down(self.target_kbps.saturating_mul(4) / 5).max(self.floor_kbps);
+                    if next < self.target_kbps {
+                        self.target_kbps = next;
+                        state = AdaptiveBitrateStateV1::Decrease;
+                    }
+                }
+            }
+            FeedbackSeverity::Clean => {
+                self.moderate_windows = 0;
+                self.clean_windows = self.clean_windows.saturating_add(1);
+                if self.clean_windows >= ADAPTIVE_BITRATE_CLEAN_WINDOWS
+                    && self.cooldown_windows == 0
+                {
+                    self.clean_windows = 0;
+                    let maximum_step =
+                        (self.target_kbps / 20).clamp(ADAPTIVE_BITRATE_QUANTUM_KBPS, 500);
+                    let next = quantize_down(
+                        self.target_kbps
+                            .saturating_add(maximum_step)
+                            .min(self.ceiling_kbps),
+                    );
+                    if next > self.target_kbps {
+                        self.target_kbps = next;
+                        state = AdaptiveBitrateStateV1::Increase;
+                    }
+                }
+            }
+            FeedbackSeverity::InsufficientEvidence | FeedbackSeverity::Stale => {
+                self.moderate_windows = 0;
+                self.clean_windows = 0;
+            }
+        }
+
+        self.target_kbps = self.target_kbps.clamp(self.floor_kbps, self.ceiling_kbps);
+        let decision = AdaptiveBitrateDecisionV1 {
+            decision_id: self.next_decision_id,
+            report_id: report.report_id,
+            target_kbps: self.target_kbps,
+            floor_kbps: self.floor_kbps,
+            ceiling_kbps: self.ceiling_kbps,
+            state,
+            reasons,
+            applied: false,
+        };
+        decision.validate()?;
+        self.next_decision_id = self
+            .next_decision_id
+            .checked_add(1)
+            .context("adaptive bitrate decision ID exhausted")?;
+        self.last_report_id = Some(report.report_id);
+        self.last_report_received_at = Some(received_at);
+        if !stale
+            || !trusted_host_pressure
+            || state == AdaptiveBitrateStateV1::Decrease
+            || self.target_kbps == self.floor_kbps
+        {
+            self.previous_telemetry = telemetry;
+        }
+        if !stale && let Some(sequence) = report.last_sequence {
+            self.last_sequence = Some(
+                self.last_sequence
+                    .map_or(sequence, |last| last.max(sequence)),
+            );
+        }
+        Ok(decision)
+    }
+
+    fn classify(
+        &mut self,
+        report: &MediaFeedbackReportV1,
+        telemetry: MediaV3TelemetrySnapshot,
+        received_at: Instant,
+    ) -> (FeedbackSeverity, AdaptiveBitrateReasonFlagsV1, bool, bool) {
+        let stale = !(FEEDBACK_FRESH_INTERVAL_MIN_MS..=FEEDBACK_FRESH_INTERVAL_MAX_MS)
+            .contains(&report.interval_ms)
+            || self.last_report_received_at.is_none()
+            || self.last_report_received_at.is_some_and(|last| {
+                let gap = received_at.saturating_duration_since(last);
+                !(FEEDBACK_FRESH_ARRIVAL_GAP_MIN..=FEEDBACK_STALE_ARRIVAL_GAP).contains(&gap)
+            });
+        let mut severity = FeedbackSeverity::Clean;
+        let mut reasons = AdaptiveBitrateReasonFlagsV1::NONE;
+
+        let lost_delta = telemetry
+            .selected_path_lost_packets
+            .saturating_sub(self.previous_telemetry.selected_path_lost_packets);
+        let congestion_delta = telemetry
+            .selected_path_congestion_events
+            .saturating_sub(self.previous_telemetry.selected_path_congestion_events);
+        let cancellation_delta = telemetry
+            .scheduler_cancellations
+            .saturating_sub(self.previous_telemetry.scheduler_cancellations);
+        let failure_delta = telemetry
+            .send_failures
+            .saturating_sub(self.previous_telemetry.send_failures);
+
+        if failure_delta > 0 || lost_delta > 0 || cancellation_delta >= 2 {
+            add_feedback_signal(
+                &mut severity,
+                &mut reasons,
+                FeedbackSeverity::Severe,
+                AdaptiveBitrateReasonFlagsV1::LOSS_OR_CANCELLATION,
+            );
+        } else if cancellation_delta > 0 || congestion_delta > 0 {
+            add_feedback_signal(
+                &mut severity,
+                &mut reasons,
+                FeedbackSeverity::Moderate,
+                AdaptiveBitrateReasonFlagsV1::LOSS_OR_CANCELLATION,
+            );
+        }
+        if cancellation_delta >= 2 || failure_delta > 0 {
+            add_feedback_signal(
+                &mut severity,
+                &mut reasons,
+                FeedbackSeverity::Severe,
+                AdaptiveBitrateReasonFlagsV1::SENDER_BACKPRESSURE,
+            );
+        } else if cancellation_delta > 0 {
+            add_feedback_signal(
+                &mut severity,
+                &mut reasons,
+                FeedbackSeverity::Moderate,
+                AdaptiveBitrateReasonFlagsV1::SENDER_BACKPRESSURE,
+            );
+        }
+
+        let rtt = telemetry.selected_path_rtt_micros;
+        if rtt > 0 {
+            let baseline = self.baseline_rtt_micros.get_or_insert(rtt);
+            if rtt < *baseline {
+                *baseline = rtt;
+            } else if rtt >= baseline.saturating_mul(2).max(80_000) {
+                add_feedback_signal(
+                    &mut severity,
+                    &mut reasons,
+                    FeedbackSeverity::Severe,
+                    AdaptiveBitrateReasonFlagsV1::RTT_INFLATION,
+                );
+            } else if rtt >= baseline.saturating_mul(3) / 2 {
+                add_feedback_signal(
+                    &mut severity,
+                    &mut reasons,
+                    FeedbackSeverity::Moderate,
+                    AdaptiveBitrateReasonFlagsV1::RTT_INFLATION,
+                );
+            }
+        }
+
+        let trusted_host_pressure = severity != FeedbackSeverity::Clean;
+        if stale {
+            reasons = reasons.union(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE);
+            if !trusted_host_pressure {
+                severity = FeedbackSeverity::Stale;
+            }
+            return (severity, reasons, true, trusted_host_pressure);
+        }
+
+        let receiver_drops = report
+            .transport_dropped_delta
+            .saturating_add(report.frontend_dropped_delta)
+            .saturating_add(report.decoder_dropped_delta)
+            .saturating_add(report.presenter_dropped_delta);
+        let queue_severe = queue_ratio_at_least(
+            report.frontend_queue_depth,
+            report.frontend_queue_capacity,
+            3,
+            4,
+        ) || queue_ratio_at_least(
+            report.decode_queue_depth,
+            report.decode_queue_capacity,
+            3,
+            4,
+        ) || queue_ratio_at_least(
+            report.presenter_queue_depth,
+            report.presenter_queue_capacity,
+            3,
+            4,
+        );
+        let queue_moderate = queue_ratio_at_least(
+            report.frontend_queue_depth,
+            report.frontend_queue_capacity,
+            1,
+            2,
+        ) || queue_ratio_at_least(
+            report.decode_queue_depth,
+            report.decode_queue_capacity,
+            1,
+            2,
+        ) || queue_ratio_at_least(
+            report.presenter_queue_depth,
+            report.presenter_queue_capacity,
+            1,
+            2,
+        );
+        if report.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE)
+            || queue_severe
+            || receiver_drops >= 4
+        {
+            add_feedback_signal(
+                &mut severity,
+                &mut reasons,
+                FeedbackSeverity::Severe,
+                AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE,
+            );
+        } else if queue_moderate || receiver_drops > 0 {
+            add_feedback_signal(
+                &mut severity,
+                &mut reasons,
+                FeedbackSeverity::Moderate,
+                AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE,
+            );
+        }
+        if report.decode_queue_depth == report.decode_queue_capacity
+            || report.decoder_dropped_delta > 0
+        {
+            add_feedback_signal(
+                &mut severity,
+                &mut reasons,
+                FeedbackSeverity::Severe,
+                AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG,
+            );
+        } else if report.decode_queue_depth >= 2 {
+            add_feedback_signal(
+                &mut severity,
+                &mut reasons,
+                FeedbackSeverity::Moderate,
+                AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG,
+            );
+        }
+
+        let delivery_p95 = report.transport_delivery_p95_ms.unwrap_or(0);
+        let decode_p95 = report.decode_p95_ms.unwrap_or(0);
+        let presentation_p95 = report.presentation_p95_ms.unwrap_or(0);
+        if delivery_p95 >= 200 || decode_p95 >= 100 || presentation_p95 >= 100 {
+            add_feedback_signal(
+                &mut severity,
+                &mut reasons,
+                FeedbackSeverity::Severe,
+                AdaptiveBitrateReasonFlagsV1::DELIVERY_LATENCY,
+            );
+        } else if delivery_p95 >= 100 || decode_p95 >= 50 || presentation_p95 >= 50 {
+            add_feedback_signal(
+                &mut severity,
+                &mut reasons,
+                FeedbackSeverity::Moderate,
+                AdaptiveBitrateReasonFlagsV1::DELIVERY_LATENCY,
+            );
+        }
+
+        if severity == FeedbackSeverity::Clean {
+            let sequence_progressed = self
+                .last_sequence
+                .zip(report.last_sequence)
+                .is_some_and(|(last, current)| current > last);
+            let complete_latency = report.transport_delivery_p95_ms.is_some()
+                && report.decode_p95_ms.is_some()
+                && report.presentation_p95_ms.is_some();
+            if sequence_progressed && complete_latency {
+                if self.target_kbps < self.ceiling_kbps {
+                    reasons = reasons.union(AdaptiveBitrateReasonFlagsV1::CLEAN_RECOVERY);
+                }
+            } else {
+                severity = FeedbackSeverity::InsufficientEvidence;
+            }
+        }
+        (severity, reasons, false, trusted_host_pressure)
+    }
+
+    fn commit_observation_from(&mut self, candidate: &Self) {
+        self.next_decision_id = candidate.next_decision_id;
+        self.last_report_id = candidate.last_report_id;
+        self.last_report_received_at = candidate.last_report_received_at;
+        self.previous_telemetry = candidate.previous_telemetry;
+        self.baseline_rtt_micros = candidate.baseline_rtt_micros;
+        self.last_sequence = candidate.last_sequence;
+    }
+}
+
+fn add_feedback_signal(
+    severity: &mut FeedbackSeverity,
+    reasons: &mut AdaptiveBitrateReasonFlagsV1,
+    signal: FeedbackSeverity,
+    reason: AdaptiveBitrateReasonFlagsV1,
+) {
+    *reasons = reasons.union(reason);
+    if signal == FeedbackSeverity::Severe
+        || (*severity == FeedbackSeverity::Clean && signal == FeedbackSeverity::Moderate)
+    {
+        *severity = signal;
+    }
+}
+
+fn quantize_down(kbps: u32) -> u32 {
+    kbps / ADAPTIVE_BITRATE_QUANTUM_KBPS * ADAPTIVE_BITRATE_QUANTUM_KBPS
+}
+
+fn queue_ratio_at_least(depth: u8, capacity: u8, numerator: u16, denominator: u16) -> bool {
+    capacity > 0
+        && u16::from(depth).saturating_mul(denominator)
+            >= u16::from(capacity).saturating_mul(numerator)
+}
 
 #[derive(Debug)]
 pub struct SessionRegistry {
@@ -86,6 +586,7 @@ struct PendingMoqAttachment {
     broadcast: BroadcastConsumer,
     attached: tokio::sync::oneshot::Sender<()>,
     closed: tokio::sync::oneshot::Sender<()>,
+    telemetry: Arc<MediaV3Telemetry>,
 }
 
 impl std::fmt::Debug for PendingMoqAttachment {
@@ -105,6 +606,7 @@ struct ClaimedMoqAttachment {
     broadcast: BroadcastConsumer,
     attached: tokio::sync::oneshot::Sender<()>,
     closed: tokio::sync::oneshot::Sender<()>,
+    telemetry: Arc<MediaV3Telemetry>,
 }
 
 struct MoqAttachmentWait {
@@ -112,7 +614,7 @@ struct MoqAttachmentWait {
     closed: tokio::sync::oneshot::Receiver<()>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ActiveSession {
     remote: EndpointId,
     session_id: u64,
@@ -122,6 +624,65 @@ struct ActiveSession {
     media_active: bool,
     input_claimed: bool,
     audio_claimed: bool,
+    feedback_claimed: bool,
+    media_v3_telemetry: Arc<MediaV3Telemetry>,
+    encoder_control: Option<EncoderControl>,
+}
+
+#[derive(Debug, Default)]
+struct MediaV3Telemetry {
+    scheduler_cancellations: AtomicU64,
+    send_failures: AtomicU64,
+    selected_path_rtt_micros: AtomicU64,
+    selected_path_lost_packets: AtomicU64,
+    selected_path_congestion_events: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MediaV3TelemetrySnapshot {
+    scheduler_cancellations: u64,
+    send_failures: u64,
+    selected_path_rtt_micros: u64,
+    selected_path_lost_packets: u64,
+    selected_path_congestion_events: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AdaptiveEncoderProposal {
+    control: EncoderControl,
+    target_kbps: u32,
+    bitrate_revision: u64,
+    force_keyframe_revision: Option<u64>,
+}
+
+impl MediaV3Telemetry {
+    fn snapshot(&self) -> MediaV3TelemetrySnapshot {
+        MediaV3TelemetrySnapshot {
+            scheduler_cancellations: self.scheduler_cancellations.load(Ordering::Relaxed),
+            send_failures: self.send_failures.load(Ordering::Relaxed),
+            selected_path_rtt_micros: self.selected_path_rtt_micros.load(Ordering::Relaxed),
+            selected_path_lost_packets: self.selected_path_lost_packets.load(Ordering::Relaxed),
+            selected_path_congestion_events: self
+                .selected_path_congestion_events
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_selected_path(&self, connection: &Connection) {
+        let paths = connection.paths();
+        let Some(path) = paths.iter().find(|path| path.is_selected()) else {
+            return;
+        };
+        let stats = path.stats();
+        self.selected_path_rtt_micros.store(
+            u64::try_from(stats.rtt.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.selected_path_lost_packets
+            .store(stats.lost_packets, Ordering::Relaxed);
+        self.selected_path_congestion_events
+            .store(stats.congestion_events, Ordering::Relaxed);
+    }
 }
 
 impl Default for SessionRegistry {
@@ -144,11 +705,12 @@ impl SessionRegistry {
         grants: InvitationGrants,
     ) -> Result<SessionLease> {
         let mut active = self.active.lock().expect("session registry poisoned");
-        if let Some(current) = *active {
+        if let Some(current) = active.as_ref() {
             bail!("host already has active client {}", current.remote);
         }
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
         let session_clock = SessionClock::start();
+        let media_v3_telemetry = Arc::new(MediaV3Telemetry::default());
         *active = Some(ActiveSession {
             remote,
             session_id,
@@ -158,12 +720,16 @@ impl SessionRegistry {
             media_active: true,
             input_claimed: false,
             audio_claimed: false,
+            feedback_claimed: false,
+            media_v3_telemetry: Arc::clone(&media_v3_telemetry),
+            encoder_control: None,
         });
         Ok(SessionLease {
             registry: Arc::clone(self),
             remote,
             session_id,
             session_clock,
+            media_v3_telemetry,
         })
     }
 
@@ -185,6 +751,86 @@ impl SessionRegistry {
             remote,
             session_id: session.session_id,
             grants: session.grants,
+        })
+    }
+
+    fn install_encoder_control(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        encoder_control: Option<EncoderControl>,
+    ) -> Result<()> {
+        let mut active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_mut()
+            .filter(|session| {
+                session.media_active && session.remote == remote && session.session_id == session_id
+            })
+            .context("encoder control does not match the active media session")?;
+        ensure!(
+            session.encoder_control.is_none(),
+            "active media session already has encoder control"
+        );
+        session.encoder_control = encoder_control;
+        Ok(())
+    }
+
+    fn propose_adaptive_encoder_update(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        target_kbps: u32,
+        force_keyframe: bool,
+    ) -> Result<Option<AdaptiveEncoderProposal>> {
+        let active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_ref()
+            .filter(|session| {
+                session.media_active && session.remote == remote && session.session_id == session_id
+            })
+            .context("adaptive encoder update does not match the active media session")?;
+        let Some(control) = session.encoder_control.clone() else {
+            return Ok(None);
+        };
+        let bitrate_revision = control.request_bitrate_kbps(target_kbps)?;
+        let force_keyframe_revision = force_keyframe
+            .then(|| control.request_force_keyframe())
+            .transpose()?;
+        Ok(Some(AdaptiveEncoderProposal {
+            control,
+            target_kbps,
+            bitrate_revision,
+            force_keyframe_revision,
+        }))
+    }
+
+    fn claim_feedback(
+        self: &Arc<Self>,
+        remote: EndpointId,
+        nonce: [u8; 16],
+    ) -> Result<FeedbackLease> {
+        let mut active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_mut()
+            .filter(|session| {
+                session.media_active && session.remote == remote && session.nonce == nonce
+            })
+            .context("feedback connection does not match the active media session")?;
+        ensure!(
+            session.grants.contains(InvitationGrants::VIEW),
+            "active Portal session lacks feedback view permission"
+        );
+        ensure!(
+            !session.feedback_claimed,
+            "active client already has a feedback connection"
+        );
+        session.feedback_claimed = true;
+        Ok(FeedbackLease {
+            registry: Arc::clone(self),
+            remote,
+            session_id: session.session_id,
+            telemetry: Arc::clone(&session.media_v3_telemetry),
+            encoder_control: session.encoder_control.clone(),
         })
     }
 
@@ -218,12 +864,13 @@ impl SessionRegistry {
         broadcast: BroadcastConsumer,
     ) -> Result<MoqAttachmentWait> {
         let active = self.active.lock().expect("session registry poisoned");
-        ensure!(
-            active.is_some_and(|session| {
+        let telemetry = active
+            .as_ref()
+            .filter(|session| {
                 session.media_active && session.remote == remote && session.session_id == session_id
-            }),
-            "MoQ expectation does not match the active control session"
-        );
+            })
+            .map(|session| Arc::clone(&session.media_v3_telemetry))
+            .context("MoQ expectation does not match the active control session")?;
         let mut pending = self.pending_moq.lock().expect("MoQ registry poisoned");
         ensure!(
             pending.is_none(),
@@ -238,6 +885,7 @@ impl SessionRegistry {
             broadcast,
             attached,
             closed,
+            telemetry,
         });
         Ok(MoqAttachmentWait {
             attached: attached_rx,
@@ -268,6 +916,7 @@ impl SessionRegistry {
             broadcast: attachment.broadcast,
             attached: attachment.attached,
             closed: attachment.closed,
+            telemetry: attachment.telemetry,
         })
     }
 
@@ -288,11 +937,12 @@ impl SessionRegistry {
             // prevents a reconnect from sharing the device with a draining
             // predecessor session.
             session.media_active = false;
-            if !session.input_claimed && !session.audio_claimed {
+            session.encoder_control = None;
+            if !session.input_claimed && !session.audio_claimed && !session.feedback_claimed {
                 *active = None;
             }
             drop(active);
-            self.session_changed.notify_one();
+            self.session_changed.notify_waiters();
         }
     }
 
@@ -300,6 +950,7 @@ impl SessionRegistry {
         self.active
             .lock()
             .expect("session registry poisoned")
+            .as_ref()
             .is_some_and(|active| {
                 active.media_active && active.remote == remote && active.session_id == session_id
             })
@@ -312,7 +963,7 @@ impl SessionRegistry {
             && session.session_id == session_id
         {
             session.input_claimed = false;
-            if !session.media_active && !session.audio_claimed {
+            if !session.media_active && !session.audio_claimed && !session.feedback_claimed {
                 *active = None;
             }
         }
@@ -325,7 +976,20 @@ impl SessionRegistry {
             && session.session_id == session_id
         {
             session.audio_claimed = false;
-            if !session.media_active && !session.input_claimed {
+            if !session.media_active && !session.input_claimed && !session.feedback_claimed {
+                *active = None;
+            }
+        }
+    }
+
+    fn release_feedback(&self, remote: EndpointId, session_id: u64) {
+        let mut active = self.active.lock().expect("session registry poisoned");
+        if let Some(session) = active.as_mut()
+            && session.remote == remote
+            && session.session_id == session_id
+        {
+            session.feedback_claimed = false;
+            if !session.media_active && !session.input_claimed && !session.audio_claimed {
                 *active = None;
             }
         }
@@ -338,6 +1002,7 @@ struct SessionLease {
     remote: EndpointId,
     session_id: u64,
     session_clock: SessionClock,
+    media_v3_telemetry: Arc<MediaV3Telemetry>,
 }
 
 impl Drop for SessionLease {
@@ -361,6 +1026,15 @@ struct AudioLease {
     session_id: u64,
     session_clock: SessionClock,
     grants: InvitationGrants,
+}
+
+#[derive(Debug)]
+struct FeedbackLease {
+    registry: Arc<SessionRegistry>,
+    remote: EndpointId,
+    session_id: u64,
+    telemetry: Arc<MediaV3Telemetry>,
+    encoder_control: Option<EncoderControl>,
 }
 
 #[derive(Debug)]
@@ -1308,6 +1982,12 @@ impl Drop for AudioLease {
     }
 }
 
+impl Drop for FeedbackLease {
+    fn drop(&mut self) {
+        self.registry.release_feedback(self.remote, self.session_id);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MediaHandler {
     pub config: HostConfig,
@@ -1331,6 +2011,13 @@ pub struct MediaV3Handler {
 
 #[derive(Clone, Debug)]
 pub struct ControlHandler {
+    pub config: HostConfig,
+    pub sessions: Arc<SessionRegistry>,
+    pub authorization: AuthorizationPolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct MediaFeedbackHandler {
     pub config: HostConfig,
     pub sessions: Arc<SessionRegistry>,
     pub authorization: AuthorizationPolicy,
@@ -1416,6 +2103,23 @@ impl ProtocolHandler for ControlHandler {
     }
 }
 
+impl ProtocolHandler for MediaFeedbackHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let remote = connection.remote_id();
+        if let Err(error) = serve_media_feedback(
+            connection,
+            &self.config,
+            &self.sessions,
+            &self.authorization,
+        )
+        .await
+        {
+            warn!(%remote, %error, "media feedback connection ended");
+        }
+        Ok(())
+    }
+}
+
 impl ProtocolHandler for AuthorizedMoqHandler {
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
         let remote = connection.remote_id();
@@ -1485,6 +2189,7 @@ async fn serve_authorized_moq(
         broadcast,
         attached,
         closed,
+        telemetry,
     } = attachment;
     let result: Result<()> = async {
         let web_transport = web_transport_iroh::Session::raw(connection);
@@ -1508,13 +2213,22 @@ async fn serve_authorized_moq(
             track = MOQ_VIDEO_H264_TRACK,
             "authorized MoQ media attachment accepted"
         );
-        tokio::select! {
-            reason = session.closed() => {
-                debug!(remote = %session.remote_id(), ?reason, "MoQ media session closed");
-            }
-            reason = broadcast_closed.closed() => {
-                debug!(remote = %session.remote_id(), ?reason, "control-owned MoQ broadcast closed");
-                session.close(0, b"control session ended");
+        let mut telemetry_interval = tokio::time::interval(Duration::from_secs(1));
+        telemetry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                reason = session.closed() => {
+                    debug!(remote = %session.remote_id(), ?reason, "MoQ media session closed");
+                    break;
+                }
+                reason = broadcast_closed.closed() => {
+                    debug!(remote = %session.remote_id(), ?reason, "control-owned MoQ broadcast closed");
+                    session.close(0, b"control session ended");
+                    break;
+                }
+                _ = telemetry_interval.tick() => {
+                    telemetry.record_selected_path(session.conn());
+                }
             }
         }
         Ok(())
@@ -1582,7 +2296,7 @@ async fn serve_control_moq(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
-        encoder_control: _encoder_control,
+        encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -1591,6 +2305,8 @@ async fn serve_control_moq(
         }
     };
     let source_task = SourceTaskGuard::new(source_task);
+    sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
+    let _encoder_control = encoder_control;
 
     let mut broadcast = Broadcast::new().produce();
     let track = broadcast
@@ -1650,6 +2366,7 @@ async fn serve_control_moq(
         closed,
         track,
         &mut broadcast,
+        Arc::clone(&lease.media_v3_telemetry),
     )
     .await;
 
@@ -1671,6 +2388,7 @@ async fn run_control_moq_session(
     mut moq_closed: tokio::sync::oneshot::Receiver<()>,
     track: TrackProducer,
     broadcast: &mut BroadcastProducer,
+    telemetry: Arc<MediaV3Telemetry>,
 ) -> Result<()> {
     let maximum_replay_age = maximum_media_replay_age(config.framerate);
     let mut replay_cursor = MediaReplayCursor::default();
@@ -1715,6 +2433,11 @@ async fn run_control_moq_session(
                         .and_then(|gop| gop.frames.last())
                         .map(|frame| frame.sequence);
                     let cancelled_group = publisher.request_keyframe();
+                    if cancelled_group.is_some() {
+                        telemetry
+                            .scheduler_cancellations
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     replay_cursor.enter_resync_through(through_sequence);
                     debug!(
                         %remote,
@@ -1758,12 +2481,21 @@ async fn run_control_moq_session(
                         ) {
                             MediaReplayDecision::Send { discontinuity } => discontinuity,
                             MediaReplayDecision::SkipUntilKeyframe => {
-                                publisher.request_keyframe();
+                                if publisher.request_keyframe().is_some() {
+                                    telemetry
+                                        .scheduler_cancellations
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                                 replay_cursor.enter_resync_through(Some(replay_through_sequence));
                                 break;
                             }
                             MediaReplayDecision::DiscardStaleSuffix { through_sequence } => {
                                 let cancelled_group = publisher.request_keyframe();
+                                if cancelled_group.is_some() {
+                                    telemetry
+                                        .scheduler_cancellations
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                                 debug!(
                                     %remote,
                                     through_sequence,
@@ -1773,12 +2505,22 @@ async fn run_control_moq_session(
                                 break;
                             }
                         };
-                        match publisher.publish(config, &frame, replay_discontinuity)? {
+                        let decision = publisher
+                            .publish(config, &frame, replay_discontinuity)
+                            .inspect_err(|_error| {
+                                telemetry.send_failures.fetch_add(1, Ordering::Relaxed);
+                            })?;
+                        match decision {
                             MoqGroupDecision::Published {
                                 group_id,
                                 frame_id,
                                 cancelled_previous,
                             } => {
+                                if cancelled_previous {
+                                    telemetry
+                                        .scheduler_cancellations
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                                 debug!(
                                     sequence = frame.sequence,
                                     group_id,
@@ -1811,6 +2553,402 @@ async fn run_control_moq_session(
         let _ = control_task.await;
     }
     result
+}
+
+async fn serve_media_feedback(
+    connection: Connection,
+    config: &HostConfig,
+    sessions: &Arc<SessionRegistry>,
+    authorization: &AuthorizationPolicy,
+) -> Result<()> {
+    let remote = connection.remote_id();
+    let handshake_permit = sessions
+        .pending_handshakes
+        .try_acquire()
+        .context("too many pending handshakes")?;
+    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
+        .await
+        .context("timed out accepting media feedback stream")?
+        .context("accepting media feedback stream")?;
+    let hello = receive_hello(&mut recv, Capability::VideoH264).await?;
+    drop(handshake_permit);
+    debug!(%remote, agent = %hello.agent, "media feedback hello received");
+    ensure!(
+        hello.invitation.is_none(),
+        "invitations are accepted only on the first media handshake"
+    );
+
+    let grants = match authorization.authorize_or_redeem(remote, None, unix_timestamp_now()?) {
+        Ok(grants) => grants,
+        Err(error) => {
+            send_rejection(&mut send, "Portal peer is not authorized").await?;
+            return Err(error.context("authorizing media feedback peer"));
+        }
+    };
+    ensure!(
+        grants.contains(InvitationGrants::VIEW),
+        "authorized feedback peer lacks view permission"
+    );
+    let ceiling_kbps = adaptive_bitrate_ceiling_kbps(config)?;
+    let lease = match sessions.claim_feedback(remote, hello.nonce) {
+        Ok(lease) => lease,
+        Err(error) => {
+            send_rejection(&mut send, error.to_string()).await?;
+            return Err(error);
+        }
+    };
+    let encoder_actuation_available =
+        adaptive_bitrate_actuation_enabled(config) && lease.encoder_control.is_some();
+
+    write_host_hello(
+        &mut send,
+        &HostHello::accepted(
+            lease.session_id,
+            negotiated_capabilities(&hello, MEDIA_CAPABILITIES),
+        ),
+    )
+    .await?;
+    info!(
+        %remote,
+        session_id = lease.session_id,
+        ceiling_kbps,
+        applied = false,
+        mode = if encoder_actuation_available { "active" } else { "shadow" },
+        "media feedback client accepted for bitrate control"
+    );
+
+    let (feedback_sender, mut feedback_receiver) =
+        tokio::sync::watch::channel(CumulativeFeedbackIngress::default());
+    let mut reader_task = tokio::spawn(forward_media_feedback_reports(recv, feedback_sender));
+    let mut reader_finished = false;
+    let mut receiver_open = true;
+    let mut controller = ShadowBitrateController::new(ceiling_kbps, lease.telemetry.snapshot());
+    let mut feedback_cursor = FeedbackIngressCursor::default();
+
+    let result: Result<()> = loop {
+        let session_changed = sessions.session_changed.notified();
+        tokio::pin!(session_changed);
+        session_changed.as_mut().enable();
+        if !sessions.is_active(remote, lease.session_id) {
+            break Ok(());
+        }
+        tokio::select! {
+            biased;
+            reader_result = &mut reader_task, if !reader_finished => {
+                reader_finished = true;
+                match reader_result {
+                    Ok(Ok(())) => {
+                        debug!(%remote, "media feedback report stream closed");
+                    }
+                    Ok(Err(error)) => {
+                        break Err(error).context("reading media feedback reports");
+                    }
+                    Err(error) => {
+                        break Err(error).context("media feedback reader task failed");
+                    }
+                }
+            }
+            changed = feedback_receiver.changed(), if receiver_open => {
+                if changed.is_err() {
+                    receiver_open = false;
+                    if reader_finished {
+                        break Ok(());
+                    }
+                    continue;
+                }
+                let ingress = *feedback_receiver.borrow_and_update();
+                let Some((report, next_cursor)) = ingress.report_since(feedback_cursor)? else {
+                    continue;
+                };
+                // This branch now owns the complete aggregate. Advance the
+                // ingress baseline exactly once before evaluation; reports
+                // arriving during an encoder wait accumulate beyond it.
+                feedback_cursor = next_cursor;
+                let telemetry = lease.telemetry.snapshot();
+                let mut candidate = controller.clone();
+                let mut decision = candidate.decide(&report, telemetry, Instant::now())?;
+                let changes_bitrate = decision.state != AdaptiveBitrateStateV1::Hold;
+                let can_actuate = changes_bitrate && encoder_actuation_available;
+                let mut recovery_acknowledged = None;
+                if can_actuate {
+                    let force_keyframe =
+                        adaptive_recovery_keyframe_required(&report, &decision);
+                    let proposal = match sessions.propose_adaptive_encoder_update(
+                        remote,
+                        lease.session_id,
+                        decision.target_kbps,
+                        force_keyframe,
+                    ) {
+                        Ok(Some(proposal)) => Some(proposal),
+                        Ok(None) => {
+                            warn!(
+                                %remote,
+                                session_id = lease.session_id,
+                                "active adaptive session lost encoder control; retaining committed bitrate"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            warn!(
+                                %remote,
+                                session_id = lease.session_id,
+                                %error,
+                                "adaptive encoder proposal failed; retaining committed bitrate"
+                            );
+                            None
+                        }
+                    };
+                    if let Some(proposal) = proposal {
+                        match commit_adaptive_encoder_proposal(
+                            sessions,
+                            remote,
+                            lease.session_id,
+                            &proposal,
+                        )
+                        .await
+                        {
+                            AdaptiveEncoderCommit::GenerationEnded => break Ok(()),
+                            AdaptiveEncoderCommit::NotApplied(error) => {
+                                warn!(
+                                    %remote,
+                                    session_id = lease.session_id,
+                                    %error,
+                                    "adaptive encoder application failed; retaining committed bitrate"
+                                );
+                            }
+                            AdaptiveEncoderCommit::Applied => {
+                                decision.applied = true;
+                                controller = candidate.clone();
+                                if proposal.force_keyframe_revision.is_some() {
+                                    match await_adaptive_recovery_keyframe(
+                                        sessions,
+                                        remote,
+                                        lease.session_id,
+                                        &proposal,
+                                    )
+                                    .await
+                                    {
+                                        None => break Ok(()),
+                                        Some(Ok(())) => recovery_acknowledged = Some(true),
+                                        Some(Err(error)) => {
+                                            recovery_acknowledged = Some(false);
+                                            warn!(
+                                                %remote,
+                                                session_id = lease.session_id,
+                                                %error,
+                                                "adaptive bitrate applied but forced-IDR recovery was not acknowledged"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !decision.applied {
+                        controller.commit_observation_from(&candidate);
+                    }
+                } else {
+                    // External gst-launch and sources without EncoderControl
+                    // remain intentionally shadow-only. Hold decisions do not
+                    // need encoder actuation.
+                    controller = candidate;
+                }
+                tokio::time::timeout(
+                    FEEDBACK_WRITE_TIMEOUT,
+                    write_adaptive_bitrate_decision_v1(&mut send, &decision),
+                )
+                .await
+                .context("timed out writing adaptive bitrate decision")??;
+                debug!(
+                    %remote,
+                    session_id = lease.session_id,
+                    report_id = decision.report_id,
+                    decision_id = decision.decision_id,
+                    target_kbps = decision.target_kbps,
+                    ?decision.state,
+                    reasons = decision.reasons.bits(),
+                    applied = decision.applied,
+                    ?recovery_acknowledged,
+                    path_rtt_micros = telemetry.selected_path_rtt_micros,
+                    path_lost_packets = telemetry.selected_path_lost_packets,
+                    path_congestion_events = telemetry.selected_path_congestion_events,
+                    scheduler_cancellations = telemetry.scheduler_cancellations,
+                    send_failures = telemetry.send_failures,
+                    mode = if can_actuate { "active" } else { "shadow" },
+                    "adaptive bitrate decision"
+                );
+            }
+            _ = &mut session_changed => {
+                if !sessions.is_active(remote, lease.session_id) {
+                    break Ok(());
+                }
+            }
+            closed = connection.closed() => {
+                debug!(%remote, ?closed, "media feedback connection closed");
+                break Ok(());
+            }
+        }
+        if reader_finished && !receiver_open {
+            break Ok(());
+        }
+    };
+
+    if !reader_finished {
+        reader_task.abort();
+        let _ = reader_task.await;
+    }
+    let _ = send.finish();
+    drop(lease);
+    info!(%remote, "media feedback client released");
+    result
+}
+
+async fn forward_media_feedback_reports<R>(
+    mut reader: R,
+    sender: tokio::sync::watch::Sender<CumulativeFeedbackIngress>,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut last_report_id = None;
+    let mut next_read_at = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep_until(next_read_at).await;
+        let Some(report) = read_media_feedback_report_v1(&mut reader).await? else {
+            return Ok(());
+        };
+        ensure!(
+            last_report_id.is_none_or(|last| report.report_id > last),
+            "feedback report IDs must increase monotonically"
+        );
+        last_report_id = Some(report.report_id);
+        sender.send_modify(|ingress| ingress.observe(report));
+        if sender.is_closed() {
+            return Ok(());
+        }
+        next_read_at = tokio::time::Instant::now() + FEEDBACK_MIN_READ_INTERVAL;
+    }
+}
+
+fn adaptive_bitrate_ceiling_kbps(config: &HostConfig) -> Result<u32> {
+    let configured = match config.source {
+        VideoSource::TestPattern => TEST_PATTERN_BITRATE_CEILING_KBPS,
+        VideoSource::GamescopePipewire => config
+            .gamescope_pipewire
+            .as_ref()
+            .and_then(|gamescope| gamescope.bitrate_kbps)
+            .context("adaptive bitrate shadow mode requires a Gamescope CBR bitrate")?,
+    };
+    let ceiling = quantize_down(configured);
+    ensure!(
+        ceiling >= ADAPTIVE_BITRATE_FLOOR_KBPS,
+        "adaptive bitrate ceiling is below the 1000 kbps floor"
+    );
+    Ok(ceiling)
+}
+
+fn adaptive_bitrate_actuation_enabled(config: &HostConfig) -> bool {
+    config.source == VideoSource::GamescopePipewire
+        && config.gamescope_pipewire.as_ref().is_some_and(|gamescope| {
+            gamescope.encoder_backend == GamescopeEncoderBackend::InProcessGstreamer
+                && gamescope.rate_control == VaapiRateControl::Cbr
+        })
+}
+
+fn adaptive_recovery_keyframe_required(
+    report: &MediaFeedbackReportV1,
+    decision: &AdaptiveBitrateDecisionV1,
+) -> bool {
+    decision.state != AdaptiveBitrateStateV1::Hold
+        && report.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE)
+}
+
+#[derive(Debug)]
+enum AdaptiveEncoderCommit {
+    GenerationEnded,
+    NotApplied(anyhow::Error),
+    Applied,
+}
+
+async fn await_while_session_active<F, T>(
+    sessions: &SessionRegistry,
+    remote: EndpointId,
+    session_id: u64,
+    future: F,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        let session_changed = sessions.session_changed.notified();
+        tokio::pin!(session_changed);
+        session_changed.as_mut().enable();
+        if !sessions.is_active(remote, session_id) {
+            return None;
+        }
+        tokio::select! {
+            result = &mut future => return sessions.is_active(remote, session_id).then_some(result),
+            _ = &mut session_changed => {}
+        }
+    }
+}
+
+async fn commit_adaptive_encoder_proposal(
+    sessions: &SessionRegistry,
+    remote: EndpointId,
+    session_id: u64,
+    proposal: &AdaptiveEncoderProposal,
+) -> AdaptiveEncoderCommit {
+    let bitrate_result = await_while_session_active(
+        sessions,
+        remote,
+        session_id,
+        proposal
+            .control
+            .wait_for_bitrate_applied(proposal.bitrate_revision, ENCODER_CONTROL_COMMIT_TIMEOUT),
+    )
+    .await;
+    let Some(bitrate_result) = bitrate_result else {
+        return AdaptiveEncoderCommit::GenerationEnded;
+    };
+    let status = match bitrate_result {
+        Ok(status) => status,
+        Err(error) => return AdaptiveEncoderCommit::NotApplied(error),
+    };
+    if status.applied_bitrate_revision != Some(proposal.bitrate_revision)
+        || status.applied_bitrate_kbps != Some(proposal.target_kbps)
+    {
+        return AdaptiveEncoderCommit::NotApplied(anyhow::anyhow!(
+            "encoder bitrate commit mismatch: revision {:?}, readback {:?}, expected revision {} at {} kbps",
+            status.applied_bitrate_revision,
+            status.applied_bitrate_kbps,
+            proposal.bitrate_revision,
+            proposal.target_kbps
+        ));
+    }
+
+    AdaptiveEncoderCommit::Applied
+}
+
+async fn await_adaptive_recovery_keyframe(
+    sessions: &SessionRegistry,
+    remote: EndpointId,
+    session_id: u64,
+    proposal: &AdaptiveEncoderProposal,
+) -> Option<Result<()>> {
+    let force_keyframe_revision = proposal.force_keyframe_revision?;
+    await_while_session_active(
+        sessions,
+        remote,
+        session_id,
+        proposal.control.wait_for_force_keyframe_acknowledged(
+            force_keyframe_revision,
+            ENCODER_CONTROL_COMMIT_TIMEOUT,
+        ),
+    )
+    .await
+    .map(|result| result.map(|_| ()))
 }
 
 async fn serve_media(
@@ -1876,7 +3014,7 @@ async fn serve_media(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
-        encoder_control: _encoder_control,
+        encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -1885,6 +3023,8 @@ async fn serve_media(
         }
     };
     let source_task = SourceTaskGuard::new(source_task);
+    sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
+    let _encoder_control = encoder_control;
 
     let mut media_hello = HostHello::accepted(
         lease.session_id,
@@ -2049,7 +3189,7 @@ async fn serve_media_v2(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
-        encoder_control: _encoder_control,
+        encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -2058,6 +3198,8 @@ async fn serve_media_v2(
         }
     };
     let source_task = SourceTaskGuard::new(source_task);
+    sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
+    let _encoder_control = encoder_control;
 
     let mut media_hello = HostHello::accepted(
         lease.session_id,
@@ -2143,7 +3285,7 @@ async fn serve_media_v3(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
-        encoder_control: _encoder_control,
+        encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -2152,6 +3294,8 @@ async fn serve_media_v3(
         }
     };
     let source_task = SourceTaskGuard::new(source_task);
+    sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
+    let _encoder_control = encoder_control;
 
     let mut media_hello = HostHello::accepted(
         lease.session_id,
@@ -2172,6 +3316,7 @@ async fn serve_media_v3(
         &mut current_gop_receiver,
         recv,
         remote,
+        Arc::clone(&lease.media_v3_telemetry),
     )
     .await;
 
@@ -2397,6 +3542,7 @@ async fn run_media_v3_session(
     current_gop_receiver: &mut tokio::sync::watch::Receiver<Option<EncodedGop>>,
     control_recv: iroh::endpoint::RecvStream,
     remote: EndpointId,
+    telemetry: Arc<MediaV3Telemetry>,
 ) -> Result<()> {
     let maximum_replay_age = maximum_media_replay_age(config.framerate);
     let delivery_timeout_ms = media_v3_delivery_timeout_ms(config.framerate);
@@ -2413,6 +3559,7 @@ async fn run_media_v3_session(
     let mut control_receiver_open = true;
 
     let result = loop {
+        telemetry.record_selected_path(connection);
         tokio::select! {
             biased;
             control_result = &mut control_task, if !control_task_finished => {
@@ -2454,6 +3601,10 @@ async fn run_media_v3_session(
                     request.reason,
                 );
                 if !cancel_sequences.is_empty() {
+                    telemetry.scheduler_cancellations.fetch_add(
+                        u64::try_from(cancel_sequences.len()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
                     send_tasks.abort_all();
                 }
                 debug!(
@@ -2486,6 +3637,11 @@ async fn run_media_v3_session(
                             sequence,
                             through_sequence,
                         ) {
+                            telemetry.send_failures.fetch_add(1, Ordering::Relaxed);
+                            telemetry.scheduler_cancellations.fetch_add(
+                                u64::try_from(cancel_sequences.len()).unwrap_or(u64::MAX),
+                                Ordering::Relaxed,
+                            );
                             warn!(
                                 sequence,
                                 %error,
@@ -2506,6 +3662,11 @@ async fn run_media_v3_session(
                     Err(error) => {
                         warn!(%error, "media v3 object task failed; waiting for keyframe");
                         let cancel_sequences = scheduler.fail_all();
+                        telemetry.send_failures.fetch_add(1, Ordering::Relaxed);
+                        telemetry.scheduler_cancellations.fetch_add(
+                            u64::try_from(cancel_sequences.len()).unwrap_or(u64::MAX),
+                            Ordering::Relaxed,
+                        );
                         group_cursor.request_keyframe();
                         let through_sequence = current_gop_receiver
                             .borrow()
@@ -2550,6 +3711,10 @@ async fn run_media_v3_session(
                         MediaReplayDecision::DiscardStaleSuffix { .. } => {
                             group_cursor.request_keyframe();
                             let cancel_sequences = scheduler.fail_all();
+                            telemetry.scheduler_cancellations.fetch_add(
+                                u64::try_from(cancel_sequences.len()).unwrap_or(u64::MAX),
+                                Ordering::Relaxed,
+                            );
                             if !cancel_sequences.is_empty() {
                                 send_tasks.abort_all();
                             }
@@ -2565,6 +3730,10 @@ async fn run_media_v3_session(
                         MediaV3GroupDecision::EnterResync => {
                             replay_cursor.enter_resync_through(Some(replay_through_sequence));
                             let cancel_sequences = scheduler.fail_all();
+                            telemetry.scheduler_cancellations.fetch_add(
+                                u64::try_from(cancel_sequences.len()).unwrap_or(u64::MAX),
+                                Ordering::Relaxed,
+                            );
                             if !cancel_sequences.is_empty() {
                                 send_tasks.abort_all();
                             }
@@ -2582,6 +3751,10 @@ async fn run_media_v3_session(
                             MediaV3ScheduleDecision::EnterResync { cancel_sequences } => {
                                 group_cursor.request_keyframe();
                                 replay_cursor.enter_resync_through(Some(replay_through_sequence));
+                                telemetry.scheduler_cancellations.fetch_add(
+                                    u64::try_from(cancel_sequences.len()).unwrap_or(u64::MAX),
+                                    Ordering::Relaxed,
+                                );
                                 if !cancel_sequences.is_empty() {
                                     send_tasks.abort_all();
                                 }
@@ -2589,6 +3762,10 @@ async fn run_media_v3_session(
                             }
                         };
                     if !cancel_sequences.is_empty() {
+                        telemetry.scheduler_cancellations.fetch_add(
+                            u64::try_from(cancel_sequences.len()).unwrap_or(u64::MAX),
+                            Ordering::Relaxed,
+                        );
                         debug!(
                             sequence = frame.sequence,
                             group_id = position.group_id,
@@ -2616,6 +3793,7 @@ async fn run_media_v3_session(
                     {
                         Ok(Ok(stream)) => stream,
                         Ok(Err(error)) => {
+                            telemetry.send_failures.fetch_add(1, Ordering::Relaxed);
                             warn!(sequence, %error, "opening media v3 object stream failed");
                             if let Some(cancel_sequences) = apply_media_v3_send_failure(
                                 &mut scheduler,
@@ -2630,6 +3808,7 @@ async fn run_media_v3_session(
                             break;
                         }
                         Err(_) => {
+                            telemetry.send_failures.fetch_add(1, Ordering::Relaxed);
                             warn!(sequence, "opening media v3 object stream timed out");
                             if let Some(cancel_sequences) = apply_media_v3_send_failure(
                                 &mut scheduler,
@@ -2648,6 +3827,7 @@ async fn run_media_v3_session(
                     let transport_priority =
                         media_v3_transport_priority(media_object.header.publisher_priority)?;
                     if let Err(error) = stream.stream().set_priority(transport_priority) {
+                        telemetry.send_failures.fetch_add(1, Ordering::Relaxed);
                         warn!(sequence, %error, "setting media v3 object priority failed");
                         if let Some(cancel_sequences) = apply_media_v3_send_failure(
                             &mut scheduler,
@@ -3191,6 +4371,323 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn clean_feedback(report_id: u64) -> MediaFeedbackReportV1 {
+        MediaFeedbackReportV1 {
+            report_id,
+            interval_ms: 1_000,
+            flags: MediaFeedbackFlags::NONE,
+            last_sequence: Some(report_id),
+            transport_dropped_delta: 0,
+            frontend_dropped_delta: 0,
+            decoder_dropped_delta: 0,
+            presenter_dropped_delta: 0,
+            frontend_queue_depth: 0,
+            frontend_queue_capacity: 4,
+            decode_queue_depth: 0,
+            decode_queue_capacity: 4,
+            presenter_queue_depth: 0,
+            presenter_queue_capacity: 2,
+            transport_delivery_p95_ms: Some(10),
+            decode_p95_ms: Some(3),
+            presentation_p95_ms: Some(5),
+        }
+    }
+
+    fn controller_decide(
+        controller: &mut ShadowBitrateController,
+        report: &MediaFeedbackReportV1,
+        second: u64,
+    ) -> AdaptiveBitrateDecisionV1 {
+        controller
+            .decide(
+                report,
+                MediaV3TelemetrySnapshot::default(),
+                Instant::now() + Duration::from_secs(second),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn shadow_controller_immediately_decreases_for_severe_feedback_and_stays_bounded() {
+        let mut controller =
+            ShadowBitrateController::new(12_137, MediaV3TelemetrySnapshot::default());
+        assert_eq!(controller.ceiling_kbps, 12_000);
+        let first = controller_decide(&mut controller, &clean_feedback(1), 0);
+        assert_eq!(first.state, AdaptiveBitrateStateV1::Hold);
+        assert!(
+            first
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE)
+        );
+        for report_id in 2..=21 {
+            let mut report = clean_feedback(report_id);
+            report.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+            let decision = controller_decide(&mut controller, &report, report_id - 1);
+            assert!(!decision.applied);
+            assert!(decision.target_kbps >= ADAPTIVE_BITRATE_FLOOR_KBPS);
+            assert!(decision.target_kbps <= 12_000);
+            assert_eq!(decision.target_kbps % ADAPTIVE_BITRATE_QUANTUM_KBPS, 0);
+            assert!(
+                decision
+                    .reasons
+                    .contains(AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE)
+            );
+        }
+        assert_eq!(controller.target_kbps, ADAPTIVE_BITRATE_FLOOR_KBPS);
+    }
+
+    #[test]
+    fn shadow_controller_requires_two_moderate_windows() {
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller_decide(&mut controller, &clean_feedback(1), 0);
+        let mut first = clean_feedback(2);
+        first.frontend_queue_depth = 2;
+        assert_eq!(
+            controller_decide(&mut controller, &first, 1).state,
+            AdaptiveBitrateStateV1::Hold
+        );
+        let mut second = clean_feedback(3);
+        second.frontend_queue_depth = 2;
+        let decision = controller_decide(&mut controller, &second, 2);
+        assert_eq!(decision.state, AdaptiveBitrateStateV1::Decrease);
+        assert_eq!(decision.target_kbps, 9_500);
+    }
+
+    #[test]
+    fn shadow_controller_increases_only_after_clean_cooldown() {
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller_decide(&mut controller, &clean_feedback(1), 0);
+        let mut severe = clean_feedback(2);
+        severe.decoder_dropped_delta = 1;
+        assert_eq!(
+            controller_decide(&mut controller, &severe, 1).target_kbps,
+            9_000
+        );
+        for report_id in 3..=11 {
+            let decision =
+                controller_decide(&mut controller, &clean_feedback(report_id), report_id - 1);
+            assert_eq!(decision.state, AdaptiveBitrateStateV1::Hold);
+            assert_eq!(decision.target_kbps, 9_000);
+        }
+        let decision = controller_decide(&mut controller, &clean_feedback(12), 11);
+        assert_eq!(decision.state, AdaptiveBitrateStateV1::Increase);
+        assert_eq!(decision.target_kbps, 9_250);
+        assert!(
+            decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::CLEAN_RECOVERY)
+        );
+    }
+
+    #[test]
+    fn stale_or_non_monotonic_feedback_cannot_drive_an_increase() {
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller_decide(&mut controller, &clean_feedback(1), 0);
+        let mut severe = clean_feedback(2);
+        severe.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+        controller_decide(&mut controller, &severe, 1);
+        let stale = controller_decide(&mut controller, &clean_feedback(3), 4);
+        assert_eq!(stale.state, AdaptiveBitrateStateV1::Hold);
+        assert_eq!(stale.target_kbps, 9_000);
+        assert!(
+            stale
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE)
+        );
+        assert!(
+            controller
+                .decide(
+                    &clean_feedback(2),
+                    MediaV3TelemetrySnapshot::default(),
+                    Instant::now() + Duration::from_secs(4),
+                )
+                .is_err()
+        );
+
+        let now = Instant::now();
+        let mut rapid = ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        rapid
+            .decide(&clean_feedback(1), MediaV3TelemetrySnapshot::default(), now)
+            .unwrap();
+        let too_fast = rapid
+            .decide(
+                &clean_feedback(2),
+                MediaV3TelemetrySnapshot::default(),
+                now + Duration::from_millis(500),
+            )
+            .unwrap();
+        assert_eq!(too_fast.state, AdaptiveBitrateStateV1::Hold);
+        assert!(
+            too_fast
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE)
+        );
+    }
+
+    #[test]
+    fn full_decode_queue_is_severe_even_at_capacity_two() {
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller_decide(&mut controller, &clean_feedback(1), 0);
+        let mut report = clean_feedback(2);
+        report.decode_queue_capacity = 2;
+        report.decode_queue_depth = 2;
+        let decision = controller_decide(&mut controller, &report, 1);
+        assert_eq!(decision.state, AdaptiveBitrateStateV1::Decrease);
+        assert!(
+            decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG)
+        );
+    }
+
+    #[test]
+    fn decision_id_exhaustion_fails_instead_of_repeating() {
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller.next_decision_id = u64::MAX;
+        assert!(
+            controller
+                .decide(
+                    &clean_feedback(1),
+                    MediaV3TelemetrySnapshot::default(),
+                    Instant::now(),
+                )
+                .is_err()
+        );
+        assert_eq!(controller.next_decision_id, u64::MAX);
+    }
+
+    #[test]
+    fn stale_feedback_applies_trusted_loss_and_send_failure_pressure_once() {
+        for telemetry in [
+            MediaV3TelemetrySnapshot {
+                selected_path_lost_packets: 1,
+                ..MediaV3TelemetrySnapshot::default()
+            },
+            MediaV3TelemetrySnapshot {
+                send_failures: 1,
+                ..MediaV3TelemetrySnapshot::default()
+            },
+        ] {
+            let now = Instant::now();
+            let mut controller =
+                ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+            let decision = controller
+                .decide(&clean_feedback(1), telemetry, now)
+                .unwrap();
+            assert_eq!(decision.state, AdaptiveBitrateStateV1::Decrease);
+            assert_eq!(decision.target_kbps, 9_000);
+            assert!(
+                decision
+                    .reasons
+                    .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE)
+            );
+            assert!(
+                decision
+                    .reasons
+                    .contains(AdaptiveBitrateReasonFlagsV1::LOSS_OR_CANCELLATION)
+            );
+
+            let repeated = controller
+                .decide(
+                    &clean_feedback(2),
+                    telemetry,
+                    now + Duration::from_millis(500),
+                )
+                .unwrap();
+            assert_eq!(repeated.state, AdaptiveBitrateStateV1::Hold);
+            assert_eq!(repeated.target_kbps, 9_000);
+        }
+    }
+
+    #[test]
+    fn stale_moderate_cancellation_is_retained_until_hysteresis_reduces() {
+        let now = Instant::now();
+        let telemetry = MediaV3TelemetrySnapshot {
+            scheduler_cancellations: 1,
+            ..MediaV3TelemetrySnapshot::default()
+        };
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        let first = controller
+            .decide(&clean_feedback(1), telemetry, now)
+            .unwrap();
+        assert_eq!(first.state, AdaptiveBitrateStateV1::Hold);
+        assert_eq!(controller.previous_telemetry.scheduler_cancellations, 0);
+
+        let second = controller
+            .decide(
+                &clean_feedback(2),
+                telemetry,
+                now + Duration::from_millis(500),
+            )
+            .unwrap();
+        assert_eq!(second.state, AdaptiveBitrateStateV1::Decrease);
+        assert_eq!(second.target_kbps, 9_500);
+        assert_eq!(controller.previous_telemetry.scheduler_cancellations, 1);
+    }
+
+    #[test]
+    fn clean_recovery_below_five_mbps_advances_by_one_quantum() {
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller.target_kbps = 4_000;
+        controller_decide(&mut controller, &clean_feedback(1), 0);
+        controller_decide(&mut controller, &clean_feedback(2), 1);
+        for report_id in 3..=11 {
+            let decision =
+                controller_decide(&mut controller, &clean_feedback(report_id), report_id - 1);
+            assert_eq!(decision.state, AdaptiveBitrateStateV1::Hold);
+        }
+        let decision = controller_decide(&mut controller, &clean_feedback(12), 11);
+        assert_eq!(decision.state, AdaptiveBitrateStateV1::Increase);
+        assert_eq!(decision.target_kbps, 4_250);
+    }
+
+    #[test]
+    fn recovery_requires_latency_samples_and_sequence_progress_but_pressure_still_reduces() {
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller.target_kbps = 9_000;
+        controller_decide(&mut controller, &clean_feedback(1), 0);
+        controller_decide(&mut controller, &clean_feedback(2), 1);
+
+        for report_id in 3..=14 {
+            let mut report = clean_feedback(report_id);
+            report.last_sequence = Some(2);
+            let decision = controller_decide(&mut controller, &report, report_id - 1);
+            assert_eq!(decision.state, AdaptiveBitrateStateV1::Hold);
+            assert_eq!(decision.target_kbps, 9_000);
+        }
+        assert_eq!(controller.clean_windows, 0);
+
+        for report_id in 15..=26 {
+            let mut report = clean_feedback(report_id);
+            report.decode_p95_ms = None;
+            let decision = controller_decide(&mut controller, &report, report_id - 1);
+            assert_eq!(decision.state, AdaptiveBitrateStateV1::Hold);
+            assert_eq!(decision.target_kbps, 9_000);
+        }
+        assert_eq!(controller.clean_windows, 0);
+
+        let mut pressure = clean_feedback(27);
+        pressure.decode_p95_ms = None;
+        pressure.decode_queue_capacity = 2;
+        pressure.decode_queue_depth = 2;
+        let decision = controller_decide(&mut controller, &pressure, 26);
+        assert_eq!(decision.state, AdaptiveBitrateStateV1::Decrease);
+        assert_eq!(decision.target_kbps, 6_750);
+        assert!(
+            decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG)
+        );
+    }
 
     struct DropNotify(Option<tokio::sync::oneshot::Sender<()>>);
 
@@ -4148,6 +5645,293 @@ mod tests {
         assert!(sessions.claim_moq(endpoint(1)).is_err());
         assert!(wait.attached.await.is_err());
         assert!(wait.closed.await.is_err());
+    }
+
+    #[test]
+    fn feedback_attaches_only_to_exact_active_view_session() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let nonce = [9; 16];
+        assert!(sessions.claim_feedback(endpoint(1), nonce).is_err());
+
+        let no_view = sessions
+            .claim(endpoint(1), nonce, InvitationGrants::GAMEPAD)
+            .unwrap();
+        assert!(sessions.claim_feedback(endpoint(1), nonce).is_err());
+        drop(no_view);
+
+        let media = sessions
+            .claim(endpoint(1), nonce, InvitationGrants::VIEW)
+            .unwrap();
+        assert!(sessions.claim_feedback(endpoint(2), nonce).is_err());
+        assert!(sessions.claim_feedback(endpoint(1), [8; 16]).is_err());
+        let feedback = sessions.claim_feedback(endpoint(1), nonce).unwrap();
+        assert_eq!(feedback.session_id, media.session_id);
+        assert!(feedback.encoder_control.is_none());
+        assert!(sessions.claim_feedback(endpoint(1), nonce).is_err());
+
+        drop(media);
+        assert!(
+            sessions
+                .claim(endpoint(2), nonce, InvitationGrants::VIEW)
+                .is_err(),
+            "feedback teardown must keep the draining session isolated"
+        );
+        drop(feedback);
+        assert!(
+            sessions
+                .claim(endpoint(2), nonce, InvitationGrants::VIEW)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn adaptive_encoder_proposals_are_bound_to_the_exact_active_generation() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let media = sessions
+            .claim(remote, [3; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let harness = crate::source::EncoderControlTestHarness::new();
+
+        assert!(
+            sessions
+                .install_encoder_control(
+                    endpoint(2),
+                    media.session_id,
+                    Some(harness.control.clone())
+                )
+                .is_err()
+        );
+        sessions
+            .install_encoder_control(remote, media.session_id, Some(harness.control.clone()))
+            .unwrap();
+        let feedback = sessions.claim_feedback(remote, [3; 16]).unwrap();
+        assert!(feedback.encoder_control.is_some());
+        let proposal = sessions
+            .propose_adaptive_encoder_update(remote, media.session_id, 8_000, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.target_kbps, 8_000);
+        assert!(proposal.force_keyframe_revision > Some(proposal.bitrate_revision));
+
+        let old_session_id = media.session_id;
+        drop(media);
+        assert!(
+            sessions
+                .propose_adaptive_encoder_update(remote, old_session_id, 7_000, false)
+                .is_err(),
+            "a draining generation must not issue another encoder proposal"
+        );
+        drop(feedback);
+    }
+
+    #[tokio::test]
+    async fn adaptive_encoder_commit_requires_exact_readback_and_tracks_recovery_separately() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let media = sessions
+            .claim(remote, [4; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let harness = crate::source::EncoderControlTestHarness::new();
+        sessions
+            .install_encoder_control(remote, media.session_id, Some(harness.control.clone()))
+            .unwrap();
+
+        let proposal = sessions
+            .propose_adaptive_encoder_update(remote, media.session_id, 8_000, true)
+            .unwrap()
+            .unwrap();
+        harness.status.send_modify(|status| {
+            status.applied_bitrate_revision = Some(proposal.bitrate_revision);
+            status.applied_bitrate_kbps = Some(8_000);
+            status.requested_force_keyframe_revision = proposal.force_keyframe_revision;
+            status.acknowledged_force_keyframe_revision = proposal.force_keyframe_revision;
+        });
+        assert!(matches!(
+            commit_adaptive_encoder_proposal(&sessions, remote, media.session_id, &proposal).await,
+            AdaptiveEncoderCommit::Applied
+        ));
+        assert!(matches!(
+            await_adaptive_recovery_keyframe(&sessions, remote, media.session_id, &proposal).await,
+            Some(Ok(()))
+        ));
+
+        let mismatch = sessions
+            .propose_adaptive_encoder_update(remote, media.session_id, 7_000, false)
+            .unwrap()
+            .unwrap();
+        harness.status.send_modify(|status| {
+            status.applied_bitrate_revision = Some(mismatch.bitrate_revision);
+            status.applied_bitrate_kbps = Some(7_250);
+        });
+        assert!(matches!(
+            commit_adaptive_encoder_proposal(&sessions, remote, media.session_id, &mismatch).await,
+            AdaptiveEncoderCommit::NotApplied(_)
+        ));
+
+        let stale_generation = sessions
+            .propose_adaptive_encoder_update(remote, media.session_id, 6_000, false)
+            .unwrap()
+            .unwrap();
+        let session_id = media.session_id;
+        drop(media);
+        assert!(matches!(
+            commit_adaptive_encoder_proposal(&sessions, remote, session_id, &stale_generation)
+                .await,
+            AdaptiveEncoderCommit::GenerationEnded
+        ));
+    }
+
+    #[test]
+    fn failed_adaptive_application_commits_observation_but_not_target() {
+        let mut committed =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller_decide(&mut committed, &clean_feedback(1), 0);
+        let old_target = committed.target_kbps;
+        let old_decision_id = committed.next_decision_id;
+        let mut severe = clean_feedback(2);
+        severe.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+
+        let mut candidate = committed.clone();
+        let decision = controller_decide(&mut candidate, &severe, 1);
+        assert_eq!(decision.state, AdaptiveBitrateStateV1::Decrease);
+        assert!(candidate.target_kbps < old_target);
+        committed.commit_observation_from(&candidate);
+
+        assert_eq!(committed.target_kbps, old_target);
+        assert_eq!(committed.last_report_id, Some(2));
+        assert_eq!(committed.next_decision_id, old_decision_id + 1);
+        assert!(
+            committed
+                .decide(
+                    &clean_feedback(3),
+                    MediaV3TelemetrySnapshot::default(),
+                    Instant::now() + Duration::from_secs(2)
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn adaptive_recovery_idr_is_only_requested_for_a_bitrate_change_during_resync() {
+        let mut report = clean_feedback(1);
+        let mut decision = AdaptiveBitrateDecisionV1 {
+            decision_id: 1,
+            report_id: 1,
+            target_kbps: 8_000,
+            floor_kbps: 1_000,
+            ceiling_kbps: 12_000,
+            state: AdaptiveBitrateStateV1::Decrease,
+            reasons: AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE,
+            applied: false,
+        };
+        assert!(!adaptive_recovery_keyframe_required(&report, &decision));
+        report.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+        assert!(adaptive_recovery_keyframe_required(&report, &decision));
+        decision.state = AdaptiveBitrateStateV1::Hold;
+        assert!(!adaptive_recovery_keyframe_required(&report, &decision));
+    }
+
+    #[tokio::test]
+    async fn stalled_adaptive_apply_coalesces_feedback_without_losing_pressure() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (sender, mut receiver) =
+            tokio::sync::watch::channel(CumulativeFeedbackIngress::default());
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let reader_task = tokio::spawn(forward_media_feedback_reports(reader, sender.clone()));
+        let mut cursor = FeedbackIngressCursor::default();
+
+        sigil_protocol::write_media_feedback_report_v1(&mut writer, &clean_feedback(1))
+            .await
+            .unwrap();
+        receiver.changed().await.unwrap();
+        let (first, next_cursor) = receiver
+            .borrow_and_update()
+            .report_since(cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.report_id, 1);
+        cursor = next_cursor;
+
+        // The consumer is now notionally stalled on an encoder commit. Two
+        // reports overwrite one watch notification, but their interval,
+        // deltas, and resync pressure must remain cumulative.
+        let mut pressured = clean_feedback(2);
+        pressured.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+        pressured.transport_dropped_delta = 2;
+        pressured.decoder_dropped_delta = 1;
+        pressured.decode_queue_depth = 3;
+        pressured.transport_delivery_p95_ms = Some(180);
+        sigil_protocol::write_media_feedback_report_v1(&mut writer, &pressured)
+            .await
+            .unwrap();
+
+        let mut latest = clean_feedback(3);
+        latest.frontend_dropped_delta = 4;
+        latest.presenter_dropped_delta = 3;
+        latest.frontend_queue_depth = 3;
+        latest.decode_queue_depth = 1;
+        latest.transport_delivery_p95_ms = Some(40);
+        latest.decode_p95_ms = Some(9);
+        sigil_protocol::write_media_feedback_report_v1(&mut writer, &latest)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        reader_task.await.unwrap().unwrap();
+
+        receiver.changed().await.unwrap();
+        let (aggregate, next_cursor) = receiver
+            .borrow_and_update()
+            .report_since(cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(aggregate.report_id, 3);
+        assert_eq!(aggregate.interval_ms, 2_000);
+        assert_eq!(aggregate.transport_dropped_delta, 2);
+        assert_eq!(aggregate.frontend_dropped_delta, 4);
+        assert_eq!(aggregate.decoder_dropped_delta, 1);
+        assert_eq!(aggregate.presenter_dropped_delta, 3);
+        assert!(aggregate.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE));
+        assert_eq!(aggregate.last_sequence, latest.last_sequence);
+        assert_eq!(aggregate.frontend_queue_depth, latest.frontend_queue_depth);
+        assert_eq!(aggregate.decode_queue_depth, latest.decode_queue_depth);
+        assert_eq!(
+            aggregate.transport_delivery_p95_ms,
+            latest.transport_delivery_p95_ms
+        );
+        assert_eq!(aggregate.decode_p95_ms, latest.decode_p95_ms);
+        cursor = next_cursor;
+        assert!(
+            receiver.borrow().report_since(cursor).unwrap().is_none(),
+            "one cumulative ingress generation must be processed only once"
+        );
+
+        for report_id in 4..=9 {
+            sender.send_modify(|ingress| ingress.observe(clean_feedback(report_id)));
+        }
+        receiver.changed().await.unwrap();
+        let (clamped, _) = receiver
+            .borrow_and_update()
+            .report_since(cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(clamped.interval_ms, 5_000);
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        let decision = controller
+            .decide(
+                &clamped,
+                MediaV3TelemetrySnapshot::default(),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE),
+            "a clamped aggregate must be stale rather than disguised as one fresh report"
+        );
     }
 
     #[test]

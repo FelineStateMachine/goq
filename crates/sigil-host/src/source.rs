@@ -188,6 +188,25 @@ impl EncoderControl {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct EncoderControlTestHarness {
+    pub control: EncoderControl,
+    pub status: watch::Sender<EncoderControlStatus>,
+    _desired: watch::Receiver<EncoderControlDesired>,
+}
+
+#[cfg(test)]
+impl EncoderControlTestHarness {
+    pub(crate) fn new() -> Self {
+        let (control, desired, status) = EncoderControl::new();
+        Self {
+            control,
+            status,
+            _desired: desired,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EncodedFrame {
     pub sequence: u64,

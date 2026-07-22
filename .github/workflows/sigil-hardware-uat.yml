@@ -1,0 +1,138 @@
+name: Sigil Hardware UAT Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact 40-character commit on main to package for temporary hardware acceptance
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sigil-hardware-uat-${{ inputs.commit }}
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    name: Build commit-pinned Bazzite UAT candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      UAT_COMMIT: ${{ inputs.commit }}
+    steps:
+      - name: Check out exact requested commit
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a clean commit already on main
+        run: |
+          [[ "$UAT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$UAT_COMMIT"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$UAT_COMMIT" origin/main
+          test -z "$(git status --porcelain=v1)"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            ffmpeg \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-tools \
+            jq \
+            libayatana-appindicator3-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer1.0-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libudev-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            python3-venv \
+            shellcheck
+          python3 -m venv "$RUNNER_TEMP/zig-venv"
+          printf '%s\n' \
+            'ziglang==0.16.0 --hash=sha256:9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b' \
+            | "$RUNNER_TEMP/zig-venv/bin/pip" install \
+                --disable-pip-version-check \
+                --only-binary=:all: \
+                --require-hashes \
+                --requirement /dev/stdin
+          install -d "$RUNNER_TEMP/uat-bin"
+          # Expand runner paths when the generated wrapper executes.
+          # shellcheck disable=SC2016
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'exec "$RUNNER_TEMP/zig-venv/bin/python" -m ziglang "$@"' \
+            >"$RUNNER_TEMP/uat-bin/zig"
+          chmod 0755 "$RUNNER_TEMP/uat-bin/zig"
+          echo "$RUNNER_TEMP/uat-bin" >>"$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked --version 0.23.0
+
+      - name: Run complete feature-enabled repository gate
+        env:
+          GOQ_VERIFY_IN_PROCESS_GSTREAMER: "1"
+        run: ./scripts/verify-demo-build.sh
+
+      - name: Build and inspect temporary UAT package
+        id: package
+        run: |
+          short_commit="$(git rev-parse --short=12 HEAD)"
+          output_dir="$RUNNER_TEMP/sigil-hardware-uat"
+          install -d -m 0700 "$output_dir"
+          archive="$output_dir/sigil-hardware-uat-$short_commit-bazzite-x86_64.tar.gz"
+          ./scripts/package-bazzite-release.sh \
+            --output "$archive" \
+            --allow-dirty \
+            --allow-unsigned
+          (cd "$output_dir" && sha256sum -c "$(basename -- "$archive.sha256")")
+          manifest="$output_dir/release-manifest.json"
+          tar -xOzf "$archive" payload/release/release-manifest.json >"$manifest"
+          test "$(jq -r .format "$manifest")" = 2
+          test "$(jq -r .product "$manifest")" = sigil-host
+          test "$(jq -r .primary_executable "$manifest")" = sigil
+          test "$(jq -r .compatibility_executable "$manifest")" = sigil-host
+          test "$(jq -r .target "$manifest")" = x86_64-unknown-linux-gnu.2.17
+          test "$(jq -r .profile "$manifest")" = release
+          test "$(jq -r .git_commit "$manifest")" = "$UAT_COMMIT"
+          test "$(jq -r .git_dirty "$manifest")" = false
+          test "$(jq -r .binary_provenance "$manifest")" = self-built-clean-head
+          test "$(jq -r .binary_provenance_verified "$manifest")" = true
+          test "$(jq -r .release_kind "$manifest")" = development
+          test "$(jq -r .release_tag "$manifest")" = development
+          test "$(jq -r .asset_name "$manifest")" = "$(basename -- "$archive")"
+          test "$(jq -r .demo_direct_node "$manifest")" = false
+          test "$(jq -c .features "$manifest")" = '["default","in-process-gstreamer"]'
+          printf '%s\n' \
+            "repository=$GITHUB_REPOSITORY" \
+            "source_commit=$UAT_COMMIT" \
+            "workflow_sha=$GITHUB_WORKFLOW_SHA" \
+            "workflow_ref=$GITHUB_WORKFLOW_REF" \
+            "workflow_run_id=$GITHUB_RUN_ID" \
+            "workflow_run_attempt=$GITHUB_RUN_ATTEMPT" \
+            "run_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            "archive=$(basename -- "$archive")" \
+            "archive_sha256=$(sha256sum "$archive" | awk '{print $1}')" \
+            >"$output_dir/uat-provenance.txt"
+          echo "artifact_name=sigil-hardware-uat-$short_commit" >>"$GITHUB_OUTPUT"
+          echo "output_dir=$output_dir" >>"$GITHUB_OUTPUT"
+
+      - name: Retain temporary hardware candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.output_dir }}
+          if-no-files-found: error
+          retention-days: 7

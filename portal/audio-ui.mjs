@@ -1,3 +1,37 @@
+import { BoundedAudioMessageTracker } from './audio-ring.mjs';
+
+export function newAudioSession({ muted = false } = {}) {
+  return {
+    expectedGeneration: null,
+    acceptsNativeEvents: false,
+    pendingTerminalStates: [],
+    failed: false,
+    failureDetail: null,
+    stopRequested: false,
+    channel: null,
+    context: null,
+    decoder: null,
+    workletNode: null,
+    available: false,
+    muted,
+    state: 'unavailable',
+    stateDetail: 'not connected',
+    packetsReceived: 0,
+    decoderDropped: 0,
+    bufferedFrames: 0,
+    underflows: 0,
+    underflowDurationMicros: 0,
+    silentDurationMicros: 0,
+    transportDropped: 0,
+    frontendDropped: 0,
+    workletDroppedFrames: 0,
+    workletRecoveryDiscardedFrames: 0,
+    audioTimeline: null,
+    avSyncEpoch: 0,
+    messageTracker: new BoundedAudioMessageTracker(),
+  };
+}
+
 export function audioButtonPresentation({ available, muted, state, detail }) {
   const normalizedState = typeof state === 'string' && state.length > 0 ? state : 'unavailable';
   const normalizedDetail = typeof detail === 'string' && detail.length > 0

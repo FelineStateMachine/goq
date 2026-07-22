@@ -1,7 +1,35 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parsePointerFeedbackMessage } from './pointer-feedback.mjs';
+import { newPointerSession, parsePointerFeedbackMessage } from './pointer-feedback.mjs';
+
+test('new pointer sessions pin feedback, channel, surface, and render defaults', () => {
+  assert.deepEqual(newPointerSession(), {
+    received: false,
+    latest: null,
+    failed: false,
+    failureDetail: null,
+    closing: false,
+    channel: null,
+    surfaceDimensions: null,
+    remotePosition: null,
+    remoteVisible: false,
+  });
+});
+
+test('new pointer sessions isolate staged and rendered feedback state', () => {
+  const staged = newPointerSession();
+  const fresh = newPointerSession();
+  staged.received = true;
+  staged.latest = { sequence: 3, position: { x: 4, y: 5 }, pointer_visible: true };
+  staged.surfaceDimensions = { width: 1280, height: 800 };
+  staged.remotePosition = { x: 4, y: 5 };
+  staged.remoteVisible = true;
+
+  assert.deepEqual(fresh, newPointerSession());
+  assert.equal(staged.received, true);
+  assert.equal(staged.remoteVisible, true);
+});
 
 test('pointer feedback position envelopes preserve validated coordinates', () => {
   assert.deepEqual(

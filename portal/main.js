@@ -1,17 +1,4 @@
 import {
-  parseAnnexBNals,
-  nalsToLengthPrefixed,
-  buildAvcDescription,
-  avcCodecStr,
-  h264NalType,
-  buildHvcDescription,
-  hevcCodecStr,
-  hevcNalType,
-  parseAv1Obus,
-  av1CodecStr,
-  buildAv1Description,
-} from './codecs.js';
-import {
   HeldInputState,
   MAX_HELD_KEYS,
   MAX_HELD_MOUSE_BUTTONS,
@@ -64,13 +51,6 @@ import {
 import { BoundedAudioMessageTracker } from './audio-ring.mjs';
 import { audioButtonPresentation } from './audio-ui.mjs';
 import {
-  BoundedCadenceWindow,
-  BoundedLatencyWindow,
-  BoundedValueWindow,
-  LatestFramePresenter,
-  RollingRateWindow,
-} from './stream-metrics.mjs';
-import {
   ControllerActivationGate,
   ControllerActionRepeater,
   GamepadEscapeHold,
@@ -90,12 +70,9 @@ import {
   fitStreamSurface,
   streamAspectKey,
 } from './window-geometry.mjs';
-import { VideoFormatTransitionGuard } from './video-format-transition.mjs';
-import { buildVideoDecoderConfig } from './video-decoder-config.mjs';
 import {
-  DECODER_RECOVERY_REASONS,
-  DecoderRecoveryState,
-} from './decoder-recovery.mjs';
+  createVideoPipelineSession,
+} from './video-pipeline.mjs';
 import {
   AdaptiveFeedbackPublisher,
   formatAdaptiveDecision,
@@ -126,8 +103,6 @@ let inputCapabilities = {
   gamepad: false,
   control: false,
 };
-let frameWidth = 0;
-let frameHeight = 0;
 let fittedStreamAspect = null;
 let pendingStreamFit = null;
 let lastObservedWindowSize = null;
@@ -138,7 +113,6 @@ let remotePointerVisible = false;
 let activeFrameChannel = null;
 let activeFrameGeneration = null;
 let activeFrameSession = null;
-let activeVideoFormatEpoch = 0;
 let activeAudioChannel = null;
 let activePointerChannel = null;
 let activePointerSession = null;
@@ -545,7 +519,7 @@ function resetAudioTelemetry() {
   audioSilentDurationMicros = 0;
   audioTransportDropped = 0;
   audioFrontendDropped = 0;
-  resetAvSyncTelemetry(activeAudioSession);
+  videoPipeline.resetAvSync(activeAudioSession);
   updateAudioUI();
 }
 
@@ -716,7 +690,7 @@ async function initializeAudioPipeline(session) {
 
 async function teardownAudioPipeline(resetStatus = true) {
   const session = activeAudioSession;
-  resetAvSyncTelemetry(session);
+  videoPipeline.resetAvSync(session);
   activeAudioSession = null;
   activeAudioChannel = null;
   audioAvailable = false;
@@ -995,7 +969,7 @@ async function disconnect() {
   activePointerChannel = null;
   activePointerSession = null;
   await teardownAudioPipeline();
-  teardownDecoderPipeline();
+  videoPipeline.teardown();
   connected = false;
   controlMode = false;
   inputCapabilities = {
@@ -1069,16 +1043,12 @@ function togglePanel(force) {
 
 // ─── WebCodecs detection ──────────────────────────────────────────────────────
 let hasWebCodecs = ('VideoDecoder' in window);
-let videoDecoder = null;
-let decoderConfigured = false;
 
 (async function detectWebCodecs() {
   await invoke('set_webcodecs_available', { available: hasWebCodecs });
 })();
 
 // ─── Frame decoding ───────────────────────────────────────────────────────────
-let activeCodec = 'h264';
-let droppedFrames = 0;
 let transportDroppedFrames = 0;
 let transportObjectDroppedFrames = null;
 let transportLateObjectDroppedFrames = null;
@@ -1091,32 +1061,12 @@ let transportIntervalStats = null;
 let frontendIpcSendDurationStats = null;
 let rustTimingWindow = null;
 let networkDiagnostics = null;
-let receivedFrames = 0;
-let decoderInputFrames = 0;
-let decoderOutputFrames = 0;
-let presentedFrames = 0;
-let presentationDroppedFrames = 0;
 let lastTransportFps = 0;
 let lastFrontendSendFps = 0;
-const frontendDeliveryRate = new RollingRateWindow();
-const decoderInputRate = new RollingRateWindow();
-const decoderOutputRate = new RollingRateWindow();
-const presentationRate = new RollingRateWindow();
-const frontendDeliveryCadence = new BoundedCadenceWindow();
-const decoderInputCadence = new BoundedCadenceWindow();
-const decoderOutputCadence = new BoundedCadenceWindow();
-const presentationCadence = new BoundedCadenceWindow();
-const decodeLatency = new BoundedLatencyWindow();
-const clientPresentationLatency = new BoundedLatencyWindow();
-const drawLatency = new BoundedLatencyWindow();
-const avSkew = new BoundedValueWindow();
-const decodeTimings = new Map();
-const MAX_DECODE_TIMINGS = 8;
 let streamPathMode = 'unknown';
 let streamTransportMode = 'unknown';
 let streamRttMs = null;
 let lastMediaSequence = null;
-const MAX_DECODE_QUEUE_SIZE = 2;
 
 function requestDecoderKeyframe(reason) {
   if (!Number.isSafeInteger(activeFrameGeneration) || activeFrameGeneration < 1) return;
@@ -1128,35 +1078,7 @@ function requestDecoderKeyframe(reason) {
   });
 }
 
-const decoderRecovery = new DecoderRecoveryState({
-  onKeyframeRequest: requestDecoderKeyframe,
-});
-const videoFormatTransition = new VideoFormatTransitionGuard();
-
-function enterDecoderRecovery(reason, { restart = false, requestKeyframe = true } = {}) {
-  const result = restart
-    ? decoderRecovery.restart(reason)
-    : decoderRecovery.enter(reason, { requestKeyframe });
-  // Closing WebCodecs and clearing the latest-frame presenter is part of the
-  // recovery boundary. Do it immediately rather than allowing already queued
-  // frames from a poisoned GOP to continue reaching the canvas.
-  teardownDecoderPipeline();
-  return result;
-}
-
-function finishVideoChunkEnqueue(keyframe, succeeded) {
-  if (succeeded) {
-    if (keyframe) decoderRecovery.confirmKeyframeEnqueued(true);
-    return;
-  }
-  // A synchronous decode rejection is a decoder-error episode if playback
-  // was previously healthy. If recovery is already active, enter() coalesces
-  // with its existing request and leaves the keyframe gate closed.
-  enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_ERROR);
-}
-
-function resetAvSyncTelemetry(session = activeAudioSession, { recoverRing = false } = {}) {
-  avSkew.reset();
+function resetAudioSyncTelemetry(session = activeAudioSession, { recoverRing = false } = {}) {
   if (!session) return;
   session.audioTimeline = null;
   session.avSyncEpoch = nextAvSyncEpoch(session.avSyncEpoch);
@@ -1178,72 +1100,40 @@ function sampleAvSkew(videoPtsMicros, presentationTimeMs) {
     || !audioAvailable
     || audioContext?.state !== 'running'
     || typeof audioContext.getOutputTimestamp !== 'function'
-  ) return;
+  ) return null;
 
   let outputTimestamp;
   try {
     outputTimestamp = audioContext.getOutputTimestamp();
   } catch (_) {
-    return;
+    return null;
   }
   const audioPtsMicros = projectAudioMediaPtsMicros(
     session.audioTimeline,
     outputTimestamp,
     presentationTimeMs,
   );
-  const skewMs = audioMinusVideoSkewMs(audioPtsMicros, videoPtsMicros);
-  if (skewMs !== null) avSkew.record(skewMs, presentationTimeMs);
+  return audioMinusVideoSkewMs(audioPtsMicros, videoPtsMicros);
 }
 
 const canvas = document.getElementById('frame-canvas');
 const remotePointer = document.getElementById('remote-pointer');
 const ctx = canvas.getContext('2d');
-let lastVideoDrawCompletedAtMs = null;
-const framePresenter = new LatestFramePresenter({
-  requestFrame: (callback) => requestAnimationFrame(callback),
-  cancelFrame: (handle) => cancelAnimationFrame(handle),
-  setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
-  cancelTimer: (handle) => clearTimeout(handle),
-  now: () => performance.now(),
-  fallbackDelayMs: 25,
-  draw: (frame) => {
-    const startedAt = performance.now();
-    ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-    const completedAt = performance.now();
-    drawLatency.record(completedAt - startedAt, completedAt);
-    lastVideoDrawCompletedAtMs = completedAt;
+const videoPipeline = createVideoPipelineSession({
+  hasWebCodecs,
+  canvas,
+  context: ctx,
+  requestKeyframe: requestDecoderKeyframe,
+  resetAudioSync: resetAudioSyncTelemetry,
+  sampleAudioSkew: sampleAvSkew,
+  onFormatChanged: () => {
+    sizeCanvasToIncomingStream();
+    if (connected) void fitWindowToIncomingStream();
   },
-  onPresent: (metadata, animationFrameTime) => {
-    const now = lastVideoDrawCompletedAtMs ?? animationFrameTime;
-    lastVideoDrawCompletedAtMs = null;
-    presentedFrames++;
-    presentationRate.record(now);
-    presentationCadence.record(now);
-    if (metadata && Number.isFinite(metadata.receivedAt)) {
-      clientPresentationLatency.record(now - metadata.receivedAt, now);
-    }
-    if (metadata) sampleAvSkew(metadata.mediaPtsMicros, now);
-  },
-  onDrop: () => { presentationDroppedFrames++; },
 });
 
-function teardownDecoderPipeline() {
-  resetAvSyncTelemetry();
-  framePresenter.clear();
-  decodeTimings.clear();
-  if (videoDecoder) {
-    try { videoDecoder.close(); } catch (_) {}
-  }
-  videoDecoder = null;
-  decoderConfigured = false;
-}
-
 function resetStreamTelemetry() {
-  teardownDecoderPipeline();
-  decoderRecovery.reset();
-  videoFormatTransition.reset();
-  activeVideoFormatEpoch = 0;
-  droppedFrames = 0;
+  videoPipeline.reset();
   transportDroppedFrames = 0;
   transportObjectDroppedFrames = null;
   transportLateObjectDroppedFrames = null;
@@ -1256,91 +1146,13 @@ function resetStreamTelemetry() {
   frontendIpcSendDurationStats = null;
   rustTimingWindow = null;
   networkDiagnostics = null;
-  receivedFrames = 0;
-  decoderInputFrames = 0;
-  decoderOutputFrames = 0;
-  presentedFrames = 0;
-  presentationDroppedFrames = 0;
   lastTransportFps = 0;
   lastFrontendSendFps = 0;
-  frontendDeliveryRate.reset();
-  decoderInputRate.reset();
-  decoderOutputRate.reset();
-  presentationRate.reset();
-  frontendDeliveryCadence.reset();
-  decoderInputCadence.reset();
-  decoderOutputCadence.reset();
-  presentationCadence.reset();
-  decodeLatency.reset();
-  clientPresentationLatency.reset();
-  drawLatency.reset();
   streamPathMode = 'unknown';
   streamTransportMode = 'unknown';
   streamRttMs = null;
   lastMediaSequence = null;
   adaptiveDecision = null;
-}
-
-function enqueueVideoChunk(chunk, receivedAt, codecLabel, mediaPtsMicros = null) {
-  if (!videoDecoder) return false;
-  const enqueuedAt = performance.now();
-  while (decodeTimings.size >= MAX_DECODE_TIMINGS) {
-    decodeTimings.delete(decodeTimings.keys().next().value);
-  }
-  decodeTimings.set(chunk.timestamp, { receivedAt, enqueuedAt, mediaPtsMicros });
-  try {
-    videoDecoder.decode(chunk);
-    decoderInputFrames++;
-    decoderInputRate.record(enqueuedAt);
-    decoderInputCadence.record(enqueuedAt);
-    return true;
-  } catch (error) {
-    decodeTimings.delete(chunk.timestamp);
-    droppedFrames++;
-    console.warn(`${codecLabel} decode failed:`, error);
-    return false;
-  }
-}
-
-function initWebCodecsDecoder(width, height, desc, codecStr) {
-  teardownDecoderPipeline();
-  console.log('WebCodecs configure:', codecStr, 'w:', width, 'h:', height, 'desc:', desc.byteLength, 'bytes');
-  const decoder = new VideoDecoder({
-    output: (frame) => {
-      if (videoDecoder !== decoder) {
-        frame.close();
-        return;
-      }
-      const now = performance.now();
-      decoderOutputFrames++;
-      decoderOutputRate.record(now);
-      decoderOutputCadence.record(now);
-      const timing = decodeTimings.get(frame.timestamp) ?? null;
-      decodeTimings.delete(frame.timestamp);
-      if (timing) decodeLatency.record(now - timing.enqueuedAt, now);
-      framePresenter.enqueue(frame, timing);
-    },
-    error: (e) => {
-      if (videoDecoder !== decoder) return;
-      console.error('VideoDecoder error:', e);
-      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_ERROR);
-    }
-  });
-  videoDecoder = decoder;
-  try {
-    decoder.configure(buildVideoDecoderConfig({
-      codec: codecStr,
-      width,
-      height,
-      description: desc,
-    }));
-    decoderConfigured = true;
-    return true;
-  } catch (error) {
-    console.warn('WebCodecs configure failed:', error);
-    enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_ERROR);
-    return false;
-  }
 }
 
 function formatCadence(summary) {
@@ -1356,30 +1168,19 @@ function formatRustDurationSummary(summary) {
 
 function updateStreamStats() {
   const now = performance.now();
-  const frontendDeliveryFps = frontendDeliveryRate.rate(now);
-  const decodeFps = decoderInputRate.rate(now);
-  const decoderOutputFps = decoderOutputRate.rate(now);
-  const presentFps = presentationRate.rate(now);
-  const decodePercentiles = decodeLatency.summary(now);
-  const presentPercentiles = clientPresentationLatency.summary(now);
-  const drawPercentiles = drawLatency.summary(now);
-  const deliveryCadence = frontendDeliveryCadence.summary(now);
-  const decoderInputIntervals = decoderInputCadence.summary(now);
-  const decoderOutputIntervals = decoderOutputCadence.summary(now);
-  const presentationIntervals = presentationCadence.summary(now);
-  const avSkewPercentiles = avSkew.summary(now);
+  const video = videoPipeline.snapshot(now);
   const networkPresentation = networkDiagnosticsPresentation(networkDiagnostics);
-  document.getElementById('stream-received').textContent = receivedFrames;
-  document.getElementById('stream-decoder-input').textContent = decoderInputFrames;
-  document.getElementById('stream-decoder-output').textContent = decoderOutputFrames;
-  document.getElementById('stream-presented').textContent = presentedFrames;
-  document.getElementById('stream-decode-queue').textContent = videoDecoder?.decodeQueueSize ?? 0;
-  document.getElementById('stream-present-queue').textContent = framePresenter.depth;
+  document.getElementById('stream-received').textContent = video.receivedFrames;
+  document.getElementById('stream-decoder-input').textContent = video.decoderInputFrames;
+  document.getElementById('stream-decoder-output').textContent = video.decoderOutputFrames;
+  document.getElementById('stream-presented').textContent = video.presentedFrames;
+  document.getElementById('stream-decode-queue').textContent = video.decoderQueueDepth;
+  document.getElementById('stream-present-queue').textContent = video.presenterQueueDepth;
   const discardTelemetry = formatVideoDiscardTelemetry({
     transportDroppedFrames,
     frontendDroppedFrames,
-    decoderDroppedFrames: droppedFrames,
-    presenterOverwrittenFrames: presentationDroppedFrames,
+    decoderDroppedFrames: video.droppedFrames,
+    presenterOverwrittenFrames: video.presentationDroppedFrames,
   });
   document.getElementById('stream-dropped').textContent = discardTelemetry.total;
   document.getElementById('stream-transport-dropped').textContent = discardTelemetry.transport;
@@ -1408,27 +1209,27 @@ function updateStreamStats() {
   document.getElementById('stream-present-dropped').textContent = discardTelemetry.presenterOverwrite;
   document.getElementById('stream-transport-fps').textContent = lastTransportFps.toFixed(1);
   document.getElementById('stream-ipc-send-fps').textContent = lastFrontendSendFps.toFixed(1);
-  document.getElementById('stream-frontend-fps').textContent = frontendDeliveryFps.toFixed(1);
-  document.getElementById('stream-decode-fps').textContent = decodeFps.toFixed(1);
-  document.getElementById('stream-decoder-output-fps').textContent = decoderOutputFps.toFixed(1);
-  document.getElementById('stream-present-fps').textContent = presentFps.toFixed(1);
-  document.getElementById('stream-av-skew').textContent = avSkewPercentiles.count
-    ? `${formatSignedMilliseconds(avSkewPercentiles.p50)} / ${formatSignedMilliseconds(avSkewPercentiles.p95)} / ${avSkewPercentiles.maxAbsolute.toFixed(1)} ms`
+  document.getElementById('stream-frontend-fps').textContent = video.frontendDeliveryFps.toFixed(1);
+  document.getElementById('stream-decode-fps').textContent = video.decodeFps.toFixed(1);
+  document.getElementById('stream-decoder-output-fps').textContent = video.decoderOutputFps.toFixed(1);
+  document.getElementById('stream-present-fps').textContent = video.presentFps.toFixed(1);
+  document.getElementById('stream-av-skew').textContent = video.avSkewPercentiles.count
+    ? `${formatSignedMilliseconds(video.avSkewPercentiles.p50)} / ${formatSignedMilliseconds(video.avSkewPercentiles.p95)} / ${video.avSkewPercentiles.maxAbsolute.toFixed(1)} ms`
     : '—';
-  document.getElementById('stream-decode-latency').textContent = decodePercentiles.count
-    ? `${decodePercentiles.p50.toFixed(1)} / ${decodePercentiles.p95.toFixed(1)} ms`
+  document.getElementById('stream-decode-latency').textContent = video.decodePercentiles.count
+    ? `${video.decodePercentiles.p50.toFixed(1)} / ${video.decodePercentiles.p95.toFixed(1)} ms`
     : '—';
-  document.getElementById('stream-present-latency').textContent = presentPercentiles.count
-    ? `${presentPercentiles.p50.toFixed(1)} / ${presentPercentiles.p95.toFixed(1)} ms`
+  document.getElementById('stream-present-latency').textContent = video.presentPercentiles.count
+    ? `${video.presentPercentiles.p50.toFixed(1)} / ${video.presentPercentiles.p95.toFixed(1)} ms`
     : '—';
-  document.getElementById('stream-draw-latency').textContent = drawPercentiles.count
-    ? `${drawPercentiles.p50.toFixed(2)} / ${drawPercentiles.p95.toFixed(2)} / ${drawPercentiles.p99.toFixed(2)} / ${drawPercentiles.max.toFixed(2)} ms`
+  document.getElementById('stream-draw-latency').textContent = video.drawPercentiles.count
+    ? `${video.drawPercentiles.p50.toFixed(2)} / ${video.drawPercentiles.p95.toFixed(2)} / ${video.drawPercentiles.p99.toFixed(2)} / ${video.drawPercentiles.max.toFixed(2)} ms`
     : '—';
-  document.getElementById('stream-delivery-cadence').textContent = formatCadence(deliveryCadence);
-  document.getElementById('stream-decoder-input-cadence').textContent = formatCadence(decoderInputIntervals);
-  document.getElementById('stream-decoder-output-cadence').textContent = formatCadence(decoderOutputIntervals);
-  document.getElementById('stream-present-cadence').textContent = formatCadence(presentationIntervals);
-  document.getElementById('stream-codec').textContent = activeCodec;
+  document.getElementById('stream-delivery-cadence').textContent = formatCadence(video.deliveryCadence);
+  document.getElementById('stream-decoder-input-cadence').textContent = formatCadence(video.decoderInputIntervals);
+  document.getElementById('stream-decoder-output-cadence').textContent = formatCadence(video.decoderOutputIntervals);
+  document.getElementById('stream-present-cadence').textContent = formatCadence(video.presentationIntervals);
+  document.getElementById('stream-codec').textContent = video.activeCodec;
   document.getElementById('stream-transport').textContent = streamTransportMode;
   document.getElementById('stream-path').textContent = streamPathMode;
   document.getElementById('stream-rtt').textContent = Number.isFinite(streamRttMs)
@@ -1451,20 +1252,20 @@ function updateStreamStats() {
     lastSequence: lastMediaSequence,
     frontendQueueDepth: frontendQueueStats?.depth ?? 0,
     frontendQueueCapacity: frontendQueueStats?.capacity ?? 4,
-    decoderQueueDepth: videoDecoder?.decodeQueueSize ?? 0,
-    decoderQueueCapacity: MAX_DECODE_QUEUE_SIZE,
-    presenterQueueDepth: framePresenter.depth,
-    presenterQueueCapacity: 2,
+    decoderQueueDepth: video.decoderQueueDepth,
+    decoderQueueCapacity: video.decoderQueueCapacity,
+    presenterQueueDepth: video.presenterQueueDepth,
+    presenterQueueCapacity: video.presenterQueueCapacity,
     transportDroppedTotal: transportDroppedFrames,
     frontendDroppedTotal: frontendDroppedFrames,
-    decoderDroppedTotal: droppedFrames,
-    presenterDroppedTotal: presentationDroppedFrames,
+    decoderDroppedTotal: video.droppedFrames,
+    presenterDroppedTotal: video.presentationDroppedFrames,
     // Portal has no clock-synchronized capture-to-delivery measurement yet.
     // IPC send duration is a different boundary and must not be mislabeled.
     transportDeliveryP95Ms: null,
-    decodeLatencyP95Ms: decodePercentiles.p95,
-    presentationLatencyP95Ms: presentPercentiles.p95,
-    resyncActive: decoderRecovery.recovering || frontendResyncStats?.active === true,
+    decodeLatencyP95Ms: video.decodePercentiles.p95,
+    presentationLatencyP95Ms: video.presentPercentiles.p95,
+    resyncActive: video.recovering || frontendResyncStats?.active === true,
   });
 }
 
@@ -1479,6 +1280,7 @@ function clientChromeHeight() {
 }
 
 function sizeCanvasToIncomingStream() {
+  const { width: frameWidth, height: frameHeight } = videoPipeline.format;
   if (frameWidth < 1 || frameHeight < 1) return;
   const main = canvas.parentElement;
   if (!main) return;
@@ -1510,6 +1312,11 @@ async function applyClientWindowGeometry(geometry, unmaximize) {
 }
 
 async function fitWindowToIncomingStream() {
+  const {
+    width: frameWidth,
+    height: frameHeight,
+    epoch: activeVideoFormatEpoch,
+  } = videoPipeline.format;
   if (!connected || frameWidth < 1 || frameHeight < 1) return false;
   const aspect = streamAspectKey(frameWidth, frameHeight);
   if (fittedStreamAspect === aspect || pendingStreamFit?.aspect === aspect) return false;
@@ -1523,13 +1330,14 @@ async function fitWindowToIncomingStream() {
     availableHeight: window.screen.availHeight,
   });
   const applied = await applyClientWindowGeometry(geometry, true);
-  const currentAspect = frameWidth > 0 && frameHeight > 0
-    ? streamAspectKey(frameWidth, frameHeight)
+  const currentFormat = videoPipeline.format;
+  const currentAspect = currentFormat.width > 0 && currentFormat.height > 0
+    ? streamAspectKey(currentFormat.width, currentFormat.height)
     : null;
   const current = pendingStreamFit === request
     && connected
     && activeFrameGeneration === request.generation
-    && activeVideoFormatEpoch === request.epoch
+    && currentFormat.epoch === request.epoch
     && currentAspect === request.aspect;
   if (pendingStreamFit === request) pendingStreamFit = null;
   if (applied && current) fittedStreamAspect = request.aspect;
@@ -1543,6 +1351,7 @@ function scheduleStreamWindowAspectCorrection() {
   if (streamWindowResizeTimer !== null) clearTimeout(streamWindowResizeTimer);
   streamWindowResizeTimer = setTimeout(() => {
     streamWindowResizeTimer = null;
+    const { width: frameWidth, height: frameHeight } = videoPipeline.format;
     if (!connected || frameWidth < 1 || frameHeight < 1) return;
     const current = { width: window.innerWidth, height: window.innerHeight };
     let geometry;
@@ -1562,224 +1371,6 @@ function scheduleStreamWindowAspectCorrection() {
     }
     if (geometry !== null) void applyClientWindowGeometry(geometry, false);
   }, 80);
-}
-
-function commitVideoFrame(plan, keyframe, enqueued) {
-  if (!enqueued) {
-    finishVideoChunkEnqueue(keyframe, false);
-    return false;
-  }
-  let committed;
-  try {
-    committed = videoFormatTransition.commit(plan);
-  } catch (error) {
-    console.warn('discarding stale video format transaction:', error);
-    enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
-    return false;
-  }
-  if (plan.reconfigure) {
-    activeCodec = committed.format.codec;
-    frameWidth = committed.format.width;
-    frameHeight = committed.format.height;
-    activeVideoFormatEpoch = committed.epoch;
-    if (canvas.width !== frameWidth) canvas.width = frameWidth;
-    if (canvas.height !== frameHeight) canvas.height = frameHeight;
-    sizeCanvasToIncomingStream();
-    if (connected) void fitWindowToIncomingStream();
-  }
-  finishVideoChunkEnqueue(keyframe, true);
-  return true;
-}
-
-function processFramePayload(payload, binaryData = null) {
-  const receivedAt = performance.now();
-  frontendDeliveryRate.record(receivedAt);
-  frontendDeliveryCadence.record(receivedAt);
-  const {
-    width,
-    height,
-    data,
-    codec = 'h264',
-    keyframe,
-    codecConfig = keyframe,
-    sequence = null,
-    pts_micros: ptsMicros,
-    discontinuity = false,
-  } = payload;
-  if (discontinuity) resetAvSyncTelemetry();
-  receivedFrames++;
-
-  if (hasWebCodecs) {
-    // Binary channels provide an exact view over the IPC ArrayBuffer. The
-    // base64 branch only supports an older in-process sender during migration.
-    const raw = binaryData ?? Uint8Array.from(atob(data), c => c.charCodeAt(0));
-    const decoderBacklogged = videoDecoder?.decodeQueueSize >= MAX_DECODE_QUEUE_SIZE;
-    if (decoderBacklogged) {
-      enterDecoderRecovery(DECODER_RECOVERY_REASONS.FRONTEND_BACKPRESSURE);
-    }
-    const decoderBoundary = discontinuity || !decoderConfigured;
-    let formatPlan;
-    try {
-      formatPlan = videoFormatTransition.plan({
-        sequence,
-        codec,
-        width,
-        height,
-        keyframe,
-        codecConfig,
-        discontinuity: decoderBoundary,
-      });
-    } catch (error) {
-      console.warn('invalid video format transition:', error);
-      droppedFrames++;
-      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
-      return;
-    }
-    if (formatPlan.action === 'drop-stale') {
-      droppedFrames++;
-      return;
-    }
-    if (formatPlan.action === 'recover') {
-      droppedFrames++;
-      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
-      return;
-    }
-    if (formatPlan.reconfigure) {
-      // A delivered discontinuity keyframe is the recovery boundary we were
-      // waiting for, not evidence that another keyframe is missing.
-      if (discontinuity) {
-        enterDecoderRecovery(DECODER_RECOVERY_REASONS.DISCONTINUITY, {
-          requestKeyframe: !keyframe,
-        });
-      } else {
-        enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET, {
-          requestKeyframe: false,
-        });
-      }
-    }
-    if (decoderRecovery.shouldDropFrame({ keyframe })) {
-      if (!decoderRecovery.requestIssued) {
-        enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
-      }
-      droppedFrames++;
-      return;
-    }
-    const mediaPtsMicros = exactMediaTimestampMicros(ptsMicros);
-    const chunkTimestamp = mediaPtsMicros !== null
-      ? mediaPtsMicros
-      : performance.now() * 1000;
-
-    if (codec === 'av1') {
-      // ── AV1 path ──
-      const obus = parseAv1Obus(raw);
-      if (keyframe) {
-        const seqHeader = obus.find(o => o.type === 12);
-        if (seqHeader && formatPlan.reconfigure) {
-          initWebCodecsDecoder(width, height, buildAv1Description(seqHeader.data), av1CodecStr(seqHeader.data));
-        }
-      }
-      if (!decoderConfigured || !videoDecoder) { droppedFrames++; return; }
-      const frameObus = obus.filter(o => o.type !== 2 && o.type !== 12);
-      if (frameObus.length > 0) {
-        let totalLen = 0;
-        for (const o of frameObus) totalLen += o.data.length;
-        const chunkData = new Uint8Array(totalLen);
-        let off = 0;
-        for (const o of frameObus) { chunkData.set(o.data, off); off += o.data.length; }
-        const chunk = new EncodedVideoChunk({
-          type: keyframe ? 'key' : 'delta',
-          timestamp: chunkTimestamp,
-          data: chunkData,
-        });
-        const enqueued = enqueueVideoChunk(chunk, receivedAt, 'av1', mediaPtsMicros);
-        commitVideoFrame(formatPlan, keyframe, enqueued);
-      }
-
-    } else if (codec === 'h265') {
-      // ── H.265 path ──
-      const nals = parseAnnexBNals(raw);
-      if (keyframe) {
-        let vps = null, sps = null, pps = null;
-        for (const nal of nals) {
-          const t = hevcNalType(nal);
-          if (t === 32) vps = nal;
-          else if (t === 33) sps = nal;
-          else if (t === 34) pps = nal;
-        }
-        if (vps && sps && pps && formatPlan.reconfigure) {
-          initWebCodecsDecoder(width, height, buildHvcDescription(vps, sps, pps), hevcCodecStr(sps));
-        }
-      }
-      if (!decoderConfigured || !videoDecoder) { droppedFrames++; return; }
-      const sliceNals = nals.filter(nal => {
-        const t = hevcNalType(nal);
-        return t !== 32 && t !== 33 && t !== 34 && t !== 35;
-      });
-      if (sliceNals.length > 0) {
-        const chunk = new EncodedVideoChunk({
-          type: keyframe ? 'key' : 'delta',
-          timestamp: chunkTimestamp,
-          data: nalsToLengthPrefixed(sliceNals),
-        });
-        const enqueued = enqueueVideoChunk(chunk, receivedAt, 'hevc', mediaPtsMicros);
-        commitVideoFrame(formatPlan, keyframe, enqueued);
-      }
-
-    } else {
-      // ── H.264 path (default) ──
-      const nals = parseAnnexBNals(raw);
-      if (keyframe) {
-        let sps = null, pps = null;
-        for (const nal of nals) {
-          const t = h264NalType(nal);
-          if (t === 7) sps = nal;
-          else if (t === 8) pps = nal;
-        }
-        if (sps && pps && formatPlan.reconfigure) {
-          initWebCodecsDecoder(width, height, buildAvcDescription(sps, pps), avcCodecStr(sps));
-        }
-      }
-      if (!decoderConfigured || !videoDecoder) { droppedFrames++; return; }
-      const sliceNals = nals.filter(nal => {
-        const t = h264NalType(nal);
-        return t !== 7 && t !== 8 && t !== 9;
-      });
-      if (sliceNals.length > 0) {
-        const chunk = new EncodedVideoChunk({
-          type: keyframe ? 'key' : 'delta',
-          timestamp: chunkTimestamp,
-          data: nalsToLengthPrefixed(sliceNals),
-        });
-        const enqueued = enqueueVideoChunk(chunk, receivedAt, 'h264', mediaPtsMicros);
-        commitVideoFrame(formatPlan, keyframe, enqueued);
-      }
-    }
-  } else {
-    // JPEG fallback (openh264 decode → JPEG encode in Rust)
-    const dimensionsChanged = frameWidth !== width || frameHeight !== height;
-    frameWidth = width;
-    frameHeight = height;
-    if (canvas.width !== width) canvas.width = width;
-    if (canvas.height !== height) canvas.height = height;
-    if (dimensionsChanged) sizeCanvasToIncomingStream();
-    if (dimensionsChanged && connected) void fitWindowToIncomingStream();
-    const bytes = Uint8Array.from(atob(data), c => c.charCodeAt(0));
-    const blob = new Blob([bytes], { type: 'image/jpeg' });
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
-    img.onload = () => {
-      const drawStartedAt = performance.now();
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      URL.revokeObjectURL(url);
-      const now = performance.now();
-      presentedFrames++;
-      presentationRate.record(now);
-      presentationCadence.record(now);
-      drawLatency.record(now - drawStartedAt, now);
-      clientPresentationLatency.record(now - receivedAt, now);
-    };
-    img.src = url;
-  }
 }
 
 function sendFrameAcknowledgment(generation) {
@@ -1808,7 +1399,7 @@ function activateConnectedFrameSession(session, generation) {
   if (pendingError) throw new Error(pendingError.error || 'Media connection failed');
   for (const payload of activation.legacyFrames) {
     if (isCurrentFrameGeneration(payload?.generation, generation)) {
-      processFramePayload(payload);
+      videoPipeline.processFramePayload(payload);
     }
   }
 }
@@ -1832,7 +1423,7 @@ function handleBinaryFrameMessage(message, session) {
     // discard. WebCodecs remains independently bounded by decodeQueueSize.
     acknowledgeFrame(session);
     acknowledged = true;
-    processFramePayload({
+    videoPipeline.processFramePayload({
       width: frame.width,
       height: frame.height,
       data: null,
@@ -1878,7 +1469,7 @@ function requestNativeAudioStop(session) {
 
 function disableAudioForSession(detail, session = activeAudioSession) {
   if (!session || session !== activeAudioSession) return;
-  resetAvSyncTelemetry(session);
+  videoPipeline.resetAvSync(session);
   session.failed = true;
   session.failureDetail = detail;
   audioAvailable = false;
@@ -1919,7 +1510,7 @@ function handleBinaryAudioMessage(message, session) {
     }
     const queuedAudioPackets = audioDecoder.decodeQueueSize;
     if (packet.discontinuity || queuedAudioPackets >= MAX_AUDIO_DECODE_QUEUE_SIZE) {
-      resetAvSyncTelemetry(session, { recoverRing: true });
+      videoPipeline.resetAvSync(session, { recoverRing: true });
       audioDecoderDropped += queuedAudioPackets;
       configureAudioDecoder(session);
     }
@@ -1946,7 +1537,7 @@ listen('frame', (event) => {
     for (const generation of delivery.acknowledgments) {
       sendFrameAcknowledgment(generation);
     }
-    if (delivery.accepted) processFramePayload(event.payload);
+    if (delivery.accepted) videoPipeline.processFramePayload(event.payload);
   } catch (error) {
     failFrameSession(session, error);
   }
@@ -2250,6 +1841,7 @@ async function releaseNativeCursorGrab(releaseGeneration) {
 }
 
 function currentPointerSurfaceSize() {
+  const { width: frameWidth, height: frameHeight } = videoPipeline.format;
   return resolvePointerSurfaceSize(
     pointerSurfaceDimensions,
     frameWidth,

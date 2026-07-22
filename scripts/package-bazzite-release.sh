@@ -194,9 +194,13 @@ else
   git -C "$repo_dir" archive --format=tar "$git_commit" | tar -xf - -C "$build_source"
   (
     cd "$build_source"
-    PKG_CONFIG_ALLOW_CROSS=1 CARGO_TARGET_DIR="$build_target" \
-      cargo zigbuild --locked -p sigil-host --bins \
-      --target "$linux_target" --release --features in-process-gstreamer
+    # Zig uses no host system-library fallback for explicit targets. Ask the
+    # GStreamer build scripts to retain pkg-config's native -L directories;
+    # these are link-time paths only and do not add an rpath to the binaries.
+    PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 \
+      CARGO_TARGET_DIR="$build_target" \
+        cargo zigbuild --locked -p sigil-host --bins \
+          --target "$linux_target" --release --features in-process-gstreamer
   )
   host_binary="$build_target/$linux_output_target/release/sigil"
   probe_binary="$build_target/$linux_output_target/release/sigil-probe"

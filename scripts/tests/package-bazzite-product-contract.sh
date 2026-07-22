@@ -41,6 +41,8 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
   'test "${1:-}" = zigbuild' \
+  'test "${PKG_CONFIG_ALLOW_CROSS:-}" = 1' \
+  'test "${PKG_CONFIG_ALLOW_SYSTEM_LIBS:-}" = 1' \
   'case " $* " in *" --features in-process-gstreamer "*) ;; *) exit 64 ;; esac' \
   'output="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"' \
   'install -d -m 0700 "$output"' \

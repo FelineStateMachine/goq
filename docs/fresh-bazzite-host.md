@@ -1180,10 +1180,15 @@ Sigil reads `GAMESCOPE_MOUSE_FOCUS_DISPLAY` from the bootstrap root, reconnects
 to the active local display, and samples `QueryPointer` at no more than 60 Hz.
 It also reads `GAMESCOPE_CURSOR_VISIBLE_FEEDBACK` from that active root so the
 client overlay disappears when Gamescope hides its cursor. Missing, malformed,
-or unreachable Xwayland state disables the separately negotiated pointer
-feedback capability; relative uinput remains available without guessed cursor
-coordinates. The service `DISPLAY=:0` line is retained as an explicit fallback
-for configurations created before `xwayland_display` was added.
+or unreachable Xwayland state during startup disables the separately
+negotiated pointer feedback capability. After successful startup, losing
+Gamescope publishes pointer feedback as unavailable, then reconnects the
+bootstrap display with a bounded 100 ms to 2 second backoff. A complete
+reconnect re-interns both Gamescope atoms, discovers the replacement native
+surface, and validates one active-display sample before publishing coordinates
+again. Relative uinput remains available without guessed cursor coordinates.
+The service `DISPLAY=:0` line is retained as an explicit fallback for
+configurations created before `xwayland_display` was added.
 
 Audio is optional and must resolve one exact PipeWire sink, never a microphone.
 The appliance owns a persistent 48 kHz stereo null sink so capture does not
@@ -1533,10 +1538,14 @@ sudo libinput debug-events --device "$pointer_node"
 target/debug/sigil-probe \
   --node-id <host-node-id> \
   --frames 120 \
-  --pointer-smoke
+  --pointer-smoke \
+  --pointer-feedback-smoke
 ```
 
-The probe must report `pointer_smoke=ok`. It uses the native pointer-surface
+The probe must report `pointer_smoke=ok` and `pointer_feedback_smoke=ok`.
+The feedback check requires an immediately available compositor position and
+visibility sample; an input acknowledgment with unavailable coordinates fails
+the proof. The pointer smoke uses the native pointer-surface
 dimensions negotiated in the media `HostHello`, not the potentially downscaled
 encoded dimensions. On a 2560x1600 Gamescope surface, before the ordinary
 motion, evtest must show the synchronization sequence:
@@ -1546,6 +1555,15 @@ motion, evtest must show the synchronization sequence:
 reports relative `POINTER_MOTION` and `POINTER_BUTTON` events. The probe fails
 closed if the host omits the native pointer-surface dimensions. The interactive
 `xmessage` activation remains the downstream Gamescope/Xwayland proof.
+
+For compositor replacement recovery, keep the candidate Sigil daemon running,
+record its PID, and restart `gamescope-session-plus@steam.service` twice. After
+each restart, wait for the `gamescope` PipeWire node and the bootstrap root
+property to return, then rerun the pointer and feedback smoke without replaying
+the redeemed invitation. Both runs must pass, the Sigil PID must remain
+unchanged, and the host log must contain one `Gamescope Xwayland pointer
+feedback reconnected` event per restart. The packaged hardware UAT performs
+this sequence after its fixed-mode session checks.
 
 For a deterministic pre-demo gamepad proof, leave `evtest "$gamepad_node"`
 running on the host and run this from the client checkout:

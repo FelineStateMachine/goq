@@ -10,12 +10,14 @@ use iroh::endpoint::{Connection, SendStream};
 use iroh::protocol::ProtocolHandler;
 use sigil_protocol::{
     AUDIO_HEADER_LEN, AudioFlags, AudioPacket, AudioPacketHeader, Capability, ClientHello,
-    FrameFlags, HostHello, InputAck, MAX_AUDIO_PAYLOAD_LEN, MediaFrame, MediaFrameHeader,
-    read_client_hello, read_input_event, write_host_hello, write_input_ack, write_media_frame,
+    FrameFlags, HostHello, InputAck, InvitationGrants, MAX_AUDIO_PAYLOAD_LEN, MediaFrame,
+    MediaFrameHeader, read_client_hello, read_input_event, write_host_hello, write_input_ack,
+    write_media_frame,
 };
 use tracing::{debug, error, info, warn};
 
 use crate::audio::spawn_pipewire_audio;
+use crate::authorization::{AuthorizationPolicy, unix_timestamp_now};
 use crate::clock::SessionClock;
 use crate::config::{HostConfig, VideoSource};
 use crate::cursor::{PointerPositionTracker, PointerState};
@@ -60,6 +62,7 @@ struct ActiveSession {
     session_id: u64,
     nonce: [u8; 16],
     session_clock: SessionClock,
+    grants: InvitationGrants,
     media_active: bool,
     input_claimed: bool,
     audio_claimed: bool,
@@ -77,7 +80,12 @@ impl Default for SessionRegistry {
 }
 
 impl SessionRegistry {
-    fn claim(self: &Arc<Self>, remote: EndpointId, nonce: [u8; 16]) -> Result<SessionLease> {
+    fn claim(
+        self: &Arc<Self>,
+        remote: EndpointId,
+        nonce: [u8; 16],
+        grants: InvitationGrants,
+    ) -> Result<SessionLease> {
         let mut active = self.active.lock().expect("session registry poisoned");
         if let Some(current) = *active {
             bail!("host already has active client {}", current.remote);
@@ -89,6 +97,7 @@ impl SessionRegistry {
             session_id,
             nonce,
             session_clock,
+            grants,
             media_active: true,
             input_claimed: false,
             audio_claimed: false,
@@ -118,6 +127,7 @@ impl SessionRegistry {
             registry: Arc::clone(self),
             remote,
             session_id: session.session_id,
+            grants: session.grants,
         })
     }
 
@@ -139,6 +149,7 @@ impl SessionRegistry {
             remote,
             session_id: session.session_id,
             session_clock: session.session_clock,
+            grants: session.grants,
         })
     }
 
@@ -216,6 +227,7 @@ struct InputLease {
     registry: Arc<SessionRegistry>,
     remote: EndpointId,
     session_id: u64,
+    grants: InvitationGrants,
 }
 
 #[derive(Debug)]
@@ -224,6 +236,7 @@ struct AudioLease {
     remote: EndpointId,
     session_id: u64,
     session_clock: SessionClock,
+    grants: InvitationGrants,
 }
 
 #[derive(Debug)]
@@ -690,18 +703,27 @@ impl Drop for AudioLease {
 pub struct MediaHandler {
     pub config: HostConfig,
     pub sessions: Arc<SessionRegistry>,
+    pub authorization: AuthorizationPolicy,
 }
 
 #[derive(Clone, Debug)]
 pub struct MediaV2Handler {
     pub config: HostConfig,
     pub sessions: Arc<SessionRegistry>,
+    pub authorization: AuthorizationPolicy,
 }
 
 impl ProtocolHandler for MediaHandler {
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
         let remote = connection.remote_id();
-        if let Err(error) = serve_media(connection, self.config.clone(), &self.sessions).await {
+        if let Err(error) = serve_media(
+            connection,
+            self.config.clone(),
+            &self.sessions,
+            &self.authorization,
+        )
+        .await
+        {
             warn!(%remote, %error, "media connection ended");
         }
         Ok(())
@@ -711,7 +733,14 @@ impl ProtocolHandler for MediaHandler {
 impl ProtocolHandler for MediaV2Handler {
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
         let remote = connection.remote_id();
-        if let Err(error) = serve_media_v2(connection, self.config.clone(), &self.sessions).await {
+        if let Err(error) = serve_media_v2(
+            connection,
+            self.config.clone(),
+            &self.sessions,
+            &self.authorization,
+        )
+        .await
+        {
             warn!(%remote, %error, "media v2 connection ended");
         }
         Ok(())
@@ -762,6 +791,7 @@ async fn serve_media(
     connection: Connection,
     config: HostConfig,
     sessions: &Arc<SessionRegistry>,
+    authorization: &AuthorizationPolicy,
 ) -> Result<()> {
     let remote = connection.remote_id();
     let handshake_permit = sessions
@@ -776,7 +806,23 @@ async fn serve_media(
     drop(handshake_permit);
     debug!(%remote, agent = %hello.agent, "media hello received");
 
-    let lease = match sessions.claim(remote, hello.nonce) {
+    let grants = match authorization.authorize_or_redeem(
+        remote,
+        hello.invitation.as_deref(),
+        unix_timestamp_now()?,
+    ) {
+        Ok(grants) => grants,
+        Err(error) => {
+            send_rejection(&mut send, "Portal peer is not authorized").await?;
+            return Err(error.context("authorizing media peer"));
+        }
+    };
+    ensure!(
+        grants.contains(InvitationGrants::VIEW),
+        "authorized media peer lacks view permission"
+    );
+
+    let lease = match sessions.claim(remote, hello.nonce, grants) {
         Ok(lease) => lease,
         Err(error) => {
             send_rejection(&mut send, "host already has an active client").await?;
@@ -921,6 +967,7 @@ async fn serve_media_v2(
     connection: Connection,
     config: HostConfig,
     sessions: &Arc<SessionRegistry>,
+    authorization: &AuthorizationPolicy,
 ) -> Result<()> {
     let remote = connection.remote_id();
     let handshake_permit = sessions
@@ -935,7 +982,23 @@ async fn serve_media_v2(
     drop(handshake_permit);
     debug!(%remote, agent = %hello.agent, "media v2 hello received");
 
-    let lease = match sessions.claim(remote, hello.nonce) {
+    let grants = match authorization.authorize_or_redeem(
+        remote,
+        hello.invitation.as_deref(),
+        unix_timestamp_now()?,
+    ) {
+        Ok(grants) => grants,
+        Err(error) => {
+            send_rejection(&mut send, "Portal peer is not authorized").await?;
+            return Err(error.context("authorizing media v2 peer"));
+        }
+    };
+    ensure!(
+        grants.contains(InvitationGrants::VIEW),
+        "authorized media peer lacks view permission"
+    );
+
+    let lease = match sessions.claim(remote, hello.nonce, grants) {
         Ok(lease) => lease,
         Err(error) => {
             send_rejection(&mut send, "host already has an active client").await?;
@@ -1229,17 +1292,10 @@ async fn serve_input(
     let hello = receive_hello_unconstrained(&mut recv).await?;
     drop(handshake_permit);
     debug!(%remote, agent = %hello.agent, "input hello received");
-
-    let supported =
-        supported_input_capabilities(backend.capabilities(), pointer_positions.is_some());
-    let negotiated = negotiated_input_capabilities(&hello, &supported);
-
-    let ack_enabled = negotiated.contains(&Capability::InputAck);
-    let feedback_enabled = negotiated.contains(&Capability::PointerPositionFeedback);
-    let visibility_feedback_enabled = negotiated.contains(&Capability::PointerVisibilityFeedback);
-    let mut pointer_positions = pointer_positions
-        .filter(|_| feedback_enabled)
-        .map(PointerPositionTracker::subscribe);
+    ensure!(
+        hello.invitation.is_none(),
+        "invitations are accepted only on the first media handshake"
+    );
     let lease = match sessions.claim_input(remote, hello.nonce) {
         Ok(lease) => lease,
         Err(error) => {
@@ -1247,6 +1303,16 @@ async fn serve_input(
             return Err(error);
         }
     };
+    let supported =
+        supported_input_capabilities(backend.capabilities(), pointer_positions.is_some());
+    let negotiated = negotiated_input_capabilities(&hello, &supported, lease.grants);
+
+    let ack_enabled = negotiated.contains(&Capability::InputAck);
+    let feedback_enabled = negotiated.contains(&Capability::PointerPositionFeedback);
+    let visibility_feedback_enabled = negotiated.contains(&Capability::PointerVisibilityFeedback);
+    let mut pointer_positions = pointer_positions
+        .filter(|_| feedback_enabled)
+        .map(PointerPositionTracker::subscribe);
     write_host_hello(
         &mut send,
         &HostHello::accepted(lease.session_id, negotiated.clone()),
@@ -1390,6 +1456,10 @@ async fn serve_audio(
     let hello = receive_hello(&mut recv, Capability::AudioOpus).await?;
     drop(handshake_permit);
     debug!(%remote, agent = %hello.agent, "audio hello received");
+    ensure!(
+        hello.invitation.is_none(),
+        "invitations are accepted only on the first media handshake"
+    );
 
     if config.audio.is_none() {
         send_rejection(&mut send, "audio is unavailable").await?;
@@ -1411,6 +1481,10 @@ async fn serve_audio(
             return Err(error);
         }
     };
+    ensure!(
+        lease.grants.contains(InvitationGrants::VIEW),
+        "active Portal session lacks audio view permission"
+    );
     let (mut audio_receiver, audio_task) =
         match spawn_pipewire_audio(config, lease.session_clock).await {
             Ok(source) => source,
@@ -1502,12 +1576,36 @@ fn negotiated_capabilities(hello: &ClientHello, supported: &[Capability]) -> Vec
         .collect()
 }
 
-fn negotiated_input_capabilities(hello: &ClientHello, supported: &[Capability]) -> Vec<Capability> {
+fn negotiated_input_capabilities(
+    hello: &ClientHello,
+    supported: &[Capability],
+    grants: InvitationGrants,
+) -> Vec<Capability> {
     let mut negotiated = negotiated_capabilities(hello, supported);
+    negotiated.retain(|capability| input_capability_authorized(*capability, grants));
     if !negotiated.contains(&Capability::PointerPositionFeedback) {
         negotiated.retain(|capability| *capability != Capability::PointerVisibilityFeedback);
     }
     negotiated
+}
+
+fn input_capability_authorized(capability: Capability, grants: InvitationGrants) -> bool {
+    match capability {
+        Capability::AbsolutePointer
+        | Capability::RelativePointer
+        | Capability::Keyboard
+        | Capability::Text
+        | Capability::PointerPositionFeedback
+        | Capability::PointerVisibilityFeedback => {
+            grants.contains(InvitationGrants::POINTER_KEYBOARD)
+        }
+        Capability::Gamepad => grants.contains(InvitationGrants::GAMEPAD),
+        Capability::InputAck => {
+            grants.contains(InvitationGrants::POINTER_KEYBOARD)
+                || grants.contains(InvitationGrants::GAMEPAD)
+        }
+        Capability::VideoH264 | Capability::AudioOpus => false,
+    }
 }
 
 fn pointer_feedback_fields(
@@ -1848,8 +1946,14 @@ mod tests {
     fn only_one_remote_can_hold_session() {
         let sessions = Arc::new(SessionRegistry::default());
         let nonce = [7; 16];
-        let first = sessions.claim(endpoint(1), nonce).unwrap();
-        assert!(sessions.claim(endpoint(2), nonce).is_err());
+        let first = sessions
+            .claim(endpoint(1), nonce, InvitationGrants::ALL)
+            .unwrap();
+        assert!(
+            sessions
+                .claim(endpoint(2), nonce, InvitationGrants::ALL)
+                .is_err()
+        );
         assert!(sessions.claim_input(endpoint(1), [8; 16]).is_err());
         let input = sessions.claim_input(endpoint(1), nonce).unwrap();
         assert_eq!(input.session_id, first.session_id);
@@ -1859,11 +1963,23 @@ mod tests {
         drop(input);
         let draining_input = sessions.claim_input(endpoint(1), nonce).unwrap();
         drop(first);
-        assert!(sessions.claim(endpoint(2), nonce).is_err());
+        assert!(
+            sessions
+                .claim(endpoint(2), nonce, InvitationGrants::ALL)
+                .is_err()
+        );
         drop(draining_input);
-        assert!(sessions.claim(endpoint(2), nonce).is_err());
+        assert!(
+            sessions
+                .claim(endpoint(2), nonce, InvitationGrants::ALL)
+                .is_err()
+        );
         drop(audio);
-        assert!(sessions.claim(endpoint(2), nonce).is_ok());
+        assert!(
+            sessions
+                .claim(endpoint(2), nonce, InvitationGrants::ALL)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1919,6 +2035,67 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_grants_are_a_strict_input_capability_ceiling() {
+        let hello = ClientHello::new(
+            "test",
+            [0; 16],
+            vec![
+                Capability::RelativePointer,
+                Capability::AbsolutePointer,
+                Capability::Keyboard,
+                Capability::Text,
+                Capability::Gamepad,
+                Capability::InputAck,
+                Capability::PointerPositionFeedback,
+                Capability::PointerVisibilityFeedback,
+            ],
+        );
+        let supported = hello.capabilities.clone();
+
+        assert!(
+            negotiated_input_capabilities(&hello, &supported, InvitationGrants::VIEW).is_empty()
+        );
+        assert_eq!(
+            negotiated_input_capabilities(
+                &hello,
+                &supported,
+                InvitationGrants::VIEW.union(InvitationGrants::POINTER_KEYBOARD),
+            ),
+            vec![
+                Capability::RelativePointer,
+                Capability::AbsolutePointer,
+                Capability::Keyboard,
+                Capability::Text,
+                Capability::InputAck,
+                Capability::PointerPositionFeedback,
+                Capability::PointerVisibilityFeedback,
+            ]
+        );
+        assert_eq!(
+            negotiated_input_capabilities(
+                &hello,
+                &supported,
+                InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD),
+            ),
+            vec![Capability::Gamepad, Capability::InputAck]
+        );
+    }
+
+    #[test]
+    fn session_substreams_inherit_the_exact_enrollment_grant() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let grants = InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD);
+        let media = sessions.claim(endpoint(1), [3; 16], grants).unwrap();
+        let input = sessions.claim_input(endpoint(1), [3; 16]).unwrap();
+        let audio = sessions.claim_audio(endpoint(1), [3; 16]).unwrap();
+        assert_eq!(input.grants, grants);
+        assert_eq!(audio.grants, grants);
+        drop(input);
+        drop(audio);
+        drop(media);
+    }
+
+    #[test]
     fn pointer_feedback_is_advertised_only_with_tracker_and_relative_input() {
         assert_eq!(
             supported_input_capabilities(&[Capability::RelativePointer], false),
@@ -1949,7 +2126,7 @@ mod tests {
             ],
         );
         let supported = supported_input_capabilities(&[Capability::RelativePointer], true);
-        let negotiated = negotiated_input_capabilities(&hello, &supported);
+        let negotiated = negotiated_input_capabilities(&hello, &supported, InvitationGrants::ALL);
         assert_eq!(
             negotiated,
             vec![
@@ -2006,7 +2183,10 @@ mod tests {
             vec![Capability::PointerVisibilityFeedback],
         );
         let supported = supported_input_capabilities(&[Capability::RelativePointer], true);
-        assert!(negotiated_input_capabilities(&visibility_only, &supported).is_empty());
+        assert!(
+            negotiated_input_capabilities(&visibility_only, &supported, InvitationGrants::ALL)
+                .is_empty()
+        );
 
         let upgraded = ClientHello::new(
             "upgraded-client",
@@ -2018,7 +2198,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            negotiated_input_capabilities(&upgraded, &supported),
+            negotiated_input_capabilities(&upgraded, &supported, InvitationGrants::ALL),
             supported
         );
 
@@ -2038,20 +2218,32 @@ mod tests {
     #[test]
     fn audio_claim_requires_the_active_remote_and_nonce() {
         let sessions = Arc::new(SessionRegistry::default());
-        let media = sessions.claim(endpoint(1), [9; 16]).unwrap();
+        let media = sessions
+            .claim(endpoint(1), [9; 16], InvitationGrants::ALL)
+            .unwrap();
         assert!(sessions.claim_audio(endpoint(2), [9; 16]).is_err());
         assert!(sessions.claim_audio(endpoint(1), [8; 16]).is_err());
         let audio = sessions.claim_audio(endpoint(1), [9; 16]).unwrap();
         drop(media);
-        assert!(sessions.claim(endpoint(2), [0; 16]).is_err());
+        assert!(
+            sessions
+                .claim(endpoint(2), [0; 16], InvitationGrants::ALL)
+                .is_err()
+        );
         drop(audio);
-        assert!(sessions.claim(endpoint(2), [0; 16]).is_ok());
+        assert!(
+            sessions
+                .claim(endpoint(2), [0; 16], InvitationGrants::ALL)
+                .is_ok()
+        );
     }
 
     #[test]
     fn media_and_audio_leases_share_one_session_clock() {
         let sessions = Arc::new(SessionRegistry::default());
-        let media = sessions.claim(endpoint(1), [9; 16]).unwrap();
+        let media = sessions
+            .claim(endpoint(1), [9; 16], InvitationGrants::ALL)
+            .unwrap();
         let audio = sessions.claim_audio(endpoint(1), [9; 16]).unwrap();
         assert_eq!(media.session_clock, audio.session_clock);
     }
@@ -2307,7 +2499,9 @@ mod tests {
         let sessions = Arc::new(SessionRegistry::default());
         let remote = endpoint(1);
         let nonce = [7; 16];
-        let media = sessions.claim(remote, nonce).unwrap();
+        let media = sessions
+            .claim(remote, nonce, InvitationGrants::ALL)
+            .unwrap();
         let input = sessions.claim_input(remote, nonce).unwrap();
         let session_id = media.session_id;
 
@@ -2362,6 +2556,10 @@ mod tests {
             .expect("input lease did not observe media shutdown")
             .unwrap();
 
-        assert!(sessions.claim(endpoint(2), [8; 16]).is_ok());
+        assert!(
+            sessions
+                .claim(endpoint(2), [8; 16], InvitationGrants::ALL)
+                .is_ok()
+        );
     }
 }

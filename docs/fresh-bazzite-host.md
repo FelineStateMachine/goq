@@ -54,25 +54,44 @@ in a production package.
 
 ### Current security boundary
 
-In the inherited protocol, the passkey lets the client derive and discover the
-host's Iroh node ID. It does not authenticate the client to the host. Iroh
-authenticates the host endpoint and encrypts the connection, but a custom client
-that already knows the node ID and ALPN can attempt to connect today.
+Portal derives a stable client Iroh identity from the security key. Sigil signs
+a short-lived invitation bound to its host identity, that exact Portal peer,
+an enrollment epoch, a nonce, expiry, and the requested grants. The first media
+handshake consumes the invitation atomically; later sessions authenticate the
+durably enrolled peer without replaying it. View, pointer/keyboard, and gamepad
+grants are intersected with operational protocol capabilities on both sides.
 
-Therefore, `--dev-connect` bypasses host discovery in the official client; it is
-not a host-side authorization bypass and must not be described as one. Keep the
-development node ID private, enforce the single-client limit, and use a fresh
-identity for the dedicated appliance. Capability tickets later add actual
-host-side client authorization. Do not treat Steps 0–2 as a production security
-model.
+`--dev-connect` remains only a build-time-contained routing bypass in Portal.
+It does not grant access to a configured host, and ordinary release builds
+reject the option. Only the explicit direct test-pattern proof form of
+`sigil serve` omits enrollment; a configured Gamescope appliance fails closed.
+Replay, expiry, wrong-peer, cross-host, stale-epoch, and capability-escalation
+attempts are rejected before capture starts.
 
-Build-time CLI containment prevents accidental product exposure; it is not an
-authorization boundary. The `demo-direct-node` feature exists only to measure
-the optimized client during temporary testing. The v1 host limits service to
-one media session and one matching input stream, bounds peer-controlled
-messages, applies handshake and stalled-media-write timeouts, and drops stale
-encoded frames. Treat node IDs and connection metadata as operationally
-sensitive until capability tickets exist.
+For first enrollment, use Portal's **show portal id** action, then issue the
+short-lived file on the host:
+
+```bash
+sigil invitation create \
+  --config ~/.config/sigil-spark/host.toml \
+  --peer PORTAL_PEER_ID \
+  --pointer-keyboard \
+  --gamepad \
+  --output ~/portal.goq-invite
+```
+
+Open the file with Portal and confirm its bounded summary with the controller.
+After the first accepted media handshake, verify the durable grant with
+`sigil enrollment show --config ~/.config/sigil-spark/host.toml`. Revocation is
+explicit and invalidates all outstanding invitations:
+
+```bash
+sigil enrollment revoke --config ~/.config/sigil-spark/host.toml
+```
+
+Then disconnect Portal and use **client -> reset enrollment** before importing
+the replacement invitation. Portal never silently overwrites a redeemed host
+profile.
 
 Do not put an identity seed in an environment variable or command-line
 argument. Store it in a mode `0600` file and pass only its path.
@@ -466,32 +485,44 @@ The preferred host artifact is the deterministic, allowlisted runtime package.
 It contains the generic Linux host/probe binaries, installer and rollback tool,
 systemd/PipeWire/udev assets, license, complete checksums, and build provenance.
 It cannot include the worktree, credentials, identity, hardware configuration,
-or evidence. Product packaging exports clean `HEAD`, builds both binaries with
-locked `cargo-zigbuild` in an isolated target directory, and never accepts
-caller-supplied binaries. It fails closed when the worktree is dirty or no
-Minisign secret key is supplied:
+or evidence. Product packaging exports clean tagged `HEAD`, builds both
+binaries with locked `cargo-zigbuild` in an isolated target directory, and
+never accepts caller-supplied binaries. It fails closed when the worktree is
+dirty, the tag does not resolve to `HEAD`, the tag differs from Sigil's Cargo
+version, or the output does not use the stable public asset name. The builder
+never receives the offline Minisign secret:
 
 ```bash
 cd /Users/dami/Developer/sigil-spark
 source ~/.cargo/env
 scripts/package-bazzite-release.sh \
-  --output /tmp/sigil-spark-host.tar.gz \
-  --minisign-key /absolute/path/to/release.key
+  --release-tag v0.1.0 \
+  --output /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz
 
-# Verify with a public key obtained through a separate trusted channel.
-minisign -Vm /tmp/sigil-spark-host.tar.gz \
-  -x /tmp/sigil-spark-host.tar.gz.minisig \
-  -P '<trusted minisign public key>'
-shasum -a 256 -c /tmp/sigil-spark-host.tar.gz.sha256
-scp /tmp/sigil-spark-host.tar.gz tank@umpc:/tmp/
+# Verify the candidate before it crosses the offline signing boundary.
+scripts/verify-sigil-release.sh \
+  --tag v0.1.0 \
+  --archive /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz \
+  --source-commit "$(git rev-parse HEAD)" \
+  --candidate
+
+# After the offline signer returns the detached signature, verify with the
+# reviewed public key before extraction. See docs/public-release-delivery.md.
+scripts/verify-sigil-release.sh \
+  --tag v0.1.0 \
+  --archive /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz \
+  --source-commit "$(git rev-parse HEAD)" \
+  --public-key-file /absolute/path/to/sigil-minisign.pub
+shasum -a 256 -c /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz.sha256
+scp /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz tank@umpc:/tmp/
 
 ssh tank@umpc '
   set -eu
   incoming="$HOME/.local/share/sigil-spark/incoming"
   install -d -m 0700 "$incoming"
   run_dir="$(mktemp -d "$incoming/package.XXXXXX")"
-  tar -tzf /tmp/sigil-spark-host.tar.gz
-  tar -xzf /tmp/sigil-spark-host.tar.gz -C "$run_dir"
+  tar -tzf /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz
+  tar -xzf /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz -C "$run_dir"
   cd "$run_dir/payload"
   sha256sum -c PACKAGE-SHA256SUMS
   bash -n stage-this-release.sh
@@ -512,8 +543,8 @@ them. It can adopt an operator-owned regular file only when it is byte-identical
 to the new release asset; any local modification or unsafe target rejects the
 whole asset migration without changing an earlier destination.
 
-For a temporary dirty and unsigned development package only, replace the
-Minisign option with `--allow-dirty --allow-unsigned`. The manifest records that
+For a temporary dirty and unsigned development package only, omit the release
+tag and use both `--allow-dirty --allow-unsigned`. The manifest records that
 state and the package prints `publisher_signature=absent-development`; never
 publish that artifact. Externally built host/probe binaries are accepted only
 as an all-or-none pair with both development flags, and their manifest records

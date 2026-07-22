@@ -12,6 +12,9 @@ pub enum ProtocolError {
     #[error("invalid audio magic: {0:02x?}")]
     InvalidAudioMagic([u8; 4]),
 
+    #[error("invalid invitation magic: {0:02x?}")]
+    InvalidInvitationMagic([u8; 4]),
+
     #[error("unsupported protocol version {actual}; expected {expected}")]
     UnsupportedVersion { expected: u16, actual: u16 },
 

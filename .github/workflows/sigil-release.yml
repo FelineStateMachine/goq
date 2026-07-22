@@ -1,0 +1,229 @@
+name: Sigil Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Build a draft candidate or verify and promote an offline-signed draft
+        required: true
+        type: choice
+        options:
+          - build-candidate
+          - promote-signed-draft
+      tag:
+        description: Existing immutable vVERSION tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    name: Build clean Sigil candidate
+    if: inputs.operation == 'build-candidate'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: main
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check out exact release tag
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify immutable source identity
+        run: |
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v1)"
+          sigil_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/sigil-host/Cargo.toml | head -n 1)"
+          test "$RELEASE_TAG" = "v$sigil_version"
+
+      - name: Install release build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            ffmpeg \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libudev-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            python3-venv \
+            shellcheck
+          python3 -m venv "$RUNNER_TEMP/zig-venv"
+          "$RUNNER_TEMP/zig-venv/bin/pip" install --disable-pip-version-check 'ziglang==0.16.0'
+          install -d "$RUNNER_TEMP/release-bin"
+          # Expand runner paths when the generated wrapper executes.
+          # shellcheck disable=SC2016
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'exec "$RUNNER_TEMP/zig-venv/bin/python" -m ziglang "$@"' \
+            >"$RUNNER_TEMP/release-bin/zig"
+          chmod 0755 "$RUNNER_TEMP/release-bin/zig"
+          echo "$RUNNER_TEMP/release-bin" >>"$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked --version 0.23.0
+
+      - name: Run complete repository gate
+        run: ./scripts/verify-demo-build.sh
+
+      - name: Build and verify unsigned candidate
+        id: candidate
+        run: |
+          source_commit="$(git rev-parse HEAD)"
+          asset_name="sigil-$RELEASE_TAG-bazzite-x86_64.tar.gz"
+          output_dir="$RUNNER_TEMP/sigil-release"
+          install -d -m 0700 "$output_dir"
+          archive="$output_dir/$asset_name"
+          ./scripts/package-bazzite-release.sh \
+            --release-tag "$RELEASE_TAG" \
+            --output "$archive"
+          ./scripts/verify-sigil-release.sh \
+            --tag "$RELEASE_TAG" \
+            --archive "$archive" \
+            --source-commit "$source_commit" \
+            --candidate
+          echo "archive=$archive" >>"$GITHUB_OUTPUT"
+          echo "asset_name=$asset_name" >>"$GITHUB_OUTPUT"
+
+      - name: Refuse to replace an existing release
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "release $RELEASE_TAG already exists; refusing to replace its assets" >&2
+            exit 1
+          fi
+
+      - name: Create draft with unsigned candidate
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --draft \
+            --verify-tag \
+            --title "goq $RELEASE_TAG public alpha" \
+            --notes "Incomplete public-alpha draft. Promotion remains blocked until signed Portal assets and the offline Sigil Minisign signature are attached and jointly verified." \
+            "${{ steps.candidate.outputs.archive }}" \
+            "${{ steps.candidate.outputs.archive }}.sha256"
+
+      - name: Retain candidate for offline transfer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sigil-${{ inputs.tag }}-offline-signing-candidate
+          path: |
+            ${{ steps.candidate.outputs.archive }}
+            ${{ steps.candidate.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  promote:
+    name: Verify offline signature and promote
+    if: inputs.operation == 'promote-signed-draft'
+    runs-on: macos-26
+    timeout-minutes: 30
+    environment: main
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check out exact release tag
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify immutable source identity
+        id: source
+        run: |
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          source_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$source_commit" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v1)"
+          sigil_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/sigil-host/Cargo.toml | head -n 1)"
+          test "$RELEASE_TAG" = "v$sigil_version"
+          echo "commit=$source_commit" >>"$GITHUB_OUTPUT"
+
+      - name: Install public verification tools
+        run: brew install minisign
+
+      - name: Require the complete signed public-alpha draft
+        id: assets
+        run: |
+          release_json="$(gh release view "$RELEASE_TAG" --json isDraft,tagName,assets)"
+          test "$(jq -r '.isDraft' <<<"$release_json")" = true
+          test "$(jq -r '.tagName' <<<"$release_json")" = "$RELEASE_TAG"
+          asset_name="sigil-$RELEASE_TAG-bazzite-x86_64.tar.gz"
+          version="${RELEASE_TAG#v}"
+          expected="$(printf '%s\n' \
+            "$asset_name" \
+            "$asset_name.minisig" \
+            "$asset_name.sha256" \
+            "Portal-${version}-arm64.dmg" \
+            "Portal-${version}-arm64.dmg.sha256" \
+            "Portal-${version}-arm64.json" | sort)"
+          actual="$(jq -r '.assets[].name' <<<"$release_json" | sort)"
+          test "$actual" = "$expected" || {
+            echo "draft release assets do not match the complete six-asset public-alpha contract" >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
+            exit 1
+          }
+          output_dir="$RUNNER_TEMP/sigil-release"
+          install -d -m 0700 "$output_dir"
+          gh release download "$RELEASE_TAG" --dir "$output_dir"
+          echo "archive=$output_dir/$asset_name" >>"$GITHUB_OUTPUT"
+
+      - name: Verify detached signature, checksum, archive, and provenance
+        run: |
+          ./scripts/verify-sigil-release.sh \
+            --tag "$RELEASE_TAG" \
+            --archive "${{ steps.assets.outputs.archive }}" \
+            --source-commit "${{ steps.source.outputs.commit }}" \
+            --public-key-file "$GITHUB_WORKSPACE/release/sigil-minisign.pub"
+
+      - name: Verify signed Portal assets against the same source tag
+        env:
+          PORTAL_APPLE_TEAM_ID: ${{ secrets.PORTAL_APPLE_TEAM_ID }}
+        run: |
+          portal_dir="$RUNNER_TEMP/portal-release"
+          install -d -m 0700 "$portal_dir"
+          gh release download "$RELEASE_TAG" --dir "$portal_dir" --pattern 'Portal-*'
+          expected_team_id="$(<release/portal-apple-team-id.txt)"
+          test "$PORTAL_APPLE_TEAM_ID" = "$expected_team_id"
+          python3 scripts/verify-portal-release.py assets \
+            --repo-dir "$GITHUB_WORKSPACE" \
+            --release-tag "$RELEASE_TAG" \
+            --asset-dir "$portal_dir"
+          for asset in "$portal_dir"/*; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/portal-release.yml" \
+              --source-ref "refs/tags/$RELEASE_TAG" \
+              --source-digest "${{ steps.source.outputs.commit }}" \
+              --deny-self-hosted-runners > /dev/null
+          done
+          ./scripts/verify-macos-portal-signature.sh \
+            --dmg "$portal_dir/Portal-${RELEASE_TAG#v}-arm64.dmg" \
+            --expected-version "${RELEASE_TAG#v}" \
+            --expected-team-id "$expected_team_id"
+
+      - name: Publish verified prerelease
+        run: |
+          gh release edit "$RELEASE_TAG" \
+            --draft=false \
+            --prerelease \
+            --notes "Verified public alpha for $RELEASE_TAG: signed Bazzite Sigil host package plus Developer ID signed, notarized, stapled macOS arm64 Portal. Hardware UAT remains tracked separately."
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = false
+          test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease')" = true

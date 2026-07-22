@@ -7,6 +7,63 @@
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
+  <div class="overlay-screen hidden" id="enrollment-overlay" role="dialog" aria-modal="true" aria-labelledby="enrollment-title">
+    <div class="overlay-content enrollment-content">
+      <h1 id="enrollment-title">mark this portal</h1>
+      <p id="enrollment-desc">Use the security key once to reveal this Portal's peer ID, then create a one-time invitation on the Sigil host.</p>
+      <div class="overlay-form" id="enrollment-pin-form">
+        <input class="overlay-input" id="enrollment-pin" data-controller-focus data-pin-target="enrollment-pin" type="password" inputmode="numeric" maxlength="64" placeholder="PIN" autocomplete="off" />
+        <button class="overlay-btn controller-pin-btn" id="controller-pin-enrollment" data-controller-focus onclick="openPinPad('enrollment-pin', this)">D-pad PIN</button>
+      </div>
+      <div class="overlay-actions">
+        <button class="overlay-btn primary" id="derive-portal-id" data-controller-focus onclick="derivePortalIdentity()">show portal id</button>
+      </div>
+      <div class="enrollment-peer hidden" id="enrollment-peer-wrap">
+        <span>portal peer</span>
+        <output id="enrollment-peer-id"></output>
+      </div>
+      <div class="overlay-actions">
+        <button class="overlay-btn" id="choose-invitation" data-controller-focus onclick="chooseInvitationFile()">open invitation</button>
+      </div>
+      <div class="overlay-status" id="enrollment-status"></div>
+      <p class="controller-hint">D-pad / left stick to move · A select · B close PIN pad</p>
+    </div>
+  </div>
+
+  <div class="overlay-screen hidden" id="invitation-overlay" role="dialog" aria-modal="true" aria-labelledby="invitation-title">
+    <div class="overlay-content invitation-content">
+      <h1 id="invitation-title">open this rift?</h1>
+      <p>Confirm the exact host, Portal peer, and controls before enrolling.</p>
+      <dl class="invitation-summary">
+        <div><dt>sigil</dt><dd id="invitation-host"></dd></div>
+        <div><dt>portal</dt><dd id="invitation-peer"></dd></div>
+        <div><dt>expires</dt><dd id="invitation-expiry"></dd></div>
+        <div><dt>grants</dt><dd id="invitation-grants"></dd></div>
+      </dl>
+      <div class="overlay-actions">
+        <button class="overlay-btn primary" id="confirm-invitation" data-controller-focus onclick="confirmInvitation()">enroll</button>
+        <button class="overlay-btn" data-controller-focus onclick="cancelInvitation()">cancel</button>
+      </div>
+      <div class="overlay-status" id="invitation-status"></div>
+    </div>
+  </div>
+
+  <div class="overlay-screen hidden" id="reset-enrollment-overlay" role="alertdialog" aria-modal="true" aria-labelledby="reset-enrollment-title">
+    <div class="overlay-content invitation-content">
+      <h1 id="reset-enrollment-title">erase this portal mark?</h1>
+      <p>Only continue after revoking enrollment on Sigil. Portal will forget this host and require a new invitation.</p>
+      <div class="enrollment-peer">
+        <span>sigil</span>
+        <output id="reset-enrollment-host"></output>
+      </div>
+      <div class="overlay-actions">
+        <button class="overlay-btn danger" id="confirm-reset-enrollment" data-controller-focus onclick="confirmEnrollmentReset()">erase enrollment</button>
+        <button class="overlay-btn" data-controller-focus onclick="cancelEnrollmentReset()">keep enrollment</button>
+      </div>
+      <div class="overlay-status" id="reset-enrollment-status"></div>
+    </div>
+  </div>
+
   <div class="overlay-screen hidden" id="tap-overlay" style="z-index: 200;">
     <div class="overlay-content">
       <div class="flow-steps" aria-hidden="true">
@@ -58,7 +115,7 @@
         <span class="flow-step">03 play</span>
       </div>
       <h1>portal</h1>
-      <p id="intro-desc">enter the host security-key pin</p>
+      <p id="intro-desc">enter the Portal security-key pin</p>
       <div class="dev-warning hidden" id="dev-connect-warning" role="alert">
         DEVELOPMENT DIRECT NODE<br />PASSKEY LOOKUP BYPASSED · NOT CLIENT AUTHORIZATION
       </div>
@@ -68,6 +125,7 @@
       </div>
       <div class="overlay-actions">
         <button class="overlay-btn primary" id="intro-connect" data-controller-focus onclick="introConnect()">connect</button>
+        <button class="overlay-btn danger hidden" id="reset-enrollment-intro" data-controller-focus onclick="openEnrollmentReset()">reset enrollment</button>
       </div>
       <div class="overlay-status" id="intro-status"></div>
       <p class="controller-hint" id="intro-controller-hint">Controller optional · keyboard and mouse remain available</p>
@@ -134,6 +192,7 @@
         <div class="info-row"><span class="info-label">extensions</span><span class="info-value" id="fido-extensions">—</span></div>
         <div class="info-row"><span class="info-label">pin retries</span><span class="info-value" id="fido-pin">—</span></div>
         <button class="link-btn panel-action" data-controller-focus onclick="scanFido()">rescan</button>
+        <button class="link-btn panel-action hidden" id="reset-enrollment" data-controller-focus onclick="openEnrollmentReset()">reset enrollment</button>
       </div>
       <div class="panel-section" id="stream-section">
         <h3><span class="hash" aria-hidden="true">#</span> stream</h3>

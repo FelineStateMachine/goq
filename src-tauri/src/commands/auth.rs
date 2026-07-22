@@ -11,6 +11,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
+const PORTAL_CLIENT_IDENTITY_DOMAIN: &[u8] = b"goq/portal-client-identity/v1\0";
+
 // ─── FIDO2 HMAC-Secret Derivation ────────────────────────────────────────────
 
 pub fn derive_secret_from_key(pin: &str) -> anyhow::Result<[u8; 32]> {
@@ -86,8 +88,19 @@ pub fn extract_hmac_secret(assertions: &[Assertion]) -> anyhow::Result<[u8; 32]>
 }
 
 pub fn derive_iroh_secret_from_key(pin: &str) -> anyhow::Result<SecretKey> {
-    let secret_bytes = derive_secret_from_key(pin)?;
-    Ok(SecretKey::from_bytes(&secret_bytes))
+    let hmac_secret = derive_secret_from_key(pin)?;
+    Ok(portal_client_secret_from_hmac(hmac_secret))
+}
+
+/// Derive Portal's stable Iroh peer identity from the FIDO hmac-secret without
+/// reusing the passkey output as another product identity directly. The same
+/// tap still supplies both onboarding and ordinary connection attempts.
+fn portal_client_secret_from_hmac(hmac_secret: [u8; 32]) -> SecretKey {
+    let mut hasher = Sha256::new();
+    hasher.update(PORTAL_CLIENT_IDENTITY_DOMAIN);
+    hasher.update(hmac_secret);
+    let digest: [u8; 32] = hasher.finalize().into();
+    SecretKey::from_bytes(&digest)
 }
 
 // ─── FIDO2 Tauri Commands ─────────────────────────────────────────────────────
@@ -225,5 +238,23 @@ pub async fn key_derive_identity(pin: String) -> KeyIdentity {
             node_id: secret.public().to_string(),
             error: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portal_identity_derivation_is_stable_and_domain_separated() {
+        let root = [0x2a; 32];
+        let first = portal_client_secret_from_hmac(root);
+        let second = portal_client_secret_from_hmac(root);
+        assert_eq!(first.to_bytes(), second.to_bytes());
+        assert_ne!(first.to_bytes(), root);
+        assert_ne!(
+            first.to_bytes(),
+            portal_client_secret_from_hmac([0x2b; 32]).to_bytes()
+        );
     }
 }

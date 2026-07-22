@@ -1,4 +1,5 @@
 use super::auth::derive_iroh_secret_from_key;
+use super::enrollment::{connection_enrollment, mark_invitation_redeemed};
 use super::state::{
     AUDIO_DELIVERY_CAPACITY, AppState, AudioDeliveryState, CLIENT_INPUT_QUEUE_CAPACITY, FRAME_ALPN,
     INPUT_ALPN, development_direct_node_available,
@@ -9,8 +10,8 @@ use openh264::{formats::YUVSource, nal_units};
 use serde::Serialize;
 use sigil_protocol::{
     AUDIO_ALPN_V1, AudioFlags, AudioPacket, AudioPacketHeader, Capability, ClientHello, FrameFlags,
-    INPUT_ALPN_V1, InputEvent, MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS,
-    MEDIA_ALPN_V1, MEDIA_ALPN_V2, MediaCodec, MediaFrame, PointerPosition,
+    INPUT_ALPN_V1, InputEvent, InvitationGrants, MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION,
+    MAX_VIDEO_PIXELS, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MediaCodec, MediaFrame, PointerPosition,
     PointerSurfaceDimensions, ProtocolError, RELATIVE_POINTER_DELTA_MAX,
     RELATIVE_POINTER_DELTA_MIN, read_host_hello, read_input_ack, read_media_frame,
     read_media_object, write_client_hello, write_input_event,
@@ -1010,8 +1011,12 @@ async fn negotiate_v1(
     capabilities: Vec<Capability>,
     required: Option<Capability>,
     stream_name: &str,
+    invitation: Option<&str>,
 ) -> Result<NegotiatedV1Stream, String> {
-    let hello = ClientHello::new("portal/0.1.0", nonce, capabilities.clone());
+    let mut hello = ClientHello::new("portal/0.1.0", nonce, capabilities.clone());
+    if let Some(invitation) = invitation {
+        hello = hello.with_invitation(invitation);
+    }
     write_client_hello(send, &hello)
         .await
         .map_err(|e| format!("Failed to send {stream_name} handshake: {e}"))?;
@@ -1073,8 +1078,16 @@ async fn open_negotiated_input_stream(
         .open_bi()
         .await
         .map_err(|error| format!("Failed to open input stream: {error}"))?;
-    let negotiation =
-        negotiate_v1(&mut send, &mut recv, nonce, capabilities, None, "input").await?;
+    let negotiation = negotiate_v1(
+        &mut send,
+        &mut recv,
+        nonce,
+        capabilities,
+        None,
+        "input",
+        None,
+    )
+    .await?;
     Ok((send, recv, negotiation))
 }
 
@@ -1082,6 +1095,7 @@ async fn open_negotiated_media_stream(
     endpoint: &Endpoint,
     address: &iroh::EndpointAddr,
     nonce: [u8; 16],
+    invitation: Option<&str>,
 ) -> Result<
     (
         iroh::endpoint::Connection,
@@ -1104,6 +1118,7 @@ async fn open_negotiated_media_stream(
                 vec![Capability::VideoH264],
                 Some(Capability::VideoH264),
                 "media v2",
+                invitation,
             )
             .await?;
             send.finish()
@@ -1135,6 +1150,7 @@ async fn open_negotiated_media_stream(
                 vec![Capability::VideoH264],
                 Some(Capability::VideoH264),
                 "media v1",
+                invitation,
             )
             .await?;
             send.finish()
@@ -1149,8 +1165,8 @@ async fn open_negotiated_media_stream(
     }
 }
 
-fn input_capability_offers() -> [Vec<Capability>; 4] {
-    [
+fn input_capability_offers(grants: InvitationGrants) -> [Vec<Capability>; 4] {
+    let mut offers = [
         vec![
             Capability::RelativePointer,
             Capability::PointerPositionFeedback,
@@ -1181,7 +1197,22 @@ fn input_capability_offers() -> [Vec<Capability>; 4] {
             Capability::Text,
             Capability::Gamepad,
         ],
-    ]
+    ];
+    for offer in &mut offers {
+        offer.retain(|capability| match capability {
+            Capability::Gamepad => grants.contains(InvitationGrants::GAMEPAD),
+            Capability::AbsolutePointer
+            | Capability::RelativePointer
+            | Capability::Keyboard
+            | Capability::Text
+            | Capability::PointerPositionFeedback
+            | Capability::PointerVisibilityFeedback => {
+                grants.contains(InvitationGrants::POINTER_KEYBOARD)
+            }
+            _ => true,
+        });
+    }
+    offers
 }
 
 fn input_event_allowed(capabilities: &[Capability], event: &InputEvent) -> bool {
@@ -1347,6 +1378,7 @@ async fn try_start_audio(
         vec![Capability::AudioOpus],
         Some(Capability::AudioOpus),
         "audio",
+        None,
     )
     .await?;
     if negotiation.session_id != media_session_id {
@@ -1549,7 +1581,7 @@ pub async fn iroh_client_connect(
     })?;
     let connect_guard = ClientConnectGuard::acquire(Arc::clone(&state.client_connection_active))?;
 
-    let (host_node_id, development_mode) = if let Some(node_id) = state.dev_connect_node_id {
+    let (client_secret, development_mode) = if let Some(node_id) = state.dev_connect_node_id {
         if !development_direct_node_available() {
             return Err(
                 "Development direct-node routing requires a debug build or the explicit demo-direct-node feature"
@@ -1563,10 +1595,10 @@ pub async fn iroh_client_connect(
                 "warning": "Passkey identity lookup skipped; this is not client authorization."
             }),
         );
-        (node_id, true)
+        (SecretKey::generate(), true)
     } else {
         // FIDO2 derivation — 30s timeout so a missing/stuck key surfaces quickly.
-        let host_secret = tokio::time::timeout(
+        let client_secret = tokio::time::timeout(
             Duration::from_secs(30),
             tokio::task::spawn_blocking(move || derive_iroh_secret_from_key(&pin)),
         )
@@ -1577,10 +1609,25 @@ pub async fn iroh_client_connect(
 
         // Key has been tapped — relay connection is next; update the UI overlay.
         let _ = app.emit("fido-done", ());
-        (host_secret.public(), false)
+        (client_secret, false)
     };
 
-    let client_secret = SecretKey::generate();
+    let (host_node_id, grants, invitation) = if development_mode {
+        (
+            state
+                .dev_connect_node_id
+                .ok_or_else(|| "Development host routing disappeared".to_string())?,
+            InvitationGrants::ALL,
+            None,
+        )
+    } else {
+        let enrollment = connection_enrollment(&app, client_secret.public())?;
+        (
+            enrollment.host_node_id,
+            enrollment.grants,
+            enrollment.pending_invitation,
+        )
+    };
     let mut handshake_nonce = [0_u8; 16];
     getrandom::fill(&mut handshake_nonce)
         .map_err(|error| format!("Failed to generate handshake nonce: {error}"))?;
@@ -1596,12 +1643,37 @@ pub async fn iroh_client_connect(
     // routing and fallback across all N0 relays automatically.
     let addr = iroh::EndpointAddr::new(host_node_id);
 
-    let use_v1 = development_mode;
+    // Public Sigil authorization exists only on the bounded, negotiated v1
+    // protocols. The inherited v0 leg is retained below solely as migration
+    // code and is no longer selected by an ordinary Portal connection.
+    let use_v1 = true;
     let input_alpn = if use_v1 { INPUT_ALPN_V1 } else { INPUT_ALPN };
 
     let (frame_conn, mut frame_recv, media_negotiation, media_transport) = if use_v1 {
-        let (connection, recv, negotiation, transport) =
-            open_negotiated_media_stream(&endpoint, &addr, handshake_nonce).await?;
+        let first_attempt =
+            open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, invitation.as_deref())
+                .await;
+        let (connection, recv, negotiation, transport) = match first_attempt {
+            Ok(result) => result,
+            Err(invitation_error)
+                if invitation.is_some()
+                    && invitation_error.contains("Portal peer is not authorized") =>
+            {
+                // Recover only the narrow crash window where Sigil durably
+                // consumed the invitation but Portal did not durably clear it.
+                // The replay itself remains rejected; a second, ticket-free
+                // connection can succeed only as the already-enrolled Iroh
+                // peer authenticated by the exact invited host.
+                open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, None)
+                    .await
+                    .map_err(|retry_error| {
+                        format!(
+                            "{invitation_error}; ticket-free enrollment recovery also failed: {retry_error}"
+                        )
+                    })?
+            }
+            Err(error) => return Err(error),
+        };
         (connection, recv, Some(negotiation), transport)
     } else {
         let connection = endpoint
@@ -1626,6 +1698,12 @@ pub async fn iroh_client_connect(
     let pointer_surface_dimensions = media_negotiation
         .as_ref()
         .and_then(|negotiation| negotiation.pointer_surface_dimensions);
+    if !development_mode && let Some(expected_invitation) = invitation.as_deref() {
+        // An accepted media hello means Sigil durably committed the one-time
+        // enrollment before returning. Future PIN/tap/play sessions send no
+        // bearer credential and authenticate by the stable Iroh peer instead.
+        mark_invitation_redeemed(&app, expected_invitation)?;
+    }
 
     let (input_send, input_recv, input_capabilities) = if use_v1 {
         let [
@@ -1633,7 +1711,7 @@ pub async fn iroh_client_connect(
             position_capabilities,
             relative_capabilities,
             legacy_capabilities,
-        ] = input_capability_offers();
+        ] = input_capability_offers(grants);
         let feedback_offer = open_negotiated_input_stream(
             &endpoint,
             &addr,
@@ -3289,7 +3367,8 @@ mod tests {
 
     #[test]
     fn input_capability_fallbacks_remove_only_one_protocol_extension_at_a_time() {
-        let [visibility, position, relative, inherited] = input_capability_offers();
+        let [visibility, position, relative, inherited] =
+            input_capability_offers(InvitationGrants::ALL);
 
         assert!(visibility.contains(&Capability::PointerVisibilityFeedback));
         assert!(visibility.contains(&Capability::PointerPositionFeedback));
@@ -3308,6 +3387,22 @@ mod tests {
                 Capability::Gamepad,
             ]
         );
+    }
+
+    #[test]
+    fn local_invitation_grants_bound_input_offers_before_the_host_intersection() {
+        let view_only = input_capability_offers(InvitationGrants::VIEW);
+        assert!(view_only.iter().all(Vec::is_empty));
+
+        let pointer = input_capability_offers(
+            InvitationGrants::VIEW.union(InvitationGrants::POINTER_KEYBOARD),
+        );
+        assert!(pointer[0].contains(&Capability::Keyboard));
+        assert!(!pointer[0].contains(&Capability::Gamepad));
+
+        let gamepad =
+            input_capability_offers(InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD));
+        assert_eq!(gamepad[0], vec![Capability::Gamepad]);
     }
 
     #[test]

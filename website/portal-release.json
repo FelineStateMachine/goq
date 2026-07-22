@@ -1,0 +1,10 @@
+{
+  "builds": {
+    "macos-arm64": {
+      "available": false,
+      "reason": "No signed and notarized public Portal release has been promoted yet."
+    }
+  },
+  "format": 1,
+  "product": "portal-client"
+}

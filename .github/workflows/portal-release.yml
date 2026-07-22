@@ -1,0 +1,197 @@
+name: Portal release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable vVERSION tag with a Sigil draft release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  policy:
+    name: Verify release policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify source, tests, and website
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 scripts/verify-portal-release.py source \
+            --repo-dir "$GITHUB_WORKSPACE" \
+            --release-tag "$RELEASE_TAG"
+          ./scripts/tests/portal-release.sh
+          ./scripts/verify-website.sh
+
+  publish:
+    name: Sign, notarize, and publish macOS arm64
+    needs: policy
+    runs-on: macos-26
+    timeout-minutes: 90
+    environment:
+      name: main
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Require workflow execution from the exact tag
+        run: |
+          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+
+      - name: Verify native arm64 runner
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          rustup target add aarch64-apple-darwin
+
+      - name: Install pinned Tauri CLI
+        run: cargo install tauri-cli --version 2.11.3 --locked
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.PORTAL_APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.PORTAL_APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          certificate_path="$RUNNER_TEMP/portal-developer-id.p12"
+          keychain_path="$RUNNER_TEMP/portal-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          python3 - "$certificate_path" <<'PY'
+          import base64
+          import os
+          import pathlib
+          import sys
+
+          encoded = os.environ.get("APPLE_CERTIFICATE_BASE64", "")
+          if not encoded:
+              raise SystemExit("PORTAL_APPLE_CERTIFICATE_BASE64 is not configured")
+          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(encoded, validate=True))
+          PY
+          chmod 0600 "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path" >/dev/null
+
+      - name: Build and verify signed release assets
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.PORTAL_APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.PORTAL_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.PORTAL_APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.PORTAL_APPLE_TEAM_ID }}
+        run: |
+          release_dir="$RUNNER_TEMP/portal-release"
+          mkdir -m 0700 "$release_dir"
+          ./scripts/package-macos-client.sh \
+            --release-tag "$RELEASE_TAG" \
+            --output-dir "$release_dir"
+
+      - name: Attest exact Portal build provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.1.0
+        with:
+          subject-path: '${{ runner.temp }}/portal-release/Portal-*'
+
+      - name: Require the exact Sigil candidate draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_json="$(gh release view "$RELEASE_TAG" --json isDraft,tagName,assets)"
+          test "$(jq -r '.isDraft' <<<"$release_json")" = true
+          test "$(jq -r '.tagName' <<<"$release_json")" = "$RELEASE_TAG"
+          sigil_asset="sigil-$RELEASE_TAG-bazzite-x86_64.tar.gz"
+          expected="$(printf '%s\n' "$sigil_asset" "$sigil_asset.sha256" | sort)"
+          actual="$(jq -r '.assets[].name' <<<"$release_json" | sort)"
+          test "$actual" = "$expected" || {
+            echo "draft must contain only the two verified Sigil candidate assets before Portal upload" >&2
+            exit 1
+          }
+
+      - name: Upload exact Portal assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          release_dir="$RUNNER_TEMP/portal-release"
+          dmg="Portal-${version}-arm64.dmg"
+          checksum="${dmg}.sha256"
+          manifest="Portal-${version}-arm64.json"
+          gh release upload "$RELEASE_TAG" \
+            "$release_dir/$dmg" \
+            "$release_dir/$checksum" \
+            "$release_dir/$manifest"
+
+      - name: Verify the combined draft remains complete and unpublished
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_json="$(gh release view "$RELEASE_TAG" --json isDraft,tagName,assets)"
+          test "$(jq -r '.isDraft' <<<"$release_json")" = true
+          test "$(jq -r '.tagName' <<<"$release_json")" = "$RELEASE_TAG"
+          version="${RELEASE_TAG#v}"
+          sigil_asset="sigil-$RELEASE_TAG-bazzite-x86_64.tar.gz"
+          expected="$(printf '%s\n' \
+            "$sigil_asset" \
+            "$sigil_asset.sha256" \
+            "Portal-${version}-arm64.dmg" \
+            "Portal-${version}-arm64.dmg.sha256" \
+            "Portal-${version}-arm64.json" | sort)"
+          actual="$(jq -r '.assets[].name' <<<"$release_json" | sort)"
+          test "$actual" = "$expected" || {
+            echo "combined draft does not match the five-asset pre-signature contract" >&2
+            exit 1
+          }
+          asset_names="$RUNNER_TEMP/portal-release-assets.json"
+          jq '[.assets[].name | select(startswith("Portal-"))]' \
+            <<<"$release_json" >"$asset_names"
+          python3 scripts/verify-portal-release.py release-assets \
+            --release-tag "$RELEASE_TAG" \
+            --names-json "$asset_names"
+
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/portal-signing.keychain-db" 2>/dev/null || true
+          python3 - "$RUNNER_TEMP/portal-developer-id.p12" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          if path.exists():
+              path.write_bytes(b"\0" * path.stat().st_size)
+              path.unlink()
+          PY

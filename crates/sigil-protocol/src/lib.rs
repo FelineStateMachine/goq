@@ -10,6 +10,7 @@ mod error;
 mod framing;
 mod handshake;
 mod input;
+mod invitation;
 mod media;
 
 pub use audio::{AUDIO_HEADER_LEN, AudioCodec, AudioFlags, AudioPacket, AudioPacketHeader};
@@ -24,6 +25,10 @@ pub use input::{
     POINTER_POSITION_MAX, POINTER_POSITION_MIN, PointerPosition, RELATIVE_POINTER_DELTA_MAX,
     RELATIVE_POINTER_DELTA_MIN, read_input_ack, read_input_event, write_input_ack,
     write_input_event,
+};
+pub use invitation::{
+    INVITATION_CLOCK_SKEW_SECS, INVITATION_TOKEN_PREFIX, InvitationClaims, InvitationGrants,
+    MAX_INVITATION_TOKEN_LEN, MAX_INVITATION_TTL_SECS, SignedInvitation,
 };
 pub use media::{
     FrameFlags, MEDIA_HEADER_LEN, MediaCodec, MediaFrame, MediaFrameHeader, read_media_frame,

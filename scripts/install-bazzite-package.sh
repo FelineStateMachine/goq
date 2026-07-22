@@ -45,7 +45,7 @@ done
 [[ "$(uname -s)" == Linux ]] || die "this package must be installed on Linux"
 [[ "$(uname -m)" == x86_64 ]] || die "expected x86_64, got $(uname -m)"
 [[ "$(id -u)" -ne 0 ]] || die "run as the dedicated gaming user, not root"
-for command in cmp diff flock ldd sha256sum systemctl systemd-analyze timeout; do
+for command in cmp diff flock ldd python3 sha256sum systemctl systemd-analyze timeout; do
   command -v "$command" >/dev/null 2>&1 || die "$command is required"
 done
 
@@ -191,7 +191,26 @@ activate_release_links() {
 }
 # END release activation transaction helpers
 
-install -d -m 0755 "$HOME/.local" "$HOME/.local/libexec" "$install_root" "$releases_root"
+ensure_owned_directory() {
+  local directory="$1"
+  local mode
+
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    [[ -d "$directory" && ! -L "$directory" ]] || die "unsafe install directory: $directory"
+    [[ "$(stat -Lc '%u' "$directory")" -eq "$(id -u)" ]] \
+      || die "install directory is not owned by the current user: $directory"
+    mode="$(stat -Lc '%a' "$directory")"
+    (( (8#$mode & 8#022) == 0 )) \
+      || die "install directory is group/world writable: $directory"
+  else
+    install -d -m 0755 "$directory"
+  fi
+}
+
+[[ "$HOME" == /* && -d "$HOME" ]] || die "HOME must be an absolute directory"
+for directory in "$HOME/.local" "$HOME/.local/libexec" "$install_root" "$releases_root"; do
+  ensure_owned_directory "$directory"
+done
 exec 9>"$lock_path"
 flock -x 9
 
@@ -225,6 +244,56 @@ validate_release_tree() {
     cd "$path"
     sha256sum -c SHA256SUMS
   )
+  python3 - "$path/release-manifest.json" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    manifest = json.loads(path.read_text())
+except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"package install failed: release manifest is invalid: {error}")
+
+expected = {
+    "format": 2,
+    "product": "sigil-host",
+    "primary_executable": "sigil",
+    "compatibility_executable": "sigil-host",
+    "target": "x86_64-unknown-linux-gnu.2.17",
+    "profile": "release",
+    "features": ["default"],
+    "demo_direct_node": False,
+}
+for key, value in expected.items():
+    if manifest.get(key) != value:
+        raise SystemExit(f"package install failed: release manifest field {key} is invalid")
+
+version = manifest.get("version")
+commit = manifest.get("git_commit")
+release_tag = manifest.get("release_tag")
+asset_name = manifest.get("asset_name")
+release_kind = manifest.get("release_kind")
+if not isinstance(version, str) or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?", version) is None:
+    raise SystemExit("package install failed: release manifest version is invalid")
+if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+    raise SystemExit("package install failed: release manifest commit is invalid")
+if not isinstance(asset_name, str) or re.fullmatch(r"[A-Za-z0-9._-]+[.]tar[.]gz", asset_name) is None:
+    raise SystemExit("package install failed: release manifest asset name is invalid")
+if release_kind == "product-candidate":
+    if release_tag != f"v{version}" or asset_name != f"sigil-{release_tag}-bazzite-x86_64.tar.gz":
+        raise SystemExit("package install failed: product release identity is inconsistent")
+    if manifest.get("git_dirty") is not False:
+        raise SystemExit("package install failed: product release claims dirty source")
+    if manifest.get("binary_provenance") != "self-built-clean-head" or manifest.get("binary_provenance_verified") is not True:
+        raise SystemExit("package install failed: product binary provenance is invalid")
+elif release_kind == "development":
+    if release_tag != "development":
+        raise SystemExit("package install failed: development release claims a product tag")
+else:
+    raise SystemExit("package install failed: release kind is invalid")
+PY
   for binary in sigil sigil-host sigil-probe; do
     [[ -f "$path/$binary" && ! -L "$path/$binary" && -x "$path/$binary" ]] \
       || die "$binary is not a regular executable"

@@ -9,7 +9,7 @@ probe_binary=""
 output_path=""
 allow_dirty=false
 allow_unsigned=false
-minisign_secret_key=""
+release_tag=""
 linux_target="x86_64-unknown-linux-gnu.2.17"
 linux_output_target="x86_64-unknown-linux-gnu"
 
@@ -28,14 +28,15 @@ Options:
   --output PATH          New .tar.gz bundle path (required; must not exist)
   --host-binary PATH     Development-only prebuilt generic Linux sigil
   --probe-binary PATH    Development-only prebuilt generic Linux sigil-probe
-  --minisign-key PATH    Create detached PACKAGE.minisig with this secret key
+  --release-tag TAG      Immutable vVERSION tag (required in product mode)
   --allow-dirty          Permit development packaging from a dirty worktree
   --allow-unsigned       Permit a package without a detached publisher signature
   --help                 Show this help
 
 The two prebuilt-binary options are an all-or-none development escape hatch and
-require both --allow-dirty and --allow-unsigned. Product packages never accept
-caller-supplied binaries.
+require both --allow-dirty and --allow-unsigned. Product mode emits a clean,
+unsigned release candidate. Sign it on the offline publisher machine with
+scripts/sign-bazzite-release.sh; this builder never receives the secret key.
 EOF
 }
 
@@ -70,9 +71,9 @@ while [[ $# -gt 0 ]]; do
       probe_binary="$2"
       shift 2
       ;;
-    --minisign-key)
-      [[ $# -ge 2 ]] || die "--minisign-key requires a path"
-      minisign_secret_key="$2"
+    --release-tag)
+      [[ $# -ge 2 ]] || die "--release-tag requires a value"
+      release_tag="$2"
       shift 2
       ;;
     --allow-dirty)
@@ -110,6 +111,21 @@ if [[ -n "$host_binary" || -n "$probe_binary" ]]; then
   caller_supplied_binaries=true
 fi
 
+development_mode=false
+if $allow_dirty || $allow_unsigned || $caller_supplied_binaries; then
+  development_mode=true
+  if ! $allow_dirty || ! $allow_unsigned; then
+    die "development packaging requires both --allow-dirty and --allow-unsigned"
+  fi
+  [[ -z "$release_tag" ]] || die "development packages must not claim a release tag"
+else
+  [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] \
+    || die "product mode requires --release-tag vVERSION"
+  expected_asset="sigil-$release_tag-bazzite-x86_64.tar.gz"
+  [[ "$(basename -- "$output_path")" == "$expected_asset" ]] \
+    || die "product output must be named $expected_asset"
+fi
+
 [[ -x "$script_dir/install-bazzite-package.sh" ]] || die "package installer is missing"
 [[ -x "$script_dir/rollback-bazzite-release.sh" ]] || die "rollback helper is missing"
 [[ -f "$script_dir/sigil-host.service" ]] || die "systemd user unit is missing"
@@ -126,12 +142,18 @@ if [[ -n "$(git -C "$repo_dir" status --porcelain=v1)" ]]; then
   git_dirty=true
   $allow_dirty || die "worktree is dirty; commit the release or pass --allow-dirty for a development package"
 fi
-if [[ -z "$minisign_secret_key" ]]; then
-  $allow_unsigned || die "publisher signature required; pass --minisign-key or explicit --allow-unsigned for development"
-else
-  [[ "$minisign_secret_key" == /* && -f "$minisign_secret_key" && ! -L "$minisign_secret_key" ]] \
-    || die "minisign secret key must be an absolute regular file"
-  command -v minisign >/dev/null 2>&1 || die "minisign is required for --minisign-key"
+if ! $development_mode; then
+  git -C "$repo_dir" show-ref --verify --quiet "refs/tags/$release_tag" \
+    || die "release tag does not exist: $release_tag"
+  tag_commit="$(git -C "$repo_dir" rev-parse "refs/tags/$release_tag^{commit}" 2>/dev/null || true)"
+  [[ "$tag_commit" == "$git_commit" ]] \
+    || die "release tag $release_tag must resolve exactly to clean HEAD"
+fi
+product_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_dir/crates/sigil-host/Cargo.toml" | head -n 1)"
+[[ -n "$product_version" ]] || die "could not read the Sigil product version"
+if ! $development_mode; then
+  [[ "$release_tag" == "v$product_version" ]] \
+    || die "release tag $release_tag does not match Sigil version v$product_version"
 fi
 
 output_parent="$(dirname -- "$output_path")"
@@ -200,15 +222,23 @@ install -m 0644 "$script_dir/70-sigil-remote-input.rules" \
 install -m 0644 "$repo_dir/LICENSE" "$release_tree/LICENSE"
 install -m 0755 "$script_dir/install-bazzite-package.sh" "$payload/install-bazzite-package.sh"
 
-product_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_dir/src-tauri/Cargo.toml" | head -n 1)"
-[[ -n "$product_version" ]] || die "could not read the product version"
+if ! $development_mode; then
+  manifest_release_tag="$release_tag"
+  manifest_asset_name="$(basename -- "$output_path")"
+  release_kind="product-candidate"
+else
+  manifest_release_tag="development"
+  manifest_asset_name="$(basename -- "$output_path")"
+  release_kind="development"
+fi
 lock_sha256="$(sha256_file "$repo_dir/Cargo.lock")"
 toolchain_sha256="$(sha256_file "$repo_dir/rust-toolchain.toml")"
 zigbuild_version="$(cargo-zigbuild --version 2>/dev/null | head -n 1 || true)"
 [[ -n "$zigbuild_version" ]] || zigbuild_version="unavailable"
 python3 - "$release_tree/release-manifest.json" "$product_version" "$git_commit" \
   "$git_dirty" "$lock_sha256" "$toolchain_sha256" "$zigbuild_version" \
-  "$binary_provenance" "$binary_provenance_verified" "$linux_target" <<'PY'
+  "$binary_provenance" "$binary_provenance_verified" "$linux_target" \
+  "$manifest_release_tag" "$manifest_asset_name" "$release_kind" <<'PY'
 import json
 import pathlib
 import sys
@@ -224,6 +254,9 @@ import sys
     binary_provenance,
     binary_provenance_verified,
     target,
+    release_tag,
+    asset_name,
+    release_kind,
 ) = sys.argv[1:]
 manifest = {
     "format": 2,
@@ -242,6 +275,9 @@ manifest = {
     "cargo_zigbuild": zigbuild,
     "binary_provenance": binary_provenance,
     "binary_provenance_verified": binary_provenance_verified == "true",
+    "release_tag": release_tag,
+    "asset_name": asset_name,
+    "release_kind": release_kind,
 }
 pathlib.Path(path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 PY
@@ -316,13 +352,10 @@ mv -- "$archive_tmp" "$output_path"
 
 package_sha256="$(sha256_file "$output_path")"
 printf '%s  %s\n' "$package_sha256" "$(basename -- "$output_path")" >"$output_path.sha256"
-if [[ -n "$minisign_secret_key" ]]; then
-  minisign -S -s "$minisign_secret_key" -m "$output_path" -x "$output_path.minisig" \
-    -t "Sigil host $product_version" \
-    -c "release $release_id"
-  signature_status="detached-minisign"
-else
+if $development_mode; then
   signature_status="absent-development"
+else
+  signature_status="pending-offline"
 fi
 
 printf 'package=%s\n' "$output_path"

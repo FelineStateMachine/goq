@@ -57,6 +57,20 @@ assert_rejected unsigned-only-supplied "$both_flags_message" \
 assert_rejected partial-development-pair \
   '--host-binary and --probe-binary must be supplied together' \
   --allow-dirty --allow-unsigned --host-binary "$host_binary"
+assert_rejected dirty-without-unsigned \
+  'development packaging requires both --allow-dirty and --allow-unsigned' \
+  --allow-dirty
+assert_rejected unsigned-without-dirty \
+  'development packaging requires both --allow-dirty and --allow-unsigned' \
+  --allow-unsigned
+assert_rejected inline-secret-key \
+  'unknown argument: --minisign-key' \
+  --minisign-key "$temp_root/not-a-key"
+assert_rejected missing-release-tag \
+  'product mode requires --release-tag vVERSION'
+assert_rejected wrong-product-name \
+  'product output must be named sigil-v0.1.0-bazzite-x86_64.tar.gz' \
+  --release-tag v0.1.0
 
 development_output="$temp_root/development-supplied.tar.gz"
 development_log="$temp_root/development-supplied.log"
@@ -99,6 +113,10 @@ if manifest.get("primary_executable") != "sigil":
     raise SystemExit("primary executable is not sigil")
 if manifest.get("compatibility_executable") != "sigil-host":
     raise SystemExit("compatibility executable is not sigil-host")
+if manifest.get("release_tag") != "development":
+    raise SystemExit("development package claims a release tag")
+if manifest.get("release_kind") != "development":
+    raise SystemExit("development release kind is missing")
 PY
 
 printf 'package_bazzite_provenance_tests=ok\n'

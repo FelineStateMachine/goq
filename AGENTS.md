@@ -69,20 +69,19 @@ Sigil host.
 
 ## Security boundary
 
-- The normal inherited FIDO flow discovers the host identity; it is not yet
-  host-side client authorization. A peer that already knows the node ID and
-  ALPN can currently attempt a connection.
+- Portal's FIDO `hmac-secret` derives its stable Iroh peer identity. Sigil signs
+  a short-lived, host-bound invitation for that exact peer and atomically
+  persists the enrolled grants before accepting the first media session.
 - `--dev-connect` is a test-only routing bypass, never an authorization claim.
   Debug builds and the explicit `demo-direct-node` feature may accept it and
   must display the development warning. Ordinary release builds must reject it.
-- Production authorization remains tracked in issue #3. The intended UX is a
-  one-time, short-lived, peer-bound capability enrollment; normal startup must
-  remain **PIN -> tap -> play**.
+- Enrollment is one-time; ordinary startup remains **PIN -> tap -> play** and
+  reconnects authenticate the enrolled Iroh peer without replaying a ticket.
 - View, pointer/keyboard, and gamepad permissions must be independently
   grantable. Replay, expiry, peer mismatch, cross-host use, and capability
   escalation must fail closed.
-- Treat node IDs and connection metadata as operationally sensitive until that
-  authorization boundary lands.
+- The authorization state and replay ledger are security-sensitive host state;
+  preserve their owner-only permissions and atomic update rules.
 
 ## Release and installation boundary
 
@@ -96,7 +95,9 @@ Sigil host.
   configuration and must not silently start, restart, or enable the service.
 - Portal is a compiled desktop download, never a shell install. The first
   public target is macOS arm64 and requires Developer ID signing, hardened
-  runtime, notarization, stapling, and strict Gatekeeper verification. Do not
+  runtime, notarization, stapling, and strict Gatekeeper verification. Its
+  TeamIdentifier must equal `release/portal-apple-team-id.txt`, and every
+  Portal asset must carry protected exact-tag GitHub build provenance. Do not
   advertise an unavailable platform/architecture as a download.
 - The Minisign secret, Apple certificate, notarization credentials, host
   identity, and FIDO-derived secrets must never enter the repository, release
@@ -120,12 +121,14 @@ Sigil host.
 
 ## Remaining public-alpha gates
 
-- Issue #3: one-time capability enrollment and controller-usable Portal import.
+- Issue #3's repository work is implemented: one-time capability enrollment,
+  replay protection, grant intersection, and controller-usable Portal import.
+  Its exact release candidates still participate in the issue #6 hardware UAT.
 - Issue #4: configure the offline Minisign trust root, publish the signed Sigil
   asset set, and prove clean install plus upgrade/rollback from the public
   command.
-- Issue #5: publish the signed/notarized macOS arm64 Portal DMG, digest, and
-  manifest.
+- Issue #5: configure the committed Apple TeamIdentifier pin, then publish the
+  signed/notarized/attested macOS arm64 Portal DMG, digest, and manifest.
 - Issue #6: prove physically headless cold boot, physical client controller
   gameplay, mouse buttons consumed by Gamescope/an actual game, sustained A/V
   and resource percentiles without latency growth, difficult-NAT relay

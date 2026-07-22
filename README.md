@@ -50,9 +50,11 @@ Steam and games.
   ownership/mode/ACL preflight and neutralization when a session ends.
 - The installed Portal application is client-only: it contains no host daemon,
   host registration, capture, encoder, or desktop input-injection path.
-- FIDO2 `hmac-secret` identity derivation remains in the normal client flow.
-  Debug builds have an explicit, visibly labeled direct-node bypass for test
-  hosts; release builds reject it.
+- FIDO2 `hmac-secret` derives Portal's stable Iroh peer identity. A signed,
+  short-lived Sigil invitation enrolls that peer once with exact view,
+  pointer/keyboard, and gamepad grants; ordinary reconnects remain
+  **PIN -> tap -> play**. Debug builds retain a visibly labeled routing bypass,
+  while release builds reject it.
 - Controller-first client navigation includes a D-pad PIN pad, negotiated
   latest-state gamepad routing, and a one-second Back+Start escape chord.
 - The Bazzite host has an allowlisted deterministic runtime package with
@@ -65,8 +67,7 @@ keyframes, dependent-object cancellation, and discontinuity recovery; full MoQ
 group/control semantics remain promoted hardening work. A dedicated persistent
 PipeWire sink, bounded Opus datagrams, WebCodecs decode, and AudioWorklet
 playback are implemented; longer-run audio/video synchronization measurement
-remains. Client authorization still needs short-lived capability enrollment;
-the debug direct-node bypass is routing, not authentication.
+remains. The debug direct-node bypass is routing, not authentication.
 
 ## Immediate milestones
 
@@ -88,7 +89,8 @@ the debug direct-node bypass is routing, not authentication.
    relative mouse replaces Gamescope-incompatible absolute motion.
 7. **Live-proven:** bounded PipeWire audio capture, a persistent headless sink,
    Opus delivery, and client playback. Quantify longer-run A/V synchronization.
-8. Replace or supplement FIDO pairing with short-lived capability tickets.
+8. **Done:** add signed, peer-bound, one-time capability enrollment with
+   durable replay protection and controller-usable Portal onboarding.
 
 ## Development
 
@@ -97,6 +99,31 @@ Requirements:
 - Rust 1.91 or newer (the repository pins Rust 1.95)
 - Tauri v2 system dependencies
 - A FIDO2 key with `hmac-secret` support for the normal identity flow
+
+### Enroll one Portal
+
+On first launch, enter the security-key PIN and choose **show portal id**. On
+the Sigil host, create an invitation for that exact peer:
+
+```bash
+sigil invitation create \
+  --config ~/.config/sigil-spark/host.toml \
+  --peer PORTAL_PEER_ID \
+  --pointer-keyboard \
+  --gamepad \
+  --output ~/portal.goq-invite
+```
+
+Move the owner-only invitation file to the client, open it with Portal, and
+confirm the displayed host, peer, expiry, and grants. Sigil consumes it once;
+future launches are simply **PIN -> tap -> play**. `--print-deep-link` is
+available for an explicit `goq://invite/...` handoff, but prints the short-lived
+credential to the terminal and should not be used in recorded shells.
+
+To move Portal to another Sigil, revoke the host enrollment first, disconnect
+Portal, then use **client -> reset enrollment** and confirm the displayed host.
+The reset is intentionally explicit and controller reachable; importing a new
+invitation never silently replaces a working enrollment.
 
 Provision a dedicated AMD host with the
 [fresh Bazzite host runbook](docs/fresh-bazzite-host.md). The runbook also
@@ -133,16 +160,16 @@ activation when package-managed service, audio, rollback, or udev links follow
 active release always includes matching assets and rollback metadata.
 
 Create the Bazzite runtime package from a committed source revision. Product
-mode exports clean `HEAD` and builds the host and probe itself with locked
-`cargo-zigbuild` in an isolated target directory; it never accepts externally
-supplied binaries. Product packages require a clean worktree and detached
-Minisign signature; the explicit development flags are only for temporary
-testing:
+mode exports clean tagged `HEAD` and builds the host and probe itself with
+locked `cargo-zigbuild` in an isolated target directory; it never accepts
+externally supplied binaries. The builder emits an unsigned candidate for the
+separate offline signing ceremony; the explicit development flags are only for
+temporary testing:
 
 ```bash
 scripts/package-bazzite-release.sh \
-  --output /tmp/sigil-spark-host.tar.gz \
-  --minisign-key /absolute/path/to/release.key
+  --release-tag v0.1.0 \
+  --output /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz
 
 # Temporary development package only:
 scripts/package-bazzite-release.sh \
@@ -156,6 +183,10 @@ scripts/package-bazzite-release.sh \
   --host-binary /absolute/path/to/sigil \
   --probe-binary /absolute/path/to/sigil-probe
 ```
+
+Verify the unsigned candidate, then follow the offline signing and protected
+draft-promotion ceremony in [public release delivery](docs/public-release-delivery.md).
+The GitHub workflow and package builder never receive the Minisign secret.
 
 The package contains the primary `sigil` host executable, its byte-identical
 `sigil-host` compatibility copy, the `sigil-probe` diagnostic, installer and
@@ -181,13 +212,20 @@ service interruption is intended.
 The macOS Portal build currently produces an arm64 DMG for development. A public
 Portal release additionally requires Developer ID signing with hardened
 runtime, notarization, stapling, and strict Gatekeeper verification; ad-hoc
-development signatures are not a distributable package. With Apple credentials
-configured as described by the official
+development signatures are not a distributable package. Before tagging, the
+public TeamIdentifier in `release/portal-apple-team-id.txt` must match the
+protected certificate, and the tag-ref workflow attests every published Portal
+asset. With Apple credentials configured as described by the official
 [Tauri macOS signing guide](https://v2.tauri.app/distribute/sign/macos/), run:
 
 ```bash
-scripts/package-macos-client.sh --output-dir /absolute/release/directory
+scripts/package-macos-client.sh \
+  --release-tag v0.1.0 \
+  --output-dir /absolute/release/directory
 ```
+
+The repository publication and website-manifest procedure is documented in the
+[Portal release runbook](docs/portal-release.md).
 
 Run Portal against Sigil during development:
 

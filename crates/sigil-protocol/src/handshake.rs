@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::framing::{read_json, write_json};
-use crate::{MAX_HANDSHAKE_MESSAGE_LEN, PROTOCOL_VERSION, ProtocolError, Result};
+use crate::{
+    MAX_HANDSHAKE_MESSAGE_LEN, MAX_INVITATION_TOKEN_LEN, PROTOCOL_VERSION, ProtocolError, Result,
+    SignedInvitation,
+};
 
 const MAX_AGENT_LEN: usize = 128;
 const MAX_MESSAGE_LEN: usize = 512;
@@ -36,6 +39,10 @@ pub struct ClientHello {
     pub agent: String,
     pub nonce: [u8; 16],
     pub capabilities: Vec<Capability>,
+    /// One-time enrollment invitation. It is accepted only on the first media
+    /// connection and is never sent again after the host persists enrollment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invitation: Option<String>,
 }
 
 /// Native coordinate space used by the host compositor for relative-pointer
@@ -75,13 +82,29 @@ impl ClientHello {
             agent: agent.into(),
             nonce,
             capabilities,
+            invitation: None,
         }
+    }
+
+    pub fn with_invitation(mut self, invitation: impl Into<String>) -> Self {
+        self.invitation = Some(invitation.into());
+        self
     }
 
     pub fn validate(&self) -> Result<()> {
         validate_version(self.version)?;
         validate_agent(&self.agent)?;
-        validate_capabilities(&self.capabilities)
+        validate_capabilities(&self.capabilities)?;
+        if let Some(invitation) = &self.invitation {
+            if invitation.len() > MAX_INVITATION_TOKEN_LEN {
+                return Err(ProtocolError::InvalidMessage {
+                    message_type: "client hello",
+                    reason: "invitation exceeds the bounded token length",
+                });
+            }
+            SignedInvitation::decode(invitation)?;
+        }
+        Ok(())
     }
 }
 
@@ -240,6 +263,7 @@ fn validate_capabilities(capabilities: &[Capability]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::SigningKey;
     use tokio::io::{AsyncWriteExt, duplex};
 
     use super::*;
@@ -262,6 +286,33 @@ mod tests {
             serde_json::to_string(&client_hello()).unwrap(),
             r#"{"version":1,"agent":"sigil-client/0.1.0","nonce":[42,42,42,42,42,42,42,42,42,42,42,42,42,42,42,42],"capabilities":["video_h264","keyboard","gamepad"]}"#
         );
+    }
+
+    #[test]
+    fn client_hello_carries_only_a_bounded_valid_invitation() {
+        let host = SigningKey::from_bytes(&[7; 32]);
+        let peer = SigningKey::from_bytes(&[9; 32]);
+        let claims = crate::InvitationClaims::new(
+            host.verifying_key().to_bytes(),
+            peer.verifying_key().to_bytes(),
+            100,
+            200,
+            1,
+            [1; 32],
+            crate::InvitationGrants::VIEW,
+        )
+        .unwrap();
+        let token = crate::SignedInvitation::issue(claims, &[7; 32])
+            .unwrap()
+            .encode();
+        let hello = ClientHello::new("portal", [0; 16], vec![Capability::VideoH264])
+            .with_invitation(token.clone());
+        hello.validate().unwrap();
+        assert_eq!(hello.invitation.as_deref(), Some(token.as_str()));
+
+        let mut malformed = hello;
+        malformed.invitation = Some("goq-invite-v1.invalid".into());
+        assert!(malformed.validate().is_err());
     }
 
     #[test]

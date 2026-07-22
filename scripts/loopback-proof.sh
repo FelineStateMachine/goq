@@ -23,6 +23,8 @@ keyframe_recovery="ok"
 media_v3=false
 media_v2=false
 media_v1=false
+relay_only=false
+expected_path_mode=direct
 
 usage() {
   cat <<'EOF'
@@ -45,6 +47,8 @@ Options:
                                 instead of upstream MoQ
   --media-v1                    Exercise ordered media v1 compatibility
                                 instead of upstream MoQ
+  --relay-only                  Remove direct probe transports and require the
+                                control, media, and input paths to stay relayed
   --help                        Show this help
 EOF
 }
@@ -102,6 +106,11 @@ while [[ $# -gt 0 ]]; do
       session_gate_name="media"
       keyframe_recovery="not-requested"
       media_v1=true
+      shift
+      ;;
+    --relay-only)
+      relay_only=true
+      expected_path_mode=relay
       shift
       ;;
     --media-v2)
@@ -430,8 +439,11 @@ validate_probe_log() {
     "$log_path" || return 1
   awk -F= '$1 == "input_ack_micros" && $2 ~ /^[0-9]+$/ { found=1 } END { exit !found }' \
     "$log_path" || return 1
-  grep -Fxq 'path_mode=direct' "$log_path" || return 1
+  grep -Fxq "path_mode=${expected_path_mode}" "$log_path" || return 1
+  grep -Fxq "media_path_mode=${expected_path_mode}" "$log_path" || return 1
+  grep -Fxq "input_path_mode=${expected_path_mode}" "$log_path" || return 1
   if [[ "$media_transport" == "iroh-moq" ]]; then
+    grep -Fxq "control_path_mode=${expected_path_mode}" "$log_path" || return 1
     grep -Fxq 'control_alpn=sigil/control/1' "$log_path" || return 1
     grep -Fxq 'group_sequence=monotonic' "$log_path" || return 1
     grep -Fxq 'moq_group_capacity=1' "$log_path" || return 1
@@ -468,9 +480,14 @@ validate_probe_log() {
   else
     grep -Fxq 'slow_consumer=not-requested' "$log_path" || return 1
   fi
+  grep -Fxq "forced_relay=$([[ "$relay_only" == true ]] && printf ok || printf not-requested)" \
+    "$log_path" || return 1
 }
 
 run_probe() {
+  if [[ "$relay_only" == true ]]; then
+    set -- --relay-only "$@"
+  fi
   if [[ "$media_v1" == true ]]; then
     "$probe_bin" --media-v1 "$@"
   elif [[ "$media_v2" == true ]]; then
@@ -546,8 +563,10 @@ primary_pid=$!
 start_watchdog "$primary_pid" "$command_timeout_seconds" "$tmp_root/primary.timeout"
 primary_watchdog_pid="$watchdog_pid"
 
-wait_for_log_count "$host_log" "$media_accept_log" 1 "$primary_pid" 'primary probe' \
-  || die "primary session did not become active"
+if ! wait_for_log_count "$host_log" "$media_accept_log" 1 "$primary_pid" 'primary probe'; then
+  sed -n '1,240p' "$primary_log" >&2 || true
+  die "primary session did not become active"
+fi
 if ! kill -0 "$primary_pid" 2>/dev/null; then
   die "primary probe ended before the concurrent rejection check"
 fi
@@ -652,7 +671,7 @@ printf 'probe_binary=%s\n' "$probe_bin"
 printf 'probe_sha256=%s\n' "$(sha256_file "$probe_bin")"
 printf 'node_id=%s\n' "$node_id"
 printf 'primary_frames=%s\n' "$primary_frames"
-grep -E '^(transport|control_alpn|transport_alpn|first_configured_idr|frame_sequence|group_sequence|keyframe_recovery|keyframe_recovery_micros|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|moq_catalog|moq_group_capacity|moq_cancelled_groups|moq_group_gaps|moq_unrecovered_group_gaps|moq_maximum_group_objects|moq_maximum_group_bytes|moq_historical_suffix_frames|recovery_barrier|slow_consumer|slow_consumer_stall_ms|slow_consumer_first_post_stall|slow_consumer_historical_suffix_frames|slow_consumer_recovery_micros|slow_consumer_cancellation_delta|slow_consumer_group_advance|slow_consumer_sequence_advance|slow_consumer_capture_advance_micros|slow_consumer_input_ack_micros|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
+grep -E '^(transport|control_alpn|transport_alpn|first_configured_idr|frame_sequence|group_sequence|keyframe_recovery|keyframe_recovery_micros|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|moq_catalog|moq_group_capacity|moq_cancelled_groups|moq_group_gaps|moq_unrecovered_group_gaps|moq_maximum_group_objects|moq_maximum_group_bytes|moq_historical_suffix_frames|recovery_barrier|slow_consumer|slow_consumer_stall_ms|slow_consumer_first_post_stall|slow_consumer_historical_suffix_frames|slow_consumer_recovery_micros|slow_consumer_cancellation_delta|slow_consumer_group_advance|slow_consumer_sequence_advance|slow_consumer_capture_advance_micros|slow_consumer_input_ack_micros|input_ack_micros|path_mode|path_rtt_ms|control_path_mode|control_path_rtt_ms|media_path_mode|media_path_rtt_ms|input_path_mode|input_path_rtt_ms|forced_relay)=' "$primary_log"
 printf 'keyframe_request_correlation=%s\n' \
   "$([[ "$media_v1" == false && "$media_v2" == false ]] && printf unique || printf not-requested)"
 printf 'active_client_rejection=ok\n'

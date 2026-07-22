@@ -43,6 +43,10 @@ struct Args {
     /// Owner-only 32-byte Iroh identity. Omit for the existing ephemeral probe.
     #[arg(long, value_name = "PATH")]
     identity: Option<PathBuf>,
+    /// Remove all direct IP transports from the probe endpoint so control,
+    /// media, and input are forced through Iroh relay paths.
+    #[arg(long)]
+    relay_only: bool,
     /// Owner-only one-time Sigil invitation file. Sent only on the first media
     /// handshake and requires a persistent identity bound to that invitation.
     #[arg(long, value_name = "PATH", requires = "identity")]
@@ -1010,8 +1014,11 @@ async fn main() -> Result<()> {
         .transpose()?;
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).context("generating handshake nonce")?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret)
+    let mut endpoint_builder = Endpoint::builder(presets::N0).secret_key(secret);
+    if args.relay_only {
+        endpoint_builder = endpoint_builder.clear_ip_transports();
+    }
+    let endpoint = endpoint_builder
         .bind()
         .await
         .context("binding probe endpoint")?;
@@ -1377,7 +1384,7 @@ async fn main() -> Result<()> {
                                 payload_len: frame.payload.len(),
                                 v3_group_id: Some(group_sequence),
                             },
-                            requested_keyframe_recovery || slow_consumer_recovery,
+                            recovery,
                         );
                     }
                 }
@@ -1654,10 +1661,26 @@ async fn main() -> Result<()> {
             "probe sustained only {accepted_fps:.3} accepted fps; required at least {minimum_fps:.3} fps"
         );
     }
-    let diagnostics_connection = moq_receiver
+    let media_diagnostics_connection = moq_receiver
         .as_ref()
         .map_or(&media_connection, MoqProbeReceiver::connection);
-    let (path_mode, path_rtt_ms) = selected_path_diagnostics(diagnostics_connection);
+    let (media_path_mode, media_path_rtt_ms) =
+        selected_path_diagnostics(media_diagnostics_connection);
+    let (control_path_mode, control_path_rtt_ms) = if media_transport == MediaTransport::UpstreamMoq
+    {
+        selected_path_diagnostics(&media_connection)
+    } else {
+        ("not-used", None)
+    };
+    let (input_path_mode, input_path_rtt_ms) = selected_path_diagnostics(&input_connection);
+    if args.relay_only {
+        ensure!(
+            control_path_mode == "relay"
+                && media_path_mode == "relay"
+                && input_path_mode == "relay",
+            "relay-only probe did not keep every transport on relay: control={control_path_mode}, media={media_path_mode}, input={input_path_mode}"
+        );
+    }
     let (
         moq_cancelled_groups,
         moq_group_gaps,
@@ -1846,11 +1869,34 @@ async fn main() -> Result<()> {
             "not-requested"
         }
     );
-    println!("path_mode={path_mode}");
-    match path_rtt_ms {
+    println!("path_mode={media_path_mode}");
+    match media_path_rtt_ms {
         Some(rtt) => println!("path_rtt_ms={rtt:.3}"),
         None => println!("path_rtt_ms=unknown"),
     }
+    println!("control_path_mode={control_path_mode}");
+    match control_path_rtt_ms {
+        Some(rtt) => println!("control_path_rtt_ms={rtt:.3}"),
+        None => println!("control_path_rtt_ms=unknown"),
+    }
+    println!("media_path_mode={media_path_mode}");
+    match media_path_rtt_ms {
+        Some(rtt) => println!("media_path_rtt_ms={rtt:.3}"),
+        None => println!("media_path_rtt_ms=unknown"),
+    }
+    println!("input_path_mode={input_path_mode}");
+    match input_path_rtt_ms {
+        Some(rtt) => println!("input_path_rtt_ms={rtt:.3}"),
+        None => println!("input_path_rtt_ms=unknown"),
+    }
+    println!(
+        "forced_relay={}",
+        if args.relay_only {
+            "ok"
+        } else {
+            "not-requested"
+        }
+    );
     println!("encoded_bytes={bytes}");
     println!("elapsed_ms={}", started.elapsed().as_millis());
     Ok(())

@@ -1365,6 +1365,27 @@ async fn open_negotiated_input_stream(
     Ok((send, recv, negotiation))
 }
 
+fn connection_error_is_unsupported_alpn(error: &iroh::endpoint::ConnectionError) -> bool {
+    matches!(
+        error,
+        iroh::endpoint::ConnectionError::ConnectionClosed(close)
+            if close.error_code == iroh::endpoint::TransportErrorCode::crypto(0x78)
+    )
+}
+
+fn connect_error_is_unsupported_alpn(error: &iroh::endpoint::ConnectError) -> bool {
+    match error {
+        iroh::endpoint::ConnectError::Connecting {
+            source: iroh::endpoint::ConnectingError::ConnectionError { source, .. },
+            ..
+        }
+        | iroh::endpoint::ConnectError::Connection { source, .. } => {
+            connection_error_is_unsupported_alpn(source)
+        }
+        _ => false,
+    }
+}
+
 async fn open_negotiated_media_stream(
     endpoint: &Endpoint,
     address: &iroh::EndpointAddr,
@@ -1404,34 +1425,35 @@ async fn open_negotiated_media_stream(
                 MediaTransport::GroupedObjectsV3,
             ))
         }
-        Err(v3_error) => match endpoint.connect(address.clone(), MEDIA_ALPN_V2).await {
-            Ok(connection) => {
-                let (mut send, mut recv) = connection
-                    .open_bi()
-                    .await
-                    .map_err(|error| format!("Failed to open media v2 handshake: {error}"))?;
-                let negotiation = negotiate_v1(
-                    &mut send,
-                    &mut recv,
-                    nonce,
-                    vec![Capability::VideoH264],
-                    Some(Capability::VideoH264),
-                    "media v2",
-                    invitation,
-                )
-                .await?;
-                send.finish()
-                    .map_err(|error| format!("Failed to finish media v2 handshake: {error}"))?;
-                Ok((
-                    connection,
-                    recv,
-                    None,
-                    negotiation,
-                    MediaTransport::IndependentObjectsV2,
-                ))
-            }
-            Err(v2_error) => {
-                let connection = endpoint
+        Err(v3_error) if connect_error_is_unsupported_alpn(&v3_error) => {
+            match endpoint.connect(address.clone(), MEDIA_ALPN_V2).await {
+                Ok(connection) => {
+                    let (mut send, mut recv) = connection
+                        .open_bi()
+                        .await
+                        .map_err(|error| format!("Failed to open media v2 handshake: {error}"))?;
+                    let negotiation = negotiate_v1(
+                        &mut send,
+                        &mut recv,
+                        nonce,
+                        vec![Capability::VideoH264],
+                        Some(Capability::VideoH264),
+                        "media v2",
+                        invitation,
+                    )
+                    .await?;
+                    send.finish()
+                        .map_err(|error| format!("Failed to finish media v2 handshake: {error}"))?;
+                    Ok((
+                        connection,
+                        recv,
+                        None,
+                        negotiation,
+                        MediaTransport::IndependentObjectsV2,
+                    ))
+                }
+                Err(v2_error) if connect_error_is_unsupported_alpn(&v2_error) => {
+                    let connection = endpoint
                     .connect(address.clone(), MEDIA_ALPN_V1)
                     .await
                     .map_err(|v1_error| {
@@ -1439,31 +1461,38 @@ async fn open_negotiated_media_stream(
                             "Failed to connect media v3 ({v3_error}); v2 compatibility connection failed ({v2_error}); v1 compatibility connection also failed ({v1_error})"
                         )
                     })?;
-                let (mut send, mut recv) = connection
-                    .open_bi()
-                    .await
-                    .map_err(|error| format!("Failed to open media v1 stream: {error}"))?;
-                let negotiation = negotiate_v1(
-                    &mut send,
-                    &mut recv,
-                    nonce,
-                    vec![Capability::VideoH264],
-                    Some(Capability::VideoH264),
-                    "media v1",
-                    invitation,
-                )
-                .await?;
-                send.finish()
-                    .map_err(|error| format!("Failed to finish media v1 handshake: {error}"))?;
-                Ok((
-                    connection,
-                    recv,
-                    None,
-                    negotiation,
-                    MediaTransport::ReliableStreamV1,
-                ))
+                    let (mut send, mut recv) = connection
+                        .open_bi()
+                        .await
+                        .map_err(|error| format!("Failed to open media v1 stream: {error}"))?;
+                    let negotiation = negotiate_v1(
+                        &mut send,
+                        &mut recv,
+                        nonce,
+                        vec![Capability::VideoH264],
+                        Some(Capability::VideoH264),
+                        "media v1",
+                        invitation,
+                    )
+                    .await?;
+                    send.finish()
+                        .map_err(|error| format!("Failed to finish media v1 handshake: {error}"))?;
+                    Ok((
+                        connection,
+                        recv,
+                        None,
+                        negotiation,
+                        MediaTransport::ReliableStreamV1,
+                    ))
+                }
+                Err(v2_error) => Err(format!(
+                    "Media v2 compatibility connection failed without an explicit unsupported-ALPN signal; refusing an unsafe downgrade to v1: {v2_error}"
+                )),
             }
-        },
+        }
+        Err(v3_error) => Err(format!(
+            "Media v3 connection failed without an explicit unsupported-ALPN signal; refusing an unsafe compatibility downgrade: {v3_error}"
+        )),
     }
 }
 
@@ -4008,6 +4037,24 @@ mod tests {
                 Capability::Gamepad,
             ]
         );
+    }
+
+    #[test]
+    fn compatibility_downgrade_requires_tls_no_application_protocol() {
+        let unsupported = iroh::endpoint::ConnectionError::ConnectionClosed(
+            iroh::endpoint::TransportError::new(
+                iroh::endpoint::TransportErrorCode::crypto(0x78),
+                "no application protocol".to_string(),
+            )
+            .into(),
+        );
+        assert!(connection_error_is_unsupported_alpn(&unsupported));
+        assert!(!connection_error_is_unsupported_alpn(
+            &iroh::endpoint::ConnectionError::TimedOut
+        ));
+        assert!(!connection_error_is_unsupported_alpn(
+            &iroh::endpoint::ConnectionError::Reset
+        ));
     }
 
     #[test]

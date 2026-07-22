@@ -12,9 +12,9 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use crate::clock::SessionClock;
-use crate::config::{
-    GamescopeEncoderBackend, GamescopePipewireConfig, HostConfig, VaapiRateControl,
-};
+#[cfg(test)]
+use crate::config::VaapiRateControl;
+use crate::config::{GamescopeEncoderBackend, GamescopePipewireConfig, HostConfig};
 
 mod annexb;
 mod external;
@@ -1079,7 +1079,7 @@ mod tests {
         // commit 17baf4abd1ab3353fb705e4d0d023f84e870f7e8, src/pipewire.cpp
         // blob 76b3ea8cc8ff01c6635498cbafe38130e33215f2. This fixture proves
         // interface compatibility; it is not SteamOS hardware evidence.
-        let dump = include_bytes!("../tests/fixtures/upstream-gamescope-pipewire-contract.json");
+        let dump = include_bytes!("../../tests/fixtures/upstream-gamescope-pipewire-contract.json");
         let mut config = gamescope_config();
         config.width = None;
         config.height = None;

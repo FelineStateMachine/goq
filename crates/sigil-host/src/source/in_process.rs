@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(test, all(target_os = "linux", feature = "in-process-gstreamer")))]
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use tokio::sync::watch;

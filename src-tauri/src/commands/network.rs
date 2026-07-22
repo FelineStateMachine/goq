@@ -1,5 +1,6 @@
 use super::auth::derive_iroh_secret_from_key;
 use super::enrollment::{connection_enrollment, mark_invitation_redeemed};
+use super::moq_catalog::subscribe_goq_video_track;
 use super::state::{
     AUDIO_DELIVERY_CAPACITY, AccumulatedMediaFeedback, AppState, AudioDeliveryState,
     CLIENT_INPUT_QUEUE_CAPACITY, FRAME_ALPN, INPUT_ALPN, MediaFeedbackSender,
@@ -8,22 +9,26 @@ use super::state::{
 use base64::Engine;
 use iroh::{Endpoint, SecretKey, endpoint::presets};
 use iroh_moq::{Moq, MoqSession};
-use moq_net::{BroadcastConsumer, GroupConsumer, Track, TrackConsumer};
+#[cfg(test)]
+use moq_net::Track;
+use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
 use openh264::{formats::YUVSource, nal_units};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use sigil_protocol::MOQ_VIDEO_H264_TRACK;
 use sigil_protocol::{
     AUDIO_ALPN_V1, AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1,
     AudioFlags, AudioPacket, AudioPacketHeader, CONTROL_ALPN_V1, Capability, ClientHello,
     FrameFlags, INPUT_ALPN_V1, InputEvent, InvitationGrants, KeyframeRequestReasonV3,
     MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MAX_MEDIA_OBJECT_ID_V3,
     MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS, MEDIA_ALPN_V1, MEDIA_ALPN_V2,
-    MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, MOQ_VIDEO_H264_TRACK, MediaCodec, MediaControlRequestV3,
-    MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame, MediaObjectV3, PointerPosition,
-    PointerSurfaceDimensions, ProtocolError, RELATIVE_POINTER_DELTA_MAX,
-    RELATIVE_POINTER_DELTA_MIN, decode_media_frame_object, media_moq_broadcast_name,
-    read_adaptive_bitrate_decision_v1, read_host_hello, read_input_ack, read_media_frame,
-    read_media_object, read_media_object_v3, write_client_hello, write_input_event,
-    write_media_control_request_v3, write_media_feedback_report_v1,
+    MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, MediaCodec, MediaControlRequestV3, MediaFeedbackFlags,
+    MediaFeedbackReportV1, MediaFrame, MediaObjectV3, PointerPosition, PointerSurfaceDimensions,
+    ProtocolError, RELATIVE_POINTER_DELTA_MAX, RELATIVE_POINTER_DELTA_MIN,
+    decode_media_frame_object, media_moq_broadcast_name, read_adaptive_bitrate_decision_v1,
+    read_host_hello, read_input_ack, read_media_frame, read_media_object, read_media_object_v3,
+    write_client_hello, write_input_event, write_media_control_request_v3,
+    write_media_feedback_report_v1,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Cursor;
@@ -2356,13 +2361,10 @@ async fn open_upstream_moq_media(
     .map_err(|error| {
         format!("Failed to subscribe to upstream MoQ broadcast {broadcast_name}: {error}")
     })?;
-    let track = broadcast
-        .subscribe_track(&Track::new(MOQ_VIDEO_H264_TRACK))
-        .map_err(|error| {
-            format!("Failed to subscribe to upstream MoQ track {MOQ_VIDEO_H264_TRACK}: {error}")
-        })?;
+    let catalog = subscribe_goq_video_track(&broadcast, CLIENT_MOQ_SUBSCRIBE_TIMEOUT).await?;
+    eprintln!("[client] moq catalog: {}", catalog.mode.label());
     Ok((
-        MoqMediaReceiver::new(moq, session, broadcast, track),
+        MoqMediaReceiver::new(moq, session, broadcast, catalog.track),
         diagnostics_connection,
     ))
 }

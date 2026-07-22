@@ -87,7 +87,12 @@ Steam and games.
 The software JPEG client decode fallback and legacy wire compatibility remain.
 The preferred video path authenticates the client over a dedicated control
 connection, then admits that exact peer to a session-scoped upstream
-`iroh-moq` broadcast and H.264 track. Configured GOPs become bounded native MoQ
+`iroh-moq` broadcast. Sigil publishes an immutable `catalog.json` snapshot;
+Portal discovers and strictly validates the versioned Goq extension before it
+subscribes to the H.264 track. The extension identifies Goq's `SGV1` media
+envelope and GOP layout, so it does not falsely advertise the track as a
+standard Hang rendition. Older hosts without a catalog retain an explicit
+static-track compatibility path. Configured GOPs become bounded native MoQ
 groups, and a new independently decodable group cancels the stale predecessor.
 The custom media v3, v2, and v1 transports remain explicit compatibility modes.
 A dedicated persistent PipeWire sink, bounded Opus datagrams, WebCodecs decode,

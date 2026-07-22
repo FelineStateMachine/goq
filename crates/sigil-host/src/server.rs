@@ -18,9 +18,9 @@ use sigil_protocol::{
     FrameFlags, HostHello, InputAck, InvitationGrants, KeyframeRequestReasonV3,
     MAX_AUDIO_PAYLOAD_LEN, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,
     MAX_MEDIA_OBJECT_ID_V3, MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MOQ_VIDEO_H264_TRACK,
-    MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame, MediaFrameHeader,
-    MediaObjectHeaderV3, MediaObjectV3, encode_media_frame_object, media_moq_broadcast_name,
-    read_client_hello, read_input_event, read_media_control_request_v3,
+    MOQ_VIDEO_TRACK_PRIORITY, MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1,
+    MediaFrame, MediaFrameHeader, MediaObjectHeaderV3, MediaObjectV3, encode_media_frame_object,
+    media_moq_broadcast_name, read_client_hello, read_input_event, read_media_control_request_v3,
     read_media_feedback_report_v1, write_adaptive_bitrate_decision_v1, write_host_hello,
     write_input_ack, write_media_frame, write_media_object_v3,
 };
@@ -32,6 +32,7 @@ use crate::clock::SessionClock;
 use crate::config::{GamescopeEncoderBackend, HostConfig, VaapiRateControl, VideoSource};
 use crate::cursor::{PointerPositionTracker, PointerState};
 use crate::input::{InputBackend, InputDisposition};
+use crate::moq_catalog::publish_goq_catalog;
 use crate::source::{
     EncodedFrame, EncodedGop, EncodedSource, EncoderControl,
     spawn_gamescope_pipewire_after_static_preflight, spawn_test_pattern,
@@ -69,7 +70,6 @@ const GAMESCOPE_STARTUP_TARGET_MIN_FRAMES: u64 = 8;
 const GAMESCOPE_STARTUP_TARGET_MIN_FPS: f64 = 45.0;
 const SOURCE_REAP_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 const MOQ_ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(10);
-const MOQ_VIDEO_TRACK_PRIORITY: u8 = u8::MAX;
 const MOQ_REJECT_CODE: u32 = 0x534d;
 const ADAPTIVE_BITRATE_FLOOR_KBPS: u32 = 1_000;
 const TEST_PATTERN_BITRATE_CEILING_KBPS: u32 = 12_000;
@@ -2689,6 +2689,7 @@ async fn serve_control_moq(
             priority: MOQ_VIDEO_TRACK_PRIORITY,
         })
         .context("creating static MoQ H.264 track")?;
+    let catalog = publish_goq_catalog(&mut broadcast)?;
     let broadcast_name = media_moq_broadcast_name(lease.session_id)?;
     let attachment = sessions.expect_moq(
         remote,
@@ -2743,13 +2744,17 @@ async fn serve_control_moq(
         Arc::clone(&lease.media_v3_telemetry),
     )
     .await;
+    let catalog_result = catalog.finish();
 
     drop(current_gop_receiver);
     drop(frame_receiver);
     source_task.wait_or_abort(SOURCE_REAP_GRACE_TIMEOUT).await;
     drop(lease);
     info!(%remote, "MoQ control client released");
-    session_result
+    match session_result {
+        Err(error) => Err(error),
+        Ok(()) => catalog_result,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

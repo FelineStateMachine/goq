@@ -14,6 +14,7 @@ mod input;
 mod invitation;
 mod media;
 mod media_v3;
+mod moq_catalog;
 
 pub use audio::{AUDIO_HEADER_LEN, AudioCodec, AudioFlags, AudioPacket, AudioPacketHeader};
 pub use error::{ProtocolError, Result};
@@ -49,6 +50,11 @@ pub use media_v3::{
     MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MediaControlRequestTypeV3, MediaControlRequestV3,
     MediaObjectHeaderV3, MediaObjectV3, read_media_control_request_v3, read_media_object_v3,
     write_media_control_request_v3, write_media_object_v3,
+};
+pub use moq_catalog::{
+    MAX_MOQ_CATALOG_BYTES, MOQ_CATALOG_EXTENSION_VERSION_V1, MOQ_GOP_GROUP_FORMAT_V1,
+    MOQ_MEDIA_OBJECT_FORMAT_V1, MOQ_VIDEO_TRACK_PRIORITY, MoqCatalogExtensionV1,
+    MoqTrackDescriptorV1, MoqVideoCatalogV1,
 };
 
 /// Protocol version encoded in v1 messages.

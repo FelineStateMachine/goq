@@ -28,6 +28,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 ctap-hid-fido2 = "3.5"
 getrandom = "0.4"
+hang.workspace = true
 iroh.workspace = true
 iroh-moq.workspace = true
 moq-net.workspace = true

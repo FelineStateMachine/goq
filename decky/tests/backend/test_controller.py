@@ -49,6 +49,7 @@ class FakeRunner:
         self.start_count = 0
         self.pending: dict[str, Any] | None = None
         self.fail_rollback = False
+        self.lose_commit_response = False
 
     async def systemctl_command(
         self, action: str, *, check: bool = True, timeout: float = 15.0
@@ -136,6 +137,8 @@ class FakeRunner:
             }
         if operation == ("appliance", "config", "commit"):
             self.pending = None
+            if self.lose_commit_response:
+                raise ControllerError("command_timeout")
             return {
                 "schema_version": 1,
                 "operation": "config_commit",
@@ -228,6 +231,23 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.runner.keep_stale_instance = True
         with self.assertRaisesRegex(ControllerError, "service_ready_timeout"):
             await self.controller.restart_service()
+
+    async def test_restart_from_proven_absent_runtime_accepts_first_instance(self):
+        self.runner.instance = None
+        self.runner.active = False
+        result = await self.controller.restart_service()
+        self.assertEqual(result["operation"], "restart")
+        self.assertTrue(self.runner.active)
+
+    async def test_lost_commit_response_is_recovered_without_rollback(self):
+        self.runner.lose_commit_response = True
+        result = await self.controller.apply_config(request())
+        self.assertTrue(result["commit_response_recovered"])
+        self.assertEqual(result["revision"], REVISION_B)
+        self.assertTrue(self.runner.active)
+        self.assertNotIn(
+            ("sigil", ("appliance", "config", "rollback")), self.runner.calls
+        )
 
     async def test_post_commit_start_failure_does_not_attempt_impossible_rollback(self):
         self.runner.fail_start_number = 2

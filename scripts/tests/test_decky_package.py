@@ -20,6 +20,7 @@ class DeckyPackageTests(unittest.TestCase):
     def build(self, output: pathlib.Path) -> pathlib.Path:
         environment = dict(os.environ)
         environment["GOQ_SOURCE_COMMIT"] = COMMIT
+        environment["GOQ_PACKAGE_TESTING"] = "1"
         subprocess.run(
             [sys.executable, str(PACKAGER), str(output)],
             cwd=REPOSITORY,
@@ -51,6 +52,11 @@ class DeckyPackageTests(unittest.TestCase):
                 )
                 self.assertEqual(provenance["source_commit"], COMMIT)
                 self.assertEqual(provenance["compatibility"]["appliance_status_schema"], 2)
+                self.assertTrue(provenance["source_tree_clean"])
+                self.assertEqual(
+                    provenance["files"]["dist/index.js"],
+                    hashlib.sha256(archive.read("goq-sigil/dist/index.js")).hexdigest(),
+                )
 
 
 if __name__ == "__main__":

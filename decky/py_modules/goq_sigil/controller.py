@@ -121,13 +121,7 @@ class Controller:
 
     async def restart_service(self) -> dict[str, Any]:
         async with self._mutation_lock:
-            previous_instance = None
-            try:
-                previous_instance = (await self._status()).get("runtime", {}).get(
-                    "instance_id"
-                )
-            except ControllerError:
-                pass
+            previous_instance = await self._current_instance()
             await self.runner.systemctl_command("restart")
             status = await self._wait_ready(previous_instance=previous_instance)
             return {"schema_version": 1, "operation": "restart", "status": status}
@@ -149,6 +143,7 @@ class Controller:
             transaction: str | None = None
             candidate_instance: str | None = None
             candidate_revision: str | None = None
+            commit_response_failure: BaseException | None = None
             try:
                 await self._stop_and_wait()
                 installed = await self.runner.sigil_json(
@@ -176,23 +171,32 @@ class Controller:
                     raise ControllerError("health_not_proven")
                 candidate_instance = instance
                 await self._stop_and_wait()
-                committed = await self.runner.sigil_json(
-                    [
-                        "appliance",
-                        "config",
-                        "commit",
-                        "--config",
-                        str(self.runner.config),
-                        "--transaction",
-                        transaction,
-                        "--expected-instance",
-                        instance,
-                        "--json",
-                    ]
-                )
-                committed_revision = self._revision(committed.get("revision"))
-                if committed_revision != candidate_revision:
-                    raise ControllerError("invalid_response")
+                try:
+                    committed = await self.runner.sigil_json(
+                        [
+                            "appliance",
+                            "config",
+                            "commit",
+                            "--config",
+                            str(self.runner.config),
+                            "--transaction",
+                            transaction,
+                            "--expected-instance",
+                            instance,
+                            "--json",
+                        ]
+                    )
+                    committed_revision = self._revision(committed.get("revision"))
+                    if committed_revision != candidate_revision:
+                        raise ControllerError("invalid_response")
+                except BaseException as failure:
+                    committed_without_response = await asyncio.shield(
+                        self._config_is_committed(candidate_revision)
+                    )
+                    if not committed_without_response:
+                        raise
+                    committed_revision = candidate_revision
+                    commit_response_failure = failure
             except BaseException as failure:
                 rollback_ok = await asyncio.shield(
                     self._recover_apply(
@@ -221,11 +225,14 @@ class Controller:
                     if isinstance(failure, asyncio.CancelledError):
                         raise
                     raise ControllerError("post_commit_service_unhealthy") from failure
+            if isinstance(commit_response_failure, asyncio.CancelledError):
+                raise commit_response_failure
             return {
                 "schema_version": 1,
                 "operation": "config_apply",
                 "changed": True,
                 "revision": committed_revision,
+                "commit_response_recovered": commit_response_failure is not None,
             }
 
     async def rollback_pending(self, transaction: str) -> dict[str, Any]:
@@ -362,6 +369,16 @@ class Controller:
             shown = await self.get_config()
             return (
                 shown.get("revision") == base_revision
+                and shown.get("pending_transaction") is None
+            )
+        except ControllerError:
+            return False
+
+    async def _config_is_committed(self, candidate_revision: str) -> bool:
+        try:
+            shown = await self.get_config()
+            return (
+                shown.get("revision") == candidate_revision
                 and shown.get("pending_transaction") is None
             )
         except ControllerError:

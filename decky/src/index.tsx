@@ -182,15 +182,14 @@ function Content() {
   };
 
   const confirmApply = (parent?: EventTarget) => {
-    if (!snapshot?.sessionActive) {
-      void apply();
-      return;
-    }
+    const description = snapshot?.sessionActive
+      ? "Applying this configuration will disconnect the active Portal session while Sigil validates and restarts."
+      : "Sigil will validate this configuration, restart to prove it, and roll back automatically if health checks fail.";
     showModal(
       <ConfirmModal
-        strTitle="Apply while streaming?"
-        strDescription="Applying this configuration will disconnect the active Portal session while Sigil validates and restarts."
-        strOKButtonText="Apply and disconnect"
+        strTitle="Validate and apply configuration?"
+        strDescription={description}
+        strOKButtonText={snapshot?.sessionActive ? "Apply and disconnect" : "Validate and apply"}
         strCancelButtonText="Cancel"
         onOK={() => void apply()}
       />,

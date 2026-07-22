@@ -77,6 +77,11 @@ const ADAPTIVE_BITRATE_QUANTUM_KBPS: u32 = 250;
 const ADAPTIVE_BITRATE_CLEAN_WINDOWS: u8 = 10;
 const ADAPTIVE_BITRATE_MODERATE_WINDOWS: u8 = 2;
 const ADAPTIVE_BITRATE_COOLDOWN_WINDOWS: u8 = 10;
+const MOTION_RESOLUTION_MODERATE_WINDOWS: u8 = 2;
+const MOTION_RESOLUTION_CLEAN_WINDOWS: u8 = 3;
+const MOTION_RESOLUTION_ACTIVITY_FPS: u64 = 10;
+const MOTION_RESOLUTION_STILL_SETTLE: Duration = Duration::from_secs(2);
+const MOTION_RESOLUTION_UPSCALE_COOLDOWN: Duration = Duration::from_secs(3);
 const FEEDBACK_FRESH_INTERVAL_MIN_MS: u16 = 750;
 const FEEDBACK_FRESH_INTERVAL_MAX_MS: u16 = 1_500;
 const FEEDBACK_FRESH_ARRIVAL_GAP_MIN: Duration = Duration::from_millis(750);
@@ -96,6 +101,290 @@ enum FeedbackSeverity {
     Moderate,
     Severe,
     Stale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VideoDimensions {
+    pub width: u16,
+    pub height: u16,
+}
+
+impl VideoDimensions {
+    fn three_quarter(self) -> Result<Self> {
+        ensure!(
+            self.width.is_multiple_of(4) && self.height.is_multiple_of(4),
+            "native dimensions must be divisible by four for an exact three-quarter tier"
+        );
+        let reduced = Self {
+            width: self.width / 4 * 3,
+            height: self.height / 4 * 3,
+        };
+        ensure!(
+            reduced.width >= 64 && reduced.height >= 64,
+            "three-quarter dimensions are below the H.264 minimum"
+        );
+        ensure!(
+            reduced.width.is_multiple_of(2) && reduced.height.is_multiple_of(2),
+            "three-quarter H.264 dimensions must be even"
+        );
+        ensure!(
+            u32::from(self.width) * u32::from(reduced.height)
+                == u32::from(self.height) * u32::from(reduced.width),
+            "three-quarter dimensions must preserve the native aspect ratio"
+        );
+        Ok(reduced)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolutionTier {
+    Native,
+    Reduced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolutionTrigger {
+    Hold,
+    Motion,
+    Pressure,
+    Recovery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MotionResolutionDecision {
+    tier: ResolutionTier,
+    target: VideoDimensions,
+    trigger: ResolutionTrigger,
+    changed: bool,
+}
+
+/// Pure two-tier resolution policy. Fresh sequence progress from Gamescope's
+/// damage-driven stream is the bounded motion proxy while the authenticated
+/// feedback path supplies pressure. A downshift is safety-biased and
+/// immediate; an upscale requires both settled motion and fresh clean
+/// feedback, so stale reports can never restore detail.
+#[derive(Clone, Debug)]
+pub(crate) struct MotionResolutionPolicy {
+    native: VideoDimensions,
+    reduced: VideoDimensions,
+    tier: ResolutionTier,
+    motion_active: bool,
+    still_since: Option<Instant>,
+    pressure_active: bool,
+    moderate_windows: u8,
+    clean_windows: u8,
+    last_transition_at: Option<Instant>,
+    last_motion_sequence: Option<u64>,
+}
+
+impl MotionResolutionPolicy {
+    pub(crate) fn new(native: VideoDimensions) -> Result<Self> {
+        ensure!(
+            native.width >= 64 && native.height >= 64,
+            "native dimensions are too small"
+        );
+        ensure!(
+            native.width.is_multiple_of(2) && native.height.is_multiple_of(2),
+            "native H.264 dimensions must be even"
+        );
+        Ok(Self {
+            native,
+            reduced: native.three_quarter()?,
+            tier: ResolutionTier::Native,
+            motion_active: false,
+            still_since: None,
+            pressure_active: false,
+            moderate_windows: 0,
+            clean_windows: 0,
+            last_transition_at: None,
+            last_motion_sequence: None,
+        })
+    }
+
+    pub(crate) fn target(&self) -> VideoDimensions {
+        match self.tier {
+            ResolutionTier::Native => self.native,
+            ResolutionTier::Reduced => self.reduced,
+        }
+    }
+
+    /// Host motion hook. Repeated still observations preserve the original
+    /// settle boundary instead of indefinitely postponing recovery.
+    #[cfg(test)]
+    fn observe_motion(
+        &mut self,
+        motion_active: bool,
+        observed_at: Instant,
+    ) -> MotionResolutionDecision {
+        self.update_motion(motion_active, observed_at);
+        self.evaluate_target(observed_at)
+    }
+
+    fn update_motion(&mut self, motion_active: bool, observed_at: Instant) {
+        if motion_active {
+            self.motion_active = true;
+            self.still_since = None;
+            return;
+        }
+        if self.motion_active || self.still_since.is_none() {
+            self.still_since = Some(observed_at);
+        }
+        self.motion_active = false;
+    }
+
+    /// Observe one classified feedback window. Only fresh moderate/severe
+    /// pressure can initiate a downshift, and only fresh clean windows count
+    /// toward restoring native detail.
+    #[cfg(test)]
+    fn observe_feedback(
+        &mut self,
+        severity: FeedbackSeverity,
+        fresh: bool,
+        observed_at: Instant,
+    ) -> MotionResolutionDecision {
+        self.update_feedback(severity, fresh);
+        self.evaluate_target(observed_at)
+    }
+
+    /// Gamescope output is damage-driven, so fresh media sequence progress is
+    /// a conservative constant-space motion proxy for this first slice. A
+    /// future raw-frame observer can call `observe_motion` without changing
+    /// pressure hysteresis or encoder actuation.
+    fn observe_window(
+        &mut self,
+        report: &MediaFeedbackReportV1,
+        evaluation: &AdaptiveBitrateEvaluation,
+        observed_at: Instant,
+    ) -> MotionResolutionDecision {
+        let previous_sequence = self.last_motion_sequence;
+        if let Some(sequence) = report.last_sequence {
+            self.last_motion_sequence = Some(
+                self.last_motion_sequence
+                    .map_or(sequence, |last| last.max(sequence)),
+            );
+        }
+        if evaluation.fresh {
+            let motion_active = report.last_sequence.is_some_and(|sequence| {
+                let delta = previous_sequence.map_or(0, |last| sequence.saturating_sub(last));
+                delta.saturating_mul(1_000)
+                    >= MOTION_RESOLUTION_ACTIVITY_FPS.saturating_mul(u64::from(report.interval_ms))
+            });
+            self.update_motion(motion_active, observed_at);
+        }
+        self.update_feedback(evaluation.pressure_severity, evaluation.fresh);
+        self.evaluate_target(observed_at)
+    }
+
+    fn update_feedback(&mut self, severity: FeedbackSeverity, fresh: bool) {
+        if !fresh
+            || matches!(
+                severity,
+                FeedbackSeverity::InsufficientEvidence | FeedbackSeverity::Stale
+            )
+        {
+            self.moderate_windows = 0;
+            self.clean_windows = 0;
+            return;
+        }
+
+        match severity {
+            FeedbackSeverity::Severe => {
+                self.pressure_active = true;
+                self.moderate_windows = 0;
+                self.clean_windows = 0;
+            }
+            FeedbackSeverity::Moderate => {
+                self.clean_windows = 0;
+                self.moderate_windows = self.moderate_windows.saturating_add(1);
+                if self.moderate_windows >= MOTION_RESOLUTION_MODERATE_WINDOWS {
+                    self.moderate_windows = 0;
+                    self.pressure_active = true;
+                }
+            }
+            FeedbackSeverity::Clean => {
+                self.moderate_windows = 0;
+                self.clean_windows = self.clean_windows.saturating_add(1);
+                if self.clean_windows >= MOTION_RESOLUTION_CLEAN_WINDOWS {
+                    self.pressure_active = false;
+                }
+            }
+            FeedbackSeverity::InsufficientEvidence | FeedbackSeverity::Stale => {}
+        }
+    }
+
+    fn evaluate_target(&mut self, observed_at: Instant) -> MotionResolutionDecision {
+        if self.motion_active {
+            self.downshift(observed_at, ResolutionTrigger::Motion)
+        } else if self.pressure_active {
+            self.downshift(observed_at, ResolutionTrigger::Pressure)
+        } else {
+            self.maybe_restore(observed_at)
+        }
+    }
+
+    fn commit_observation_from(&mut self, candidate: &Self) {
+        self.motion_active = candidate.motion_active;
+        self.still_since = candidate.still_since;
+        self.pressure_active = candidate.pressure_active;
+        self.moderate_windows = candidate.moderate_windows;
+        self.clean_windows = candidate.clean_windows;
+        self.last_motion_sequence = candidate.last_motion_sequence;
+    }
+
+    fn downshift(
+        &mut self,
+        observed_at: Instant,
+        trigger: ResolutionTrigger,
+    ) -> MotionResolutionDecision {
+        let changed = self.tier != ResolutionTier::Reduced;
+        if changed {
+            self.tier = ResolutionTier::Reduced;
+            self.last_transition_at = Some(observed_at);
+        }
+        MotionResolutionDecision {
+            tier: self.tier,
+            target: self.target(),
+            trigger,
+            changed,
+        }
+    }
+
+    fn maybe_restore(&mut self, observed_at: Instant) -> MotionResolutionDecision {
+        let still_settled = !self.motion_active
+            && self.still_since.is_some_and(|still_since| {
+                observed_at.saturating_duration_since(still_since) >= MOTION_RESOLUTION_STILL_SETTLE
+            });
+        let cooldown_complete = self.last_transition_at.is_none_or(|last| {
+            observed_at.saturating_duration_since(last) >= MOTION_RESOLUTION_UPSCALE_COOLDOWN
+        });
+        let clean = self.clean_windows >= MOTION_RESOLUTION_CLEAN_WINDOWS;
+        if self.tier == ResolutionTier::Reduced
+            && still_settled
+            && cooldown_complete
+            && clean
+            && !self.pressure_active
+        {
+            self.tier = ResolutionTier::Native;
+            self.clean_windows = 0;
+            self.last_transition_at = Some(observed_at);
+            return MotionResolutionDecision {
+                tier: self.tier,
+                target: self.target(),
+                trigger: ResolutionTrigger::Recovery,
+                changed: true,
+            };
+        }
+        self.hold()
+    }
+
+    fn hold(&self) -> MotionResolutionDecision {
+        MotionResolutionDecision {
+            tier: self.tier,
+            target: self.target(),
+            trigger: ResolutionTrigger::Hold,
+            changed: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -211,6 +500,13 @@ struct ShadowBitrateController {
     cooldown_windows: u8,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AdaptiveBitrateEvaluation {
+    decision: AdaptiveBitrateDecisionV1,
+    pressure_severity: FeedbackSeverity,
+    fresh: bool,
+}
+
 impl ShadowBitrateController {
     fn new(configured_ceiling_kbps: u32, telemetry: MediaV3TelemetrySnapshot) -> Self {
         let ceiling_kbps = quantize_down(configured_ceiling_kbps).max(ADAPTIVE_BITRATE_FLOOR_KBPS);
@@ -230,18 +526,18 @@ impl ShadowBitrateController {
         }
     }
 
-    fn decide(
+    fn evaluate(
         &mut self,
         report: &MediaFeedbackReportV1,
         telemetry: MediaV3TelemetrySnapshot,
         received_at: Instant,
-    ) -> Result<AdaptiveBitrateDecisionV1> {
+    ) -> Result<AdaptiveBitrateEvaluation> {
         ensure!(
             self.last_report_id
                 .is_none_or(|last| report.report_id > last),
             "feedback report IDs must increase monotonically"
         );
-        let (severity, reasons, stale, trusted_host_pressure) =
+        let (severity, pressure_severity, reasons, stale, trusted_host_pressure) =
             self.classify(report, telemetry, received_at);
         let mut state = AdaptiveBitrateStateV1::Hold;
 
@@ -331,7 +627,22 @@ impl ShadowBitrateController {
                     .map_or(sequence, |last| last.max(sequence)),
             );
         }
-        Ok(decision)
+        Ok(AdaptiveBitrateEvaluation {
+            decision,
+            pressure_severity,
+            fresh: !stale,
+        })
+    }
+
+    #[cfg(test)]
+    fn decide(
+        &mut self,
+        report: &MediaFeedbackReportV1,
+        telemetry: MediaV3TelemetrySnapshot,
+        received_at: Instant,
+    ) -> Result<AdaptiveBitrateDecisionV1> {
+        self.evaluate(report, telemetry, received_at)
+            .map(|evaluation| evaluation.decision)
     }
 
     fn classify(
@@ -339,7 +650,13 @@ impl ShadowBitrateController {
         report: &MediaFeedbackReportV1,
         telemetry: MediaV3TelemetrySnapshot,
         received_at: Instant,
-    ) -> (FeedbackSeverity, AdaptiveBitrateReasonFlagsV1, bool, bool) {
+    ) -> (
+        FeedbackSeverity,
+        FeedbackSeverity,
+        AdaptiveBitrateReasonFlagsV1,
+        bool,
+        bool,
+    ) {
         let stale = !(FEEDBACK_FRESH_INTERVAL_MIN_MS..=FEEDBACK_FRESH_INTERVAL_MAX_MS)
             .contains(&report.interval_ms)
             || self.last_report_received_at.is_none()
@@ -422,7 +739,7 @@ impl ShadowBitrateController {
             if !trusted_host_pressure {
                 severity = FeedbackSeverity::Stale;
             }
-            return (severity, reasons, true, trusted_host_pressure);
+            return (severity, severity, reasons, true, trusted_host_pressure);
         }
 
         let receiver_drops = report
@@ -517,6 +834,7 @@ impl ShadowBitrateController {
             );
         }
 
+        let pressure_severity = severity;
         if severity == FeedbackSeverity::Clean {
             let sequence_progressed = self
                 .last_sequence
@@ -533,7 +851,13 @@ impl ShadowBitrateController {
                 severity = FeedbackSeverity::InsufficientEvidence;
             }
         }
-        (severity, reasons, false, trusted_host_pressure)
+        (
+            severity,
+            pressure_severity,
+            reasons,
+            false,
+            trusted_host_pressure,
+        )
     }
 
     fn commit_observation_from(&mut self, candidate: &Self) {
@@ -653,6 +977,13 @@ struct AdaptiveEncoderProposal {
     target_kbps: u32,
     bitrate_revision: u64,
     force_keyframe_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolutionEncoderProposal {
+    control: EncoderControl,
+    target: VideoDimensions,
+    revision: u64,
 }
 
 impl MediaV3Telemetry {
@@ -801,6 +1132,30 @@ impl SessionRegistry {
             target_kbps,
             bitrate_revision,
             force_keyframe_revision,
+        }))
+    }
+
+    fn propose_resolution_update(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        target: VideoDimensions,
+    ) -> Result<Option<ResolutionEncoderProposal>> {
+        let active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_ref()
+            .filter(|session| {
+                session.media_active && session.remote == remote && session.session_id == session_id
+            })
+            .context("resolution update does not match the active media session")?;
+        let Some(control) = session.encoder_control.clone() else {
+            return Ok(None);
+        };
+        let revision = control.request_resolution(target.width, target.height)?;
+        Ok(Some(ResolutionEncoderProposal {
+            control,
+            target,
+            revision,
         }))
     }
 
@@ -2623,6 +2978,14 @@ async fn serve_media_feedback(
     let mut reader_finished = false;
     let mut receiver_open = true;
     let mut controller = ShadowBitrateController::new(ceiling_kbps, lease.telemetry.snapshot());
+    let mut resolution_controller = if encoder_actuation_available {
+        Some(MotionResolutionPolicy::new(VideoDimensions {
+            width: u16::try_from(config.width).context("native width exceeds protocol")?,
+            height: u16::try_from(config.height).context("native height exceeds protocol")?,
+        })?)
+    } else {
+        None
+    };
     let mut feedback_cursor = FeedbackIngressCursor::default();
 
     let result: Result<()> = loop {
@@ -2665,15 +3028,24 @@ async fn serve_media_feedback(
                 // arriving during an encoder wait accumulate beyond it.
                 feedback_cursor = next_cursor;
                 let telemetry = lease.telemetry.snapshot();
+                let observed_at = Instant::now();
                 let mut candidate = controller.clone();
-                let mut decision = candidate.decide(&report, telemetry, Instant::now())?;
+                let evaluation = candidate.evaluate(&report, telemetry, observed_at)?;
+                let mut decision = evaluation.decision;
+                let mut resolution_candidate = resolution_controller.clone();
+                let resolution_decision = resolution_candidate
+                    .as_mut()
+                    .map(|policy| policy.observe_window(&report, &evaluation, observed_at));
                 let changes_bitrate = decision.state != AdaptiveBitrateStateV1::Hold;
-                let can_actuate = changes_bitrate && encoder_actuation_available;
+                let changes_resolution = resolution_decision.is_some_and(|change| change.changed);
+                let can_actuate_bitrate = changes_bitrate && encoder_actuation_available;
+                let can_actuate_resolution = changes_resolution && encoder_actuation_available;
                 let mut recovery_acknowledged = None;
-                if can_actuate {
+                let bitrate_proposal = if can_actuate_bitrate {
                     let force_keyframe =
-                        adaptive_recovery_keyframe_required(&report, &decision);
-                    let proposal = match sessions.propose_adaptive_encoder_update(
+                        adaptive_recovery_keyframe_required(&report, &decision)
+                            && !changes_resolution;
+                    match sessions.propose_adaptive_encoder_update(
                         remote,
                         lease.session_id,
                         decision.target_kbps,
@@ -2697,8 +3069,39 @@ async fn serve_media_feedback(
                             );
                             None
                         }
-                    };
-                    if let Some(proposal) = proposal {
+                    }
+                } else {
+                    None
+                };
+                let resolution_proposal = if can_actuate_resolution {
+                    let target = resolution_decision
+                        .expect("resolution change is required for actuation")
+                        .target;
+                    match sessions.propose_resolution_update(remote, lease.session_id, target) {
+                        Ok(Some(proposal)) => Some(proposal),
+                        Ok(None) => {
+                            warn!(
+                                %remote,
+                                session_id = lease.session_id,
+                                "active adaptive session lost encoder control; retaining committed resolution"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            warn!(
+                                %remote,
+                                session_id = lease.session_id,
+                                %error,
+                                "adaptive resolution proposal failed; retaining committed resolution"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(proposal) = bitrate_proposal {
                         match commit_adaptive_encoder_proposal(
                             sessions,
                             remote,
@@ -2743,7 +3146,8 @@ async fn serve_media_feedback(
                                 }
                             }
                         }
-                    }
+                }
+                if can_actuate_bitrate {
                     if !decision.applied {
                         controller.commit_observation_from(&candidate);
                     }
@@ -2752,6 +3156,44 @@ async fn serve_media_feedback(
                     // remain intentionally shadow-only. Hold decisions do not
                     // need encoder actuation.
                     controller = candidate;
+                }
+
+                let mut resolution_applied = None;
+                if let Some(proposal) = resolution_proposal {
+                    match commit_resolution_encoder_proposal(
+                        sessions,
+                        remote,
+                        lease.session_id,
+                        &proposal,
+                    )
+                    .await
+                    {
+                        AdaptiveEncoderCommit::GenerationEnded => break Ok(()),
+                        AdaptiveEncoderCommit::NotApplied(error) => {
+                            resolution_applied = Some(false);
+                            warn!(
+                                %remote,
+                                session_id = lease.session_id,
+                                target_width = proposal.target.width,
+                                target_height = proposal.target.height,
+                                %error,
+                                "adaptive resolution application failed; retaining committed resolution"
+                            );
+                        }
+                        AdaptiveEncoderCommit::Applied => {
+                            resolution_applied = Some(true);
+                            resolution_controller = resolution_candidate.clone();
+                        }
+                    }
+                }
+                if can_actuate_resolution && resolution_applied != Some(true) {
+                    if let (Some(committed), Some(candidate)) =
+                        (resolution_controller.as_mut(), resolution_candidate.as_ref())
+                    {
+                        committed.commit_observation_from(candidate);
+                    }
+                } else if !changes_resolution {
+                    resolution_controller = resolution_candidate;
                 }
                 tokio::time::timeout(
                     FEEDBACK_WRITE_TIMEOUT,
@@ -2769,12 +3211,16 @@ async fn serve_media_feedback(
                     reasons = decision.reasons.bits(),
                     applied = decision.applied,
                     ?recovery_acknowledged,
+                    resolution_width = resolution_decision.map(|change| change.target.width),
+                    resolution_height = resolution_decision.map(|change| change.target.height),
+                    resolution_trigger = ?resolution_decision.map(|change| change.trigger),
+                    ?resolution_applied,
                     path_rtt_micros = telemetry.selected_path_rtt_micros,
                     path_lost_packets = telemetry.selected_path_lost_packets,
                     path_congestion_events = telemetry.selected_path_congestion_events,
                     scheduler_cancellations = telemetry.scheduler_cancellations,
                     send_failures = telemetry.send_failures,
-                    mode = if can_actuate { "active" } else { "shadow" },
+                    mode = if encoder_actuation_available { "active" } else { "shadow" },
                     "adaptive bitrate decision"
                 );
             }
@@ -2929,6 +3375,48 @@ async fn commit_adaptive_encoder_proposal(
     }
 
     AdaptiveEncoderCommit::Applied
+}
+
+async fn commit_resolution_encoder_proposal(
+    sessions: &SessionRegistry,
+    remote: EndpointId,
+    session_id: u64,
+    proposal: &ResolutionEncoderProposal,
+) -> AdaptiveEncoderCommit {
+    let result = await_while_session_active(
+        sessions,
+        remote,
+        session_id,
+        proposal.control.wait_for_resolution_applied(
+            proposal.revision,
+            proposal.target.width,
+            proposal.target.height,
+            ENCODER_CONTROL_COMMIT_TIMEOUT,
+        ),
+    )
+    .await;
+    let Some(result) = result else {
+        return AdaptiveEncoderCommit::GenerationEnded;
+    };
+    match result {
+        Ok(status)
+            if status.applied_resolution_revision == Some(proposal.revision)
+                && status.applied_width == Some(proposal.target.width)
+                && status.applied_height == Some(proposal.target.height) =>
+        {
+            AdaptiveEncoderCommit::Applied
+        }
+        Ok(status) => AdaptiveEncoderCommit::NotApplied(anyhow::anyhow!(
+            "encoder resolution commit mismatch: revision {:?}, dimensions {:?}x{:?}, expected revision {} at {}x{}",
+            status.applied_resolution_revision,
+            status.applied_width,
+            status.applied_height,
+            proposal.revision,
+            proposal.target.width,
+            proposal.target.height
+        )),
+        Err(error) => AdaptiveEncoderCommit::NotApplied(error),
+    }
 }
 
 async fn await_adaptive_recovery_keyframe(
@@ -3088,28 +3576,7 @@ async fn serve_media(
                         break;
                     }
                 };
-                let mut flags = FrameFlags::NONE;
-                if frame.keyframe {
-                    flags = flags.union(FrameFlags::KEYFRAME);
-                }
-                if frame.codec_config {
-                    flags = flags.union(FrameFlags::CODEC_CONFIG);
-                }
-                if discontinuity {
-                    flags = flags.union(FrameFlags::DISCONTINUITY);
-                }
-                let width = u16::try_from(config.width).context("width exceeds protocol")?;
-                let height = u16::try_from(config.height).context("height exceeds protocol")?;
-                let header = MediaFrameHeader::h264(
-                    width,
-                    height,
-                    frame.data.len(),
-                    frame.sequence,
-                    frame.capture_timestamp_micros,
-                    frame.presentation_timestamp_micros,
-                    flags,
-                )?;
-                let media_frame = MediaFrame::new(header, frame.data.as_ref().to_vec())?;
+                let media_frame = media_frame_for_encoded(&config, &frame, discontinuity)?;
                 tokio::time::timeout(
                     MEDIA_WRITE_TIMEOUT,
                     write_media_frame(&mut send, &media_frame),
@@ -3476,7 +3943,7 @@ async fn run_media_v2_session(
 }
 
 fn media_frame_for_encoded(
-    config: &HostConfig,
+    _config: &HostConfig,
     frame: &EncodedFrame,
     discontinuity: bool,
 ) -> Result<MediaFrame> {
@@ -3487,14 +3954,12 @@ fn media_frame_for_encoded(
     if frame.codec_config {
         flags = flags.union(FrameFlags::CODEC_CONFIG);
     }
-    if discontinuity {
+    if discontinuity || frame.discontinuity {
         flags = flags.union(FrameFlags::DISCONTINUITY);
     }
-    let width = u16::try_from(config.width).context("width exceeds protocol")?;
-    let height = u16::try_from(config.height).context("height exceeds protocol")?;
     let header = MediaFrameHeader::h264(
-        width,
-        height,
+        frame.width,
+        frame.height,
         frame.data.len(),
         frame.sequence,
         frame.capture_timestamp_micros,
@@ -3874,7 +4339,7 @@ fn media_v3_delivery_timeout_ms(framerate: u32) -> u32 {
 }
 
 fn media_v3_object_for_encoded(
-    config: &HostConfig,
+    _config: &HostConfig,
     frame: &EncodedFrame,
     position: MediaV3ObjectPosition,
     discontinuity: bool,
@@ -3887,7 +4352,7 @@ fn media_v3_object_for_encoded(
     if frame.codec_config {
         flags = flags.union(FrameFlags::CODEC_CONFIG);
     }
-    if discontinuity {
+    if discontinuity || frame.discontinuity {
         flags = flags.union(FrameFlags::DISCONTINUITY);
     }
     let publisher_priority = if position.object_id == 0 {
@@ -3896,8 +4361,8 @@ fn media_v3_object_for_encoded(
         MEDIA_V3_DELTA_PUBLISHER_PRIORITY
     };
     let header = MediaObjectHeaderV3::h264(
-        u16::try_from(config.width).context("width exceeds protocol")?,
-        u16::try_from(config.height).context("height exceeds protocol")?,
+        frame.width,
+        frame.height,
         frame.data.len(),
         publisher_priority,
         flags,
@@ -4408,6 +4873,233 @@ mod tests {
             .unwrap()
     }
 
+    fn native_dimensions() -> VideoDimensions {
+        VideoDimensions {
+            width: 1_280,
+            height: 800,
+        }
+    }
+
+    #[test]
+    fn motion_resolution_tier_is_exact_even_and_same_aspect() {
+        let native = native_dimensions();
+        let policy = MotionResolutionPolicy::new(native).unwrap();
+        assert_eq!(policy.target(), native);
+        assert_eq!(
+            policy.reduced,
+            VideoDimensions {
+                width: 960,
+                height: 600,
+            }
+        );
+        assert_eq!(
+            u32::from(native.width) * u32::from(policy.reduced.height),
+            u32::from(native.height) * u32::from(policy.reduced.width)
+        );
+        assert!(policy.reduced.width.is_multiple_of(2));
+        assert!(policy.reduced.height.is_multiple_of(2));
+
+        assert!(
+            MotionResolutionPolicy::new(VideoDimensions {
+                width: 1_278,
+                height: 800,
+            })
+            .is_err()
+        );
+        assert!(
+            MotionResolutionPolicy::new(VideoDimensions {
+                width: 80,
+                height: 64,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn motion_downshifts_immediately_and_recovers_only_after_settle_and_clean_windows() {
+        let now = Instant::now();
+        let mut policy = MotionResolutionPolicy::new(native_dimensions()).unwrap();
+        let down = policy.observe_motion(true, now);
+        assert_eq!(down.tier, ResolutionTier::Reduced);
+        assert_eq!(down.trigger, ResolutionTrigger::Motion);
+        assert!(down.changed);
+
+        let still = policy.observe_motion(false, now + Duration::from_secs(1));
+        assert!(!still.changed);
+        for second in [2, 3] {
+            assert!(
+                !policy
+                    .observe_feedback(
+                        FeedbackSeverity::Clean,
+                        true,
+                        now + Duration::from_secs(second),
+                    )
+                    .changed
+            );
+        }
+        let recovered =
+            policy.observe_feedback(FeedbackSeverity::Clean, true, now + Duration::from_secs(4));
+        assert_eq!(recovered.tier, ResolutionTier::Native);
+        assert_eq!(recovered.target, native_dimensions());
+        assert_eq!(recovered.trigger, ResolutionTrigger::Recovery);
+        assert!(recovered.changed);
+    }
+
+    #[test]
+    fn repeated_still_observations_do_not_postpone_resolution_recovery() {
+        let now = Instant::now();
+        let mut policy = MotionResolutionPolicy::new(native_dimensions()).unwrap();
+        policy.observe_motion(true, now);
+        policy.observe_motion(false, now + Duration::from_secs(1));
+        policy.observe_feedback(FeedbackSeverity::Clean, true, now + Duration::from_secs(2));
+        policy.observe_motion(false, now + Duration::from_millis(2_500));
+        policy.observe_feedback(FeedbackSeverity::Clean, true, now + Duration::from_secs(3));
+        let recovered =
+            policy.observe_feedback(FeedbackSeverity::Clean, true, now + Duration::from_secs(4));
+        assert!(recovered.changed);
+        assert_eq!(recovered.tier, ResolutionTier::Native);
+    }
+
+    #[test]
+    fn resolution_pressure_requires_fresh_hysteresis_but_severe_is_immediate() {
+        let now = Instant::now();
+        let mut moderate = MotionResolutionPolicy::new(native_dimensions()).unwrap();
+        moderate.observe_motion(false, now);
+        assert!(
+            !moderate
+                .observe_feedback(
+                    FeedbackSeverity::Moderate,
+                    true,
+                    now + Duration::from_secs(1),
+                )
+                .changed
+        );
+        assert!(
+            !moderate
+                .observe_feedback(
+                    FeedbackSeverity::Moderate,
+                    false,
+                    now + Duration::from_secs(2),
+                )
+                .changed
+        );
+        assert!(
+            !moderate
+                .observe_feedback(
+                    FeedbackSeverity::Moderate,
+                    true,
+                    now + Duration::from_secs(3),
+                )
+                .changed
+        );
+        let down = moderate.observe_feedback(
+            FeedbackSeverity::Moderate,
+            true,
+            now + Duration::from_secs(4),
+        );
+        assert!(down.changed);
+        assert_eq!(down.trigger, ResolutionTrigger::Pressure);
+
+        let mut severe = MotionResolutionPolicy::new(native_dimensions()).unwrap();
+        let immediate =
+            severe.observe_feedback(FeedbackSeverity::Severe, true, now + Duration::from_secs(1));
+        assert!(immediate.changed);
+        assert_eq!(immediate.tier, ResolutionTier::Reduced);
+    }
+
+    #[test]
+    fn stale_feedback_cannot_restore_native_resolution() {
+        let now = Instant::now();
+        let mut policy = MotionResolutionPolicy::new(native_dimensions()).unwrap();
+        policy.observe_motion(false, now);
+        policy.observe_feedback(FeedbackSeverity::Severe, true, now + Duration::from_secs(1));
+        for second in [2, 3, 4, 5] {
+            let decision = policy.observe_feedback(
+                FeedbackSeverity::Clean,
+                false,
+                now + Duration::from_secs(second),
+            );
+            assert_eq!(decision.tier, ResolutionTier::Reduced);
+            assert!(!decision.changed);
+        }
+        assert!(policy.pressure_active);
+
+        for second in [6, 7] {
+            assert!(
+                !policy
+                    .observe_feedback(
+                        FeedbackSeverity::Clean,
+                        true,
+                        now + Duration::from_secs(second),
+                    )
+                    .changed
+            );
+        }
+        let recovered =
+            policy.observe_feedback(FeedbackSeverity::Clean, true, now + Duration::from_secs(8));
+        assert!(recovered.changed);
+        assert_eq!(recovered.tier, ResolutionTier::Native);
+    }
+
+    #[test]
+    fn motion_keeps_resolution_reduced_after_pressure_clears() {
+        let now = Instant::now();
+        let mut policy = MotionResolutionPolicy::new(native_dimensions()).unwrap();
+        policy.observe_motion(true, now);
+        policy.observe_feedback(FeedbackSeverity::Severe, true, now + Duration::from_secs(1));
+        for second in 2..=5 {
+            let decision = policy.observe_feedback(
+                FeedbackSeverity::Clean,
+                true,
+                now + Duration::from_secs(second),
+            );
+            assert_eq!(decision.tier, ResolutionTier::Reduced);
+            assert!(!decision.changed);
+        }
+        assert!(!policy.pressure_active);
+        assert!(policy.motion_active);
+    }
+
+    #[test]
+    fn damage_driven_motion_proxy_seeds_then_downshifts_and_stale_blocks_upscale() {
+        let now = Instant::now();
+        let telemetry = MediaV3TelemetrySnapshot::default();
+        let mut bitrate = ShadowBitrateController::new(12_000, telemetry);
+        let mut resolution = MotionResolutionPolicy::new(native_dimensions()).unwrap();
+
+        let mut first = clean_feedback(1);
+        first.last_sequence = Some(100);
+        let first_evaluation = bitrate.evaluate(&first, telemetry, now).unwrap();
+        assert!(!first_evaluation.fresh);
+        let seeded = resolution.observe_window(&first, &first_evaluation, now);
+        assert_eq!(seeded.tier, ResolutionTier::Native);
+        assert!(!seeded.changed);
+
+        let mut second = clean_feedback(2);
+        second.last_sequence = Some(110);
+        let second_evaluation = bitrate
+            .evaluate(&second, telemetry, now + Duration::from_secs(1))
+            .unwrap();
+        assert!(second_evaluation.fresh);
+        let down =
+            resolution.observe_window(&second, &second_evaluation, now + Duration::from_secs(1));
+        assert_eq!(down.trigger, ResolutionTrigger::Motion);
+        assert_eq!(down.tier, ResolutionTier::Reduced);
+        assert!(down.changed);
+
+        let mut stale = clean_feedback(3);
+        stale.interval_ms = 5_000;
+        stale.last_sequence = Some(110);
+        let stale_evaluation = bitrate
+            .evaluate(&stale, telemetry, now + Duration::from_secs(5))
+            .unwrap();
+        assert!(!stale_evaluation.fresh);
+        let held =
+            resolution.observe_window(&stale, &stale_evaluation, now + Duration::from_secs(5));
+        assert_eq!(held.tier, ResolutionTier::Reduced);
+        assert!(!held.changed);
+    }
+
     #[test]
     fn shadow_controller_immediately_decreases_for_severe_feedback_and_stays_bounded() {
         let mut controller =
@@ -4828,11 +5520,14 @@ mod tests {
     ) -> EncodedFrame {
         EncodedFrame {
             sequence,
+            width: 1_280,
+            height: 800,
             capture_timestamp_micros: sequence,
             presentation_timestamp_micros: sequence as i64,
             observed_at: Instant::now(),
             keyframe,
             codec_config,
+            discontinuity: false,
             data: Arc::from(vec![sequence as u8; payload_len]),
         }
     }
@@ -5444,11 +6139,14 @@ mod tests {
         let now = Instant::now();
         let frame = EncodedFrame {
             sequence: 0,
+            width: 1_280,
+            height: 800,
             capture_timestamp_micros: 0,
             presentation_timestamp_micros: 0,
             observed_at: now,
             keyframe: true,
             codec_config: true,
+            discontinuity: false,
             data: Arc::from([1_u8, 2, 3]),
         };
         let (_frame_sender, mut frame_receiver) = tokio::sync::watch::channel(Some(frame.clone()));
@@ -6204,11 +6902,14 @@ mod tests {
     fn current_gop_replay_is_complete_and_skips_already_sent_frames() {
         let frame = |sequence, keyframe| EncodedFrame {
             sequence,
+            width: 1_280,
+            height: 800,
             capture_timestamp_micros: sequence,
             presentation_timestamp_micros: sequence as i64,
             observed_at: std::time::Instant::now(),
             keyframe,
             codec_config: keyframe,
+            discontinuity: false,
             data: Arc::from([sequence as u8]),
         };
 
@@ -6250,11 +6951,14 @@ mod tests {
         let old_observation = observed_now - Duration::from_secs(1);
         let frame = |sequence, keyframe| EncodedFrame {
             sequence,
+            width: 1_280,
+            height: 800,
             capture_timestamp_micros: sequence,
             presentation_timestamp_micros: sequence as i64,
             observed_at: old_observation,
             keyframe,
             codec_config: keyframe,
+            discontinuity: false,
             data: Arc::from([sequence as u8]),
         };
         let mut cursor = MediaReplayCursor::default();
@@ -6296,11 +7000,14 @@ mod tests {
         let old_observation = replay_started_at - Duration::from_secs(1);
         let frame = |sequence, keyframe| EncodedFrame {
             sequence,
+            width: 1_280,
+            height: 800,
             capture_timestamp_micros: sequence,
             presentation_timestamp_micros: sequence as i64,
             observed_at: old_observation,
             keyframe,
             codec_config: keyframe,
+            discontinuity: false,
             data: Arc::from([sequence as u8]),
         };
         let mut cursor = MediaReplayCursor::default();
@@ -6346,11 +7053,14 @@ mod tests {
         assert_eq!(maximum_replay_age, Duration::from_nanos(33_333_334));
         let frame = EncodedFrame {
             sequence: 11,
+            width: 1_280,
+            height: 800,
             capture_timestamp_micros: 11,
             presentation_timestamp_micros: 11,
             observed_at: observed_now - maximum_replay_age,
             keyframe: false,
             codec_config: false,
+            discontinuity: false,
             data: Arc::from([11]),
         };
         let mut cursor = MediaReplayCursor {
@@ -6375,11 +7085,14 @@ mod tests {
         let maximum_replay_age = maximum_media_replay_age(60);
         let frame = EncodedFrame {
             sequence: 11,
+            width: 1_280,
+            height: 800,
             capture_timestamp_micros: 11,
             presentation_timestamp_micros: 11,
             observed_at: observed_now - maximum_replay_age - Duration::from_nanos(1),
             keyframe: false,
             codec_config: false,
+            discontinuity: false,
             data: Arc::from([11]),
         };
         let mut cursor = MediaReplayCursor {
@@ -6405,11 +7118,14 @@ mod tests {
         let maximum_replay_age = maximum_media_replay_age(60);
         let frame = |sequence, keyframe| EncodedFrame {
             sequence,
+            width: 1_280,
+            height: 800,
             capture_timestamp_micros: sequence,
             presentation_timestamp_micros: sequence as i64,
             observed_at: observed_now,
             keyframe,
             codec_config: keyframe,
+            discontinuity: false,
             data: Arc::from([sequence as u8]),
         };
         let mut cursor = MediaReplayCursor {

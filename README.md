@@ -39,6 +39,11 @@ Steam and games.
   dependency.
 - The Bazzite path captures the exact Gamescope PipeWire node and uses AMD
   GstVA H.264 at the fixed 1280×800/60 first target.
+- Gamescope video keeps the proven external `gst-launch` pipeline as its
+  configuration default. Linux builds made explicitly with
+  `in-process-gstreamer` can opt into an in-process pipeline for bounded
+  bitrate and force-keyframe control; ordinary release packages do not enable
+  that feature yet.
 - Portal delivers encoded frames to WebCodecs through a raw Tauri binary
   channel. The handoff is capped at four frames, the decode queue and
   presentation queue at two, and a bounded watchdog recovers a suspended
@@ -83,9 +88,10 @@ not authentication.
 5. **Upstream Iroh/MoQ transport implemented; hardware proof pending:** an
    authenticated control lease gates a session-scoped upstream MoQ broadcast;
    bounded native groups cancel stale GOPs and recover through explicit
-   keyframe requests. The external encoder currently responds at its next
-   natural configured IDR; in-process force-key-unit control and induced-loss
-   relay proof remain in issue #7.
+   keyframe requests. The external encoder responds at its next natural
+   configured IDR. An opt-in in-process encoder-control foundation exists, but
+   its Bazzite/package acceptance and induced-loss relay proof remain in issue
+   #7.
 6. **Host hardware-proven; physical client controller pending:** the virtual
    Xbox-style controller negotiated over Iroh and produced the expected
    button, stick, trigger, D-pad, and neutral-release events on the Bazzite
@@ -105,6 +111,12 @@ Requirements:
 - Rust 1.91 or newer (the repository pins Rust 1.95)
 - Tauri v2 system dependencies
 - A FIDO2 key with `hmac-secret` support for the normal identity flow
+
+The optional Linux `in-process-gstreamer` host feature additionally needs the
+GStreamer core, app, and video development libraries. Its matching runtime
+libraries and plugins, including `appsink`, must be installed on the host. The
+published Sigil package remains a default-feature build until native Bazzite
+and cross-build linking are proven.
 
 ### Enroll one Portal
 

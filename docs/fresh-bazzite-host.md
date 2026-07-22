@@ -44,6 +44,13 @@ low-latency encoder properties do not match. This implementation still needs
 the attached-display and headless appliance gates below before it is proven on
 the target Bazzite image.
 
+The proven compatibility backend launches the video pipeline through the
+configured `gst-launch-1.0` executable and remains the default when
+`encoder_backend` is omitted. `encoder_backend = "in-process-gstreamer"` is an
+explicit test opt-in. Sigil rejects that setting unless it is a Linux binary
+built with the matching Cargo feature; it must never silently fall back to the
+external backend. The public release package does not enable this feature yet.
+
 The host identity file is part of the normal daemon design. The client-side
 `--dev-connect` passkey bypass is accepted by debug builds and by an explicitly
 feature-gated optimized demo build. Ordinary release clients reject that
@@ -361,6 +368,7 @@ Inside the container:
 ```bash
 sudo dnf install -y --setopt=install_weak_deps=False \
   clang cmake curl gcc gcc-c++ git make \
+  gstreamer1-devel gstreamer1-plugins-base-devel \
   openssl-devel pipewire-devel pkgconf-pkg-config systemd-devel
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -368,6 +376,11 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 source "$HOME/.cargo/env"
 rpm -qa | sort > "$HOME/sigil-dev-rpms.txt"
 ```
+
+`gstreamer1-devel` supplies the core API and
+`gstreamer1-plugins-base-devel` supplies the app/video APIs linked by the
+optional in-process backend. They are build dependencies only; do not copy
+headers or development libraries into the Sigil runtime archive.
 
 The toolchain pinned by the repository must be Rust 1.91 or newer. Save the
 container digest and exact RPM NEVRAs with the evidence. Distrobox is
@@ -943,7 +956,20 @@ gst-inspect-1.0 | awk '
     -e '/^[[:space:]]*device-path[[:space:]]*:/,+4p' \
     -e '/^[[:space:]]*rate-control[[:space:]]*:/,+20p'
 done
+
+for element in appsink pipewiresrc queue videoconvert videoscale videorate h264parse fdsink; do
+  gst-inspect-1.0 "$element" >/dev/null
+done
+
+rpm -q gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-bad-free
 ```
+
+Record the exact runtime package NEVRAs. `appsink` is mandatory for a binary
+built with the in-process feature, and the package installer must resolve its
+linked GStreamer core/app/video libraries with `ldd`. `pipewiresrc`,
+conversion/parser elements, and the chosen GstVA plugin remain required for
+either video backend. The external `gst-launch` path is also still used for
+audio capture when audio is enabled.
 
 ### Grant the gaming user only the uinput capability
 
@@ -1047,6 +1073,7 @@ xwayland_display = ":0"
 pw_dump_path = "$pw_dump_path"
 gst_launch_path = "$gst_launch_path"
 gst_inspect_path = "$gst_inspect_path"
+encoder_backend = "external-gst-launch"
 vaapi_encoder = "$vaapi_encoder"
 vaapi_render_node = "$render_node"
 rate_control = "cbr"
@@ -1054,6 +1081,21 @@ bitrate_kbps = 12000
 EOF
 chmod 0600 "$probe_config"
 ```
+
+Omitting `encoder_backend` has the same external default. After the external
+baseline passes, a locally built Linux binary containing the feature can use:
+
+```toml
+encoder_backend = "in-process-gstreamer"
+```
+
+That selection is not an availability hint: a binary without the feature, a
+missing `appsink`, or an unavailable encoder factory makes preflight fail. The
+foundation currently requires CBR, and a bitrate property that is not mutable
+while PLAYING also fails the control preflight. Runtime bitrate control is
+acknowledged only after exact property readback. CQP remains on the external
+compatibility backend until its in-process force-keyframe path is implemented
+and proven separately.
 
 The configured `:0` is a bootstrap connection, not a fixed input target.
 Gamescope may move mouse focus between its `:0` and `:1` Xwayland servers.
@@ -1177,6 +1219,10 @@ For a factory that advertises only CQP, replace the last two settings with:
 rate_control = "cqp"
 quantizer = 24
 ```
+
+Keep `encoder_backend = "external-gst-launch"` for CQP. The current
+in-process foundation rejects CQP rather than implying runtime control that it
+does not implement.
 
 If `pw-dump` exposes an additional stable GPU identity on the Gamescope node,
 add it as an exact match; do not add a changing global ID, node ID, client ID,

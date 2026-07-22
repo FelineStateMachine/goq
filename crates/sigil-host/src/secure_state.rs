@@ -46,8 +46,37 @@ pub fn validate_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn open_lifetime_lock(directory: &Path, file_name: &str) -> Result<File> {
-    validate_private_directory(directory)?;
+#[derive(Debug)]
+pub enum LockAcquireError {
+    Busy,
+    Unsafe(anyhow::Error),
+}
+
+impl std::fmt::Display for LockAcquireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => {
+                formatter.write_str("another Sigil daemon already owns this state directory")
+            }
+            Self::Unsafe(error) => write!(formatter, "unsafe lock storage: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LockAcquireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Busy => None,
+            Self::Unsafe(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+pub fn try_open_lifetime_lock(
+    directory: &Path,
+    file_name: &str,
+) -> std::result::Result<File, LockAcquireError> {
+    validate_private_directory(directory).map_err(LockAcquireError::Unsafe)?;
     let path = directory.join(file_name);
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
@@ -57,19 +86,22 @@ pub fn open_lifetime_lock(directory: &Path, file_name: &str) -> Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     let file = options
         .open(&path)
-        .with_context(|| format!("opening lifecycle lock {}", path.display()))?;
-    validate_private_file(&file, &path)?;
+        .with_context(|| format!("opening lifecycle lock {}", path.display()))
+        .map_err(LockAcquireError::Unsafe)?;
+    validate_private_file(&file, &path).map_err(LockAcquireError::Unsafe)?;
 
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
 
         let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        ensure!(
-            status == 0,
-            "another Sigil daemon already owns this state directory: {}",
-            std::io::Error::last_os_error()
-        );
+        if status != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(LockAcquireError::Busy);
+            }
+            return Err(LockAcquireError::Unsafe(error.into()));
+        }
     }
 
     Ok(file)
@@ -117,9 +149,21 @@ pub fn atomic_write(
     bytes: &[u8],
     maximum_bytes: u64,
 ) -> Result<()> {
+    let mut terminated = Vec::with_capacity(bytes.len().saturating_add(1));
+    terminated.extend_from_slice(bytes);
+    terminated.push(b'\n');
+    atomic_write_exact(directory, file_name, &terminated, maximum_bytes)
+}
+
+pub fn atomic_write_exact(
+    directory: &Path,
+    file_name: &str,
+    bytes: &[u8],
+    maximum_bytes: u64,
+) -> Result<()> {
     validate_private_directory(directory)?;
     ensure!(
-        (bytes.len() as u64).saturating_add(1) <= maximum_bytes,
+        bytes.len() as u64 <= maximum_bytes,
         "private state file exceeds its fixed size bound"
     );
     let mut random = [0_u8; 8];
@@ -143,7 +187,6 @@ pub fn atomic_write(
     })?;
     let result = (|| -> Result<()> {
         file.write_all(bytes)?;
-        file.write_all(b"\n")?;
         file.sync_all()?;
         fs::rename(&temporary, &destination)?;
         File::open(directory)?.sync_all()?;
@@ -153,6 +196,38 @@ pub fn atomic_write(
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+pub fn remove_file_if_exists(directory: &Path, file_name: &str) -> Result<bool> {
+    validate_private_directory(directory)?;
+    let path = directory.join(file_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(
+                !metadata.file_type().is_symlink() && metadata.is_file(),
+                "private state cleanup target is not a regular file"
+            );
+            #[cfg(unix)]
+            {
+                ensure!(
+                    metadata.mode() & 0o077 == 0,
+                    "private state cleanup target is accessible by group or others"
+                );
+                ensure!(
+                    metadata.uid() == unsafe { libc::geteuid() },
+                    "private state cleanup target has the wrong owner"
+                );
+            }
+            fs::remove_file(&path)
+                .with_context(|| format!("removing private state {}", path.display()))?;
+            File::open(directory)?.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspecting private state {}", path.display()))
+        }
+    }
 }
 
 fn validate_private_file(file: &File, path: &Path) -> Result<()> {
@@ -195,10 +270,13 @@ mod tests {
     #[test]
     fn lifetime_lock_is_exclusive_and_reacquirable() {
         let directory = private_directory();
-        let first = open_lifetime_lock(directory.path(), "daemon-v1.lock").unwrap();
-        assert!(open_lifetime_lock(directory.path(), "daemon-v1.lock").is_err());
+        let first = try_open_lifetime_lock(directory.path(), "daemon-v1.lock").unwrap();
+        assert!(matches!(
+            try_open_lifetime_lock(directory.path(), "daemon-v1.lock"),
+            Err(LockAcquireError::Busy)
+        ));
         drop(first);
-        open_lifetime_lock(directory.path(), "daemon-v1.lock").unwrap();
+        try_open_lifetime_lock(directory.path(), "daemon-v1.lock").unwrap();
     }
 
     #[test]
@@ -223,6 +301,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exact_atomic_state_preserves_bytes_and_cleanup_is_durable() {
+        let directory = private_directory();
+        atomic_write_exact(directory.path(), "config.toml", b"x = 1\n\n", 64).unwrap();
+        assert_eq!(
+            read_bounded(directory.path(), "config.toml", 64)
+                .unwrap()
+                .unwrap(),
+            b"x = 1\n\n"
+        );
+        assert!(remove_file_if_exists(directory.path(), "config.toml").unwrap());
+        assert!(!remove_file_if_exists(directory.path(), "config.toml").unwrap());
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_symlink_and_permissive_state() {
@@ -234,6 +326,9 @@ mod tests {
         assert!(read_bounded(directory.path(), "status.json", 64).is_err());
 
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(open_lifetime_lock(directory.path(), "daemon-v1.lock").is_err());
+        assert!(matches!(
+            try_open_lifetime_lock(directory.path(), "daemon-v1.lock"),
+            Err(LockAcquireError::Unsafe(_))
+        ));
     }
 }

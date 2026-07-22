@@ -186,8 +186,11 @@ invitation never silently replaces a working enrollment.
 Provision a dedicated AMD host with the
 [fresh Bazzite host runbook](docs/fresh-bazzite-host.md). The runbook also
 defines the temporary `slate` stand-in used for protocol and daemon extraction.
-The [appliance status v1 contract](docs/sigil-appliance-status-v1.md) defines
-the local, redacted interface intended for the Decky management surface.
+The backward-compatible [appliance status v1 contract](docs/sigil-appliance-status-v1.md)
+and explicit [v2 contract](docs/sigil-appliance-status-v2.md) define the local,
+redacted interface intended for the Decky management surface.
+The [transactional configuration v1 contract](docs/sigil-appliance-config-v1.md)
+defines its bounded, crash-recoverable settings workflow.
 The [enrollment reset v1 contract](docs/sigil-appliance-enrollment-reset-v1.md)
 defines the offline, identity-preserving reset used by that surface.
 Run `scripts/bazzite-inventory.sh` on a candidate host for a read-only report;

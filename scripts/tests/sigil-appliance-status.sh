@@ -43,8 +43,13 @@ config_path="$temp_root/host.toml"
 host_log="$temp_root/host.log"
 second_log="$temp_root/second.log"
 live_status="$temp_root/live-status.json"
+legacy_status="$temp_root/legacy-status.json"
 stopped_status="$temp_root/stopped-status.json"
 reset_status="$temp_root/reset-status.json"
+config_show="$temp_root/config-show.json"
+config_request="$temp_root/config-request.json"
+config_set="$temp_root/config-set.json"
+candidate_status="$temp_root/candidate-status.json"
 
 mkdir -m 0700 "$identity_directory" "$state_directory" "$runtime_directory"
 "$sigil" identity init --output "$identity_path" >"$temp_root/identity.log"
@@ -90,7 +95,43 @@ if [[ "$ready" != 'true' ]]; then
 fi
 
 XDG_RUNTIME_DIR="$runtime_directory" \
-  "$sigil" appliance status --config "$config_path" --json >"$live_status"
+  "$sigil" appliance status --config "$config_path" --json --schema-version 2 >"$live_status"
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance status --config "$config_path" --json >"$legacy_status"
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance config show --config "$config_path" --json \
+  >"$temp_root/live-config-show.json"
+python3 - "$temp_root/live-config-show.json" "$temp_root/live-config-request.json" <<'PY'
+import json
+import pathlib
+import sys
+show = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+request = {
+    "schema_version": 1,
+    "expected_revision": show["revision"],
+    "settings": {
+        "resolution": {"mode": "native"},
+        "framerate": 72,
+        "rate_control": None,
+    },
+}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(request), encoding="utf-8")
+PY
+if XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance config set --config "$config_path" --json \
+  <"$temp_root/live-config-request.json" >"$temp_root/live-config-set.out" \
+  2>"$temp_root/live-config-set.error"; then
+  printf 'config set unexpectedly mutated a live Sigil daemon\n' >&2
+  exit 1
+fi
+python3 - "$temp_root/live-config-set.error" <<'PY'
+import json
+import pathlib
+import sys
+error = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if error != {"schema_version": 1, "error": {"code": "lifecycle_busy"}}:
+    raise SystemExit(f"unexpected live config error: {error}")
+PY
 
 if XDG_RUNTIME_DIR="$runtime_directory" \
   "$sigil" serve \
@@ -115,7 +156,7 @@ raw = path.read_text(encoding="utf-8")
 status = json.loads(raw)
 host_node_id = sys.argv[2]
 
-if status.get("schema_version") != 1:
+if status.get("schema_version") != 2:
     raise SystemExit("unexpected appliance status schema")
 if status.get("overall") != "ready":
     raise SystemExit(f"unexpected live overall state: {status.get('overall')}")
@@ -123,6 +164,10 @@ if status.get("runtime", {}).get("daemon") != "ready":
     raise SystemExit("live daemon state is not ready")
 if status.get("runtime", {}).get("session") != "inactive":
     raise SystemExit("live proof unexpectedly reports a session")
+if not status.get("runtime", {}).get("loaded_config_revision", "").startswith("sha256:"):
+    raise SystemExit("live runtime is not bound to an exact config revision")
+if status.get("runtime", {}).get("reached_ready") is not True:
+    raise SystemExit("live runtime did not retain its ready transition")
 if status.get("enrollment", {}).get("state") != "none":
     raise SystemExit("direct proof unexpectedly reports an enrollment")
 if host_node_id in raw:
@@ -130,6 +175,21 @@ if host_node_id in raw:
 fingerprint = status.get("identity", {}).get("host_fingerprint", "")
 if len(fingerprint) != 17 or "…" not in fingerprint:
     raise SystemExit("host fingerprint is not bounded and redacted")
+PY
+
+python3 - "$legacy_status" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if status.get("schema_version") != 1:
+    raise SystemExit("default appliance status did not preserve schema v1")
+if "revision" in status.get("config", {}) or "pending_transaction" in status.get("config", {}):
+    raise SystemExit("status v1 leaked status-v2 config fields")
+runtime = status.get("runtime", {})
+if any(field in runtime for field in ("instance_id", "loaded_config_revision", "reached_ready")):
+    raise SystemExit("status v1 leaked status-v2 runtime fields")
 PY
 
 host_fingerprint="$(python3 - "$live_status" <<'PY'
@@ -172,7 +232,7 @@ XDG_RUNTIME_DIR="$runtime_directory" \
     --expected-host-fingerprint "$host_fingerprint" \
     --json >"$reset_status"
 XDG_RUNTIME_DIR="$runtime_directory" \
-  "$sigil" appliance status --config "$config_path" --json >"$stopped_status"
+  "$sigil" appliance status --config "$config_path" --json --schema-version 2 >"$stopped_status"
 
 python3 - "$stopped_status" "$reset_status" "$host_node_id" <<'PY'
 import json
@@ -190,6 +250,10 @@ if runtime.get("session") != "inactive":
     raise SystemExit("stopped daemon did not report an inactive session")
 if runtime.get("uptime_ms") is not None:
     raise SystemExit("stopped daemon retained a live uptime")
+if not runtime.get("instance_id"):
+    raise SystemExit("fresh stopped state omitted its daemon instance")
+if runtime.get("reached_ready") is not True:
+    raise SystemExit("fresh stopped state forgot that it reached ready")
 if reset.get("schema_version") != 1 or reset.get("operation") != "enrollment_reset":
     raise SystemExit("unexpected enrollment reset schema")
 if reset.get("had_enrollment") is not False:
@@ -203,6 +267,141 @@ if host_node_id in reset_raw:
 if status.get("enrollment", {}).get("epoch") != reset.get("current_epoch"):
     raise SystemExit("status does not reflect the enrollment reset epoch")
 PY
+
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance config show --config "$config_path" --json >"$config_show"
+python3 - "$config_show" "$config_request" <<'PY'
+import json
+import pathlib
+import sys
+
+show = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if show.get("schema_version") != 1 or show.get("pending_transaction") is not None:
+    raise SystemExit("unexpected initial config projection")
+request = {
+    "schema_version": 1,
+    "expected_revision": show["revision"],
+    "settings": {
+        "resolution": {"mode": "native"},
+        "framerate": 72,
+        "rate_control": None,
+    },
+}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(request), encoding="utf-8")
+PY
+
+base_hash="$(python3 - "$config_path" <<'PY'
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance config validate --config "$config_path" --json \
+  <"$config_request" >"$temp_root/config-validate.json"
+[[ "$base_hash" == "$(python3 - "$config_path" <<'PY'
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)" ]]
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance config set --config "$config_path" --json \
+  <"$config_request" >"$config_set"
+
+transaction="$(python3 - "$config_set" <<'PY'
+import json
+import pathlib
+import sys
+result = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if result.get("changed") is not True or result.get("restart_required") is not True:
+    raise SystemExit("config set did not require candidate validation")
+print(result["transaction"])
+PY
+)"
+
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" serve --config "$config_path" --max-runtime-seconds 1 \
+  >"$temp_root/candidate.log" 2>&1
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance status --config "$config_path" --json --schema-version 2 >"$candidate_status"
+candidate_instance="$(python3 - "$candidate_status" "$config_set" <<'PY'
+import json
+import pathlib
+import sys
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+staged = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+runtime = status["runtime"]
+if runtime.get("daemon") != "stopped" or runtime.get("reached_ready") is not True:
+    raise SystemExit("candidate did not stop cleanly after reaching ready")
+if runtime.get("loaded_config_revision") != staged.get("candidate_revision"):
+    raise SystemExit("candidate runtime revision does not match staged config")
+if status.get("config", {}).get("pending_transaction", {}).get("transaction") != staged.get("transaction"):
+    raise SystemExit("status omitted the pending config transaction")
+print(runtime["instance_id"])
+PY
+)"
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance config commit \
+    --config "$config_path" \
+    --transaction "$transaction" \
+    --expected-instance "$candidate_instance" \
+    --json >"$temp_root/config-commit.json"
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance config show --config "$config_path" --json \
+  >"$temp_root/committed-show.json"
+
+python3 - "$temp_root/committed-show.json" "$temp_root/rollback-request.json" <<'PY'
+import json
+import pathlib
+import sys
+show = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if show.get("pending_transaction") is not None or show["settings"]["framerate"] != 72:
+    raise SystemExit("committed config state is incorrect")
+request = {
+    "schema_version": 1,
+    "expected_revision": show["revision"],
+    "settings": {
+        "resolution": {"mode": "fixed", "width": 1280, "height": 800},
+        "framerate": 60,
+        "rate_control": None,
+    },
+}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(request), encoding="utf-8")
+PY
+committed_hash="$(python3 - "$config_path" <<'PY'
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance config set --config "$config_path" --json \
+  <"$temp_root/rollback-request.json" >"$temp_root/rollback-set.json"
+rollback_transaction="$(python3 - "$temp_root/rollback-set.json" <<'PY'
+import json
+import pathlib
+import sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["transaction"])
+PY
+)"
+XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" appliance config rollback \
+    --config "$config_path" --transaction "$rollback_transaction" --json \
+    >"$temp_root/config-rollback.json"
+[[ "$committed_hash" == "$(python3 - "$config_path" <<'PY'
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)" ]]
+[[ ! -e "$state_directory/config-transaction-v1.json" ]]
+[[ ! -e "$state_directory/config-base-v1.toml" ]]
+[[ ! -e "$state_directory/config-candidate-v1.toml" ]]
 
 if env -u XDG_RUNTIME_DIR \
   "$sigil" serve --config "$config_path" --max-runtime-seconds 1 \

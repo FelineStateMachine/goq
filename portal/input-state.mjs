@@ -51,9 +51,9 @@ export function resolvePointerSurfaceSize(
   pointerSurfaceDimensions,
   frameWidth,
   frameHeight,
-  relativePointer,
+  _relativePointer,
 ) {
-  if (relativePointer && pointerSurfaceDimensions !== null) {
+  if (pointerSurfaceDimensions !== null) {
     return pointerSurfaceDimensions;
   }
   if (
@@ -63,6 +63,29 @@ export function resolvePointerSurfaceSize(
     || frameHeight <= 0
   ) return null;
   return { width: frameWidth, height: frameHeight };
+}
+
+export function mapCanvasPointToSurface({ clientX, clientY, rect, surface }) {
+  if (
+    !Number.isFinite(clientX)
+    || !Number.isFinite(clientY)
+    || !Number.isFinite(rect?.left)
+    || !Number.isFinite(rect?.top)
+    || !Number.isFinite(rect?.width)
+    || rect.width <= 0
+    || !Number.isFinite(rect?.height)
+    || rect.height <= 0
+    || !Number.isSafeInteger(surface?.width)
+    || surface.width <= 0
+    || !Number.isSafeInteger(surface?.height)
+    || surface.height <= 0
+  ) return null;
+  return {
+    x: Math.max(0, Math.min(surface.width - 1,
+      Math.floor((clientX - rect.left) * surface.width / rect.width))),
+    y: Math.max(0, Math.min(surface.height - 1,
+      Math.floor((clientY - rect.top) * surface.height / rect.height))),
+  };
 }
 
 export function validatePointerPositionFeedback(value, surface = null) {

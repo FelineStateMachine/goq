@@ -9,7 +9,7 @@ import {
 
 function frameEnvelope({
   codec = 1,
-  flags = 3,
+  flags = 7,
   width = 1280,
   height = 800,
   payload = Uint8Array.of(0, 0, 0, 1, 0x65),
@@ -42,6 +42,7 @@ test('parses an exact v1 frame envelope without copying its payload', () => {
       codec: frame.codec,
       keyframe: frame.keyframe,
       discontinuity: frame.discontinuity,
+      codecConfig: frame.codecConfig,
       sequence: frame.sequence,
       captureTimestampMicros: frame.captureTimestampMicros,
       ptsMicros: frame.ptsMicros,
@@ -52,6 +53,7 @@ test('parses an exact v1 frame envelope without copying its payload', () => {
       codec: 'h264',
       keyframe: true,
       discontinuity: true,
+      codecConfig: true,
       sequence: 42,
       captureTimestampMicros: 123456,
       ptsMicros: 98765,
@@ -79,6 +81,7 @@ test('rejects malformed identity, version, codec, flags, and reserved fields', (
     (bytes) => { bytes[4] = 2; },
     (bytes) => { bytes[5] = 0; },
     (bytes) => { bytes[6] = 0x80; },
+    (bytes) => { bytes[6] = 0b100; },
     (bytes) => { bytes[7] = 1; },
   ];
   for (const mutate of mutations) {

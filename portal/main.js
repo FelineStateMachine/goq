@@ -17,6 +17,7 @@ import {
   MAX_HELD_MOUSE_BUTTONS,
   PointerMotionBuffer,
   browserPointerLockLossRequiresControlExit,
+  mapCanvasPointToSurface,
   resolvePointerSurfaceSize,
   restoreRejectedPointerMotion,
   scaleRelativePointerDelta,
@@ -86,7 +87,9 @@ import {
   constrainStreamWindowResize,
   fitInitialStreamWindow,
   fitStreamSurface,
+  streamAspectKey,
 } from './window-geometry.mjs';
+import { VideoFormatTransitionGuard } from './video-format-transition.mjs';
 import { buildVideoDecoderConfig } from './video-decoder-config.mjs';
 import {
   DECODER_RECOVERY_REASONS,
@@ -123,7 +126,8 @@ let inputCapabilities = {
 };
 let frameWidth = 0;
 let frameHeight = 0;
-let fittedStreamDimensions = null;
+let fittedStreamAspect = null;
+let pendingStreamFit = null;
 let lastObservedWindowSize = null;
 let streamWindowResizeTimer = null;
 let pointerSurfaceDimensions = null;
@@ -132,6 +136,7 @@ let remotePointerVisible = false;
 let activeFrameChannel = null;
 let activeFrameGeneration = null;
 let activeFrameSession = null;
+let activeVideoFormatEpoch = 0;
 let activeAudioChannel = null;
 let activePointerChannel = null;
 let activePointerSession = null;
@@ -1001,7 +1006,8 @@ async function disconnect() {
     control: false,
   };
   pointerSurfaceDimensions = null;
-  fittedStreamDimensions = null;
+  fittedStreamAspect = null;
+  pendingStreamFit = null;
   lastObservedWindowSize = null;
   if (streamWindowResizeTimer !== null) clearTimeout(streamWindowResizeTimer);
   streamWindowResizeTimer = null;
@@ -1122,6 +1128,7 @@ function requestDecoderKeyframe(reason) {
 const decoderRecovery = new DecoderRecoveryState({
   onKeyframeRequest: requestDecoderKeyframe,
 });
+const videoFormatTransition = new VideoFormatTransitionGuard();
 
 function enterDecoderRecovery(reason, { restart = false, requestKeyframe = true } = {}) {
   const result = restart
@@ -1231,6 +1238,8 @@ function teardownDecoderPipeline() {
 function resetStreamTelemetry() {
   teardownDecoderPipeline();
   decoderRecovery.reset();
+  videoFormatTransition.reset();
+  activeVideoFormatEpoch = 0;
   droppedFrames = 0;
   transportDroppedFrames = 0;
   transportObjectDroppedFrames = null;
@@ -1492,8 +1501,10 @@ async function applyClientWindowGeometry(geometry, unmaximize) {
 
 async function fitWindowToIncomingStream() {
   if (!connected || frameWidth < 1 || frameHeight < 1) return false;
-  const dimensions = `${frameWidth}x${frameHeight}`;
-  if (fittedStreamDimensions === dimensions) return false;
+  const aspect = streamAspectKey(frameWidth, frameHeight);
+  if (fittedStreamAspect === aspect || pendingStreamFit?.aspect === aspect) return false;
+  const request = { aspect, generation: activeFrameGeneration, epoch: activeVideoFormatEpoch };
+  pendingStreamFit = request;
   const geometry = fitInitialStreamWindow({
     frameWidth,
     frameHeight,
@@ -1502,8 +1513,17 @@ async function fitWindowToIncomingStream() {
     availableHeight: window.screen.availHeight,
   });
   const applied = await applyClientWindowGeometry(geometry, true);
-  if (applied) fittedStreamDimensions = dimensions;
-  return applied;
+  const currentAspect = frameWidth > 0 && frameHeight > 0
+    ? streamAspectKey(frameWidth, frameHeight)
+    : null;
+  const current = pendingStreamFit === request
+    && connected
+    && activeFrameGeneration === request.generation
+    && activeVideoFormatEpoch === request.epoch
+    && currentAspect === request.aspect;
+  if (pendingStreamFit === request) pendingStreamFit = null;
+  if (applied && current) fittedStreamAspect = request.aspect;
+  return applied && current;
 }
 
 function scheduleStreamWindowAspectCorrection() {
@@ -1534,27 +1554,49 @@ function scheduleStreamWindowAspectCorrection() {
   }, 80);
 }
 
+function commitVideoFrame(plan, keyframe, enqueued) {
+  if (!enqueued) {
+    finishVideoChunkEnqueue(keyframe, false);
+    return false;
+  }
+  let committed;
+  try {
+    committed = videoFormatTransition.commit(plan);
+  } catch (error) {
+    console.warn('discarding stale video format transaction:', error);
+    enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
+    return false;
+  }
+  if (plan.reconfigure) {
+    activeCodec = committed.format.codec;
+    frameWidth = committed.format.width;
+    frameHeight = committed.format.height;
+    activeVideoFormatEpoch = committed.epoch;
+    if (canvas.width !== frameWidth) canvas.width = frameWidth;
+    if (canvas.height !== frameHeight) canvas.height = frameHeight;
+    sizeCanvasToIncomingStream();
+    if (connected) void fitWindowToIncomingStream();
+  }
+  finishVideoChunkEnqueue(keyframe, true);
+  return true;
+}
+
 function processFramePayload(payload, binaryData = null) {
   const receivedAt = performance.now();
   frontendDeliveryRate.record(receivedAt);
   frontendDeliveryCadence.record(receivedAt);
-  const { width, height, data, codec, keyframe, pts_micros: ptsMicros, discontinuity } = payload;
+  const {
+    width,
+    height,
+    data,
+    codec = 'h264',
+    keyframe,
+    codecConfig = keyframe,
+    sequence = null,
+    pts_micros: ptsMicros,
+    discontinuity = false,
+  } = payload;
   if (discontinuity) resetAvSyncTelemetry();
-  const dimensionsChanged = frameWidth !== width || frameHeight !== height;
-  frameWidth = width;
-  frameHeight = height;
-  if (canvas.width !== width) canvas.width = width;
-  if (canvas.height !== height) canvas.height = height;
-  if (dimensionsChanged) sizeCanvasToIncomingStream();
-  if (dimensionsChanged && connected) void fitWindowToIncomingStream();
-
-  if (codec && codec !== activeCodec) {
-    activeCodec = codec;
-    decoderConfigured = false;
-    enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
-    console.log('codec changed:', activeCodec);
-  }
-
   receivedFrames++;
 
   if (hasWebCodecs) {
@@ -1562,14 +1604,48 @@ function processFramePayload(payload, binaryData = null) {
     // base64 branch only supports an older in-process sender during migration.
     const raw = binaryData ?? Uint8Array.from(atob(data), c => c.charCodeAt(0));
     const decoderBacklogged = videoDecoder?.decodeQueueSize >= MAX_DECODE_QUEUE_SIZE;
-    if (discontinuity) {
+    if (decoderBacklogged) {
+      enterDecoderRecovery(DECODER_RECOVERY_REASONS.FRONTEND_BACKPRESSURE);
+    }
+    const decoderBoundary = discontinuity || !decoderConfigured;
+    let formatPlan;
+    try {
+      formatPlan = videoFormatTransition.plan({
+        sequence,
+        codec,
+        width,
+        height,
+        keyframe,
+        codecConfig,
+        discontinuity: decoderBoundary,
+      });
+    } catch (error) {
+      console.warn('invalid video format transition:', error);
+      droppedFrames++;
+      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
+      return;
+    }
+    if (formatPlan.action === 'drop-stale') {
+      droppedFrames++;
+      return;
+    }
+    if (formatPlan.action === 'recover') {
+      droppedFrames++;
+      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
+      return;
+    }
+    if (formatPlan.reconfigure) {
       // A delivered discontinuity keyframe is the recovery boundary we were
       // waiting for, not evidence that another keyframe is missing.
-      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DISCONTINUITY, {
-        requestKeyframe: !keyframe,
-      });
-    } else if (decoderBacklogged) {
-      enterDecoderRecovery(DECODER_RECOVERY_REASONS.FRONTEND_BACKPRESSURE);
+      if (discontinuity) {
+        enterDecoderRecovery(DECODER_RECOVERY_REASONS.DISCONTINUITY, {
+          requestKeyframe: !keyframe,
+        });
+      } else {
+        enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET, {
+          requestKeyframe: false,
+        });
+      }
     }
     if (decoderRecovery.shouldDropFrame({ keyframe })) {
       if (!decoderRecovery.requestIssued) {
@@ -1583,12 +1659,12 @@ function processFramePayload(payload, binaryData = null) {
       ? mediaPtsMicros
       : performance.now() * 1000;
 
-    if (activeCodec === 'av1') {
+    if (codec === 'av1') {
       // ── AV1 path ──
       const obus = parseAv1Obus(raw);
       if (keyframe) {
         const seqHeader = obus.find(o => o.type === 12);
-        if (seqHeader && !decoderConfigured) {
+        if (seqHeader && formatPlan.reconfigure) {
           initWebCodecsDecoder(width, height, buildAv1Description(seqHeader.data), av1CodecStr(seqHeader.data));
         }
       }
@@ -1606,10 +1682,10 @@ function processFramePayload(payload, binaryData = null) {
           data: chunkData,
         });
         const enqueued = enqueueVideoChunk(chunk, receivedAt, 'av1', mediaPtsMicros);
-        finishVideoChunkEnqueue(keyframe, enqueued);
+        commitVideoFrame(formatPlan, keyframe, enqueued);
       }
 
-    } else if (activeCodec === 'h265') {
+    } else if (codec === 'h265') {
       // ── H.265 path ──
       const nals = parseAnnexBNals(raw);
       if (keyframe) {
@@ -1620,7 +1696,7 @@ function processFramePayload(payload, binaryData = null) {
           else if (t === 33) sps = nal;
           else if (t === 34) pps = nal;
         }
-        if (vps && sps && pps && !decoderConfigured) {
+        if (vps && sps && pps && formatPlan.reconfigure) {
           initWebCodecsDecoder(width, height, buildHvcDescription(vps, sps, pps), hevcCodecStr(sps));
         }
       }
@@ -1636,7 +1712,7 @@ function processFramePayload(payload, binaryData = null) {
           data: nalsToLengthPrefixed(sliceNals),
         });
         const enqueued = enqueueVideoChunk(chunk, receivedAt, 'hevc', mediaPtsMicros);
-        finishVideoChunkEnqueue(keyframe, enqueued);
+        commitVideoFrame(formatPlan, keyframe, enqueued);
       }
 
     } else {
@@ -1649,7 +1725,7 @@ function processFramePayload(payload, binaryData = null) {
           if (t === 7) sps = nal;
           else if (t === 8) pps = nal;
         }
-        if (sps && pps && !decoderConfigured) {
+        if (sps && pps && formatPlan.reconfigure) {
           initWebCodecsDecoder(width, height, buildAvcDescription(sps, pps), avcCodecStr(sps));
         }
       }
@@ -1665,11 +1741,18 @@ function processFramePayload(payload, binaryData = null) {
           data: nalsToLengthPrefixed(sliceNals),
         });
         const enqueued = enqueueVideoChunk(chunk, receivedAt, 'h264', mediaPtsMicros);
-        finishVideoChunkEnqueue(keyframe, enqueued);
+        commitVideoFrame(formatPlan, keyframe, enqueued);
       }
     }
   } else {
     // JPEG fallback (openh264 decode → JPEG encode in Rust)
+    const dimensionsChanged = frameWidth !== width || frameHeight !== height;
+    frameWidth = width;
+    frameHeight = height;
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+    if (dimensionsChanged) sizeCanvasToIncomingStream();
+    if (dimensionsChanged && connected) void fitWindowToIncomingStream();
     const bytes = Uint8Array.from(atob(data), c => c.charCodeAt(0));
     const blob = new Blob([bytes], { type: 'image/jpeg' });
     const url = URL.createObjectURL(blob);
@@ -1745,6 +1828,8 @@ function handleBinaryFrameMessage(message, session) {
       data: null,
       codec: frame.codec,
       keyframe: frame.keyframe,
+      codecConfig: frame.codecConfig,
+      sequence: frame.sequence,
       pts_micros: frame.ptsMicros,
       discontinuity: frame.discontinuity,
     }, frame.data);
@@ -2214,12 +2299,12 @@ function updateControlUI() {
 
 function scaleCoords(clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
-  const scaleX = frameWidth / rect.width;
-  const scaleY = frameHeight / rect.height;
-  return {
-    x: Math.round((clientX - rect.left) * scaleX),
-    y: Math.round((clientY - rect.top) * scaleY),
-  };
+  return mapCanvasPointToSurface({
+    clientX,
+    clientY,
+    rect,
+    surface: currentPointerSurfaceSize(),
+  }) ?? { x: 0, y: 0 };
 }
 
 function mapKey(e) {

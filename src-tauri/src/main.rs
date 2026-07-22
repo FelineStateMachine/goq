@@ -96,6 +96,7 @@ fn main() {
             commands::network::iroh_client_disconnect,
             commands::network::iroh_client_ack_frame,
             commands::network::iroh_client_request_keyframe,
+            commands::network::iroh_client_send_media_feedback,
             commands::network::iroh_client_ack_audio,
             commands::network::iroh_client_stop_audio,
             commands::network::iroh_client_send_input,

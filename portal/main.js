@@ -93,6 +93,11 @@ import {
   DecoderRecoveryState,
 } from './decoder-recovery.mjs';
 import {
+  AdaptiveFeedbackPublisher,
+  formatAdaptiveDecision,
+  normalizeAdaptiveDecisionEnvelope,
+} from './adaptive-feedback.mjs';
+import {
   formatInvitationExpiry,
   grantLabel,
   normalizeInvitationSummary,
@@ -229,6 +234,10 @@ function handlePointerPositionFeedback(message, session) {
 
 const invoke = (...args) => window.__TAURI__.core.invoke(...args);
 const listen = (...args) => window.__TAURI__.event.listen(...args);
+const adaptiveFeedbackPublisher = new AdaptiveFeedbackPublisher({ invokeCommand: invoke });
+let adaptiveFeedbackAvailable = false;
+let adaptiveFeedbackError = null;
+let adaptiveDecision = null;
 
 function updatePanelVisibility() {
   const streamSection = document.getElementById('stream-section');
@@ -762,6 +771,10 @@ async function connectHost() {
     if (activeFrameSession) activeFrameSession.closing = true;
     activeFrameSession = null;
     activeFrameGeneration = null;
+    adaptiveFeedbackPublisher.stop();
+    adaptiveFeedbackAvailable = false;
+    adaptiveFeedbackError = null;
+    adaptiveDecision = null;
     resetStreamTelemetry();
     pointerSurfaceDimensions = null;
     remotePointerPosition = null;
@@ -818,6 +831,10 @@ async function connectHost() {
       : null;
     if (result.connected) {
       activateConnectedFrameSession(frameSession, result.media_generation);
+      adaptiveFeedbackAvailable = result.adaptive_feedback_available === true;
+      adaptiveFeedbackError = typeof result.adaptive_feedback_error === 'string'
+        ? result.adaptive_feedback_error : null;
+      adaptiveFeedbackPublisher.start(result.media_generation, adaptiveFeedbackAvailable);
       connected = true;
       disconnecting = false;
       inputCapabilities = {
@@ -918,6 +935,9 @@ async function connectHost() {
     if (frameSession) frameSession.closing = true;
     if (activeFrameSession === frameSession) activeFrameSession = null;
     activeFrameGeneration = null;
+    adaptiveFeedbackPublisher.stop();
+    adaptiveFeedbackAvailable = false;
+    adaptiveDecision = null;
     if (rustConnectionCommitted) {
       // Rust commits its active-connection guard before returning. A client-side
       // validation failure must close that exact committed attempt directly;
@@ -946,6 +966,10 @@ async function disconnect() {
   if (activeFrameSession) activeFrameSession.closing = true;
   activeFrameSession = null;
   activeFrameGeneration = null;
+  adaptiveFeedbackPublisher.stop();
+  adaptiveFeedbackAvailable = false;
+  adaptiveFeedbackError = null;
+  adaptiveDecision = null;
   controlTransitionGeneration += 1;
   controlTransitionInProgress = false;
   controllerActivationGate.reset();
@@ -1082,6 +1106,7 @@ const MAX_DECODE_TIMINGS = 8;
 let streamPathMode = 'unknown';
 let streamTransportMode = 'unknown';
 let streamRttMs = null;
+let lastMediaSequence = null;
 const MAX_DECODE_QUEUE_SIZE = 2;
 
 function requestDecoderKeyframe(reason) {
@@ -1239,6 +1264,8 @@ function resetStreamTelemetry() {
   streamPathMode = 'unknown';
   streamTransportMode = 'unknown';
   streamRttMs = null;
+  lastMediaSequence = null;
+  adaptiveDecision = null;
 }
 
 function enqueueVideoChunk(chunk, receivedAt, codecLabel, mediaPtsMicros = null) {
@@ -1393,6 +1420,31 @@ function updateStreamStats() {
   document.getElementById('stream-rtt').textContent = Number.isFinite(streamRttMs)
     ? `${streamRttMs.toFixed(1)} ms`
     : '— ms';
+  document.getElementById('stream-adaptive-feedback').textContent = adaptiveFeedbackAvailable
+    ? 'authenticated · 1 Hz bounded reports'
+    : adaptiveFeedbackError || 'unavailable';
+  document.getElementById('stream-adaptive-decision').textContent = formatAdaptiveDecision(
+    adaptiveDecision,
+    adaptiveFeedbackAvailable,
+  );
+
+  adaptiveFeedbackPublisher.publish({
+    lastSequence: lastMediaSequence,
+    frontendQueueDepth: frontendQueueStats?.depth ?? 0,
+    frontendQueueCapacity: frontendQueueStats?.capacity ?? 4,
+    decoderQueueDepth: videoDecoder?.decodeQueueSize ?? 0,
+    decoderQueueCapacity: MAX_DECODE_QUEUE_SIZE,
+    presenterQueueDepth: framePresenter.depth,
+    presenterQueueCapacity: 2,
+    transportDroppedTotal: transportDroppedFrames,
+    frontendDroppedTotal: frontendDroppedFrames,
+    decoderDroppedTotal: droppedFrames,
+    presenterDroppedTotal: presentationDroppedFrames,
+    deliveryLatencyP95Ms: frontendIpcSendDurationStats?.p95Ms ?? null,
+    decodeLatencyP95Ms: decodePercentiles.p95,
+    presentationLatencyP95Ms: presentPercentiles.p95,
+    resyncActive: decoderRecovery.recovering || frontendResyncStats?.active === true,
+  });
 }
 
 setInterval(() => {
@@ -1823,6 +1875,8 @@ listen('frame-stats', (event) => {
   streamRttMs = Number.isFinite(event.payload.path_rtt_ms)
     ? event.payload.path_rtt_ms
     : streamRttMs;
+  lastMediaSequence = Number.isSafeInteger(event.payload.sequence) && event.payload.sequence >= 0
+    ? event.payload.sequence : lastMediaSequence;
   lastTransportFps = Number.isFinite(event.payload.transport_receive_fps)
     ? event.payload.transport_receive_fps
     : Number.isFinite(event.payload.transport_fps)
@@ -1833,6 +1887,27 @@ listen('frame-stats', (event) => {
     : Number.isFinite(event.payload.frontend_fps)
       ? event.payload.frontend_fps
       : event.payload.fps;
+  updateStreamStats();
+});
+
+listen('adaptive-bitrate-decision', (event) => {
+  try {
+    const decision = normalizeAdaptiveDecisionEnvelope(event.payload, activeFrameGeneration);
+    if (decision === null) return;
+    adaptiveDecision = decision;
+    updateStreamStats();
+  } catch (error) {
+    console.warn('invalid adaptive bitrate diagnostic:', error);
+  }
+});
+
+listen('adaptive-feedback-state', (event) => {
+  if (!isCurrentFrameGeneration(event.payload?.generation, activeFrameGeneration)) return;
+  if (event.payload?.available !== false) return;
+  adaptiveFeedbackAvailable = false;
+  adaptiveFeedbackError = typeof event.payload.error === 'string'
+    ? event.payload.error : 'feedback stream closed';
+  adaptiveFeedbackPublisher.stop();
   updateStreamStats();
 });
 

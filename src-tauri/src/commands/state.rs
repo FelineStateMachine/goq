@@ -1,5 +1,5 @@
 use serde::Serialize;
-use sigil_protocol::KeyframeRequestReasonV3;
+use sigil_protocol::{KeyframeRequestReasonV3, MediaFeedbackReportV1};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -335,6 +335,8 @@ pub struct AppState {
     pub client_endpoint: TokioMutex<Option<iroh::Endpoint>>,
     pub media_connection: TokioMutex<Option<(u64, iroh::endpoint::Connection)>>,
     pub media_control: TokioMutex<Option<(u64, MediaControlRequestSender)>>,
+    pub media_feedback: TokioMutex<Option<(u64, iroh::endpoint::Connection, MediaFeedbackSender)>>,
+    pub media_feedback_report_id: Arc<AtomicU64>,
     pub frame_delivery: TokioMutex<Option<(u64, Arc<AtomicUsize>)>>,
     pub client_media_generation: Arc<AtomicU64>,
     pub audio_deliveries: Arc<StdMutex<AudioDeliveryState>>,
@@ -348,6 +350,7 @@ pub struct AppState {
 
 pub type MediaControlRequestSender =
     tokio::sync::mpsc::Sender<(KeyframeRequestReasonV3, Option<u64>)>;
+pub type MediaFeedbackSender = tokio::sync::watch::Sender<Option<MediaFeedbackReportV1>>;
 
 impl Default for AppState {
     fn default() -> Self {
@@ -371,6 +374,8 @@ impl AppState {
             client_endpoint: TokioMutex::new(None),
             media_connection: TokioMutex::new(None),
             media_control: TokioMutex::new(None),
+            media_feedback: TokioMutex::new(None),
+            media_feedback_report_id: Arc::new(AtomicU64::new(0)),
             frame_delivery: TokioMutex::new(None),
             client_media_generation: Arc::new(AtomicU64::new(0)),
             audio_deliveries: Arc::new(StdMutex::new(AudioDeliveryState::default())),
@@ -650,6 +655,7 @@ mod tests {
         assert!(state.client_endpoint.try_lock().unwrap().is_none());
         assert!(state.media_connection.try_lock().unwrap().is_none());
         assert!(state.media_control.try_lock().unwrap().is_none());
+        assert!(state.media_feedback.try_lock().unwrap().is_none());
         assert!(state.audio_connection.try_lock().unwrap().is_none());
     }
 

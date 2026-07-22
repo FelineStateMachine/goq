@@ -78,7 +78,13 @@ done
 real_config="$HOME/.config/sigil-spark/host.toml"
 real_sigil="$HOME/.local/libexec/sigil-spark/current/sigil"
 real_identity="$(sed -n 's/^identity_path = "\(.*\)"$/\1/p' "$real_config")"
+uinput_block="$(awk '
+  /^\[uinput\]$/ { emit = 1 }
+  emit && /^\[/ && $0 != "[uinput]" { exit }
+  emit { print }
+' "$real_config")"
 [[ -n "$real_identity" && -f "$real_identity" ]]
+[[ "$uinput_block" == '[uinput]'$'\n'* ]]
 [[ -x "$real_sigil" ]]
 original_ready() {
   local invocation pid
@@ -196,6 +202,7 @@ probe_node_id="$(sed -n 's/^node_id=//p' "$private/probe-identity.log")"
 
 pw_dump="$(command -v pw-dump)"
 pw_link="$(command -v pw-link)"
+xprop="$(command -v xprop)"
 gst_launch="$(command -v gst-launch-1.0)"
 gst_inspect="$(command -v gst-inspect-1.0)"
 ffmpeg="$(command -v ffmpeg)"
@@ -212,8 +219,10 @@ width = 1280
 height = 800
 framerate = 60
 codec = "h264"
-input_mode = "log"
+input_mode = "uinput"
 ffmpeg_path = "$ffmpeg"
+
+$uinput_block
 
 [gamescope_pipewire]
 node_name = "gamescope"
@@ -235,8 +244,10 @@ state_path = "$state"
 source = "gamescope-pipewire"
 framerate = 60
 codec = "h264"
-input_mode = "log"
+input_mode = "uinput"
 ffmpeg_path = "$ffmpeg"
+
+$uinput_block
 
 [gamescope_pipewire]
 node_name = "gamescope"
@@ -508,6 +519,7 @@ run_probe_cycle() {
   local invitation_path="${5:-}"
   local slow_consumer_ms="${6:-}"
   local expected_path_mode="${7:-direct}"
+  local pointer_feedback_smoke="${8:-false}"
   local log="$raw/$mode-$transport-$request_id.log"
   local command=(
     "$probe"
@@ -523,8 +535,15 @@ run_probe_cycle() {
   [[ -n "$invitation_path" ]] && command+=(--invitation "$invitation_path")
   [[ -n "$slow_consumer_ms" ]] && command+=(--slow-consumer-ms "$slow_consumer_ms")
   [[ "$expected_path_mode" != relay ]] || command+=(--relay-only)
+  if [[ "$pointer_feedback_smoke" == true ]]; then
+    command+=(--pointer-smoke --pointer-feedback-smoke)
+  fi
   timeout --signal=TERM --kill-after=5s 45s "${command[@]}" >"$log" 2>&1
   validate_probe "$log" "$transport" "$size" "$request_id" "$slow_consumer_ms" "$expected_path_mode"
+  if [[ "$pointer_feedback_smoke" == true ]]; then
+    grep -Fxq pointer_smoke=ok "$log"
+    grep -Fxq pointer_feedback_smoke=ok "$log"
+  fi
 }
 
 validate_host_recovery() {
@@ -661,6 +680,47 @@ for cycle in $(seq 1 10); do
   run_probe_cycle fixed grouped-v3 1280x800 "$((1100 + cycle))"
 done
 validate_host_recovery "$raw/fixed-host.log"
+
+fixed_candidate_pid="$(systemctl --user show -p MainPID --value \
+  "$fixed_candidate_unit.service")"
+[[ "$fixed_candidate_pid" =~ ^[0-9]+$ && "$fixed_candidate_pid" -gt 1 ]]
+pointer_reconnects_before="$(grep -Fc \
+  'Gamescope Xwayland pointer feedback reconnected' "$raw/fixed-host.log" || true)"
+for cycle in 1 2; do
+  systemctl --user restart gamescope-session-plus@steam.service
+  gamescope_ready=false
+  for _ in $(seq 1 600); do
+    if systemctl --user is-active --quiet gamescope-session-plus@steam.service \
+      && DISPLAY=:0 "$xprop" -root GAMESCOPE_MOUSE_FOCUS_DISPLAY >/dev/null 2>&1 \
+      && "$pw_dump" | jq -e '
+        .[]
+        | select(.type == "PipeWire:Interface:Node")
+        | select(.info.props["node.name"] == "gamescope")
+        | select(.info.props["media.class"] == "Video/Source")
+      ' >/dev/null
+    then
+      gamescope_ready=true
+      break
+    fi
+    sleep 0.1
+  done
+  [[ "$gamescope_ready" == true ]]
+  [[ "$(systemctl --user show -p MainPID --value \
+    "$fixed_candidate_unit.service")" == "$fixed_candidate_pid" ]]
+  expected_reconnects="$((pointer_reconnects_before + cycle))"
+  for _ in $(seq 1 100); do
+    reconnects="$(grep -Fc 'Gamescope Xwayland pointer feedback reconnected' \
+      "$raw/fixed-host.log" || true)"
+    [[ "$reconnects" -ge "$expected_reconnects" ]] && break
+    sleep 0.1
+  done
+  [[ "$reconnects" -ge "$expected_reconnects" ]]
+  run_probe_cycle "pointer-recovery-$cycle" iroh-moq 1280x800 \
+    "$((1200 + cycle))" "" "" direct true
+  sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g' \
+    "$raw/pointer-recovery-$cycle-iroh-moq-$((1200 + cycle)).log" \
+    >"$evidence/pointer-recovery-$cycle.log"
+done
 stop_candidate
 
 native_timer="goq-uat-native-$invocation_id"
@@ -753,6 +813,9 @@ fi
   echo external_cqp_minimum_fps=55
   echo "external_cqp_observed_fps=$external_cqp_observed_fps"
   echo cross_state_capture_contention=rejected
+  echo gamescope_pointer_restart_cycles=2
+  echo gamescope_pointer_feedback_recovery=pass
+  echo gamescope_pointer_daemon_pid_stable=pass
   echo "native_size=$native_size"
   echo native_performance_gate=observational
   echo "native_observed_fps=$native_observed_fps"
@@ -791,5 +854,9 @@ sha256sum -c "$private/original-identity.sha256"
   echo original_identity_preserved=pass
   echo original_release_preserved=pass
 } >"$evidence/summary.env"
-chmod 0600 "$evidence/summary.env" "$evidence"/probes/*.log "$evidence"/*-capture.log
+chmod 0600 \
+  "$evidence/summary.env" \
+  "$evidence"/probes/*.log \
+  "$evidence"/*-capture.log \
+  "$evidence"/pointer-recovery-*.log
 cat "$evidence/summary.env"

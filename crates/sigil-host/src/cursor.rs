@@ -12,6 +12,10 @@ use sigil_protocol::{PointerPosition, PointerSurfaceDimensions};
 #[cfg(target_os = "linux")]
 const POINTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_667);
 #[cfg(any(target_os = "linux", test))]
+const BOOTSTRAP_RECONNECT_INITIAL: Duration = Duration::from_millis(100);
+#[cfg(any(target_os = "linux", test))]
+const BOOTSTRAP_RECONNECT_MAXIMUM: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", test))]
 const POINTER_ACTIVITY_VISIBLE_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(target_os = "linux")]
 const FOCUS_DISPLAY_PROPERTY: &[u8] = b"GAMESCOPE_MOUSE_FOCUS_DISPLAY";
@@ -84,6 +88,41 @@ impl PointerActivityVisibility {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+struct ReconnectBackoff {
+    delay: Duration,
+    retry_not_before: Instant,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ReconnectBackoff {
+    fn new(now: Instant) -> Self {
+        Self {
+            delay: BOOTSTRAP_RECONNECT_INITIAL,
+            retry_not_before: now,
+        }
+    }
+
+    fn ready(&self, now: Instant) -> bool {
+        now >= self.retry_not_before
+    }
+
+    fn failed(&mut self, now: Instant) {
+        self.retry_not_before = now.checked_add(self.delay).unwrap_or(now);
+        self.delay = self
+            .delay
+            .checked_mul(2)
+            .unwrap_or(BOOTSTRAP_RECONNECT_MAXIMUM)
+            .min(BOOTSTRAP_RECONNECT_MAXIMUM);
+    }
+
+    fn recovered(&mut self, now: Instant) {
+        self.delay = BOOTSTRAP_RECONNECT_INITIAL;
+        self.retry_not_before = now;
+    }
+}
+
 #[derive(Clone)]
 pub struct PointerPositionTracker {
     inner: Arc<TrackerInner>,
@@ -117,29 +156,32 @@ impl PointerPositionTracker {
         configured_display: Option<&str>,
         pointer_surface_dimensions: PointerSurfaceDimensions,
     ) -> Result<Self> {
-        use x11rb::protocol::xproto::ConnectionExt;
-
         let bootstrap_display = match configured_display {
             Some(display) => display.to_owned(),
             None => std::env::var("DISPLAY")
                 .context("neither gamescope_pipewire.xwayland_display nor DISPLAY is configured")?,
         };
         validate_display_name(&bootstrap_display)?;
-        let (bootstrap_connection, bootstrap_root) = connect_display(&bootstrap_display)
-            .context("connecting to bootstrap Gamescope Xwayland")?;
-        let focus_atom = bootstrap_connection
-            .intern_atom(false, FOCUS_DISPLAY_PROPERTY)
-            .context("interning Gamescope mouse-focus property")?
-            .reply()
-            .context("receiving Gamescope mouse-focus atom")?
-            .atom;
-        let focus_display = query_focus_display(&bootstrap_connection, bootstrap_root, focus_atom)
-            .context("querying initial Gamescope mouse-focus display")?;
+        let bootstrap = connect_bootstrap_display(&bootstrap_display)?;
+        anyhow::ensure!(
+            bootstrap.pointer_surface_dimensions == pointer_surface_dimensions,
+            "bootstrap Gamescope pointer surface is {}x{}, but capture preflight resolved {}x{}",
+            bootstrap.pointer_surface_dimensions.width,
+            bootstrap.pointer_surface_dimensions.height,
+            pointer_surface_dimensions.width,
+            pointer_surface_dimensions.height
+        );
+        let focus_display =
+            query_focus_display(&bootstrap.connection, bootstrap.root, bootstrap.focus_atom)
+                .context("querying initial Gamescope mouse-focus display")?;
         let active = connect_active_display(&focus_display)
             .context("connecting to active Gamescope Xwayland")?;
-        let initial_position =
-            query_pointer_position(&active.connection, active.root, pointer_surface_dimensions)
-                .context("querying initial Gamescope Xwayland pointer position")?;
+        let initial_position = query_pointer_position(
+            &active.connection,
+            active.root,
+            bootstrap.pointer_surface_dimensions,
+        )
+        .context("querying initial Gamescope Xwayland pointer position")?;
         let initial = available_pointer_state(initial_position, query_cursor_visible(&active).ok());
         let (latest, _) = tokio::sync::watch::channel(initial);
         let stop = Arc::new(AtomicBool::new(false));
@@ -148,27 +190,102 @@ impl PointerPositionTracker {
         std::thread::Builder::new()
             .name("sigil-xwayland-pointer".into())
             .spawn(move || {
+                let mut bootstrap = Some(bootstrap);
                 let mut active_display = focus_display;
                 let mut active_connection = Some(active);
                 let mut activity_visibility = PointerActivityVisibility::new(initial_position);
+                let mut reconnect_backoff = ReconnectBackoff::new(Instant::now());
                 while !thread_stop.load(Ordering::Acquire) {
                     std::thread::sleep(POINTER_POLL_INTERVAL);
+                    if bootstrap.is_none() {
+                        let now = Instant::now();
+                        if !reconnect_backoff.ready(now) {
+                            continue;
+                        }
+                        match connect_bootstrap_display(&bootstrap_display) {
+                            Ok(reconnected) => {
+                                let focus_display = query_focus_display(
+                                    &reconnected.connection,
+                                    reconnected.root,
+                                    reconnected.focus_atom,
+                                );
+                                let recovered = focus_display.and_then(|focus_display| {
+                                    let active = connect_active_display(&focus_display)?;
+                                    let position = query_pointer_position(
+                                        &active.connection,
+                                        active.root,
+                                        reconnected.pointer_surface_dimensions,
+                                    )?;
+                                    Ok((focus_display, active, position))
+                                });
+                                match recovered {
+                                    Ok((focus_display, active, position)) => {
+                                        let visible = query_cursor_visible(&active).ok();
+                                        let pointer_surface_dimensions =
+                                            reconnected.pointer_surface_dimensions;
+                                        bootstrap = Some(reconnected);
+                                        active_display = focus_display;
+                                        active_connection = Some(active);
+                                        activity_visibility =
+                                            PointerActivityVisibility::new(position);
+                                        reconnect_backoff.recovered(now);
+                                        let state = available_pointer_state(position, visible);
+                                        thread_latest.send_if_modified(|latest| {
+                                            if *latest == state {
+                                                false
+                                            } else {
+                                                *latest = state;
+                                                true
+                                            }
+                                        });
+                                        tracing::info!(
+                                            display = %bootstrap_display,
+                                            pointer_surface_width = pointer_surface_dimensions.width,
+                                            pointer_surface_height = pointer_surface_dimensions.height,
+                                            "Gamescope Xwayland pointer feedback reconnected"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        reconnect_backoff.failed(now);
+                                        tracing::warn!(
+                                            display = %bootstrap_display,
+                                            error = %error,
+                                            "Gamescope Xwayland pointer feedback reconnect incomplete"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                reconnect_backoff.failed(now);
+                                tracing::warn!(
+                                    display = %bootstrap_display,
+                                    error = %error,
+                                    "Gamescope Xwayland pointer feedback reconnect failed"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    let bootstrap_connection = bootstrap
+                        .as_ref()
+                        .expect("bootstrap connection was checked above");
                     let focus_display = match query_focus_display(
-                        &bootstrap_connection,
-                        bootstrap_root,
-                        focus_atom,
+                        &bootstrap_connection.connection,
+                        bootstrap_connection.root,
+                        bootstrap_connection.focus_atom,
                     ) {
                         Ok(display) => display,
-                        Err(_) => {
+                        Err(error) => {
+                            tracing::warn!(
+                                display = %bootstrap_display,
+                                error = %error,
+                                "Gamescope bootstrap Xwayland connection was lost"
+                            );
+                            bootstrap = None;
+                            active_connection = None;
                             activity_visibility.reset();
-                            thread_latest.send_if_modified(|latest| {
-                                if *latest == PointerState::UNAVAILABLE {
-                                    false
-                                } else {
-                                    *latest = PointerState::UNAVAILABLE;
-                                    true
-                                }
-                            });
+                            reconnect_backoff.failed(Instant::now());
+                            publish_unavailable(&thread_latest);
                             continue;
                         }
                     };
@@ -178,20 +295,13 @@ impl PointerPositionTracker {
                         activity_visibility.reset();
                     }
                     let Some(active) = active_connection.as_ref() else {
-                        thread_latest.send_if_modified(|latest| {
-                            if *latest == PointerState::UNAVAILABLE {
-                                false
-                            } else {
-                                *latest = PointerState::UNAVAILABLE;
-                                true
-                            }
-                        });
+                        publish_unavailable(&thread_latest);
                         continue;
                     };
                     match query_pointer_position(
                         &active.connection,
                         active.root,
-                        pointer_surface_dimensions,
+                        bootstrap_connection.pointer_surface_dimensions,
                     ) {
                         Ok(position) => {
                             let visible = activity_visibility.resolve(
@@ -212,14 +322,7 @@ impl PointerPositionTracker {
                         Err(_) => {
                             active_connection = None;
                             activity_visibility.reset();
-                            thread_latest.send_if_modified(|latest| {
-                                if *latest == PointerState::UNAVAILABLE {
-                                    false
-                                } else {
-                                    *latest = PointerState::UNAVAILABLE;
-                                    true
-                                }
-                            });
+                            publish_unavailable(&thread_latest);
                         }
                     }
                 }
@@ -260,6 +363,53 @@ fn connect_display(display: &str) -> Result<(x11rb::rust_connection::RustConnect
         .with_context(|| format!("Xwayland {display} selected an invalid screen"))?
         .root;
     Ok((connection, root))
+}
+
+#[cfg(target_os = "linux")]
+struct BootstrapXwayland {
+    connection: x11rb::rust_connection::RustConnection,
+    root: u32,
+    focus_atom: u32,
+    pointer_surface_dimensions: PointerSurfaceDimensions,
+}
+
+#[cfg(target_os = "linux")]
+fn connect_bootstrap_display(display: &str) -> Result<BootstrapXwayland> {
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    let (connection, root) =
+        connect_display(display).context("connecting to bootstrap Gamescope Xwayland")?;
+    let focus_atom = connection
+        .intern_atom(false, FOCUS_DISPLAY_PROPERTY)
+        .context("interning Gamescope mouse-focus property")?
+        .reply()
+        .context("receiving Gamescope mouse-focus atom")?
+        .atom;
+    let geometry = connection
+        .get_geometry(root)
+        .context("sending bootstrap X11 GetGeometry")?
+        .reply()
+        .context("receiving bootstrap X11 GetGeometry reply")?;
+    let pointer_surface_dimensions = PointerSurfaceDimensions::new(geometry.width, geometry.height)
+        .context("validating bootstrap Gamescope pointer surface dimensions")?;
+    Ok(BootstrapXwayland {
+        connection,
+        root,
+        focus_atom,
+        pointer_surface_dimensions,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn publish_unavailable(latest: &tokio::sync::watch::Sender<PointerState>) {
+    latest.send_if_modified(|latest| {
+        if *latest == PointerState::UNAVAILABLE {
+            false
+        } else {
+            *latest = PointerState::UNAVAILABLE;
+            true
+        }
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -607,5 +757,28 @@ mod tests {
         assert!(visibility.resolve(moved, None, sampled_at));
         visibility.reset();
         assert!(!visibility.resolve(moved, None, sampled_at));
+    }
+
+    #[test]
+    fn bootstrap_reconnect_backoff_is_bounded_and_resets_after_recovery() {
+        let started_at = Instant::now();
+        let mut backoff = ReconnectBackoff::new(started_at);
+
+        assert!(backoff.ready(started_at));
+        backoff.failed(started_at);
+        assert!(!backoff.ready(started_at));
+        assert!(backoff.ready(started_at + BOOTSTRAP_RECONNECT_INITIAL));
+
+        let mut now = started_at + BOOTSTRAP_RECONNECT_INITIAL;
+        for _ in 0..16 {
+            backoff.failed(now);
+            assert!(backoff.delay <= BOOTSTRAP_RECONNECT_MAXIMUM);
+            now += BOOTSTRAP_RECONNECT_MAXIMUM;
+        }
+        assert_eq!(backoff.delay, BOOTSTRAP_RECONNECT_MAXIMUM);
+
+        backoff.recovered(now);
+        assert!(backoff.ready(now));
+        assert_eq!(backoff.delay, BOOTSTRAP_RECONNECT_INITIAL);
     }
 }

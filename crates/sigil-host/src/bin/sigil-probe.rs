@@ -103,6 +103,10 @@ struct Args {
     /// complete left-click. Intended for libinput/Gamescope-backed proof.
     #[arg(long)]
     pointer_smoke: bool,
+    /// Require the host to return an immediately available compositor pointer
+    /// position and visibility sample. Intended for Gamescope restart proofs.
+    #[arg(long, requires = "pointer_smoke")]
+    pointer_feedback_smoke: bool,
     /// Attach the media-feedback stream to the active session, submit one
     /// complete report, and print the host's bounded decision. Intended for
     /// validating shadow-only encoder configurations.
@@ -1581,6 +1585,10 @@ async fn main() -> Result<()> {
     if args.pointer_smoke {
         input_offers.push(Capability::RelativePointer);
     }
+    if args.pointer_feedback_smoke {
+        input_offers.push(Capability::PointerPositionFeedback);
+        input_offers.push(Capability::PointerVisibilityFeedback);
+    }
     if args.gamepad_smoke {
         input_offers.push(Capability::Gamepad);
     }
@@ -1598,6 +1606,27 @@ async fn main() -> Result<()> {
         session_id == input_negotiation.session_id,
         "media and input session IDs differ"
     );
+    if args.pointer_feedback_smoke {
+        ensure!(
+            input_negotiation
+                .capabilities
+                .contains(&Capability::PointerPositionFeedback)
+                && input_negotiation
+                    .capabilities
+                    .contains(&Capability::PointerVisibilityFeedback),
+            "host did not accept the required pointer feedback capabilities"
+        );
+        let initial_feedback =
+            read_expected_input_ack(&mut input_recv, args.timeout_seconds, 0).await?;
+        ensure!(
+            initial_feedback.pointer_position.is_some(),
+            "host pointer feedback is unavailable"
+        );
+        ensure!(
+            initial_feedback.pointer_visible.is_some(),
+            "host omitted negotiated pointer visibility feedback"
+        );
+    }
     let input_started = Instant::now();
     write_input_event(&mut input_send, &InputEvent::Probe)
         .await
@@ -2454,6 +2483,14 @@ async fn main() -> Result<()> {
         }
     );
     println!(
+        "pointer_feedback_smoke={}",
+        if args.pointer_feedback_smoke {
+            "ok"
+        } else {
+            "not-requested"
+        }
+    );
+    println!(
         "gamepad_smoke={}",
         if args.gamepad_smoke {
             "ok"
@@ -2748,29 +2785,79 @@ struct Negotiated {
     pointer_surface_dimensions: Option<PointerSurfaceDimensions>,
 }
 
-async fn read_expected_input_ack(
-    recv: &mut iroh::endpoint::RecvStream,
+async fn read_expected_input_ack<R>(
+    recv: &mut R,
     timeout_seconds: u64,
     expected_sequence: u64,
-) -> Result<()> {
-    let input_ack = tokio::time::timeout(
-        Duration::from_secs(timeout_seconds.min(5)),
-        read_input_ack(recv),
-    )
+) -> Result<sigil_protocol::InputAck>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let input_ack = tokio::time::timeout(Duration::from_secs(timeout_seconds.min(5)), async {
+        loop {
+            let input_ack = read_input_ack(recv)
+                .await?
+                .context("host closed before input acknowledgment")?;
+            ensure!(
+                input_ack.sequence <= expected_sequence,
+                "unexpected input acknowledgment sequence {}; expected at most {expected_sequence}",
+                input_ack.sequence
+            );
+            if input_ack.sequence == expected_sequence {
+                break Ok(input_ack);
+            }
+        }
+    })
     .await
-    .context("timed out waiting for input acknowledgment")??
-    .context("host closed before input acknowledgment")?;
-    ensure!(
-        input_ack.sequence == expected_sequence,
-        "unexpected input acknowledgment sequence {}; expected {expected_sequence}",
-        input_ack.sequence
-    );
-    Ok(())
+    .context("timed out waiting for input acknowledgment")??;
+    Ok(input_ack)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expected_input_ack_skips_older_feedback_under_one_deadline() {
+        let (mut sender, mut receiver) = tokio::io::duplex(512);
+        for sequence in [0, 0, 1] {
+            sigil_protocol::write_input_ack(
+                &mut sender,
+                &sigil_protocol::InputAck {
+                    sequence,
+                    pointer_position: None,
+                    pointer_visible: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let input_ack = read_expected_input_ack(&mut receiver, 1, 1).await.unwrap();
+
+        assert_eq!(input_ack.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn expected_input_ack_rejects_future_feedback() {
+        let (mut sender, mut receiver) = tokio::io::duplex(256);
+        sigil_protocol::write_input_ack(
+            &mut sender,
+            &sigil_protocol::InputAck {
+                sequence: 2,
+                pointer_position: None,
+                pointer_visible: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = read_expected_input_ack(&mut receiver, 1, 1)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("expected at most 1"));
+    }
 
     #[test]
     fn feedback_report_is_complete_and_keeps_the_observed_sequence() {

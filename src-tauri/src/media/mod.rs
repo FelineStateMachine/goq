@@ -1,5 +1,6 @@
 pub(crate) mod adaptive_feedback;
 pub(crate) mod audio_delivery;
+pub(crate) mod connect;
 pub(crate) mod frame_channel;
 pub(crate) mod input_delivery;
 pub(crate) mod media_control;

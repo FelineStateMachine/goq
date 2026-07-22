@@ -56,9 +56,11 @@ test('publisher is generation-scoped, one hertz, single-flight, and reports delt
     },
   });
   publisher.start(7, true);
+  assert.equal(publisher.publish(snapshot()), false);
+  now = 1000;
   assert.equal(publisher.publish(snapshot()), true);
   assert.equal(publisher.publish(snapshot({ transportDroppedTotal: 10 })), false);
-  now = 1000;
+  now = 2000;
   assert.equal(publisher.publish(snapshot({ transportDroppedTotal: 11 })), false);
   assert.equal(calls.length, 1);
   completions.shift()(true);
@@ -80,9 +82,16 @@ test('counter deltas saturate and counter resets do not underflow', async () => 
     },
   });
   publisher.start(1, true);
+  publisher.publish(snapshot({
+    transportDroppedTotal: 0,
+    frontendDroppedTotal: 0,
+    decoderDroppedTotal: 0,
+    presenterDroppedTotal: 0,
+  }));
+  now = 1000;
   publisher.publish(snapshot({ transportDroppedTotal: ADAPTIVE_COUNTER_DELTA_MAX + 10 }));
   await flushPromises();
-  now = 1000;
+  now = 2000;
   publisher.publish(snapshot({ transportDroppedTotal: 1 }));
   assert.equal(calls[0].transport_dropped_delta, ADAPTIVE_COUNTER_DELTA_MAX);
   assert.equal(calls[1].transport_dropped_delta, 0);
@@ -90,9 +99,10 @@ test('counter deltas saturate and counter resets do not underflow', async () => 
 
 test('stale completion cannot unlock or alter a newer generation', async () => {
   let resolveOld;
+  let now = 0;
   const calls = [];
   const publisher = new AdaptiveFeedbackPublisher({
-    now: () => 2000,
+    now: () => now,
     invokeCommand: (_command, args) => {
       calls.push(args.generation);
       if (args.generation === 1) return new Promise((resolve) => { resolveOld = resolve; });
@@ -101,7 +111,11 @@ test('stale completion cannot unlock or alter a newer generation', async () => {
   });
   publisher.start(1, true);
   publisher.publish(snapshot());
+  now = 1000;
+  publisher.publish(snapshot());
   publisher.start(2, true);
+  publisher.publish(snapshot());
+  now = 2000;
   publisher.publish(snapshot());
   resolveOld();
   await flushPromises();
@@ -128,19 +142,30 @@ test('false and rejected sends retain cumulative loss until a report is accepted
       },
     });
     publisher.start(1, true);
+    publisher.publish(snapshot({
+      transportDroppedTotal: 0,
+      frontendDroppedTotal: 0,
+      decoderDroppedTotal: 0,
+      presenterDroppedTotal: 0,
+    }));
+    now = 1000;
     publisher.publish(snapshot({ transportDroppedTotal: 3 }));
     await flushPromises();
-    now = 1000;
+    now = 2000;
     publisher.publish(snapshot({ transportDroppedTotal: 7 }));
     await flushPromises();
-    now = 2000;
+    now = 3000;
     publisher.publish(snapshot({ transportDroppedTotal: 9 }));
     await flushPromises();
-    now = 3000;
+    now = 4000;
     publisher.publish(snapshot({ transportDroppedTotal: 10 }));
     assert.deepEqual(
       reports.map((report) => report.transport_dropped_delta),
       [3, 7, 9, 1],
+    );
+    assert.deepEqual(
+      reports.map((report) => report.interval_ms),
+      [1000, 2000, 3000, 1000],
     );
   } finally {
     console.warn = originalWarn;
@@ -149,11 +174,12 @@ test('false and rejected sends retain cumulative loss until a report is accepted
 
 test('a synchronous invoke throw clears single-flight state and permits retry', async () => {
   let attempts = 0;
+  let now = 0;
   const originalWarn = console.warn;
   console.warn = () => {};
   try {
     const publisher = new AdaptiveFeedbackPublisher({
-      now: () => 0,
+      now: () => now,
       invokeCommand: () => {
         attempts++;
         if (attempts === 1) throw new Error('synchronous bridge failure');
@@ -161,6 +187,8 @@ test('a synchronous invoke throw clears single-flight state and permits retry', 
       },
     });
     publisher.start(1, true);
+    publisher.publish(snapshot());
+    now = 1000;
     assert.equal(publisher.publish(snapshot()), false);
     assert.equal(publisher.inFlight, false);
     assert.equal(publisher.publish(snapshot()), true);
@@ -170,6 +198,28 @@ test('a synchronous invoke throw clears single-flight state and permits retry', 
   } finally {
     console.warn = originalWarn;
   }
+});
+
+test('publisher measures and bounds the actual baseline interval', async () => {
+  let now = 0;
+  const reports = [];
+  const publisher = new AdaptiveFeedbackPublisher({
+    now: () => now,
+    invokeCommand: async (_command, args) => {
+      reports.push(args.report);
+      return true;
+    },
+  });
+  publisher.start(1, true);
+  publisher.publish(snapshot());
+  now = 249;
+  assert.equal(publisher.publish(snapshot()), false);
+  now = 1_275;
+  assert.equal(publisher.publish(snapshot()), true);
+  await flushPromises();
+  now = 8_000;
+  assert.equal(publisher.publish(snapshot({ transportDroppedTotal: 7 })), true);
+  assert.deepEqual(reports.map((report) => report.interval_ms), [1_275, 5_000]);
 });
 
 test('decision diagnostics reject stale generations and say advisory not applied', () => {

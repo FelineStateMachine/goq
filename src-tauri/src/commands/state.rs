@@ -350,7 +350,90 @@ pub struct AppState {
 
 pub type MediaControlRequestSender =
     tokio::sync::mpsc::Sender<(KeyframeRequestReasonV3, Option<u64>)>;
-pub type MediaFeedbackSender = tokio::sync::watch::Sender<Option<MediaFeedbackReportV1>>;
+pub type MediaFeedbackSender = tokio::sync::watch::Sender<Option<AccumulatedMediaFeedback>>;
+
+const MAX_MEDIA_FEEDBACK_INTERVAL_MS: u64 = 5_000;
+
+/// Constant-size latest receiver state plus cumulative interval pressure.
+///
+/// A watch channel deliberately coalesces updates while its consumer is
+/// blocked. Keeping cumulative counters here lets the writer recover the full
+/// delta since its last successful write instead of losing the reports that
+/// were replaced in the meantime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccumulatedMediaFeedback {
+    latest: MediaFeedbackReportV1,
+    interval_ms_total: u64,
+    transport_dropped_total: u64,
+    frontend_dropped_total: u64,
+    decoder_dropped_total: u64,
+    presenter_dropped_total: u64,
+}
+
+impl AccumulatedMediaFeedback {
+    pub fn new(report: MediaFeedbackReportV1) -> Self {
+        Self {
+            latest: report,
+            interval_ms_total: u64::from(report.interval_ms),
+            transport_dropped_total: u64::from(report.transport_dropped_delta),
+            frontend_dropped_total: u64::from(report.frontend_dropped_delta),
+            decoder_dropped_total: u64::from(report.decoder_dropped_delta),
+            presenter_dropped_total: u64::from(report.presenter_dropped_delta),
+        }
+    }
+
+    pub fn merge(&mut self, report: MediaFeedbackReportV1) {
+        self.latest = report;
+        self.interval_ms_total = self
+            .interval_ms_total
+            .saturating_add(u64::from(report.interval_ms));
+        self.transport_dropped_total = self
+            .transport_dropped_total
+            .saturating_add(u64::from(report.transport_dropped_delta));
+        self.frontend_dropped_total = self
+            .frontend_dropped_total
+            .saturating_add(u64::from(report.frontend_dropped_delta));
+        self.decoder_dropped_total = self
+            .decoder_dropped_total
+            .saturating_add(u64::from(report.decoder_dropped_delta));
+        self.presenter_dropped_total = self
+            .presenter_dropped_total
+            .saturating_add(u64::from(report.presenter_dropped_delta));
+    }
+
+    pub fn report_since(self, previous: Option<Self>) -> MediaFeedbackReportV1 {
+        let previous = previous.unwrap_or(Self {
+            latest: self.latest,
+            interval_ms_total: 0,
+            transport_dropped_total: 0,
+            frontend_dropped_total: 0,
+            decoder_dropped_total: 0,
+            presenter_dropped_total: 0,
+        });
+        let mut report = self.latest;
+        report.interval_ms = self
+            .interval_ms_total
+            .saturating_sub(previous.interval_ms_total)
+            .min(MAX_MEDIA_FEEDBACK_INTERVAL_MS) as u16;
+        report.transport_dropped_delta = cumulative_delta(
+            self.transport_dropped_total,
+            previous.transport_dropped_total,
+        );
+        report.frontend_dropped_delta =
+            cumulative_delta(self.frontend_dropped_total, previous.frontend_dropped_total);
+        report.decoder_dropped_delta =
+            cumulative_delta(self.decoder_dropped_total, previous.decoder_dropped_total);
+        report.presenter_dropped_delta = cumulative_delta(
+            self.presenter_dropped_total,
+            previous.presenter_dropped_total,
+        );
+        report
+    }
+}
+
+fn cumulative_delta(current: u64, previous: u64) -> u32 {
+    current.saturating_sub(previous).min(u64::from(u32::MAX)) as u32
+}
 
 impl Default for AppState {
     fn default() -> Self {

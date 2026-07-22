@@ -1,8 +1,9 @@
 use super::auth::derive_iroh_secret_from_key;
 use super::enrollment::{connection_enrollment, mark_invitation_redeemed};
 use super::state::{
-    AUDIO_DELIVERY_CAPACITY, AppState, AudioDeliveryState, CLIENT_INPUT_QUEUE_CAPACITY, FRAME_ALPN,
-    INPUT_ALPN, MediaFeedbackSender, development_direct_node_available,
+    AUDIO_DELIVERY_CAPACITY, AccumulatedMediaFeedback, AppState, AudioDeliveryState,
+    CLIENT_INPUT_QUEUE_CAPACITY, FRAME_ALPN, INPUT_ALPN, MediaFeedbackSender,
+    development_direct_node_available,
 };
 use base64::Engine;
 use iroh::{Endpoint, SecretKey, endpoint::presets};
@@ -95,7 +96,6 @@ const CLIENT_FRAME_CHANNEL_CAPACITY: usize = 4;
 const CLIENT_FRAME_STATS_INTERVAL: Duration = Duration::from_millis(250);
 const CLIENT_ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_MEDIA_FEEDBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const CLIENT_MEDIA_FEEDBACK_INTERVAL_MS: u16 = 1_000;
 const CLIENT_MEDIA_FEEDBACK_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_ADAPTIVE_DECISION_DELIVERY_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_FRAME_RATE_WINDOW: Duration = Duration::from_secs(1);
@@ -783,6 +783,7 @@ pub struct ConnectResult {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ClientMediaFeedbackReport {
+    pub interval_ms: u16,
     pub last_sequence: Option<u64>,
     pub transport_dropped_delta: u32,
     pub frontend_dropped_delta: u32,
@@ -2083,17 +2084,21 @@ async fn run_media_feedback_session(
     generation: u64,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
-    mut reports: tokio::sync::watch::Receiver<Option<MediaFeedbackReportV1>>,
+    mut reports: tokio::sync::watch::Receiver<Option<AccumulatedMediaFeedback>>,
 ) {
     let (decision_tx, decision_rx) = tokio::sync::watch::channel(None);
     let writer = async {
+        let mut last_written = None;
         loop {
             reports
                 .changed()
                 .await
                 .map_err(|_| "adaptive feedback sender closed".to_string())?;
-            let report = *reports.borrow_and_update();
-            let Some(report) = report else { continue };
+            let accumulated = *reports.borrow_and_update();
+            let Some(accumulated) = accumulated else {
+                continue;
+            };
+            let report = accumulated.report_since(last_written);
             tokio::time::timeout(
                 CLIENT_MEDIA_FEEDBACK_IO_TIMEOUT,
                 write_media_feedback_report_v1(&mut send, &report),
@@ -2101,6 +2106,7 @@ async fn run_media_feedback_session(
             .await
             .map_err(|_| "adaptive feedback write timed out".to_string())?
             .map_err(|error| format!("adaptive feedback write failed: {error}"))?;
+            last_written = Some(accumulated);
         }
         #[allow(unreachable_code)]
         Ok::<(), String>(())
@@ -4689,6 +4695,7 @@ mod tests {
 
     fn client_feedback() -> ClientMediaFeedbackReport {
         ClientMediaFeedbackReport {
+            interval_ms: 1_000,
             last_sequence: Some(99),
             transport_dropped_delta: 1,
             frontend_dropped_delta: 2,
@@ -4711,7 +4718,7 @@ mod tests {
     fn adaptive_feedback_conversion_is_bounded_and_protocol_valid() {
         let report = media_feedback_report(7, client_feedback()).unwrap();
         assert_eq!(report.report_id, 7);
-        assert_eq!(report.interval_ms, CLIENT_MEDIA_FEEDBACK_INTERVAL_MS);
+        assert_eq!(report.interval_ms, 1_000);
         assert_eq!(report.last_sequence, Some(99));
         assert_eq!(report.transport_delivery_p95_ms, Some(17));
         assert_eq!(report.decode_p95_ms, Some(5));
@@ -4721,6 +4728,9 @@ mod tests {
         let mut invalid = client_feedback();
         invalid.decode_queue_depth = 3;
         assert!(media_feedback_report(8, invalid).is_err());
+        let mut invalid_interval = client_feedback();
+        invalid_interval.interval_ms = 249;
+        assert!(media_feedback_report(9, invalid_interval).is_err());
         assert!(feedback_latency_ms(Some(f64::INFINITY), "decode").is_err());
         assert!(feedback_latency_ms(Some(60_001.0), "decode").is_err());
     }
@@ -4733,15 +4743,36 @@ mod tests {
         assert!(next_feedback_report_id(&AtomicU64::new(u64::MAX)).is_err());
     }
 
-    #[test]
-    fn adaptive_feedback_watch_coalesces_to_the_latest_report() {
+    #[tokio::test]
+    async fn adaptive_feedback_watch_coalesces_latest_state_without_losing_pressure() {
         let (sender, mut receiver) = tokio::sync::watch::channel(None);
-        sender.send_replace(Some(media_feedback_report(1, client_feedback()).unwrap()));
+        let first = media_feedback_report(1, client_feedback()).unwrap();
+        sender.send_replace(Some(AccumulatedMediaFeedback::new(first)));
+        receiver.changed().await.unwrap();
+        let stalled_write = receiver.borrow_and_update().unwrap();
+
         let mut latest = client_feedback();
+        latest.interval_ms = 1_250;
         latest.transport_dropped_delta = 9;
-        sender.send_replace(Some(media_feedback_report(2, latest).unwrap()));
-        assert_eq!(receiver.borrow_and_update().unwrap().report_id, 2);
-        assert_eq!(receiver.borrow().unwrap().transport_dropped_delta, 9);
+        let second = media_feedback_report(2, latest).unwrap();
+        sender.send_modify(|pending| pending.as_mut().unwrap().merge(second));
+        let mut newest = client_feedback();
+        newest.interval_ms = 1_500;
+        newest.transport_dropped_delta = 11;
+        newest.frontend_queue_depth = 3;
+        let third = media_feedback_report(3, newest).unwrap();
+        sender.send_modify(|pending| pending.as_mut().unwrap().merge(third));
+
+        assert_eq!(stalled_write.report_since(None), first);
+        receiver.changed().await.unwrap();
+        let coalesced = receiver
+            .borrow_and_update()
+            .unwrap()
+            .report_since(Some(stalled_write));
+        assert_eq!(coalesced.report_id, 3);
+        assert_eq!(coalesced.interval_ms, 2_750);
+        assert_eq!(coalesced.transport_dropped_delta, 20);
+        assert_eq!(coalesced.frontend_queue_depth, 3);
     }
 
     #[test]
@@ -5580,7 +5611,7 @@ fn media_feedback_report(
     };
     let report = MediaFeedbackReportV1 {
         report_id,
-        interval_ms: CLIENT_MEDIA_FEEDBACK_INTERVAL_MS,
+        interval_ms: input.interval_ms,
         flags,
         last_sequence: input.last_sequence,
         transport_dropped_delta: input.transport_dropped_delta,
@@ -5623,7 +5654,11 @@ pub async fn iroh_client_send_media_feedback(
         return Err("Adaptive feedback channel closed".to_string());
     }
     let report_id = next_feedback_report_id(&state.media_feedback_report_id)?;
-    sender.send_replace(Some(media_feedback_report(report_id, report)?));
+    let report = media_feedback_report(report_id, report)?;
+    sender.send_modify(|pending| match pending {
+        Some(pending) => pending.merge(report),
+        None => *pending = Some(AccumulatedMediaFeedback::new(report)),
+    });
     Ok(true)
 }
 

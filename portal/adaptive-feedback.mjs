@@ -1,4 +1,6 @@
 export const ADAPTIVE_FEEDBACK_INTERVAL_MS = 1000;
+export const ADAPTIVE_FEEDBACK_INTERVAL_MIN_MS = 250;
+export const ADAPTIVE_FEEDBACK_INTERVAL_MAX_MS = 5000;
 export const ADAPTIVE_QUEUE_DEPTH_MAX = 16;
 export const ADAPTIVE_COUNTER_DELTA_MAX = 0xffff_ffff;
 export const ADAPTIVE_LATENCY_MS_MAX = 60_000;
@@ -109,8 +111,9 @@ function counterBaseline(snapshot) {
   };
 }
 
-function intervalReport(snapshot, baseline) {
+function intervalReport(snapshot, baseline, intervalMs) {
   return {
+    interval_ms: intervalMs,
     last_sequence: snapshot.last_sequence,
     frontend_queue_depth: snapshot.frontend_queue_depth,
     frontend_queue_capacity: snapshot.frontend_queue_capacity,
@@ -137,6 +140,7 @@ export class AdaptiveFeedbackPublisher {
   #available = false;
   #inFlight = false;
   #lastStartedAt = Number.NEGATIVE_INFINITY;
+  #baselineAt = null;
   #baseline = { transport: 0, frontend: 0, decoder: 0, presenter: 0 };
   #latest = null;
 
@@ -156,6 +160,7 @@ export class AdaptiveFeedbackPublisher {
     this.#available = available;
     this.#inFlight = false;
     this.#lastStartedAt = Number.NEGATIVE_INFINITY;
+    this.#baselineAt = null;
     this.#baseline = { transport: 0, frontend: 0, decoder: 0, presenter: 0 };
     this.#latest = null;
   }
@@ -164,6 +169,7 @@ export class AdaptiveFeedbackPublisher {
     this.#generation = null;
     this.#available = false;
     this.#inFlight = false;
+    this.#baselineAt = null;
     this.#latest = null;
   }
 
@@ -176,10 +182,27 @@ export class AdaptiveFeedbackPublisher {
     this.#latest = snapshot;
     const now = this.#now();
     if (!Number.isFinite(now)) throw new TypeError('feedback clock must be finite');
+    if (this.#baselineAt === null) {
+      // Counters can advance while the native connect command is still
+      // returning. Establish the first baseline after the generation is live
+      // so pre-generation pressure is never mislabeled as a short interval.
+      this.#baseline = counterBaseline(snapshot);
+      this.#baselineAt = now;
+      return false;
+    }
+    const elapsed = now - this.#baselineAt;
+    if (!Number.isFinite(elapsed) || elapsed < 0) {
+      throw new TypeError('feedback interval must be finite and non-negative');
+    }
     if (this.#inFlight || now - this.#lastStartedAt < ADAPTIVE_FEEDBACK_INTERVAL_MS) return false;
+    if (elapsed < ADAPTIVE_FEEDBACK_INTERVAL_MIN_MS) return false;
 
     const generation = this.#generation;
-    const report = intervalReport(snapshot, this.#baseline);
+    const intervalMs = Math.min(
+      Math.max(Math.round(elapsed), ADAPTIVE_FEEDBACK_INTERVAL_MIN_MS),
+      ADAPTIVE_FEEDBACK_INTERVAL_MAX_MS,
+    );
+    const report = intervalReport(snapshot, this.#baseline, intervalMs);
     this.#inFlight = true;
     let invocation;
     try {
@@ -194,6 +217,7 @@ export class AdaptiveFeedbackPublisher {
       .then((accepted) => {
         if (generation === this.#generation && accepted === true) {
           this.#baseline = counterBaseline(snapshot);
+          this.#baselineAt = now;
         }
       })
       .catch((error) => {

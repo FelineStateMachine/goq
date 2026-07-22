@@ -103,6 +103,10 @@ struct Args {
     /// complete left-click. Intended for libinput/Gamescope-backed proof.
     #[arg(long)]
     pointer_smoke: bool,
+    /// Require the host to return an immediately available compositor pointer
+    /// position and visibility sample. Intended for Gamescope restart proofs.
+    #[arg(long, requires = "pointer_smoke")]
+    pointer_feedback_smoke: bool,
     /// Attach the media-feedback stream to the active session, submit one
     /// complete report, and print the host's bounded decision. Intended for
     /// validating shadow-only encoder configurations.
@@ -1581,6 +1585,10 @@ async fn main() -> Result<()> {
     if args.pointer_smoke {
         input_offers.push(Capability::RelativePointer);
     }
+    if args.pointer_feedback_smoke {
+        input_offers.push(Capability::PointerPositionFeedback);
+        input_offers.push(Capability::PointerVisibilityFeedback);
+    }
     if args.gamepad_smoke {
         input_offers.push(Capability::Gamepad);
     }
@@ -1598,6 +1606,27 @@ async fn main() -> Result<()> {
         session_id == input_negotiation.session_id,
         "media and input session IDs differ"
     );
+    if args.pointer_feedback_smoke {
+        ensure!(
+            input_negotiation
+                .capabilities
+                .contains(&Capability::PointerPositionFeedback)
+                && input_negotiation
+                    .capabilities
+                    .contains(&Capability::PointerVisibilityFeedback),
+            "host did not accept the required pointer feedback capabilities"
+        );
+        let initial_feedback =
+            read_expected_input_ack(&mut input_recv, args.timeout_seconds, 0).await?;
+        ensure!(
+            initial_feedback.pointer_position.is_some(),
+            "host pointer feedback is unavailable"
+        );
+        ensure!(
+            initial_feedback.pointer_visible.is_some(),
+            "host omitted negotiated pointer visibility feedback"
+        );
+    }
     let input_started = Instant::now();
     write_input_event(&mut input_send, &InputEvent::Probe)
         .await
@@ -2454,6 +2483,14 @@ async fn main() -> Result<()> {
         }
     );
     println!(
+        "pointer_feedback_smoke={}",
+        if args.pointer_feedback_smoke {
+            "ok"
+        } else {
+            "not-requested"
+        }
+    );
+    println!(
         "gamepad_smoke={}",
         if args.gamepad_smoke {
             "ok"
@@ -2752,7 +2789,7 @@ async fn read_expected_input_ack(
     recv: &mut iroh::endpoint::RecvStream,
     timeout_seconds: u64,
     expected_sequence: u64,
-) -> Result<()> {
+) -> Result<sigil_protocol::InputAck> {
     let input_ack = tokio::time::timeout(
         Duration::from_secs(timeout_seconds.min(5)),
         read_input_ack(recv),
@@ -2765,7 +2802,7 @@ async fn read_expected_input_ack(
         "unexpected input acknowledgment sequence {}; expected {expected_sequence}",
         input_ack.sequence
     );
-    Ok(())
+    Ok(input_ack)
 }
 
 #[cfg(test)]

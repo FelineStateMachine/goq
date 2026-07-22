@@ -25,12 +25,7 @@ import {
   chooseDirectionalIndex,
 } from './controller-state.mjs';
 import { createControllerRuntime } from './controller-runtime.mjs';
-import {
-  constrainStreamWindowResize,
-  fitInitialStreamWindow,
-  fitStreamSurface,
-  streamAspectKey,
-} from './window-geometry.mjs';
+import { createWindowRuntime } from './window-runtime.mjs';
 import {
   createVideoPipelineSession,
 } from './video-pipeline.mjs';
@@ -49,10 +44,6 @@ import { mapKey } from './keyboard-map.mjs';
 let enrollmentReady = false;
 let pendingInvitationSummary = null;
 let currentEnrollmentStatus = null;
-let fittedStreamAspect = null;
-let pendingStreamFit = null;
-let lastObservedWindowSize = null;
-let streamWindowResizeTimer = null;
 let activePointerSession = null;
 let controllerActivationInProgress = false;
 let controlRuntime = null;
@@ -469,7 +460,7 @@ async function showConnectedAttempt({ result, attempt }) {
   document.getElementById('frame-canvas').style.display = 'block';
   document.getElementById('placeholder').classList.add('hidden');
   document.getElementById('control-bar').classList.add('visible');
-  void fitWindowToIncomingStream();
+  void windowRuntime.fitWindowToIncomingStream();
   updateControlUI();
   // Land controller users on the deliberate view-only/control boundary.
   // The connect button is hidden at this point, so retaining its focus
@@ -499,11 +490,7 @@ async function teardownConnectedResources() {
 }
 
 async function showDisconnectedState() {
-  fittedStreamAspect = null;
-  pendingStreamFit = null;
-  lastObservedWindowSize = null;
-  if (streamWindowResizeTimer !== null) clearTimeout(streamWindowResizeTimer);
-  streamWindowResizeTimer = null;
+  windowRuntime.reset();
   controlRuntime.resetDisconnected();
   updatePanelVisibility();
   setStatus('', 'idle');
@@ -595,6 +582,36 @@ let hasWebCodecs = ('VideoDecoder' in window);
 const canvas = document.getElementById('frame-canvas');
 const remotePointer = document.getElementById('remote-pointer');
 const ctx = canvas.getContext('2d');
+const windowRuntime = createWindowRuntime({
+  isConnected: () => connectionState.connected,
+  getFormat: () => videoPipeline.format,
+  getGeneration: () => streamRuntime.generation,
+  getChromeHeight: () => {
+    const topbar = document.querySelector('.topbar');
+    const bottombar = document.querySelector('.bottombar');
+    return Math.max(0, (topbar?.offsetHeight ?? 0) + (bottombar?.offsetHeight ?? 0));
+  },
+  getScreenBounds: () => ({
+    width: window.screen.availWidth,
+    height: window.screen.availHeight,
+  }),
+  getWindowSize: () => ({ width: window.innerWidth, height: window.innerHeight }),
+  getSurfaceBounds: () => {
+    const main = canvas.parentElement;
+    if (!main) return null;
+    const bounds = main.getBoundingClientRect();
+    return { width: bounds.width, height: bounds.height };
+  },
+  setSurfaceSize: ({ width, height }) => {
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+  },
+  applyNativeGeometry: (geometry, unmaximize) => invoke('set_client_window_size', {
+    logicalWidth: geometry.width,
+    logicalHeight: geometry.height,
+    unmaximize,
+  }),
+});
 controlRuntime = createControlRuntime({
   getConnection: () => ({
     connected: connectionState.connected,
@@ -630,8 +647,8 @@ videoPipeline = createVideoPipelineSession({
   resetAudioSync: audioPipeline.resetSyncTelemetry,
   sampleAudioSkew: audioPipeline.sampleSkew,
   onFormatChanged: () => {
-    sizeCanvasToIncomingStream();
-    if (connectionState.connected) void fitWindowToIncomingStream();
+    windowRuntime.sizeSurfaceToIncomingStream();
+    if (connectionState.connected) void windowRuntime.fitWindowToIncomingStream();
   },
 });
 streamRuntime = createStreamRuntime({
@@ -761,106 +778,6 @@ function updateStreamStats() {
 setInterval(() => {
   if (connectionState.connected) updateStreamStats();
 }, 250);
-
-function clientChromeHeight() {
-  const topbar = document.querySelector('.topbar');
-  const bottombar = document.querySelector('.bottombar');
-  return Math.max(0, (topbar?.offsetHeight ?? 0) + (bottombar?.offsetHeight ?? 0));
-}
-
-function sizeCanvasToIncomingStream() {
-  const { width: frameWidth, height: frameHeight } = videoPipeline.format;
-  if (frameWidth < 1 || frameHeight < 1) return;
-  const main = canvas.parentElement;
-  if (!main) return;
-  const bounds = main.getBoundingClientRect();
-  if (bounds.width <= 0 || bounds.height <= 0) return;
-  const surface = fitStreamSurface({
-    frameWidth,
-    frameHeight,
-    availableWidth: bounds.width,
-    availableHeight: bounds.height,
-  });
-  canvas.style.width = `${surface.width}px`;
-  canvas.style.height = `${surface.height}px`;
-}
-
-async function applyClientWindowGeometry(geometry, unmaximize) {
-  try {
-    const applied = await invoke('set_client_window_size', {
-      logicalWidth: geometry.width,
-      logicalHeight: geometry.height,
-      unmaximize,
-    });
-    if (applied) lastObservedWindowSize = { ...geometry };
-    return applied;
-  } catch (error) {
-    console.warn('could not apply stream window geometry:', error);
-    return false;
-  }
-}
-
-async function fitWindowToIncomingStream() {
-  const {
-    width: frameWidth,
-    height: frameHeight,
-    epoch: activeVideoFormatEpoch,
-  } = videoPipeline.format;
-  if (!connectionState.connected || frameWidth < 1 || frameHeight < 1) return false;
-  const aspect = streamAspectKey(frameWidth, frameHeight);
-  if (fittedStreamAspect === aspect || pendingStreamFit?.aspect === aspect) return false;
-  const request = { aspect, generation: streamRuntime.generation, epoch: activeVideoFormatEpoch };
-  pendingStreamFit = request;
-  const geometry = fitInitialStreamWindow({
-    frameWidth,
-    frameHeight,
-    chromeHeight: clientChromeHeight(),
-    availableWidth: window.screen.availWidth,
-    availableHeight: window.screen.availHeight,
-  });
-  const applied = await applyClientWindowGeometry(geometry, true);
-  const currentFormat = videoPipeline.format;
-  const currentAspect = currentFormat.width > 0 && currentFormat.height > 0
-    ? streamAspectKey(currentFormat.width, currentFormat.height)
-    : null;
-  const current = pendingStreamFit === request
-    && connectionState.connected
-    && streamRuntime.generation === request.generation
-    && currentFormat.epoch === request.epoch
-    && currentAspect === request.aspect;
-  if (pendingStreamFit === request) pendingStreamFit = null;
-  if (applied && current) fittedStreamAspect = request.aspect;
-  return applied && current;
-}
-
-function scheduleStreamWindowAspectCorrection() {
-  const observed = { width: window.innerWidth, height: window.innerHeight };
-  const previous = lastObservedWindowSize ?? observed;
-  lastObservedWindowSize = observed;
-  if (streamWindowResizeTimer !== null) clearTimeout(streamWindowResizeTimer);
-  streamWindowResizeTimer = setTimeout(() => {
-    streamWindowResizeTimer = null;
-    const { width: frameWidth, height: frameHeight } = videoPipeline.format;
-    if (!connectionState.connected || frameWidth < 1 || frameHeight < 1) return;
-    const current = { width: window.innerWidth, height: window.innerHeight };
-    let geometry;
-    try {
-      geometry = constrainStreamWindowResize({
-        frameWidth,
-        frameHeight,
-        chromeHeight: clientChromeHeight(),
-        width: current.width,
-        height: current.height,
-        previousWidth: previous.width,
-        previousHeight: previous.height,
-      });
-    } catch (error) {
-      console.warn('could not constrain stream window geometry:', error);
-      return;
-    }
-    if (geometry !== null) void applyClientWindowGeometry(geometry, false);
-  }, 80);
-}
 
 // The software decoder/JPEG compatibility path intentionally remains an event:
 // it is only selected when WebCodecs is unavailable and is not latency-critical.
@@ -1264,9 +1181,9 @@ document.addEventListener('pointerdown', () => {
 }, { capture: true });
 
 window.addEventListener('resize', () => {
-  sizeCanvasToIncomingStream();
+  windowRuntime.sizeSurfaceToIncomingStream();
   renderRemotePointer();
-  scheduleStreamWindowAspectCorrection();
+  windowRuntime.scheduleAspectCorrection();
 });
 
 window.addEventListener('focus', () => {

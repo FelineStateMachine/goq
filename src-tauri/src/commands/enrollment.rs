@@ -64,6 +64,12 @@ pub struct ConnectionEnrollment {
     pub pending_invitation: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OpenedInvitationSource {
+    DeepLinkToken(String),
+    File(PathBuf),
+}
+
 fn now_unix() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -179,6 +185,52 @@ fn read_bounded_file(path: &Path, maximum: u64, require_private: bool) -> Result
     file.read_to_end(&mut bytes)
         .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
     Ok(bytes)
+}
+
+fn invitation_token_from_file(path: &Path) -> Result<String, String> {
+    if path.extension().and_then(|value| value.to_str()) != Some("goq-invite") {
+        return Err("Invitation file must end in .goq-invite".to_string());
+    }
+    let bytes = read_bounded_file(path, MAX_IMPORT_BYTES, false)?;
+    let token = std::str::from_utf8(&bytes)
+        .map_err(|_| "Invitation file is not UTF-8".to_string())?
+        .trim_end_matches(['\r', '\n']);
+    if token.len() != bytes.len() && bytes.len() - token.len() > 2 {
+        return Err("Invitation file has unexpected trailing data".to_string());
+    }
+    Ok(token.to_string())
+}
+
+fn opened_invitation_source(url: &url::Url) -> Result<OpenedInvitationSource, String> {
+    if url.scheme() == "goq" {
+        if url.host_str() != Some("invite")
+            || url.port().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("Invitation deep link shape is invalid".to_string());
+        }
+        let mut segments = url
+            .path_segments()
+            .ok_or_else(|| "Invitation deep link has no token".to_string())?
+            .filter(|segment| !segment.is_empty());
+        let token = segments
+            .next()
+            .ok_or_else(|| "Invitation deep link has no token".to_string())?;
+        if segments.next().is_some() {
+            return Err("Invitation deep link has extra path segments".to_string());
+        }
+        Ok(OpenedInvitationSource::DeepLinkToken(token.to_string()))
+    } else if url.scheme() == "file" {
+        let path = url
+            .to_file_path()
+            .map_err(|_| "Invitation file URL is invalid".to_string())?;
+        Ok(OpenedInvitationSource::File(path))
+    } else {
+        Err("Only goq invitation links and invitation files are accepted".to_string())
+    }
 }
 
 fn load_profile(path: &Path) -> Result<Option<EnrollmentProfile>, String> {
@@ -331,17 +383,7 @@ pub fn portal_import_invitation_file(
     state: State<'_, super::state::AppState>,
 ) -> Result<InvitationSummary, String> {
     let path = PathBuf::from(path);
-    if path.extension().and_then(|value| value.to_str()) != Some("goq-invite") {
-        return Err("Invitation file must end in .goq-invite".to_string());
-    }
-    let bytes = read_bounded_file(&path, MAX_IMPORT_BYTES, false)?;
-    let token = std::str::from_utf8(&bytes)
-        .map_err(|_| "Invitation file is not UTF-8".to_string())?
-        .trim_end_matches(['\r', '\n']);
-    if token.len() != bytes.len() && bytes.len() - token.len() > 2 {
-        return Err("Invitation file has unexpected trailing data".to_string());
-    }
-    stage_token(&state.enrollment, token.to_string())
+    stage_token(&state.enrollment, invitation_token_from_file(&path)?)
 }
 
 fn ensure_profile_can_be_replaced(existing: Option<&EnrollmentProfile>) -> Result<(), String> {
@@ -440,34 +482,11 @@ pub async fn portal_reset_enrollment(
 
 pub fn stage_opened_url(app: &AppHandle, url: &url::Url) -> Result<(), String> {
     let state = app.state::<super::state::AppState>();
-    let summary = if url.scheme() == "goq" {
-        if url.host_str() != Some("invite")
-            || url.port().is_some()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err("Invitation deep link shape is invalid".to_string());
+    let summary = match opened_invitation_source(url)? {
+        OpenedInvitationSource::DeepLinkToken(token) => stage_token(&state.enrollment, token)?,
+        OpenedInvitationSource::File(path) => {
+            stage_token(&state.enrollment, invitation_token_from_file(&path)?)?
         }
-        let mut segments = url
-            .path_segments()
-            .ok_or_else(|| "Invitation deep link has no token".to_string())?
-            .filter(|segment| !segment.is_empty());
-        let token = segments
-            .next()
-            .ok_or_else(|| "Invitation deep link has no token".to_string())?;
-        if segments.next().is_some() {
-            return Err("Invitation deep link has extra path segments".to_string());
-        }
-        stage_token(&state.enrollment, token.to_string())?
-    } else if url.scheme() == "file" {
-        let path = url
-            .to_file_path()
-            .map_err(|_| "Invitation file URL is invalid".to_string())?;
-        portal_import_invitation_file(path.to_string_lossy().into_owned(), state)?
-    } else {
-        return Err("Only goq invitation links and invitation files are accepted".to_string());
     };
     app.emit("invitation-pending", summary)
         .map_err(|error| format!("Could not announce invitation: {error}"))?;
@@ -640,5 +659,89 @@ mod tests {
         );
         clear_exact_pending_invitation(&mut profile, &expected).unwrap();
         assert!(ensure_profile_can_be_replaced(Some(&profile)).is_err());
+    }
+
+    #[test]
+    fn strict_deep_link_shape_accepts_only_one_bounded_token_path() {
+        let raw = token(now_unix().unwrap());
+        let accepted = url::Url::parse(&format!("goq://invite/{raw}")).unwrap();
+        assert_eq!(
+            opened_invitation_source(&accepted).unwrap(),
+            OpenedInvitationSource::DeepLinkToken(raw.clone())
+        );
+
+        let rejected = [
+            format!("goq://other/{raw}"),
+            "goq://invite".to_string(),
+            format!("goq://invite/{raw}/extra"),
+            format!("goq://invite/{raw}?unexpected=1"),
+            format!("goq://invite/{raw}#unexpected"),
+            format!("goq://user@invite/{raw}"),
+            format!("goq://invite:123/{raw}"),
+            format!("https://invite/{raw}"),
+        ];
+        for value in rejected {
+            let url = url::Url::parse(&value).unwrap();
+            assert!(
+                opened_invitation_source(&url).is_err(),
+                "unexpected invitation URL accepted: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_ingress_accepts_only_bounded_exact_invitation_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = token(now_unix().unwrap());
+        for (name, suffix) in [
+            ("exact.goq-invite", ""),
+            ("newline.goq-invite", "\n"),
+            ("crlf.goq-invite", "\r\n"),
+        ] {
+            let path = temp.path().join(name);
+            fs::write(&path, format!("{raw}{suffix}")).unwrap();
+            assert_eq!(invitation_token_from_file(&path).unwrap(), raw);
+        }
+
+        let file_url = url::Url::from_file_path(temp.path().join("exact.goq-invite")).unwrap();
+        assert_eq!(
+            opened_invitation_source(&file_url).unwrap(),
+            OpenedInvitationSource::File(temp.path().join("exact.goq-invite"))
+        );
+    }
+
+    #[test]
+    fn file_ingress_rejects_unsafe_or_malformed_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = token(now_unix().unwrap());
+
+        let wrong_extension = temp.path().join("invitation.txt");
+        fs::write(&wrong_extension, &raw).unwrap();
+        assert!(invitation_token_from_file(&wrong_extension).is_err());
+
+        let trailing = temp.path().join("trailing.goq-invite");
+        fs::write(&trailing, format!("{raw}\n\n\n")).unwrap();
+        assert!(invitation_token_from_file(&trailing).is_err());
+
+        let invalid_utf8 = temp.path().join("invalid-utf8.goq-invite");
+        fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        assert!(invitation_token_from_file(&invalid_utf8).is_err());
+
+        let oversized = temp.path().join("oversized.goq-invite");
+        fs::write(&oversized, vec![b'x'; MAX_IMPORT_BYTES as usize + 1]).unwrap();
+        assert!(invitation_token_from_file(&oversized).is_err());
+
+        let directory = temp.path().join("directory.goq-invite");
+        fs::create_dir(&directory).unwrap();
+        assert!(invitation_token_from_file(&directory).is_err());
+
+        #[cfg(unix)]
+        {
+            let target = temp.path().join("target.goq-invite");
+            let symlink = temp.path().join("symlink.goq-invite");
+            fs::write(&target, raw).unwrap();
+            std::os::unix::fs::symlink(target, &symlink).unwrap();
+            assert!(invitation_token_from_file(&symlink).is_err());
+        }
     }
 }

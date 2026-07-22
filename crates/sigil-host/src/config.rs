@@ -492,11 +492,6 @@ impl HostConfig {
         self.width.zip(self.height)
     }
 
-    pub fn resolved_dimensions(&self) -> Result<(u32, u32)> {
-        self.configured_dimensions()
-            .context("video dimensions have not been resolved")
-    }
-
     pub fn test_pattern_dimensions(&self) -> Result<(u32, u32)> {
         ensure!(
             self.source == VideoSource::TestPattern,
@@ -505,13 +500,6 @@ impl HostConfig {
         Ok(self
             .configured_dimensions()
             .unwrap_or((Self::TEST_PATTERN_WIDTH, Self::TEST_PATTERN_HEIGHT)))
-    }
-
-    pub fn apply_resolved_dimensions(&mut self, width: u32, height: u32) -> Result<()> {
-        validate_video_dimensions(width, height)?;
-        self.width = Some(width);
-        self.height = Some(height);
-        Ok(())
     }
 
     pub fn ensure_runtime_directory(&self) -> Result<()> {

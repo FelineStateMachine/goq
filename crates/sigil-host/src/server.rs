@@ -413,6 +413,13 @@ fn motion_resolution_policy(width: u32, height: u32) -> Result<Option<MotionReso
     }
 }
 
+fn motion_resolution_policy_for_encoder(
+    control: &EncoderControl,
+) -> Result<Option<MotionResolutionPolicy>> {
+    let (width, height) = control.initial_dimensions();
+    motion_resolution_policy(u32::from(width), u32::from(height))
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FeedbackIngressCursor {
     last_report_id: Option<u64>,
@@ -3235,8 +3242,12 @@ async fn serve_media_feedback(
     let mut receiver_open = true;
     let mut controller = ShadowBitrateController::new(ceiling_kbps, lease.telemetry.snapshot());
     let mut resolution_controller = if encoder_actuation_available {
-        let (width, height) = config.resolved_dimensions()?;
-        motion_resolution_policy(width, height)?
+        lease
+            .encoder_control
+            .as_ref()
+            .map(motion_resolution_policy_for_encoder)
+            .transpose()?
+            .flatten()
     } else {
         None
     };
@@ -5195,6 +5206,28 @@ mod tests {
         );
         assert!(motion_resolution_policy(1_920, 1_080).unwrap().is_some());
         assert!(motion_resolution_policy(1_366, 768).unwrap().is_none());
+    }
+
+    #[test]
+    fn feedback_resolution_policy_uses_encoder_generation_dimensions() {
+        let full_hd = crate::source::EncoderControlTestHarness::with_dimensions(1_920, 1_080);
+        let policy = motion_resolution_policy_for_encoder(&full_hd.control)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            policy.native,
+            VideoDimensions {
+                width: 1_920,
+                height: 1_080,
+            }
+        );
+
+        let no_exact_tier = crate::source::EncoderControlTestHarness::with_dimensions(1_366, 768);
+        assert!(
+            motion_resolution_policy_for_encoder(&no_exact_tier.control)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

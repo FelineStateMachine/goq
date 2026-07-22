@@ -93,7 +93,14 @@ After the first accepted media handshake, verify the durable grant with
 explicit and invalidates all outstanding invitations:
 
 ```bash
-sigil enrollment revoke --config ~/.config/sigil-spark/host.toml
+fingerprint="$(sigil appliance status \
+  --config ~/.config/sigil-spark/host.toml --json | jq -r .identity.host_fingerprint)"
+systemctl --user stop sigil-host.service
+sigil appliance enrollment-reset \
+  --config ~/.config/sigil-spark/host.toml \
+  --expected-host-fingerprint "$fingerprint" \
+  --json
+systemctl --user start sigil-host.service
 ```
 
 Then disconnect Portal and use **client -> reset enrollment** before importing

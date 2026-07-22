@@ -188,6 +188,8 @@ Provision a dedicated AMD host with the
 defines the temporary `slate` stand-in used for protocol and daemon extraction.
 The [appliance status v1 contract](docs/sigil-appliance-status-v1.md) defines
 the local, redacted interface intended for the Decky management surface.
+The [enrollment reset v1 contract](docs/sigil-appliance-enrollment-reset-v1.md)
+defines the offline, identity-preserving reset used by that surface.
 Run `scripts/bazzite-inventory.sh` on a candidate host for a read-only report;
 add `--smoke` to exercise a bounded 1280×800/60 VA-API encode. On the first SSH
 login after a physically headless cold boot, use `--cold-boot` for a strict,

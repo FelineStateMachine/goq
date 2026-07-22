@@ -13,11 +13,19 @@ import sys
 
 REPOSITORY = "FelineStateMachine/goq"
 UNCONFIGURED = "unconfigured"
+MINISIGN_VERSION = "0.12"
+MINISIGN_URL = (
+    "https://github.com/jedisct1/minisign/releases/download/0.12/"
+    "minisign-0.12-linux.tar.gz"
+)
+MINISIGN_SHA256 = (
+    "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
+)
 TAG_PATTERN = re.compile(
     r"^v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z][0-9A-Za-z.-]*)?$"
 )
 READONLY_ASSIGNMENT_PATTERN = re.compile(
-    r'^readonly (?P<name>[a-z_]+)="(?P<value>[^"\n]*)"$', re.MULTILINE
+    r'^readonly (?P<name>[a-z_][a-z0-9_]*)="(?P<value>[^"\n]*)"$', re.MULTILINE
 )
 
 
@@ -44,11 +52,33 @@ def parse_bootstrap_pins(source: str) -> dict[str, str]:
         assignments.setdefault(match.group("name"), []).append(match.group("value"))
 
     pins: dict[str, str] = {}
-    for name in ("repository", "publisher_key", "release_tag"):
+    for name in (
+        "repository",
+        "publisher_key",
+        "release_tag",
+        "minisign_version",
+        "minisign_url",
+        "minisign_sha256",
+    ):
         values = assignments.get(name, [])
         require(len(values) == 1, f"bootstrap must declare readonly {name} exactly once")
         pins[name] = values[0]
-    require(pins["repository"] == REPOSITORY, "bootstrap repository pin is not the Goq release repository")
+    require(
+        pins["repository"] == REPOSITORY,
+        "bootstrap repository pin is not the Goq release repository",
+    )
+    require(
+        pins["minisign_version"] == MINISIGN_VERSION,
+        "bootstrap Minisign version is not the reviewed verifier version",
+    )
+    require(
+        pins["minisign_url"] == MINISIGN_URL,
+        "bootstrap Minisign URL is not the reviewed verifier asset",
+    )
+    require(
+        pins["minisign_sha256"] == MINISIGN_SHA256,
+        "bootstrap Minisign checksum is not the reviewed verifier digest",
+    )
     return pins
 
 

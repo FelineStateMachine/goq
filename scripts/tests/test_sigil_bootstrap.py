@@ -27,6 +27,16 @@ PUBLISHER_KEY = base64.b64encode(b"Ed" + b"A" * 8 + b"B" * 32).decode("ascii")
 OTHER_PUBLISHER_KEY = base64.b64encode(b"Ed" + b"C" * 8 + b"D" * 32).decode("ascii")
 RELEASE_TAG = "v1.2.3-alpha.1"
 ASSET_NAME = f"sigil-{RELEASE_TAG}-bazzite-x86_64.tar.gz"
+MINISIGN_VERSION = "0.12"
+MINISIGN_ASSET_NAME = f"minisign-{MINISIGN_VERSION}-linux.tar.gz"
+MINISIGN_URL = (
+    "https://github.com/jedisct1/minisign/releases/download/0.12/"
+    f"{MINISIGN_ASSET_NAME}"
+)
+MINISIGN_SHA256 = (
+    "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
+)
+ZERO_SHA256 = "0" * 64
 
 
 def bootstrap_with_pins(
@@ -34,6 +44,7 @@ def bootstrap_with_pins(
     *,
     publisher_key: str = PUBLISHER_KEY,
     release_tag: str = RELEASE_TAG,
+    minisign_sha256: str | None = None,
 ) -> str:
     source, publisher_replacements = re.subn(
         r'^readonly publisher_key="[^"\n]*"$',
@@ -49,7 +60,21 @@ def bootstrap_with_pins(
         count=1,
         flags=re.MULTILINE,
     )
-    if publisher_replacements != 1 or tag_replacements != 1:
+    if minisign_sha256 is not None:
+        source, minisign_replacements = re.subn(
+            r'^readonly minisign_sha256="[^"\n]*"$',
+            f'readonly minisign_sha256="{minisign_sha256}"',
+            source,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    else:
+        minisign_replacements = 1
+    if (
+        publisher_replacements != 1
+        or tag_replacements != 1
+        or minisign_replacements != 1
+    ):
         raise AssertionError("bootstrap fixture pins must each occur exactly once")
     return source
 
@@ -133,6 +158,35 @@ class SigilBootstrapContractTests(unittest.TestCase):
                 public_key,
             )
 
+    def test_verifier_provisioning_is_bound_to_reviewed_exact_pins(self) -> None:
+        pins = VERIFIER.parse_bootstrap_pins(self.bootstrap_source)
+        self.assertEqual(pins["minisign_version"], MINISIGN_VERSION)
+        self.assertEqual(pins["minisign_url"], MINISIGN_URL)
+        self.assertEqual(pins["minisign_sha256"], MINISIGN_SHA256)
+
+        public_key = "unconfigured\n"
+        replacements = {
+            'readonly minisign_version="0.12"': 'readonly minisign_version="0.13"',
+            f'readonly minisign_url="{MINISIGN_URL}"': (
+                'readonly minisign_url="https://example.invalid/minisign.tar.gz"'
+            ),
+            f'readonly minisign_sha256="{MINISIGN_SHA256}"': (
+                f'readonly minisign_sha256="{ZERO_SHA256}"'
+            ),
+        }
+        for original, replacement in replacements.items():
+            with self.subTest(pin=original.split("=", 1)[0]):
+                mutated = self.bootstrap_source.replace(original, replacement, 1)
+                with self.assertRaises(VERIFIER.VerificationError):
+                    VERIFIER.verify_contract(mutated, public_key)
+
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "exactly once"):
+            VERIFIER.verify_contract(
+                self.bootstrap_source
+                + f'\nreadonly minisign_sha256="{MINISIGN_SHA256}"\n',
+                public_key,
+            )
+
     def test_rejects_structurally_invalid_minisign_public_keys(self) -> None:
         invalid_keys = {
             "wrong algorithm": base64.b64encode(b"ED" + b"A" * 40).decode("ascii"),
@@ -170,14 +224,19 @@ class SigilBootstrapBehaviorTests(unittest.TestCase):
         self.curl_log = self.root / "curl.log"
         self.stage_marker = self.root / "stage.marker"
         self.forbidden_marker = self.root / "forbidden.marker"
+        self.minisign_marker = self.root / "minisign.marker"
         self.bootstrap = self.root / "install-sigil"
+        self.write_command_stubs()
+        minisign_digest = self.write_minisign_fixture()
+        self.write_release_fixture()
         self.bootstrap.write_text(
-            bootstrap_with_pins(BOOTSTRAP_PATH.read_text(encoding="utf-8")),
+            bootstrap_with_pins(
+                BOOTSTRAP_PATH.read_text(encoding="utf-8"),
+                minisign_sha256=minisign_digest,
+            ),
             encoding="utf-8",
         )
         self.bootstrap.chmod(0o755)
-        self.write_command_stubs()
-        self.write_release_fixture()
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -259,6 +318,24 @@ cp -- "$BOOTSTRAP_FIXTURE_DIR/$name" "$output"
             "minisign",
             """#!/usr/bin/env bash
 set -euo pipefail
+printf 'PATH minisign invoked\n' >>"$BOOTSTRAP_FORBIDDEN_MARKER"
+exit 99
+""",
+        )
+        self.write_stub(
+            "systemctl",
+            """#!/usr/bin/env bash
+set -euo pipefail
+printf 'systemctl %s\n' "$*" >>"$BOOTSTRAP_FORBIDDEN_MARKER"
+exit 99
+""",
+        )
+
+    def write_minisign_fixture(self, *, variant: str = "valid") -> str:
+        archive_path = self.fixture_dir / MINISIGN_ASSET_NAME
+        verifier = b"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'invoked\\n' >>"$BOOTSTRAP_MINISIGN_MARKER"
 [[ "${BOOTSTRAP_TEST_MINISIGN:-ok}" == ok ]] || exit 1
 message=''
 signature=''
@@ -272,16 +349,48 @@ while (( $# )); do
   esac
 done
 [[ -s "$message" && -s "$signature" && "$key" == "$BOOTSTRAP_EXPECTED_KEY" ]]
-""",
+"""
+        with tarfile.open(archive_path, "w:gz") as archive:
+            self.add_archive_directory(archive, "minisign-linux/")
+            self.add_archive_directory(archive, "minisign-linux/aarch64/")
+            self.add_archive_directory(archive, "minisign-linux/x86_64/")
+            self.add_archive_file(
+                archive,
+                "minisign-linux/aarch64/minisign",
+                b"fixture aarch64 binary\n",
+                0o755,
+            )
+            if variant == "symlink":
+                link = tarfile.TarInfo("minisign-linux/x86_64/minisign")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "../aarch64/minisign"
+                archive.addfile(link)
+            else:
+                self.add_archive_file(
+                    archive,
+                    "minisign-linux/x86_64/minisign",
+                    verifier,
+                    0o755,
+                )
+            if variant == "unexpected":
+                self.add_archive_file(
+                    archive,
+                    "minisign-linux/README",
+                    b"unexpected\n",
+                    0o644,
+                )
+        return hashlib.sha256(archive_path.read_bytes()).hexdigest()
+
+    def repin_minisign_fixture(self, *, variant: str) -> None:
+        digest = self.write_minisign_fixture(variant=variant)
+        self.bootstrap.write_text(
+            bootstrap_with_pins(
+                BOOTSTRAP_PATH.read_text(encoding="utf-8"),
+                minisign_sha256=digest,
+            ),
+            encoding="utf-8",
         )
-        self.write_stub(
-            "systemctl",
-            """#!/usr/bin/env bash
-set -euo pipefail
-printf 'systemctl %s\n' "$*" >>"$BOOTSTRAP_FORBIDDEN_MARKER"
-exit 99
-""",
-        )
+        self.bootstrap.chmod(0o755)
 
     def write_release_fixture(
         self,
@@ -322,6 +431,13 @@ exit 99
         )
 
     @staticmethod
+    def add_archive_directory(archive: tarfile.TarFile, name: str) -> None:
+        info = tarfile.TarInfo(name)
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+        archive.addfile(info)
+
+    @staticmethod
     def add_archive_file(
         archive: tarfile.TarFile,
         name: str,
@@ -344,6 +460,7 @@ exit 99
                 "BOOTSTRAP_CURL_LOG": str(self.curl_log),
                 "BOOTSTRAP_STAGE_MARKER": str(self.stage_marker),
                 "BOOTSTRAP_FORBIDDEN_MARKER": str(self.forbidden_marker),
+                "BOOTSTRAP_MINISIGN_MARKER": str(self.minisign_marker),
             }
         )
         environment.update(overrides)
@@ -378,6 +495,37 @@ exit 99
             with self.subTest(expected=expected):
                 self.assert_rejected(expected, **overrides)
 
+    def test_verifier_download_and_digest_fail_before_any_verifier_executes(self) -> None:
+        self.assert_rejected(
+            "Minisign verifier download failed",
+            BOOTSTRAP_TEST_CURL_PARTIAL=MINISIGN_ASSET_NAME,
+        )
+        self.assertFalse(self.minisign_marker.exists())
+        self.assertEqual(
+            self.curl_log.read_text(encoding="utf-8").splitlines(),
+            [MINISIGN_ASSET_NAME],
+        )
+
+        (self.fixture_dir / MINISIGN_ASSET_NAME).write_bytes(b"")
+        self.assert_rejected("Minisign verifier download is empty")
+        self.assertFalse(self.minisign_marker.exists())
+
+        digest = self.write_minisign_fixture()
+        self.assertNotEqual(digest, ZERO_SHA256)
+        with (self.fixture_dir / MINISIGN_ASSET_NAME).open("ab") as archive:
+            archive.write(b"corrupt")
+        self.assert_rejected("Minisign verifier checksum does not match")
+        self.assertFalse(self.minisign_marker.exists())
+
+    def test_verifier_archive_shape_and_types_fail_before_execution(self) -> None:
+        self.repin_minisign_fixture(variant="unexpected")
+        self.assert_rejected("Minisign verifier archive has unexpected contents")
+        self.assertFalse(self.minisign_marker.exists())
+
+        self.repin_minisign_fixture(variant="symlink")
+        self.assert_rejected("Minisign verifier archive contains a special file or link")
+        self.assertFalse(self.minisign_marker.exists())
+
     def test_rejects_partial_download_bad_signature_and_bad_checksum(self) -> None:
         self.assert_rejected(
             "signed release asset download failed",
@@ -385,7 +533,7 @@ exit 99
         )
         self.assertEqual(
             self.curl_log.read_text(encoding="utf-8").splitlines(),
-            [ASSET_NAME, f"{ASSET_NAME}.sha256"],
+            [MINISIGN_ASSET_NAME, ASSET_NAME, f"{ASSET_NAME}.sha256"],
         )
         (self.fixture_dir / f"{ASSET_NAME}.sha256").write_text("", encoding="utf-8")
         self.assert_rejected("signed release asset download is empty")
@@ -394,6 +542,7 @@ exit 99
             "publisher signature is invalid",
             BOOTSTRAP_TEST_MINISIGN="fail",
         )
+        self.assertEqual(self.minisign_marker.read_text(encoding="utf-8"), "invoked\n")
         self.write_release_fixture(valid_checksum=False)
         self.assert_rejected("release checksum does not match")
 
@@ -418,6 +567,7 @@ exit 99
         result = self.run_bootstrap()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.stage_marker.read_text(encoding="utf-8"), "staged\n")
+        self.assertEqual(self.minisign_marker.read_text(encoding="utf-8"), "invoked\n")
         self.assertFalse(self.forbidden_marker.exists())
         self.assertIn(f"Sigil runtime {RELEASE_TAG} is installed.", result.stdout)
         self.assertEqual(list(self.tmp_dir.glob("goq-sigil-install.*")), [])

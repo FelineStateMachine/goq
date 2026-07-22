@@ -40,8 +40,11 @@ state_directory="$temp_root/state"
 runtime_directory="$temp_root/runtime"
 alternate_runtime_directory="$temp_root/runtime-alternate"
 invalid_runtime_directory="$temp_root/invalid-runtime"
+config_directory="$temp_root/config"
+unsafe_config_directory="$temp_root/config-unsafe"
 identity_path="$identity_directory/host.key"
-config_path="$temp_root/host.toml"
+config_path="$config_directory/host.toml"
+unsafe_config_path="$unsafe_config_directory/host.toml"
 host_log="$temp_root/host.log"
 second_log="$temp_root/second.log"
 live_status="$temp_root/live-status.json"
@@ -58,6 +61,9 @@ mkdir -m 0700 \
   "$state_directory" \
   "$runtime_directory" \
   "$alternate_runtime_directory"
+mkdir -m 0755 "$config_directory"
+mkdir -m 0775 "$unsafe_config_directory"
+chmod 0775 "$unsafe_config_directory"
 mkdir -m 0755 "$invalid_runtime_directory"
 "$sigil" identity init --output "$identity_path" >"$temp_root/identity.log"
 host_node_id="$(sed -n 's/^node_id=//p' "$temp_root/identity.log")"
@@ -76,6 +82,30 @@ printf '%s\n' \
   "ffmpeg_path = \"$ffmpeg\"" \
   >"$config_path"
 chmod 0600 "$config_path"
+
+cp "$config_path" "$unsafe_config_path"
+chmod 0600 "$unsafe_config_path"
+unsafe_config_hash="$(python3 - "$unsafe_config_path" <<'PY'
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+if XDG_RUNTIME_DIR="$runtime_directory" \
+  "$sigil" config check --config "$unsafe_config_path" \
+    >"$temp_root/unsafe-config-check.out" \
+    2>"$temp_root/unsafe-config-check.error"; then
+  printf 'config check accepted a group-writable config directory\n' >&2
+  exit 1
+fi
+[[ "$unsafe_config_hash" == "$(python3 - "$unsafe_config_path" <<'PY'
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)" ]]
 
 XDG_RUNTIME_DIR="$runtime_directory" \
   "$sigil" serve \

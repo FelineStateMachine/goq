@@ -835,8 +835,13 @@ fn replace_config(config_path: &Path, bytes: &[u8]) -> ManagementResult<()> {
                 anyhow::anyhow!("config filename is invalid"),
             )
         })?;
-    secure_state::atomic_write_exact(parent, file_name, bytes, MAX_CONFIG_BYTES)
-        .map_err(|error| ManagementError::new(ManagementErrorCode::UnsafeStorage, error))
+    secure_state::atomic_write_exact_in_integrity_protected_directory(
+        parent,
+        file_name,
+        bytes,
+        MAX_CONFIG_BYTES,
+    )
+    .map_err(|error| ManagementError::new(ManagementErrorCode::UnsafeStorage, error))
 }
 
 fn write_artifact(state_directory: &Path, file_name: &str, bytes: &[u8]) -> ManagementResult<()> {
@@ -1009,7 +1014,7 @@ mod tests {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+                fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
             }
             let state_directory = directory.path().join("state");
             secure_state::ensure_private_directory(&state_directory).unwrap();
@@ -1117,6 +1122,22 @@ mod tests {
             Some(Path::new("relative-runtime")),
         )
         .unwrap_err();
+        assert_eq!(error.code, ManagementErrorCode::UnsafeStorage);
+        assert_eq!(fs::read(&fixture.config_path).unwrap(), original);
+        assert!(read_journal(&fixture.state_directory).unwrap().is_none());
+        assert!(!fixture.state_directory.join(BASE_FILE).exists());
+        assert!(!fixture.state_directory.join(CANDIDATE_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_config_parent_fails_before_transaction_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = Fixture::new();
+        let original = fs::read(&fixture.config_path).unwrap();
+        fs::set_permissions(fixture._directory.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        let error = set(&fixture.config_path, &fixture.request(72), None).unwrap_err();
         assert_eq!(error.code, ManagementErrorCode::UnsafeStorage);
         assert_eq!(fs::read(&fixture.config_path).unwrap(), original);
         assert!(read_journal(&fixture.state_directory).unwrap().is_none());

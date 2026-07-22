@@ -410,6 +410,13 @@ Use these locations consistently:
 
 This avoids modifying Bazzite's immutable base image.
 
+Sigil requires the configuration file and its immediate directory to be owned
+by the service user and not writable by group or other users. This appliance
+layout deliberately uses mode `0700`; a conventional owner-controlled mode
+`0755` configuration directory is also valid, while group- or world-writable
+directories fail during `config check` and daemon startup before any managed
+configuration transaction can begin.
+
 ## 6. Prepare a containerized build environment
 
 Bazzite recommends Distrobox for development packages. The repository must

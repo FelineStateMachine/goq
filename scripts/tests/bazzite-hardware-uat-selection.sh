@@ -60,6 +60,10 @@ cat >"$bin/gst-inspect-1.0" <<'EOF'
 set -euo pipefail
 
 fixture="${SIGIL_TEST_FACTORY_FIXTURE:?}"
+if [[ "${SIGIL_TEST_GST_MODE:-}" == oversize-factory && $# -gt 0 ]]; then
+  awk 'BEGIN { for (i = 0; i < 1048578; i++) printf "x" }'
+  exit 0
+fi
 if [[ $# -eq 0 ]]; then
   awk -F '\t' '{ printf "va:  %s: fixture encoder\n", $1 }' "$fixture"
   exit 0
@@ -87,12 +91,26 @@ for property in aud b-frames key-int-max ref-frames target-usage bitrate qpi qpp
 done
 EOF
 chmod 0755 "$bin/gst-inspect-1.0"
+cat >"$bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ "${SIGIL_TEST_TIMEOUT:-}" != true ]] || exit 124
+[[ "${1:-}" == --signal=TERM ]]
+shift
+[[ "${1:-}" == --kill-after=2s ]]
+shift
+[[ "${1:-}" == 5s ]]
+shift
+exec "$@"
+EOF
+chmod 0755 "$bin/timeout"
 export SIGIL_TEST_FACTORY_FIXTURE="$factory_fixture"
 
 select_fixture() {
   select_amd_gstva_h264_encoder \
     "$bin/gst-inspect-1.0" "$sysfs_root" "$device_root" false \
-    "${1:-}" "${2:-}"
+    "${1:-}" "${2:-}" "$bin/timeout" "$fixture"
 }
 
 reset_render_nodes
@@ -168,6 +186,20 @@ if select_fixture; then
   fail 'a factory missing a required writable property was accepted'
 fi
 
+SIGIL_TEST_GST_MODE=oversize-factory
+export SIGIL_TEST_GST_MODE
+if select_fixture; then
+  fail 'oversized factory inspection output was accepted'
+fi
+unset SIGIL_TEST_GST_MODE
+
+SIGIL_TEST_TIMEOUT=true
+export SIGIL_TEST_TIMEOUT
+if select_fixture; then
+  fail 'a timed-out GStreamer registry inspection was accepted'
+fi
+unset SIGIL_TEST_TIMEOUT
+
 printf '%s\t%s\t%s\t%s\n' \
   x264enc "$device_root/renderD130" cqp,cbr complete \
   vah264enc-malformed "$device_root/renderD130" cqp,cbr complete \
@@ -191,7 +223,8 @@ fi
 rm -f -- "$device_root/renderD130"
 install -m 0600 /dev/null "$device_root/renderD130"
 if select_amd_gstva_h264_encoder \
-  "$bin/gst-inspect-1.0" "$sysfs_root" "$device_root" true '' ''
+  "$bin/gst-inspect-1.0" "$sysfs_root" "$device_root" true '' '' \
+  "$bin/timeout" "$fixture"
 then
   fail 'a regular file was accepted as a production DRM character device'
 fi

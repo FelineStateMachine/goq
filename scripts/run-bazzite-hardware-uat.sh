@@ -2,6 +2,25 @@
 
 set -euo pipefail
 
+GST_INSPECT_MAX_BYTES=1048576
+
+run_bounded_gst_inspect() {
+  local timeout_path="$1"
+  local gst_inspect_path="$2"
+  local output_path="$3"
+  local output_size
+  shift 3
+
+  if ! "$timeout_path" --signal=TERM --kill-after=2s 5s \
+    "$gst_inspect_path" "$@" 2>/dev/null \
+    | head -c "$((GST_INSPECT_MAX_BYTES + 1))" >"$output_path"
+  then
+    return 1
+  fi
+  output_size="$(wc -c <"$output_path" | tr -d '[:space:]')"
+  [[ "$output_size" =~ ^[0-9]+$ && "$output_size" -le "$GST_INSPECT_MAX_BYTES" ]]
+}
+
 gst_property_block_contains() {
   local property="$1"
   local needle="$2"
@@ -59,8 +78,11 @@ select_amd_gstva_h264_encoder() {
   local require_character="${4:-true}"
   local override_node="${5:-}"
   local override_factory="${6:-}"
+  local timeout_path="${7:?timeout command is required}"
+  local output_root="${8:?bounded inspection output directory is required}"
   local factory
   local factories
+  local factory_output
   local inspection
   local node_name
   local sysfs_node
@@ -72,14 +94,18 @@ select_amd_gstva_h264_encoder() {
   render_node=''
   va_encoder=''
   va_candidates=''
-  factories="$(
-    LC_ALL=C "$gst_inspect_path" 2>/dev/null | awk '
-      $2 ~ /^va(renderD[0-9]+)?h264(lp)?enc:$/ {
-        sub(/:$/, "", $2)
-        print $2
-      }
-    ' | sort -u
-  )" || return 1
+  [[ -d "$output_root" && ! -L "$output_root" ]] || return 1
+  if ! LC_ALL=C run_bounded_gst_inspect \
+    "$timeout_path" "$gst_inspect_path" "$output_root/gst-inspect.registry";
+  then
+    return 1
+  fi
+  factories="$(awk '
+    $2 ~ /^va(renderD[0-9]+)?h264(lp)?enc:$/ {
+      sub(/:$/, "", $2)
+      print $2
+    }
+  ' "$output_root/gst-inspect.registry" | sort -u)" || return 1
 
   for sysfs_node in "$sysfs_root"/renderD*; do
     [[ -e "$sysfs_node/device/driver" ]] || continue
@@ -96,9 +122,13 @@ select_amd_gstva_h264_encoder() {
 
     while IFS= read -r factory; do
       [[ -n "$factory" ]] || continue
-      if ! inspection="$(LC_ALL=C "$gst_inspect_path" "$factory" 2>/dev/null)"; then
+      factory_output="$output_root/gst-inspect.$factory"
+      if ! LC_ALL=C run_bounded_gst_inspect \
+        "$timeout_path" "$gst_inspect_path" "$factory_output" "$factory";
+      then
         continue
       fi
+      inspection="$(<"$factory_output")"
       gst_property_block_contains device-path "Default: \"$candidate\"" \
         <<<"$inspection" || continue
       gstva_factory_supports_uat "$inspection" || continue
@@ -381,12 +411,14 @@ pw_link="$(command -v pw-link)"
 xprop="$(command -v xprop)"
 gst_launch="$(command -v gst-launch-1.0)"
 gst_inspect="$(command -v gst-inspect-1.0)"
+timeout_command="$(command -v timeout)"
 ffmpeg="$(command -v ffmpeg)"
 [[ -S "$XDG_RUNTIME_DIR/pipewire-0" ]]
 selection_status=0
 select_amd_gstva_h264_encoder \
   "$gst_inspect" /sys/class/drm /dev/dri true \
-  "$render_node_override" "$va_encoder_override" || selection_status=$?
+  "$render_node_override" "$va_encoder_override" \
+  "$timeout_command" "$private" || selection_status=$?
 if [[ "$selection_status" -ne 0 ]]; then
   if [[ -n "$render_node_override" ]]; then
     echo "the requested render-node and VA-encoder pair is not eligible for this UAT" >&2

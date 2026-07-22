@@ -23,6 +23,9 @@ an isolated Cargo target directory. The package includes atomic install,
 upgrade/rollback support, the systemd user unit, PipeWire sink, staged udev
 rule, complete checksums, and build provenance. It never includes the source
 tree, host identity, hardware configuration, environment files, or evidence.
+Product mode intentionally uses Sigil's default feature set; the opt-in
+in-process-gstreamer backend is excluded until its native/cross-build gate is
+approved.
 
 Options:
   --output PATH          New .tar.gz bundle path (required; must not exist)

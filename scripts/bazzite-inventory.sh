@@ -15,6 +15,52 @@ optional() {
   fi
 }
 
+gstreamer_inventory() {
+  if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
+    echo 'gstreamer_inventory=unavailable'
+    return
+  fi
+
+  local element
+  for element in appsink pipewiresrc queue videoconvert videoscale videorate h264parse fdsink; do
+    if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
+      printf 'gstreamer_element=%s status=present\n' "$element"
+    else
+      printf 'gstreamer_element=%s status=missing\n' "$element"
+    fi
+  done
+  gst-inspect-1.0 pipewiresrc 2>/dev/null || true
+  while IFS= read -r encoder; do
+    printf 'gstreamer_va_h264_factory=%s\n' "$encoder"
+    gst-inspect-1.0 "$encoder" 2>/dev/null || true
+  done < <(
+    gst-inspect-1.0 2>/dev/null | awk '
+      $2 ~ /^va(renderD[0-9]+)?h264(lp)?enc:$/ {
+        sub(/:$/, "", $2)
+        print $2
+      }
+    '
+  )
+}
+
+gstreamer_development_inventory() {
+  if ! command -v pkg-config >/dev/null 2>&1; then
+    echo 'gstreamer_development_metadata=unavailable'
+    return
+  fi
+
+  local module
+  local version
+  for module in gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0; do
+    if version="$(pkg-config --modversion "$module" 2>/dev/null)"; then
+      printf 'gstreamer_development_module=%s status=present version=%s\n' \
+        "$module" "$version"
+    else
+      printf 'gstreamer_development_module=%s status=missing\n' "$module"
+    fi
+  done
+}
+
 cold_boot_failures=0
 cold_boot_insufficient=0
 
@@ -401,27 +447,10 @@ section capture_backends
 if command -v ffmpeg >/dev/null 2>&1; then
   ffmpeg -hide_banner -devices 2>/dev/null || true
 fi
-if command -v gst-inspect-1.0 >/dev/null 2>&1; then
-  for element in pipewiresrc queue videoconvert videoscale videorate h264parse fdsink; do
-    if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
-      printf 'gstreamer_element=%s status=present\n' "$element"
-    else
-      printf 'gstreamer_element=%s status=missing\n' "$element"
-    fi
-  done
-  gst-inspect-1.0 pipewiresrc 2>/dev/null || true
-  while IFS= read -r encoder; do
-    printf 'gstreamer_va_h264_factory=%s\n' "$encoder"
-    gst-inspect-1.0 "$encoder" 2>/dev/null || true
-  done < <(
-    gst-inspect-1.0 2>/dev/null | awk '
-      $2 ~ /^va(renderD[0-9]+)?h264(lp)?enc:$/ {
-        sub(/:$/, "", $2)
-        print $2
-      }
-    '
-  )
-fi
+gstreamer_inventory
+
+section gstreamer_development
+gstreamer_development_inventory
 
 section gamescope_pipewire
 systemctl --user status pipewire.service pipewire.socket wireplumber.service --no-pager || true

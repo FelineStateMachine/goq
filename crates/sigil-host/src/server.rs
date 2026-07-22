@@ -510,6 +510,7 @@ async fn reap_encoded_source_with_timeout(source: EncodedSource, grace_timeout: 
         current_gop,
         task,
         pointer_surface_dimensions: _,
+        encoder_control: _,
     } = source;
     // Closing both bounded outputs gives the capture task a chance to kill and
     // wait for its GStreamer child itself. Abort is only the bounded fallback.
@@ -1581,6 +1582,7 @@ async fn serve_control_moq(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
+        encoder_control: _encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -1874,6 +1876,7 @@ async fn serve_media(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
+        encoder_control: _encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -2046,6 +2049,7 @@ async fn serve_media_v2(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
+        encoder_control: _encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -2139,6 +2143,7 @@ async fn serve_media_v3(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
+        encoder_control: _encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -3979,6 +3984,7 @@ mod tests {
             current_gop: gop_receiver,
             task,
             pointer_surface_dimensions: None,
+            encoder_control: None,
         };
 
         reap_encoded_source_with_timeout(source, Duration::from_millis(100)).await;
@@ -4003,6 +4009,7 @@ mod tests {
             current_gop: gop_receiver,
             task,
             pointer_surface_dimensions: None,
+            encoder_control: None,
         };
 
         started_rx.await.unwrap();

@@ -9,6 +9,10 @@ rust-version = "1.91"
 autobins = false
 default-run = "sigil"
 
+[features]
+default = []
+in-process-gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+
 [[bin]]
 name = "sigil"
 path = "src/main.rs"
@@ -36,6 +40,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 web-transport-iroh.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+gstreamer = { version = "=0.24.5", optional = true }
+gstreamer-app = { version = "=0.24.5", optional = true }
+gstreamer-video = { version = "=0.24.5", optional = true }
 input-linux = "0.7.1"
 x11rb = { version = "0.13.2", default-features = false }
 

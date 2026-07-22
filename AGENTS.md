@@ -29,7 +29,8 @@ Sigil host.
   - `server.rs` owns session admission and separate media, input, and audio
     protocols.
   - `source.rs` owns test-pattern and Gamescope PipeWire capture plus AMD GstVA
-    H.264 encoding.
+    H.264 encoding. External `gst-launch` remains the default; an explicitly
+    feature-gated in-process backend owns bounded encoder control.
   - `input.rs` owns strict Linux `uinput` pointer, keyboard, and Xbox-style
     virtual gamepad devices.
   - `audio.rs` owns bounded PipeWire/Opus capture.
@@ -52,6 +53,11 @@ Sigil host.
 - Gamescope's exact PipeWire node is resolved from strict configured
   properties. AMD GstVA H.264 sustains the fixed 1280x800/60 first target on
   the GPD Pocket 4 test host with bounded post-encode delivery.
+- Existing host configurations default to the proven external `gst-launch`
+  backend. `encoder_backend = "in-process-gstreamer"` fails closed unless the
+  Linux binary was explicitly built with that feature and its runtime
+  GStreamer elements are available. The opt-in backend currently requires CBR;
+  CQP remains on the external compatibility backend.
 - The preferred media path authenticates and claims the single client over
   `sigil/control/1`, then admits that exact peer to a session-scoped upstream
   `iroh-moq` broadcast and static H.264 track. One configured GOP maps to one
@@ -141,14 +147,20 @@ Sigil host.
   bitrate, motion-sensitive resolution, and automatic low-latency codec
   selection. The preferred path now uses pinned upstream `iroh-moq`; the
   external `gst-launch` encoder can still honor a keyframe request only at its
-  next natural configured IDR. An in-process GStreamer control path plus
-  hardware loss/relay proof remain before claiming issue #7 complete.
+  next natural configured IDR. An opt-in in-process GStreamer control path now
+  exists; hardware loss/relay proof remains before claiming issue #7 complete.
+  The in-process encoder backend is not part of the product release feature set
+  until its native Bazzite and cross-build/package dependency gates pass.
 
 ## Working rules
 
 - Use Rust edition 2024. Sigil and Portal require Rust 1.91 or newer and the
   repository pins Rust 1.95 in `rust-toolchain.toml`; `sigil-protocol` retains a
   1.85 minimum. Source `~/.cargo/env` before invoking Cargo directly.
+- Building Sigil with `in-process-gstreamer` requires the GStreamer core, app,
+  and video development packages. Deployment requires their matching runtime
+  libraries plus `appsink`, `pipewiresrc`, parser/conversion elements, and the
+  selected GstVA encoder plugin; never treat build headers as runtime payload.
 - Run `./scripts/verify-demo-build.sh` for the complete repository gate. It
   covers Rust format/tests/clippy, the Linux cross-build when available,
   frontend syntax/tests, ShellCheck, package tests, loopback transport, and

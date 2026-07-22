@@ -31,6 +31,18 @@ pub enum VaapiRateControl {
     Cqp,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GamescopeEncoderBackend {
+    /// Preserve the proven child-process pipeline and its natural-IDR control
+    /// limitation for existing configurations.
+    #[default]
+    ExternalGstLaunch,
+    /// Run the video pipeline in-process so Sigil can apply bounded encoder
+    /// controls. This remains an explicit opt-in until hardware acceptance.
+    InProcessGstreamer,
+}
+
 fn default_width() -> u32 {
     1280
 }
@@ -77,6 +89,10 @@ pub struct GamescopePipewireConfig {
     pub pw_dump_path: PathBuf,
     pub gst_launch_path: PathBuf,
     pub gst_inspect_path: PathBuf,
+    /// External gst-launch remains the compatibility default. The in-process
+    /// backend is accepted only by Linux builds that contain its feature.
+    #[serde(default)]
+    pub encoder_backend: GamescopeEncoderBackend,
     /// Exact dynamically registered VA encoder factory, such as `vah264enc`.
     pub vaapi_encoder: String,
     /// Exact AMD DRM render node expected to back `vaapi_encoder`.
@@ -176,6 +192,16 @@ impl GamescopePipewireConfig {
                 "gamescope_pipewire.{name} must be an absolute path"
             );
         }
+        ensure!(
+            self.encoder_backend != GamescopeEncoderBackend::InProcessGstreamer
+                || cfg!(all(target_os = "linux", feature = "in-process-gstreamer")),
+            "gamescope_pipewire.encoder_backend=in-process-gstreamer requires a Linux Sigil build with the in-process-gstreamer feature"
+        );
+        ensure!(
+            self.encoder_backend != GamescopeEncoderBackend::InProcessGstreamer
+                || self.rate_control == VaapiRateControl::Cbr,
+            "gamescope_pipewire.encoder_backend=in-process-gstreamer currently requires CBR"
+        );
         ensure!(
             self.vaapi_render_node
                 .file_name()
@@ -485,6 +511,7 @@ xwayland_display = ":0"
 pw_dump_path = "/usr/bin/pw-dump"
 gst_launch_path = "/usr/bin/gst-launch-1.0"
 gst_inspect_path = "/usr/bin/gst-inspect-1.0"
+encoder_backend = "external-gst-launch"
 vaapi_encoder = "vah264enc"
 vaapi_render_node = "/dev/dri/renderD128"
 rate_control = "cbr"
@@ -511,6 +538,10 @@ bitrate_bps = 96000
                 .xwayland_display
                 .as_deref(),
             Some(":0")
+        );
+        assert_eq!(
+            config.gamescope_pipewire.as_ref().unwrap().encoder_backend,
+            GamescopeEncoderBackend::ExternalGstLaunch
         );
     }
 
@@ -582,6 +613,7 @@ source = "gamescope-pipewire"
             pw_dump_path: "/usr/bin/pw-dump".into(),
             gst_launch_path: "/usr/bin/gst-launch-1.0".into(),
             gst_inspect_path: "/usr/bin/gst-inspect-1.0".into(),
+            encoder_backend: GamescopeEncoderBackend::ExternalGstLaunch,
             vaapi_encoder: "vah264enc".into(),
             vaapi_render_node: "/dev/dri/renderD128".into(),
             rate_control: VaapiRateControl::Cbr,
@@ -597,6 +629,117 @@ source = "gamescope-pipewire"
         config.validate().unwrap();
         config.gamescope_pipewire.as_mut().unwrap().vaapi_encoder = "x264enc".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn gamescope_encoder_backend_defaults_external() {
+        let config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+source = "gamescope-pipewire"
+
+[gamescope_pipewire]
+node_name = "gamescope"
+media_class = "Video/Source"
+pw_dump_path = "/usr/bin/pw-dump"
+gst_launch_path = "/usr/bin/gst-launch-1.0"
+gst_inspect_path = "/usr/bin/gst-inspect-1.0"
+vaapi_encoder = "vah264enc"
+vaapi_render_node = "/dev/dri/renderD128"
+rate_control = "cbr"
+bitrate_kbps = 12000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.gamescope_pipewire.unwrap().encoder_backend,
+            GamescopeEncoderBackend::ExternalGstLaunch
+        );
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "in-process-gstreamer")))]
+    #[test]
+    fn unavailable_in_process_backend_fails_closed() {
+        let mut config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+source = "gamescope-pipewire"
+
+[gamescope_pipewire]
+node_name = "gamescope"
+media_class = "Video/Source"
+pw_dump_path = "/usr/bin/pw-dump"
+gst_launch_path = "/usr/bin/gst-launch-1.0"
+gst_inspect_path = "/usr/bin/gst-inspect-1.0"
+vaapi_encoder = "vah264enc"
+vaapi_render_node = "/dev/dri/renderD128"
+rate_control = "cbr"
+bitrate_kbps = 12000
+"#,
+        )
+        .unwrap();
+        config.gamescope_pipewire.as_mut().unwrap().encoder_backend =
+            GamescopeEncoderBackend::InProcessGstreamer;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
+    #[test]
+    fn feature_built_linux_accepts_in_process_backend() {
+        let mut config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+source = "gamescope-pipewire"
+
+[gamescope_pipewire]
+node_name = "gamescope"
+media_class = "Video/Source"
+pw_dump_path = "/usr/bin/pw-dump"
+gst_launch_path = "/usr/bin/gst-launch-1.0"
+gst_inspect_path = "/usr/bin/gst-inspect-1.0"
+vaapi_encoder = "vah264enc"
+vaapi_render_node = "/dev/dri/renderD128"
+rate_control = "cbr"
+bitrate_kbps = 12000
+"#,
+        )
+        .unwrap();
+        let pipewire = config.gamescope_pipewire.as_mut().unwrap();
+        pipewire.encoder_backend = GamescopeEncoderBackend::InProcessGstreamer;
+
+        config.validate().unwrap();
+        let pipewire = config.gamescope_pipewire.unwrap();
+        assert_eq!(
+            pipewire.encoder_backend,
+            GamescopeEncoderBackend::InProcessGstreamer
+        );
+        assert_eq!(pipewire.rate_control, VaapiRateControl::Cbr);
+    }
+
+    #[test]
+    fn in_process_cqp_fails_closed() {
+        let pipewire = GamescopePipewireConfig {
+            node_name: "gamescope".into(),
+            media_class: "Video/Source".into(),
+            match_properties: BTreeMap::new(),
+            xwayland_display: None,
+            pw_dump_path: "/usr/bin/pw-dump".into(),
+            gst_launch_path: "/usr/bin/gst-launch-1.0".into(),
+            gst_inspect_path: "/usr/bin/gst-inspect-1.0".into(),
+            encoder_backend: GamescopeEncoderBackend::InProcessGstreamer,
+            vaapi_encoder: "vah264enc".into(),
+            vaapi_render_node: "/dev/dri/renderD128".into(),
+            rate_control: VaapiRateControl::Cqp,
+            bitrate_kbps: None,
+            quantizer: Some(24),
+        };
+
+        assert!(pipewire.validate().is_err());
     }
 
     #[test]

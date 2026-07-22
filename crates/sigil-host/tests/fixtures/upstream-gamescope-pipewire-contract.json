@@ -1,0 +1,107 @@
+[
+  {
+    "id": 71,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "info": {
+      "props": {
+        "media.class": "Video/Source",
+        "node.name": "gamescope",
+        "object.serial": 8842
+      },
+      "params": {
+        "EnumFormat": [
+          {
+            "mediaType": "video",
+            "mediaSubtype": "raw",
+            "format": "BGRx",
+            "size": {
+              "width": 1920,
+              "height": 1080
+            },
+            "framerate": {
+              "num": 0,
+              "denom": 1
+            },
+            "id-00070000": {
+              "default": {
+                "width": 0,
+                "height": 0
+              },
+              "min": {
+                "width": 0,
+                "height": 0
+              },
+              "max": {
+                "width": 4294967295,
+                "height": 4294967295
+              }
+            },
+            "id-00070001": {
+              "default": 0,
+              "min": -9223372036854775808,
+              "max": 9223372036854775807
+            }
+          },
+          {
+            "mediaType": "video",
+            "mediaSubtype": "raw",
+            "format": "NV12",
+            "size": {
+              "width": 1920,
+              "height": 1080
+            },
+            "framerate": {
+              "num": 0,
+              "denom": 1
+            },
+            "id-00070000": {
+              "default": {
+                "width": 0,
+                "height": 0
+              },
+              "min": {
+                "width": 0,
+                "height": 0
+              },
+              "max": {
+                "width": 4294967295,
+                "height": 4294967295
+              }
+            },
+            "id-00070001": {
+              "default": 0,
+              "min": -9223372036854775808,
+              "max": 9223372036854775807
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 72,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "info": {
+      "props": {
+        "media.class": "Video/Source",
+        "node.name": "desktop-capture",
+        "object.serial": "8843"
+      },
+      "params": {
+        "EnumFormat": [
+          {
+            "mediaType": "video",
+            "mediaSubtype": "raw",
+            "format": "BGRx",
+            "size": {
+              "width": 1280,
+              "height": 720
+            }
+          }
+        ]
+      }
+    }
+  }
+]

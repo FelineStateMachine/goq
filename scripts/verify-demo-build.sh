@@ -56,6 +56,8 @@ printf 'revision=%s\n' "$(git rev-parse HEAD)"
 rustc --version
 cargo --version
 
+require_rust_test 'resolves_pinned_upstream_gamescope_pipewire_contract' \
+  -p sigil-host --bin sigil
 cargo fmt --all -- --check
 cargo test --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings

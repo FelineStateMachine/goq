@@ -72,7 +72,7 @@ const SOURCE_REAP_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 const MOQ_ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const MOQ_REJECT_CODE: u32 = 0x534d;
 const ADAPTIVE_BITRATE_FLOOR_KBPS: u32 = 1_000;
-const TEST_PATTERN_BITRATE_CEILING_KBPS: u32 = 12_000;
+const SHADOW_BITRATE_CEILING_KBPS: u32 = 12_000;
 const ADAPTIVE_BITRATE_QUANTUM_KBPS: u32 = 250;
 const ADAPTIVE_BITRATE_CLEAN_WINDOWS: u8 = 10;
 const ADAPTIVE_BITRATE_MODERATE_WINDOWS: u8 = 2;
@@ -3532,12 +3532,19 @@ where
 
 fn adaptive_bitrate_ceiling_kbps(config: &HostConfig) -> Result<u32> {
     let configured = match config.source {
-        VideoSource::TestPattern => TEST_PATTERN_BITRATE_CEILING_KBPS,
-        VideoSource::GamescopePipewire => config
-            .gamescope_pipewire
-            .as_ref()
-            .and_then(|gamescope| gamescope.bitrate_kbps)
-            .context("adaptive bitrate shadow mode requires a Gamescope CBR bitrate")?,
+        VideoSource::TestPattern => SHADOW_BITRATE_CEILING_KBPS,
+        VideoSource::GamescopePipewire => {
+            let gamescope = config
+                .gamescope_pipewire
+                .as_ref()
+                .context("Gamescope feedback requires gamescope_pipewire configuration")?;
+            match gamescope.rate_control {
+                VaapiRateControl::Cbr => gamescope
+                    .bitrate_kbps
+                    .context("adaptive bitrate shadow mode requires a Gamescope CBR bitrate")?,
+                VaapiRateControl::Cqp => SHADOW_BITRATE_CEILING_KBPS,
+            }
+        }
     };
     let ceiling = quantize_down(configured);
     ensure!(
@@ -5925,6 +5932,65 @@ mod tests {
             gamescope_pipewire: None,
             audio: None,
         }
+    }
+
+    fn gamescope_feedback_test_config(rate_control: VaapiRateControl) -> HostConfig {
+        let (bitrate_kbps, quantizer) = match rate_control {
+            VaapiRateControl::Cbr => (Some(12_123), None),
+            VaapiRateControl::Cqp => (None, Some(24)),
+        };
+        let mut config = moq_test_config();
+        config.source = VideoSource::GamescopePipewire;
+        config.width = None;
+        config.height = None;
+        config.gamescope_pipewire = Some(crate::config::GamescopePipewireConfig {
+            node_name: "gamescope".into(),
+            media_class: "Video/Source".into(),
+            match_properties: std::collections::BTreeMap::new(),
+            xwayland_display: None,
+            pw_dump_path: "/usr/bin/pw-dump".into(),
+            gst_launch_path: "/usr/bin/gst-launch-1.0".into(),
+            gst_inspect_path: "/usr/bin/gst-inspect-1.0".into(),
+            encoder_backend: GamescopeEncoderBackend::ExternalGstLaunch,
+            vaapi_encoder: "vah264enc".into(),
+            vaapi_render_node: "/dev/dri/renderD128".into(),
+            rate_control,
+            bitrate_kbps,
+            quantizer,
+        });
+        config.validate().unwrap();
+        config
+    }
+
+    #[test]
+    fn external_cqp_uses_a_fixed_shadow_bitrate_ceiling() {
+        let config = gamescope_feedback_test_config(VaapiRateControl::Cqp);
+
+        assert_eq!(
+            adaptive_bitrate_ceiling_kbps(&config).unwrap(),
+            SHADOW_BITRATE_CEILING_KBPS
+        );
+        assert!(!adaptive_bitrate_actuation_enabled(&config));
+    }
+
+    #[test]
+    fn gamescope_cbr_keeps_its_quantized_configured_ceiling() {
+        let config = gamescope_feedback_test_config(VaapiRateControl::Cbr);
+
+        assert_eq!(adaptive_bitrate_ceiling_kbps(&config).unwrap(), 12_000);
+    }
+
+    #[test]
+    fn malformed_cbr_without_a_bitrate_still_fails_closed() {
+        let mut config = gamescope_feedback_test_config(VaapiRateControl::Cbr);
+        config.gamescope_pipewire.as_mut().unwrap().bitrate_kbps = None;
+
+        assert_eq!(
+            adaptive_bitrate_ceiling_kbps(&config)
+                .unwrap_err()
+                .to_string(),
+            "adaptive bitrate shadow mode requires a Gamescope CBR bitrate"
+        );
     }
 
     #[tokio::test]

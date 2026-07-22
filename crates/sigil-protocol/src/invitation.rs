@@ -305,6 +305,71 @@ mod tests {
     }
 
     #[test]
+    fn malformed_ticket_shapes_fail_closed() {
+        let token = invitation().encode();
+        let encoded = token.strip_prefix(INVITATION_TOKEN_PREFIX).unwrap();
+        let bytes = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+
+        let encode =
+            |bytes: &[u8]| format!("{INVITATION_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes));
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] ^= 0xff;
+        let mut bad_version = bytes.clone();
+        bad_version[5] ^= 0xff;
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        let mut oversized = bytes.clone();
+        oversized.push(0);
+
+        let malformed = [
+            (
+                "wrong prefix",
+                token.replacen(INVITATION_TOKEN_PREFIX, "wrong.", 1),
+            ),
+            ("leading whitespace", format!(" {token}")),
+            ("trailing whitespace", format!("{token}\n")),
+            ("invalid base64url", format!("{INVITATION_TOKEN_PREFIX}!")),
+            ("wrong decoded size", encode(&truncated)),
+            ("oversized decoded body", encode(&oversized)),
+            ("wrong magic", encode(&bad_magic)),
+            ("wrong version", encode(&bad_version)),
+        ];
+
+        for (case, malformed) in malformed {
+            assert!(
+                SignedInvitation::decode(&malformed).is_err(),
+                "malformed invitation unexpectedly accepted: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_nonzero_known_grant_combination_round_trips_exactly() {
+        let host = SigningKey::from_bytes(&[7; 32]);
+        let peer = SigningKey::from_bytes(&[9; 32]);
+
+        for bits in 1..=InvitationGrants::ALL.bits() {
+            let grants = InvitationGrants::new(bits).unwrap();
+            let claims = InvitationClaims::new(
+                host.verifying_key().to_bytes(),
+                peer.verifying_key().to_bytes(),
+                1_700_000_000,
+                1_700_000_600,
+                3,
+                [bits; 32],
+                grants,
+            )
+            .unwrap();
+            let token = SignedInvitation::issue(claims, &[7; 32]).unwrap().encode();
+
+            assert_eq!(
+                SignedInvitation::decode(&token).unwrap().claims.grants,
+                grants
+            );
+        }
+    }
+
+    #[test]
     fn claims_reject_unknown_grants_lifetime_epoch_and_nonce() {
         assert!(InvitationGrants::new(0).is_err());
         assert!(InvitationGrants::new(0x80).is_err());

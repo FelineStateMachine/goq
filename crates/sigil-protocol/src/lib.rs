@@ -7,6 +7,7 @@
 
 mod audio;
 mod error;
+mod feedback;
 mod framing;
 mod handshake;
 mod input;
@@ -16,6 +17,12 @@ mod media_v3;
 
 pub use audio::{AUDIO_HEADER_LEN, AudioCodec, AudioFlags, AudioPacket, AudioPacketHeader};
 pub use error::{ProtocolError, Result};
+pub use feedback::{
+    ADAPTIVE_BITRATE_DECISION_V1_LEN, AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1,
+    AdaptiveBitrateStateV1, MEDIA_FEEDBACK_REPORT_V1_LEN, MediaFeedbackFlags,
+    MediaFeedbackReportV1, read_adaptive_bitrate_decision_v1, read_media_feedback_report_v1,
+    write_adaptive_bitrate_decision_v1, write_media_feedback_report_v1,
+};
 pub use handshake::{
     Capability, ClientHello, HostHello, MAX_POINTER_SURFACE_HEIGHT, MAX_POINTER_SURFACE_WIDTH,
     MIN_POINTER_SURFACE_HEIGHT, MIN_POINTER_SURFACE_WIDTH, PointerSurfaceDimensions,
@@ -55,6 +62,8 @@ pub const MEDIA_ALPN_V2: &[u8] = b"sigil/media/2";
 ///
 /// This is a Sigil protocol and is not IETF MoQ Transport compatible.
 pub const MEDIA_ALPN_V3: &[u8] = b"sigil/media/3";
+/// ALPN for bounded receiver telemetry and host bitrate decisions.
+pub const MEDIA_FEEDBACK_ALPN_V1: &[u8] = b"sigil/media-feedback/1";
 /// ALPN for the v1 latency-independent input stream.
 pub const INPUT_ALPN_V1: &[u8] = b"sigil/input/1";
 /// ALPN for the v1 session-control stream.
@@ -112,6 +121,7 @@ mod tests {
         assert_eq!(MEDIA_ALPN_V1, b"sigil/media/1");
         assert_eq!(MEDIA_ALPN_V2, b"sigil/media/2");
         assert_eq!(MEDIA_ALPN_V3, b"sigil/media/3");
+        assert_eq!(MEDIA_FEEDBACK_ALPN_V1, b"sigil/media-feedback/1");
         assert_eq!(INPUT_ALPN_V1, b"sigil/input/1");
         assert_eq!(CONTROL_ALPN_V1, b"sigil/control/1");
         assert_eq!(AUDIO_ALPN_V1, b"sigil/audio/1");

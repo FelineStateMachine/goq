@@ -105,6 +105,12 @@ sigil appliance enrollment-reset \
 systemctl --user start sigil-host.service
 ```
 
+Enrollment reset needs only the durable per-state lifecycle lock when
+`XDG_RUNTIME_DIR` is unavailable, so the stopped-host command also works from
+an SSH or recovery shell. If a valid XDG runtime root is present, reset also
+takes the per-user global lock. An unsafe or malformed XDG runtime directory is
+still rejected rather than ignored.
+
 Then disconnect Portal and use **client -> reset enrollment** before importing
 the replacement invitation. Portal never silently overwrites a redeemed host
 profile.

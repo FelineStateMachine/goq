@@ -49,6 +49,13 @@ state directories. Configured production service mode requires a valid private
 Only the explicit direct test-pattern proof may fall back to its per-state lock
 without publishing a heartbeat.
 
+Offline enrollment reset and configuration rollback may fall back to the
+durable per-state lock when `XDG_RUNTIME_DIR` is unset. Configuration `set` and
+`commit` still require the service's exact runtime authority; management shells
+without the environment may supply its private XDG root explicitly with
+`--runtime-dir` (Sigil appends `sigil-spark`). Configured service startup itself
+continues to require `XDG_RUNTIME_DIR`.
+
 Sigil atomically publishes
 `$XDG_RUNTIME_DIR/sigil-spark/daemon-status-v1.json` at most once per two-second
 heartbeat, plus explicit lifecycle transitions. Keeping the heartbeat in the

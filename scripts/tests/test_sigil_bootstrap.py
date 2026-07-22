@@ -27,6 +27,10 @@ PUBLISHER_KEY = base64.b64encode(b"Ed" + b"A" * 8 + b"B" * 32).decode("ascii")
 OTHER_PUBLISHER_KEY = base64.b64encode(b"Ed" + b"C" * 8 + b"D" * 32).decode("ascii")
 RELEASE_TAG = "v1.2.3-alpha.1"
 ASSET_NAME = f"sigil-{RELEASE_TAG}-bazzite-x86_64.tar.gz"
+ASSET_BASE = (
+    "https://github.com/FelineStateMachine/goq/releases/download/"
+    f"{RELEASE_TAG}/{ASSET_NAME}"
+)
 MINISIGN_VERSION = "0.12"
 MINISIGN_ASSET_NAME = f"minisign-{MINISIGN_VERSION}-linux.tar.gz"
 MINISIGN_URL = (
@@ -37,6 +41,20 @@ MINISIGN_SHA256 = (
     "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
 )
 ZERO_SHA256 = "0" * 64
+MINISIGN_CORE_MEMBERS = {
+    "minisign-linux/",
+    "minisign-linux/aarch64/",
+    "minisign-linux/x86_64/",
+    "minisign-linux/aarch64/minisign",
+    "minisign-linux/x86_64/minisign",
+}
+MINISIGN_APPLEDOUBLE_MEMBERS = {
+    "._minisign-linux",
+    "minisign-linux/._aarch64",
+    "minisign-linux/._x86_64",
+    "minisign-linux/aarch64/._minisign",
+    "minisign-linux/x86_64/._minisign",
+}
 
 
 def bootstrap_with_pins(
@@ -306,7 +324,7 @@ done
 [[ "$proto" == =https && "$tls" == 1 && "$fail" == 1 && "$silent" == 1 \
   && "$show_error" == 1 && "$location" == 1 && -n "$output" && -n "$url" ]] || exit 64
 name="${url##*/}"
-printf '%s\n' "$name" >>"$BOOTSTRAP_CURL_LOG"
+printf '%s\n' "$url" >>"$BOOTSTRAP_CURL_LOG"
 if [[ -n "${BOOTSTRAP_TEST_CURL_PARTIAL:-}" && "$name" == *"$BOOTSTRAP_TEST_CURL_PARTIAL" ]]; then
   printf partial >"$output"
   exit 22
@@ -354,6 +372,25 @@ done
             self.add_archive_directory(archive, "minisign-linux/")
             self.add_archive_directory(archive, "minisign-linux/aarch64/")
             self.add_archive_directory(archive, "minisign-linux/x86_64/")
+            self.add_archive_file(archive, "._minisign-linux", b"metadata\n", 0o644)
+            self.add_archive_file(
+                archive, "minisign-linux/._aarch64", b"metadata\n", 0o644
+            )
+            self.add_archive_file(
+                archive, "minisign-linux/._x86_64", b"metadata\n", 0o644
+            )
+            self.add_archive_file(
+                archive,
+                "minisign-linux/aarch64/._minisign",
+                b"metadata\n",
+                0o644,
+            )
+            self.add_archive_file(
+                archive,
+                "minisign-linux/x86_64/._minisign",
+                b"metadata\n",
+                0o644,
+            )
             self.add_archive_file(
                 archive,
                 "minisign-linux/aarch64/minisign",
@@ -503,7 +540,7 @@ done
         self.assertFalse(self.minisign_marker.exists())
         self.assertEqual(
             self.curl_log.read_text(encoding="utf-8").splitlines(),
-            [MINISIGN_ASSET_NAME],
+            [MINISIGN_URL],
         )
 
         (self.fixture_dir / MINISIGN_ASSET_NAME).write_bytes(b"")
@@ -526,6 +563,17 @@ done
         self.assert_rejected("Minisign verifier archive contains a special file or link")
         self.assertFalse(self.minisign_marker.exists())
 
+    def test_verifier_fixture_models_the_full_official_archive_layout(self) -> None:
+        with tarfile.open(self.fixture_dir / MINISIGN_ASSET_NAME, "r:gz") as archive:
+            self.assertEqual(
+                {member.name.rstrip("/") for member in archive.getmembers()},
+                {
+                    member.rstrip("/")
+                    for member in MINISIGN_CORE_MEMBERS
+                    | MINISIGN_APPLEDOUBLE_MEMBERS
+                },
+            )
+
     def test_rejects_partial_download_bad_signature_and_bad_checksum(self) -> None:
         self.assert_rejected(
             "signed release asset download failed",
@@ -533,7 +581,7 @@ done
         )
         self.assertEqual(
             self.curl_log.read_text(encoding="utf-8").splitlines(),
-            [MINISIGN_ASSET_NAME, ASSET_NAME, f"{ASSET_NAME}.sha256"],
+            [MINISIGN_URL, ASSET_BASE, f"{ASSET_BASE}.sha256"],
         )
         (self.fixture_dir / f"{ASSET_NAME}.sha256").write_text("", encoding="utf-8")
         self.assert_rejected("signed release asset download is empty")

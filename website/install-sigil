@@ -65,28 +65,39 @@ actual_minisign_hash="$(sha256sum "$minisign_archive" | awk '{ print $1 }')"
 [[ "$actual_minisign_hash" == "$minisign_sha256" ]] \
   || die "the Minisign verifier checksum does not match"
 
-minisign_entries="$(tar --list --gzip --file "$minisign_archive")" \
+minisign_entries="$(tar --list --gzip --file "$minisign_archive" 2>/dev/null)" \
   || die "the Minisign verifier archive is unreadable"
 if ! printf '%s\n' "$minisign_entries" | awk '
   BEGIN {
-    expected["minisign-linux/"] = 1
-    expected["minisign-linux/aarch64/"] = 1
-    expected["minisign-linux/x86_64/"] = 1
-    expected["minisign-linux/aarch64/minisign"] = 1
-    expected["minisign-linux/x86_64/minisign"] = 1
+    required["minisign-linux/"] = 1
+    required["minisign-linux/aarch64/"] = 1
+    required["minisign-linux/x86_64/"] = 1
+    required["minisign-linux/aarch64/minisign"] = 1
+    required["minisign-linux/x86_64/minisign"] = 1
+    metadata["._minisign-linux"] = 1
+    metadata["minisign-linux/._aarch64"] = 1
+    metadata["minisign-linux/._x86_64"] = 1
+    metadata["minisign-linux/aarch64/._minisign"] = 1
+    metadata["minisign-linux/x86_64/._minisign"] = 1
   }
   {
-    if (!($0 in expected) || seen[$0]++) exit 1
-    count++
+    if ($0 in required) {
+      if (seen[$0]++) exit 1
+      required_count++
+    } else if ($0 in metadata) {
+      if (seen[$0]++) exit 1
+    } else {
+      exit 1
+    }
   }
   END {
-    if (count != 5) exit 1
-    for (name in expected) if (!seen[name]) exit 1
+    if (required_count != 5) exit 1
+    for (name in required) if (!seen[name]) exit 1
   }
 '; then
   die "the Minisign verifier archive has unexpected contents"
 fi
-if ! LC_ALL=C tar --list --verbose --gzip --file "$minisign_archive" \
+if ! LC_ALL=C tar --list --verbose --gzip --file "$minisign_archive" 2>/dev/null \
   | awk '{ type = substr($1, 1, 1); if (type != "-" && type != "d") exit 1 }'
 then
   die "the Minisign verifier archive contains a special file or link"
@@ -95,7 +106,7 @@ fi
 install -d -m 0700 "$minisign_unpack_path"
 tar --extract --gzip --file "$minisign_archive" \
   --directory "$minisign_unpack_path" --no-same-owner --no-same-permissions \
-  minisign-linux/x86_64/minisign \
+  minisign-linux/x86_64/minisign 2>/dev/null \
   || die "the Minisign verifier could not be extracted"
 [[ -f "$minisign_binary" && ! -L "$minisign_binary" && -x "$minisign_binary" ]] \
   || die "the Minisign verifier is missing or unsafe"

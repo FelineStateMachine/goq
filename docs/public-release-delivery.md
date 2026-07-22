@@ -56,12 +56,13 @@ a malformed immutable release tag before the website can deploy.
 A clean Bazzite image does not need a preinstalled Minisign package. The
 bootstrap downloads the exact official Minisign 0.12 Linux archive and checks
 its hard-coded SHA-256 before archive inspection, extraction, or execution. It
-accepts only the reviewed archive layout, extracts only the x86_64 verifier
-into private temporary state, and invokes that verifier by absolute path rather
-than trusting `PATH`. Changing the verifier version, URL, or independently
-computed content digest requires a reviewed website commit. The Sigil publisher
-key and release tag remain separate pins and keep the release channel closed
-while either is `unconfigured`.
+accepts only the reviewed archive layout (including its inert AppleDouble
+metadata members), extracts only the x86_64 verifier into private temporary
+state, and invokes that verifier by absolute path rather than trusting `PATH`.
+Changing the verifier version, URL, or independently computed content digest
+requires a reviewed website commit. The Sigil publisher key and release tag
+remain separate pins and keep the release channel closed while either is
+`unconfigured`.
 
 ## Sigil candidate and offline signing ceremony
 

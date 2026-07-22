@@ -1048,6 +1048,13 @@ impl Default for SessionRegistry {
 }
 
 impl SessionRegistry {
+    pub fn has_session(&self) -> bool {
+        self.active
+            .lock()
+            .expect("session registry poisoned")
+            .is_some()
+    }
+
     fn claim(
         self: &Arc<Self>,
         remote: EndpointId,
@@ -6242,10 +6249,12 @@ mod tests {
     #[test]
     fn only_one_remote_can_hold_session() {
         let sessions = Arc::new(SessionRegistry::default());
+        assert!(!sessions.has_session());
         let nonce = [7; 16];
         let first = sessions
             .claim(endpoint(1), nonce, InvitationGrants::ALL)
             .unwrap();
+        assert!(sessions.has_session());
         assert!(
             sessions
                 .claim(endpoint(2), nonce, InvitationGrants::ALL)
@@ -6272,6 +6281,7 @@ mod tests {
                 .is_err()
         );
         drop(audio);
+        assert!(!sessions.has_session());
         assert!(
             sessions
                 .claim(endpoint(2), nonce, InvitationGrants::ALL)

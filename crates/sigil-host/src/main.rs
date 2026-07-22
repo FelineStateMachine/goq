@@ -1,3 +1,4 @@
+mod appliance;
 mod audio;
 mod authorization;
 mod clock;
@@ -6,6 +7,7 @@ mod cursor;
 mod identity;
 mod input;
 mod moq_catalog;
+mod secure_state;
 mod server;
 mod source;
 
@@ -54,6 +56,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect or manage the local Sigil appliance service.
+    Appliance {
+        #[command(subcommand)]
+        command: ApplianceCommand,
+    },
     /// Create or inspect the persistent Iroh host identity.
     Identity {
         #[command(subcommand)]
@@ -81,6 +88,18 @@ enum Command {
     },
     /// Run the headless host daemon in the foreground.
     Serve(ServeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ApplianceCommand {
+    /// Print a versioned, redacted daemon and enrollment snapshot.
+    Status {
+        #[arg(long)]
+        config: PathBuf,
+        /// Emit the stable machine-readable schema.
+        #[arg(long, required = true)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -222,6 +241,7 @@ async fn main() -> Result<()> {
     server::install_panic_hook();
 
     match Cli::parse().command {
+        Command::Appliance { command } => appliance_command(command),
         Command::Identity { command } => identity_command(command),
         Command::Config { command } => config_command(command).await,
         Command::Capture { command } => capture_command(command).await,
@@ -229,6 +249,16 @@ async fn main() -> Result<()> {
         Command::Enrollment { command } => enrollment_command(command),
         Command::Serve(args) => serve_command(args).await,
     }
+}
+
+fn appliance_command(command: ApplianceCommand) -> Result<()> {
+    match command {
+        ApplianceCommand::Status { config, json: _ } => {
+            let status = appliance::collect_status(&config)?;
+            println!("{}", serde_json::to_string(&status)?);
+        }
+    }
+    Ok(())
 }
 
 fn authorization_store_from_config(
@@ -571,75 +601,111 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     config.validate()?;
     config.ensure_runtime_directory()?;
     let secret = identity::load(&config.identity_path)?;
-    let authorization = if args.config.is_some() {
-        AuthorizationPolicy::Required(AuthorizationStore::open(
-            config.state_path.clone(),
-            secret.public(),
-        )?)
+    let configured_service = args.config.is_some();
+    let _lifecycle = appliance::LifecycleGuard::acquire(&config.state_path, configured_service)?;
+    let sessions = Arc::new(SessionRegistry::default());
+    let publisher = appliance::RuntimePublisher::start(
+        secret.public(),
+        Arc::clone(&sessions),
+        configured_service,
+    )?;
+    let authorization_result = if configured_service {
+        AuthorizationStore::open(config.state_path.clone(), secret.public())
+            .map(AuthorizationPolicy::Required)
     } else {
-        AuthorizationPolicy::TestPatternProof
+        Ok(AuthorizationPolicy::TestPatternProof)
     };
-    let pointer_surface_dimensions = if config.source == VideoSource::TestPattern {
-        let (width, height) = config.test_pattern_dimensions()?;
-        config.apply_resolved_dimensions(width, height)?;
-        let status = tokio::process::Command::new(&config.ffmpeg_path)
-            .arg("-version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .with_context(|| format!("starting {}", config.ffmpeg_path.display()))?;
-        ensure!(
-            status.success(),
-            "ffmpeg version probe failed with {status}"
-        );
-        None
-    } else {
-        let preflight = source::preflight_gamescope_pipewire(&config).await?;
-        info!(
-            target_object = %preflight.target_object,
-            pointer_surface_width = preflight.pointer_surface_dimensions.width,
-            pointer_surface_height = preflight.pointer_surface_dimensions.height,
-            encoded_width = preflight.video_mode.width,
-            encoded_height = preflight.video_mode.height,
-            encoded_framerate = preflight.video_mode.framerate,
-            "Gamescope PipeWire capture preflight passed"
-        );
-        config.apply_resolved_dimensions(
-            u32::from(preflight.video_mode.width),
-            u32::from(preflight.video_mode.height),
-        )?;
-        if config.audio.is_some() {
-            audio::preflight_audio_static(&config).await?;
-            info!("PipeWire Opus audio static preflight passed");
+    let authorization = match authorization_result {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            if let Some(publisher) = publisher.as_ref() {
+                let _ = publisher
+                    .mark_degraded(appliance::RuntimeErrorCode::AuthorizationState)
+                    .await;
+            }
+            return Err(error);
         }
-        Some(preflight.pointer_surface_dimensions)
     };
-    let input_backend = InputBackend::initialize(&config)?;
 
-    let pointer_positions = if config.source == VideoSource::GamescopePipewire
-        && config.input_mode == InputMode::Uinput
-    {
-        let configured_display = config
-            .gamescope_pipewire
-            .as_ref()
-            .and_then(|gamescope| gamescope.xwayland_display.as_deref());
-        let pointer_surface_dimensions = pointer_surface_dimensions
-            .context("Gamescope capture preflight did not provide pointer surface dimensions")?;
-        match PointerPositionTracker::try_initialize(configured_display, pointer_surface_dimensions)
+    let preflight_result: Result<(InputBackend, Option<PointerPositionTracker>)> = async {
+        let pointer_surface_dimensions = if config.source == VideoSource::TestPattern {
+            let (width, height) = config.test_pattern_dimensions()?;
+            config.apply_resolved_dimensions(width, height)?;
+            let status = tokio::process::Command::new(&config.ffmpeg_path)
+                .arg("-version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .with_context(|| format!("starting {}", config.ffmpeg_path.display()))?;
+            ensure!(
+                status.success(),
+                "ffmpeg version probe failed with {status}"
+            );
+            None
+        } else {
+            let preflight = source::preflight_gamescope_pipewire(&config).await?;
+            info!(
+                target_object = %preflight.target_object,
+                pointer_surface_width = preflight.pointer_surface_dimensions.width,
+                pointer_surface_height = preflight.pointer_surface_dimensions.height,
+                encoded_width = preflight.video_mode.width,
+                encoded_height = preflight.video_mode.height,
+                encoded_framerate = preflight.video_mode.framerate,
+                "Gamescope PipeWire capture preflight passed"
+            );
+            config.apply_resolved_dimensions(
+                u32::from(preflight.video_mode.width),
+                u32::from(preflight.video_mode.height),
+            )?;
+            if config.audio.is_some() {
+                audio::preflight_audio_static(&config).await?;
+                info!("PipeWire Opus audio static preflight passed");
+            }
+            Some(preflight.pointer_surface_dimensions)
+        };
+        let input_backend = InputBackend::initialize(&config)?;
+
+        let pointer_positions = if config.source == VideoSource::GamescopePipewire
+            && config.input_mode == InputMode::Uinput
         {
-            Ok(tracker) => {
-                info!("Gamescope Xwayland pointer feedback ready");
-                Some(tracker)
+            let configured_display = config
+                .gamescope_pipewire
+                .as_ref()
+                .and_then(|gamescope| gamescope.xwayland_display.as_deref());
+            let pointer_surface_dimensions = pointer_surface_dimensions.context(
+                "Gamescope capture preflight did not provide pointer surface dimensions",
+            )?;
+            match PointerPositionTracker::try_initialize(
+                configured_display,
+                pointer_surface_dimensions,
+            ) {
+                Ok(tracker) => {
+                    info!("Gamescope Xwayland pointer feedback ready");
+                    Some(tracker)
+                }
+                Err(error) => {
+                    warn!(%error, "Gamescope Xwayland pointer feedback unavailable");
+                    None
+                }
             }
-            Err(error) => {
-                warn!(%error, "Gamescope Xwayland pointer feedback unavailable");
-                None
+        } else {
+            None
+        };
+        Ok((input_backend, pointer_positions))
+    }
+    .await;
+    let (input_backend, pointer_positions) = match preflight_result {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            if let Some(publisher) = publisher.as_ref() {
+                let _ = publisher
+                    .mark_degraded(appliance::RuntimeErrorCode::Preflight)
+                    .await;
             }
+            return Err(error);
         }
-    } else {
-        None
     };
 
     let idle_timeout = CONNECTION_IDLE_TIMEOUT
@@ -649,12 +715,22 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         .max_idle_timeout(Some(idle_timeout))
         .keep_alive_interval(CONNECTION_KEEP_ALIVE_INTERVAL)
         .build();
-    let endpoint = Endpoint::builder(presets::N0)
+    let endpoint = match Endpoint::builder(presets::N0)
         .secret_key(secret)
         .transport_config(transport_config)
         .bind()
         .await
-        .context("binding iroh endpoint")?;
+    {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            if let Some(publisher) = publisher.as_ref() {
+                let _ = publisher
+                    .mark_degraded(appliance::RuntimeErrorCode::EndpointBind)
+                    .await;
+            }
+            return Err(error).context("binding iroh endpoint");
+        }
+    };
     let node_id = endpoint.id();
     match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
         Ok(()) => info!(%node_id, "iroh endpoint is online"),
@@ -663,7 +739,6 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         }
     }
 
-    let sessions = Arc::new(SessionRegistry::default());
     let moq_origin = Origin::random();
     let router = Router::builder(endpoint)
         .accept(
@@ -725,10 +800,16 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
             AUDIO_ALPN_V1,
             AudioHandler {
                 config: config.clone(),
-                sessions,
+                sessions: Arc::clone(&sessions),
             },
         )
         .spawn();
+
+    if let Some(publisher) = publisher.as_ref()
+        && let Err(error) = publisher.mark_ready().await
+    {
+        warn!(%error, "publishing ready appliance status failed; continuing service");
+    }
 
     println!("node_id={node_id}");
     println!("status=ready");
@@ -738,14 +819,38 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         tokio::time::sleep(Duration::from_secs(seconds)).await;
         info!(seconds, "maximum runtime reached");
     } else {
-        let signal = wait_for_shutdown_signal().await?;
+        let signal = match wait_for_shutdown_signal().await {
+            Ok(signal) => signal,
+            Err(error) => {
+                if let Some(publisher) = publisher.as_ref() {
+                    let _ = publisher
+                        .mark_degraded(appliance::RuntimeErrorCode::ShutdownSignal)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
         info!(signal, "shutdown signal received");
     }
 
-    router
-        .shutdown()
-        .await
-        .context("shutting down iroh router")?;
+    if let Some(publisher) = publisher.as_ref()
+        && let Err(error) = publisher.mark_stopping().await
+    {
+        warn!(%error, "publishing stopping appliance status failed; continuing shutdown");
+    }
+    if let Err(error) = router.shutdown().await {
+        if let Some(publisher) = publisher.as_ref() {
+            let _ = publisher
+                .mark_degraded(appliance::RuntimeErrorCode::RouterShutdown)
+                .await;
+        }
+        return Err(error).context("shutting down iroh router");
+    }
+    if let Some(publisher) = publisher
+        && let Err(error) = publisher.finish_clean().await
+    {
+        warn!(%error, "publishing stopped appliance status failed");
+    }
     Ok(())
 }
 
@@ -891,6 +996,25 @@ mod tests {
                 "/tmp/host.toml"
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn appliance_status_requires_explicit_json_output() {
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "appliance",
+                "status",
+                "--config",
+                "/tmp/host.toml",
+                "--json",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["sigil", "appliance", "status", "--config", "/tmp/host.toml"])
+                .is_err()
         );
     }
 

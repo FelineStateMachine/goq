@@ -13,13 +13,13 @@ use serde::Serialize;
 use sigil_protocol::{
     AUDIO_ALPN_V1, AudioFlags, AudioPacket, AudioPacketHeader, CONTROL_ALPN_V1, Capability,
     ClientHello, FrameFlags, INPUT_ALPN_V1, InputEvent, InvitationGrants, KeyframeRequestReasonV3,
-    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION,
-    MAX_VIDEO_PIXELS, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3, MOQ_VIDEO_H264_TRACK,
-    MediaCodec, MediaControlRequestV3, MediaFrame, MediaObjectV3, PointerPosition,
-    PointerSurfaceDimensions, ProtocolError, RELATIVE_POINTER_DELTA_MAX,
-    RELATIVE_POINTER_DELTA_MIN, decode_media_frame_object, media_moq_broadcast_name,
-    read_host_hello, read_input_ack, read_media_frame, read_media_object, read_media_object_v3,
-    write_client_hello, write_input_event, write_media_control_request_v3,
+    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MAX_MEDIA_OBJECT_ID_V3,
+    MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS, MEDIA_ALPN_V1, MEDIA_ALPN_V2,
+    MEDIA_ALPN_V3, MOQ_VIDEO_H264_TRACK, MediaCodec, MediaControlRequestV3, MediaFrame,
+    MediaObjectV3, PointerPosition, PointerSurfaceDimensions, ProtocolError,
+    RELATIVE_POINTER_DELTA_MAX, RELATIVE_POINTER_DELTA_MIN, decode_media_frame_object,
+    media_moq_broadcast_name, read_host_hello, read_input_ack, read_media_frame, read_media_object,
+    read_media_object_v3, write_client_hello, write_input_event, write_media_control_request_v3,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Cursor;
@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::{Duration, Instant};
 use tauri::{
-    AppHandle, Emitter, State,
+    AppHandle, Emitter, Manager, State,
     ipc::{Channel, Response},
 };
 
@@ -76,7 +76,13 @@ const CLIENT_MEDIA_OBJECT_CAPACITY: usize = 4;
 const CLIENT_MEDIA_OBJECT_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const CLIENT_MOQ_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_MOQ_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
-const CLIENT_MOQ_GROUP_RECOVERY_TIMEOUT: Duration = Duration::from_millis(250);
+// Match the protocol's maximum single-object delivery horizon. A publisher may
+// never hold a partially delivered object open indefinitely.
+const CLIENT_MOQ_OBJECT_READ_TIMEOUT: Duration =
+    Duration::from_millis(MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS as u64);
+// Sigil's external encoder can take 500 ms to reach its next configured IDR.
+// Allow another 500 ms for a relay path to deliver the superseding group.
+const CLIENT_MOQ_GROUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 // Absorb brief webview→Rust acknowledgment jitter without allowing Tauri IPC
 // to grow without bound. Four 60 fps frames cap this handoff at about 67 ms;
 // WebCodecs has a separate, stricter decode-queue bound in the frontend.
@@ -396,6 +402,83 @@ fn close_generation_connection<T>(
     })
 }
 
+fn take_generation_owned<T>(slot: &mut Option<(u64, T)>, expected_generation: u64) -> Option<T> {
+    if slot
+        .as_ref()
+        .is_some_and(|(generation, _)| *generation == expected_generation)
+    {
+        slot.take().map(|(_, value)| value)
+    } else {
+        None
+    }
+}
+
+async fn retire_upstream_moq_generation(
+    app: &AppHandle,
+    media_generation: u64,
+    audio_generation: Option<u64>,
+) -> bool {
+    let state = app.state::<AppState>();
+    let endpoint = {
+        // Selection and retirement are one generation-checked transaction.
+        // A stale reader must never close a replacement session whose task was
+        // installed after an explicit disconnect/reconnect.
+        let _connection_serial = state.client_connection_serial.lock().await;
+        let media_connection = {
+            let mut slot = state.media_connection.lock().await;
+            take_generation_owned(&mut slot, media_generation)
+        };
+        let Some(media_connection) = media_connection else {
+            return false;
+        };
+
+        {
+            let mut control = state.media_control.lock().await;
+            let _ = take_generation_owned(&mut control, media_generation);
+        }
+        {
+            let mut delivery = state.frame_delivery.lock().await;
+            let _ = take_generation_owned(&mut delivery, media_generation);
+        }
+        *state.input_send.lock().await = None;
+
+        let audio_connection = if let Some(audio_generation) = audio_generation {
+            if let Err(error) = cancel_audio_generation(
+                &state.audio_connection_generation,
+                &state.audio_deliveries,
+                audio_generation,
+            ) {
+                eprintln!(
+                    "[client] failed to retire audio generation after upstream MoQ ended: {error}"
+                );
+            }
+            let mut slot = state.audio_connection.lock().await;
+            take_generation_owned(&mut slot, audio_generation)
+        } else {
+            None
+        };
+
+        let endpoint = state.client_endpoint.lock().await.take();
+        media_connection.close(0_u32.into(), b"upstream MoQ media ended");
+        if let Some(audio_connection) = audio_connection {
+            audio_connection.close(0_u32.into(), b"upstream MoQ media ended");
+        }
+        state
+            .client_connection_active
+            .store(false, Ordering::SeqCst);
+        endpoint
+    };
+
+    if let Some(endpoint) = endpoint
+        && tokio::time::timeout(CLIENT_ENDPOINT_CLOSE_TIMEOUT, endpoint.close())
+            .await
+            .is_err()
+    {
+        eprintln!("[client] timed out retiring endpoint after upstream MoQ media ended");
+    }
+    true
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct FrameStatsPayload {
     generation: u64,
@@ -692,6 +775,15 @@ enum MoqMediaReadOutcome {
     Malformed(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoqGroupRecovery {
+    /// Sigil deliberately cancels the old GOP when a configured IDR starts a
+    /// replacement. This is normal live-edge supersession, not evidence that
+    /// another keyframe request is needed.
+    ExpectedSupersession,
+    RecoverableGap(KeyframeRequestReasonV3),
+}
+
 struct MoqGroupCursor {
     group: GroupConsumer,
     sequence: u64,
@@ -717,7 +809,7 @@ struct MoqMediaReceiver {
     last_group_sequence: Option<u64>,
     last_frame_sequence: Option<u64>,
     waiting_for_keyframe: bool,
-    pending_group_recovery: Option<KeyframeRequestReasonV3>,
+    pending_group_recovery: Option<MoqGroupRecovery>,
 }
 
 impl MoqMediaReceiver {
@@ -756,23 +848,43 @@ impl MoqMediaReceiver {
     }
 
     async fn next(&mut self) -> Result<Option<MoqMediaReadOutcome>, String> {
+        self.next_with_timeouts(
+            CLIENT_MOQ_OBJECT_READ_TIMEOUT,
+            CLIENT_MOQ_GROUP_RECOVERY_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn next_with_timeouts(
+        &mut self,
+        object_read_timeout: Duration,
+        group_recovery_timeout: Duration,
+    ) -> Result<Option<MoqMediaReadOutcome>, String> {
         loop {
             if self.current_group.is_none() {
                 let replacement_for_cancelled_group = self.pending_group_recovery.is_some();
                 let group = if replacement_for_cancelled_group {
                     match tokio::time::timeout(
-                        CLIENT_MOQ_GROUP_RECOVERY_TIMEOUT,
+                        group_recovery_timeout,
                         self.track.next_group(),
                     )
                     .await
                     {
                         Ok(group) => group,
                         Err(_) => {
-                            let reason = self
+                            let recovery = self
                                 .pending_group_recovery
                                 .take()
                                 .expect("pending MoQ recovery reason was present");
-                            return Ok(Some(MoqMediaReadOutcome::Dropped { reason }));
+                            return match recovery {
+                                MoqGroupRecovery::ExpectedSupersession => Err(format!(
+                                    "Timed out after {} ms waiting for the MoQ group that supersedes an expected GOP cancellation",
+                                    group_recovery_timeout.as_millis()
+                                )),
+                                MoqGroupRecovery::RecoverableGap(reason) => {
+                                    Ok(Some(MoqMediaReadOutcome::Dropped { reason }))
+                                }
+                            };
                         }
                     }
                 } else {
@@ -806,23 +918,39 @@ impl MoqMediaReceiver {
                 .current_group
                 .as_mut()
                 .expect("MoQ group cursor was initialized");
-            let object = match cursor.group.read_frame().await {
-                Ok(object) => object,
-                Err(error) if moq_group_error_is_recoverable(&error) => {
-                    let sequence = cursor.sequence;
-                    self.last_group_sequence = Some(sequence);
-                    self.current_group = None;
-                    self.waiting_for_keyframe = true;
-                    self.pending_group_recovery = Some(moq_group_error_reason(&error));
-                    continue;
-                }
-                Err(error) => {
-                    return Ok(Some(MoqMediaReadOutcome::Malformed(format!(
-                        "Upstream MoQ group {} failed: {error}",
-                        cursor.sequence
-                    ))));
-                }
-            };
+            let object =
+                match tokio::time::timeout(object_read_timeout, cursor.group.read_frame()).await {
+                    Err(_) => {
+                        let sequence = cursor.sequence;
+                        self.last_group_sequence = Some(sequence);
+                        self.current_group = None;
+                        self.waiting_for_keyframe = true;
+                        return Ok(Some(MoqMediaReadOutcome::Dropped {
+                            reason: KeyframeRequestReasonV3::DeliveryTimeout,
+                        }));
+                    }
+                    Ok(Ok(object)) => object,
+                    Ok(Err(error)) if moq_group_error_is_recoverable(&error) => {
+                        let sequence = cursor.sequence;
+                        self.last_group_sequence = Some(sequence);
+                        self.current_group = None;
+                        self.waiting_for_keyframe = true;
+                        let reason = moq_group_error_reason(&error);
+                        self.pending_group_recovery =
+                            Some(if matches!(error, moq_net::Error::Cancel) {
+                                MoqGroupRecovery::ExpectedSupersession
+                            } else {
+                                MoqGroupRecovery::RecoverableGap(reason)
+                            });
+                        continue;
+                    }
+                    Ok(Err(error)) => {
+                        return Ok(Some(MoqMediaReadOutcome::Malformed(format!(
+                            "Upstream MoQ group {} failed: {error}",
+                            cursor.sequence
+                        ))));
+                    }
+                };
             let Some(object) = object else {
                 if cursor.object_count == 0 {
                     if cursor.replacement_for_cancelled_group {
@@ -2828,6 +2956,14 @@ pub async fn iroh_client_connect(
                 Ok(d) => Some(d),
                 Err(e) => {
                     emit_frame_error(&app, media_generation, format!("Decoder init failed: {e}"));
+                    if media_transport == MediaTransport::UpstreamMoq {
+                        retire_upstream_moq_generation(
+                            &app,
+                            media_generation,
+                            connected_audio_generation,
+                        )
+                        .await;
+                    }
                     return;
                 }
             }
@@ -3328,6 +3464,10 @@ pub async fn iroh_client_connect(
 
         let _ = stats_stop.send(true);
         let _ = stats_task.await;
+        if media_transport == MediaTransport::UpstreamMoq {
+            retire_upstream_moq_generation(&app, media_generation, connected_audio_generation)
+                .await;
+        }
         drop(endpoint);
     });
 
@@ -3529,7 +3669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_moq_cancel_without_bounded_replacement_requests_recovery() {
+    async fn upstream_moq_expected_cancel_without_replacement_is_terminal_without_request() {
         let mut producer = Track::new(MOQ_VIDEO_H264_TRACK).produce();
         let mut receiver = MoqMediaReceiver::for_test(producer.consume());
         let mut group = producer.append_group().unwrap();
@@ -3543,12 +3683,33 @@ mod tests {
         ));
         group.abort(moq_net::Error::Cancel).unwrap();
 
+        let error = receiver
+            .next_with_timeouts(Duration::from_millis(25), Duration::from_millis(25))
+            .await
+            .unwrap_err();
+        assert!(error.contains("expected GOP cancellation"));
+    }
+
+    #[tokio::test]
+    async fn upstream_moq_partial_object_read_has_protocol_bounded_deadline() {
+        let mut producer = Track::new(MOQ_VIDEO_H264_TRACK).produce();
+        let mut receiver = MoqMediaReceiver::for_test(producer.consume());
+        let _stalled_group = producer.append_group().unwrap();
+
         assert!(matches!(
-            receiver.next().await.unwrap(),
+            receiver
+                .next_with_timeouts(Duration::from_millis(25), Duration::from_millis(25))
+                .await
+                .unwrap(),
             Some(MoqMediaReadOutcome::Dropped {
-                reason: KeyframeRequestReasonV3::TransportGap
+                reason: KeyframeRequestReasonV3::DeliveryTimeout
             })
         ));
+        assert_eq!(
+            CLIENT_MOQ_OBJECT_READ_TIMEOUT,
+            Duration::from_millis(MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS as u64)
+        );
+        assert!(CLIENT_MOQ_GROUP_RECOVERY_TIMEOUT >= Duration::from_millis(1_000));
     }
 
     #[tokio::test]
@@ -4231,6 +4392,15 @@ mod tests {
             None
         );
         assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn generation_owned_retirement_cannot_take_a_replacement_session() {
+        let mut slot = Some((12, "replacement"));
+        assert_eq!(take_generation_owned(&mut slot, 11), None);
+        assert_eq!(slot, Some((12, "replacement")));
+        assert_eq!(take_generation_owned(&mut slot, 12), Some("replacement"));
+        assert_eq!(slot, None);
     }
 
     #[test]

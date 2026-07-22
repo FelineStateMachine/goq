@@ -12,6 +12,7 @@ mod handshake;
 mod input;
 mod invitation;
 mod media;
+mod media_v3;
 
 pub use audio::{AUDIO_HEADER_LEN, AudioCodec, AudioFlags, AudioPacket, AudioPacketHeader};
 pub use error::{ProtocolError, Result};
@@ -34,6 +35,13 @@ pub use media::{
     FrameFlags, MEDIA_HEADER_LEN, MediaCodec, MediaFrame, MediaFrameHeader, read_media_frame,
     read_media_object, write_media_frame,
 };
+pub use media_v3::{
+    KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,
+    MAX_MEDIA_OBJECT_ID_V3, MEDIA_CONTROL_REQUEST_V3_LEN, MEDIA_OBJECT_V3_HEADER_LEN,
+    MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MediaControlRequestTypeV3, MediaControlRequestV3,
+    MediaObjectHeaderV3, MediaObjectV3, read_media_control_request_v3, read_media_object_v3,
+    write_media_control_request_v3, write_media_object_v3,
+};
 
 /// Protocol version encoded in v1 messages.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -42,6 +50,10 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const MEDIA_ALPN_V1: &[u8] = b"sigil/media/1";
 /// ALPN for one encoded video object per host-opened unidirectional stream.
 pub const MEDIA_ALPN_V2: &[u8] = b"sigil/media/2";
+/// ALPN for custom MoQ-style grouped media objects and keyframe control.
+///
+/// This is a Sigil protocol and is not IETF MoQ Transport compatible.
+pub const MEDIA_ALPN_V3: &[u8] = b"sigil/media/3";
 /// ALPN for the v1 latency-independent input stream.
 pub const INPUT_ALPN_V1: &[u8] = b"sigil/input/1";
 /// ALPN for the v1 session-control stream.
@@ -81,6 +93,7 @@ mod tests {
     fn alpn_values_are_deployment_golden_vectors() {
         assert_eq!(MEDIA_ALPN_V1, b"sigil/media/1");
         assert_eq!(MEDIA_ALPN_V2, b"sigil/media/2");
+        assert_eq!(MEDIA_ALPN_V3, b"sigil/media/3");
         assert_eq!(INPUT_ALPN_V1, b"sigil/input/1");
         assert_eq!(CONTROL_ALPN_V1, b"sigil/control/1");
         assert_eq!(AUDIO_ALPN_V1, b"sigil/audio/1");

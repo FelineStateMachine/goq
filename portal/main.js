@@ -89,6 +89,10 @@ import {
 } from './window-geometry.mjs';
 import { buildVideoDecoderConfig } from './video-decoder-config.mjs';
 import {
+  DECODER_RECOVERY_REASONS,
+  DecoderRecoveryState,
+} from './decoder-recovery.mjs';
+import {
   formatInvitationExpiry,
   grantLabel,
   normalizeInvitationSummary,
@@ -826,6 +830,7 @@ async function connectHost() {
         control: result.control_available === true,
       };
       streamTransportMode = [
+        'grouped-v3',
         'independent-v2',
         'reliable-v1',
         'reliable-v0',
@@ -881,7 +886,6 @@ async function connectHost() {
         await teardownAudioPipeline(false);
         setAudioState('unavailable', result.audio_error || audioSupport.error || 'host audio unavailable');
       }
-      waitingForDecoderKeyframe = true;
       updatePanelVisibility();
       document.getElementById('node-id-text').textContent = result.host_node_id.substring(0, 16) + '...';
       document.getElementById('frame-canvas').style.display = 'block';
@@ -1079,7 +1083,42 @@ let streamPathMode = 'unknown';
 let streamTransportMode = 'unknown';
 let streamRttMs = null;
 const MAX_DECODE_QUEUE_SIZE = 2;
-let waitingForDecoderKeyframe = true;
+
+function requestDecoderKeyframe(reason) {
+  if (!Number.isSafeInteger(activeFrameGeneration) || activeFrameGeneration < 1) return;
+  void invoke('iroh_client_request_keyframe', {
+    generation: activeFrameGeneration,
+    reason,
+  }).catch((error) => {
+    console.warn(`keyframe request failed (${reason}):`, error);
+  });
+}
+
+const decoderRecovery = new DecoderRecoveryState({
+  onKeyframeRequest: requestDecoderKeyframe,
+});
+
+function enterDecoderRecovery(reason, { restart = false, requestKeyframe = true } = {}) {
+  const result = restart
+    ? decoderRecovery.restart(reason)
+    : decoderRecovery.enter(reason, { requestKeyframe });
+  // Closing WebCodecs and clearing the latest-frame presenter is part of the
+  // recovery boundary. Do it immediately rather than allowing already queued
+  // frames from a poisoned GOP to continue reaching the canvas.
+  teardownDecoderPipeline();
+  return result;
+}
+
+function finishVideoChunkEnqueue(keyframe, succeeded) {
+  if (succeeded) {
+    if (keyframe) decoderRecovery.confirmKeyframeEnqueued(true);
+    return;
+  }
+  // A synchronous decode rejection is a decoder-error episode if playback
+  // was previously healthy. If recovery is already active, enter() coalesces
+  // with its existing request and leaves the keyframe gate closed.
+  enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_ERROR);
+}
 
 function resetAvSyncTelemetry(session = activeAudioSession, { recoverRing = false } = {}) {
   avSkew.reset();
@@ -1166,6 +1205,7 @@ function teardownDecoderPipeline() {
 
 function resetStreamTelemetry() {
   teardownDecoderPipeline();
+  decoderRecovery.reset();
   droppedFrames = 0;
   transportDroppedFrames = 0;
   transportObjectDroppedFrames = null;
@@ -1199,7 +1239,6 @@ function resetStreamTelemetry() {
   streamPathMode = 'unknown';
   streamTransportMode = 'unknown';
   streamRttMs = null;
-  waitingForDecoderKeyframe = true;
 }
 
 function enqueueVideoChunk(chunk, receivedAt, codecLabel, mediaPtsMicros = null) {
@@ -1226,8 +1265,12 @@ function enqueueVideoChunk(chunk, receivedAt, codecLabel, mediaPtsMicros = null)
 function initWebCodecsDecoder(width, height, desc, codecStr) {
   teardownDecoderPipeline();
   console.log('WebCodecs configure:', codecStr, 'w:', width, 'h:', height, 'desc:', desc.byteLength, 'bytes');
-  videoDecoder = new VideoDecoder({
+  const decoder = new VideoDecoder({
     output: (frame) => {
+      if (videoDecoder !== decoder) {
+        frame.close();
+        return;
+      }
       const now = performance.now();
       decoderOutputFrames++;
       decoderOutputRate.record(now);
@@ -1238,19 +1281,26 @@ function initWebCodecsDecoder(width, height, desc, codecStr) {
       framePresenter.enqueue(frame, timing);
     },
     error: (e) => {
+      if (videoDecoder !== decoder) return;
       console.error('VideoDecoder error:', e);
-      waitingForDecoderKeyframe = true;
-      teardownDecoderPipeline();
+      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_ERROR);
     }
   });
-  videoDecoder.configure(buildVideoDecoderConfig({
-    codec: codecStr,
-    width,
-    height,
-    description: desc,
-  }));
-  decoderConfigured = true;
-  waitingForDecoderKeyframe = false;
+  videoDecoder = decoder;
+  try {
+    decoder.configure(buildVideoDecoderConfig({
+      codec: codecStr,
+      width,
+      height,
+      description: desc,
+    }));
+    decoderConfigured = true;
+    return true;
+  } catch (error) {
+    console.warn('WebCodecs configure failed:', error);
+    enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_ERROR);
+    return false;
+  }
 }
 
 function formatCadence(summary) {
@@ -1447,8 +1497,7 @@ function processFramePayload(payload, binaryData = null) {
   if (codec && codec !== activeCodec) {
     activeCodec = codec;
     decoderConfigured = false;
-    waitingForDecoderKeyframe = true;
-    teardownDecoderPipeline();
+    enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
     console.log('codec changed:', activeCodec);
   }
 
@@ -1459,13 +1508,21 @@ function processFramePayload(payload, binaryData = null) {
     // base64 branch only supports an older in-process sender during migration.
     const raw = binaryData ?? Uint8Array.from(atob(data), c => c.charCodeAt(0));
     const decoderBacklogged = videoDecoder?.decodeQueueSize >= MAX_DECODE_QUEUE_SIZE;
-    if (discontinuity || decoderBacklogged) waitingForDecoderKeyframe = true;
-    if (!keyframe && waitingForDecoderKeyframe) {
+    if (discontinuity) {
+      // A delivered discontinuity keyframe is the recovery boundary we were
+      // waiting for, not evidence that another keyframe is missing.
+      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DISCONTINUITY, {
+        requestKeyframe: !keyframe,
+      });
+    } else if (decoderBacklogged) {
+      enterDecoderRecovery(DECODER_RECOVERY_REASONS.FRONTEND_BACKPRESSURE);
+    }
+    if (decoderRecovery.shouldDropFrame({ keyframe })) {
+      if (!decoderRecovery.requestIssued) {
+        enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
+      }
       droppedFrames++;
       return;
-    }
-    if (keyframe && waitingForDecoderKeyframe && videoDecoder) {
-      teardownDecoderPipeline();
     }
     const mediaPtsMicros = exactMediaTimestampMicros(ptsMicros);
     const chunkTimestamp = mediaPtsMicros !== null
@@ -1494,7 +1551,8 @@ function processFramePayload(payload, binaryData = null) {
           timestamp: chunkTimestamp,
           data: chunkData,
         });
-        enqueueVideoChunk(chunk, receivedAt, 'av1', mediaPtsMicros);
+        const enqueued = enqueueVideoChunk(chunk, receivedAt, 'av1', mediaPtsMicros);
+        finishVideoChunkEnqueue(keyframe, enqueued);
       }
 
     } else if (activeCodec === 'h265') {
@@ -1523,7 +1581,8 @@ function processFramePayload(payload, binaryData = null) {
           timestamp: chunkTimestamp,
           data: nalsToLengthPrefixed(sliceNals),
         });
-        enqueueVideoChunk(chunk, receivedAt, 'hevc', mediaPtsMicros);
+        const enqueued = enqueueVideoChunk(chunk, receivedAt, 'hevc', mediaPtsMicros);
+        finishVideoChunkEnqueue(keyframe, enqueued);
       }
 
     } else {
@@ -1551,7 +1610,8 @@ function processFramePayload(payload, binaryData = null) {
           timestamp: chunkTimestamp,
           data: nalsToLengthPrefixed(sliceNals),
         });
-        enqueueVideoChunk(chunk, receivedAt, 'h264', mediaPtsMicros);
+        const enqueued = enqueueVideoChunk(chunk, receivedAt, 'h264', mediaPtsMicros);
+        finishVideoChunkEnqueue(keyframe, enqueued);
       }
     }
   } else {

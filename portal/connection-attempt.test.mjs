@@ -1,10 +1,20 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
   committedRustConnection,
   disconnectRejectedRustConnection,
 } from './connection-attempt.mjs';
+
+const main = await readFile(new URL('./main.js', import.meta.url), 'utf8');
+
+test('connection diagnostics recognize grouped media v3', () => {
+  assert.match(
+    main,
+    /streamTransportMode = \[\s*'grouped-v3',\s*'independent-v2',\s*'reliable-v1',\s*'reliable-v0',\s*\]/,
+  );
+});
 
 test('only an explicitly connected result owns committed Rust state', () => {
   assert.equal(committedRustConnection({ connected: true }), true);

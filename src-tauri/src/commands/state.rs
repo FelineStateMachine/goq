@@ -1,4 +1,5 @@
 use serde::Serialize;
+use sigil_protocol::KeyframeRequestReasonV3;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -333,6 +334,7 @@ pub struct AppState {
     pub input_send: TokioMutex<Option<tokio::sync::mpsc::Sender<sigil_protocol::InputEvent>>>,
     pub client_endpoint: TokioMutex<Option<iroh::Endpoint>>,
     pub media_connection: TokioMutex<Option<(u64, iroh::endpoint::Connection)>>,
+    pub media_control: TokioMutex<Option<(u64, MediaControlRequestSender)>>,
     pub frame_delivery: TokioMutex<Option<(u64, Arc<AtomicUsize>)>>,
     pub client_media_generation: Arc<AtomicU64>,
     pub audio_deliveries: Arc<StdMutex<AudioDeliveryState>>,
@@ -343,6 +345,9 @@ pub struct AppState {
     pub webcodecs: AtomicBool,
     pub dev_connect_node_id: Option<iroh::PublicKey>,
 }
+
+pub type MediaControlRequestSender =
+    tokio::sync::mpsc::Sender<(KeyframeRequestReasonV3, Option<u64>)>;
 
 impl Default for AppState {
     fn default() -> Self {
@@ -365,6 +370,7 @@ impl AppState {
             input_send: TokioMutex::new(None),
             client_endpoint: TokioMutex::new(None),
             media_connection: TokioMutex::new(None),
+            media_control: TokioMutex::new(None),
             frame_delivery: TokioMutex::new(None),
             client_media_generation: Arc::new(AtomicU64::new(0)),
             audio_deliveries: Arc::new(StdMutex::new(AudioDeliveryState::default())),
@@ -643,6 +649,7 @@ mod tests {
 
         assert!(state.client_endpoint.try_lock().unwrap().is_none());
         assert!(state.media_connection.try_lock().unwrap().is_none());
+        assert!(state.media_control.try_lock().unwrap().is_none());
         assert!(state.audio_connection.try_lock().unwrap().is_none());
     }
 

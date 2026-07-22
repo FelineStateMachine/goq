@@ -52,9 +52,12 @@ Sigil host.
 - Gamescope's exact PipeWire node is resolved from strict configured
   properties. AMD GstVA H.264 sustains the fixed 1280x800/60 first target on
   the GPD Pocket 4 test host with bounded post-encode delivery.
-- Media v2 uses one bounded, prioritized QUIC object stream per encoded frame.
-  Stale dependent objects are cancelled; discontinuity keyframes provide a
-  latest-frame barrier. Media v1 remains a compatibility fallback.
+- Media v3 uses one bounded, prioritized QUIC object stream per encoded frame
+  with explicit GOP/object identity, publisher priority, delivery deadlines,
+  and a persistent keyframe-request leg. Stale dependent objects are cancelled;
+  discontinuity keyframes provide a latest-frame barrier. Media v2 and v1
+  remain compatibility fallbacks. This is a custom MoQ-style protocol, not a
+  claim of IETF MoQ Transport compatibility.
 - Portal crosses Rust-to-webview video and audio through bounded binary Tauri
   channels. It reports transport, frontend, decoder, presentation, and audio
   queue/drop timing separately.
@@ -136,8 +139,11 @@ Sigil host.
   candidates.
 - Issues #7-#10 are streaming hardening: full Iroh/MoQ semantics, adaptive
   bitrate, motion-sensitive resolution, and automatic low-latency codec
-  selection. The current independent media objects are an incremental transport
-  step, not a claim that the full MoQ milestone is complete.
+  selection. Media v3 adds grouped object identity, expiry, cancellation, and
+  explicit recovery, but the external `gst-launch` encoder can only honor a
+  keyframe request at its next natural configured IDR. An in-process GStreamer
+  control path plus hardware loss/relay proof remain before claiming the full
+  MoQ milestone complete.
 
 ## Working rules
 

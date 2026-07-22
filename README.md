@@ -62,9 +62,10 @@ Steam and games.
   rollback, and package-owned user assets that follow the active release.
 
 The software JPEG client decode fallback and legacy wire compatibility remain.
-Media v2 now uses bounded independent QUIC object streams with prioritized
-keyframes, dependent-object cancellation, and discontinuity recovery; full MoQ
-group/control semantics remain promoted hardening work. A dedicated persistent
+Media v3 adds bounded QUIC objects with explicit GOP/object identity, publisher
+priority, delivery expiry, dependent-object cancellation, and client-requested
+discontinuity recovery. It is deliberately MoQ-style rather than an IETF MoQ
+Transport compatibility claim; v2 and v1 remain fallbacks. A dedicated persistent
 PipeWire sink, bounded Opus datagrams, WebCodecs decode, and AudioWorklet
 playback are implemented; longer-run audio/video synchronization measurement
 remains. The debug direct-node bypass is routing, not authentication.
@@ -77,9 +78,12 @@ remains. The debug direct-node bypass is routing, not authentication.
    and service startup remain public-alpha acceptance gates.
 3. **Hardware-proven:** encode H.264 at 1280x800/60 with bounded buffers and no B-frames.
 4. **Done:** replace base64 WebCodecs delivery with a bounded binary Tauri channel.
-5. **Incremental object transport done:** bounded independent QUIC media
-   objects cancel stale dependent frames and recover at discontinuity
-   keyframes. Full Iroh/MoQ group/control semantics remain tracked in issue #7.
+5. **Grouped object transport implemented; hardware proof pending:** bounded
+   QUIC media objects carry GOP/object identity and delivery deadlines, cancel
+   stale dependent frames, and recover through explicit keyframe requests.
+   The external encoder currently responds at its next natural configured IDR;
+   in-process force-key-unit control and induced-loss/relay proof remain in
+   issue #7.
 6. **Host hardware-proven; physical client controller pending:** the virtual
    Xbox-style controller negotiated over Iroh and produced the expected
    button, stick, trigger, D-pad, and neutral-release events on the Bazzite

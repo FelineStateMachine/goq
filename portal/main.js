@@ -1,17 +1,13 @@
 import {
-  HeldInputState,
-  MAX_HELD_KEYS,
-  MAX_HELD_MOUSE_BUTTONS,
-  PointerMotionBuffer,
   browserPointerLockLossRequiresControlExit,
   mapCanvasPointToSurface,
   resolvePointerSurfaceSize,
-  restoreRejectedPointerMotion,
   scaleRelativePointerDelta,
   validatePointerSurfaceDimensions,
   validatePointerPositionFeedback,
   browserMouseButtonCode,
 } from './input-state.mjs';
+import { createInputRuntime } from './input-runtime.mjs';
 import { formatVideoDiscardTelemetry } from './frame-stats.mjs';
 import { networkDiagnosticsPresentation } from './network-diagnostics.mjs';
 import { newPointerSession, parsePointerFeedbackMessage } from './pointer-feedback.mjs';
@@ -116,6 +112,13 @@ function handlePointerPositionFeedback(message, session) {
 
 const invoke = (...args) => window.__TAURI__.core.invoke(...args);
 const listen = (...args) => window.__TAURI__.event.listen(...args);
+const inputRuntime = createInputRuntime({
+  invokeCommand: invoke,
+  getCapabilities: () => connectionState.inputCapabilities,
+  isConnected: () => connectionState.connected,
+  onFatal: () => { void disconnect(); },
+  resetControllerActivation: () => controllerActivationGate.reset(),
+});
 let videoPipeline = null;
 let streamRuntime = null;
 const audioPipeline = createAudioPipelineSession({
@@ -495,7 +498,7 @@ function updateAcceptedConnectionState({ attempt, state }) {
     session.remoteVisible = attempt.initialPointerFeedback.pointer_visible;
   }
   controlMode = false;
-  clearPendingInput();
+  inputRuntime.clear();
 }
 
 async function showConnectedAttempt({ result, attempt }) {
@@ -528,13 +531,13 @@ async function prepareDisconnect() {
   controlTransitionInProgress = false;
   controllerActivationGate.reset();
   queueNeutralControllerState();
-  releaseHeldInputs();
+  inputRuntime.releaseHeld();
   controlMode = false;
   releasePointerLock();
   updateControlUI();
   // Give release commands a short, finite opportunity to cross the bounded
   // Tauri queue before closing it. A broken stream cannot stall disconnect.
-  await waitForInputDrain(250);
+  await inputRuntime.drain(250);
 }
 
 async function teardownConnectedResources() {
@@ -552,7 +555,7 @@ async function showDisconnectedState() {
   lastObservedWindowSize = null;
   if (streamWindowResizeTimer !== null) clearTimeout(streamWindowResizeTimer);
   streamWindowResizeTimer = null;
-  clearPendingInput();
+  inputRuntime.clear();
   updateControlUI();
   updatePanelVisibility();
   setStatus('', 'idle');
@@ -926,7 +929,7 @@ async function toggleControl() {
     controlTransitionGeneration += 1;
     controllerActivationGate.reset();
     queueNeutralControllerState();
-    releaseHeldInputs();
+    inputRuntime.releaseHeld();
     controlMode = false;
     releasePointerLock();
   } else {
@@ -975,7 +978,7 @@ async function toggleControl() {
 
 function queueNeutralControllerState() {
   if (!connectionState.connected || !connectionState.inputCapabilities.gamepad) return false;
-  return sendInput({ t: 'gp', state: neutralGamepadInputState() });
+  return inputRuntime.send({ t: 'gp', state: neutralGamepadInputState() });
 }
 
 function describeInputCapabilities() {
@@ -1068,7 +1071,7 @@ function exitControlAfterBrowserPointerLockFailure() {
   controllerActivationGate.reset();
   controllerEscape.reset();
   queueNeutralControllerState();
-  releaseHeldInputs();
+  inputRuntime.releaseHeld();
   controlMode = false;
   releasePointerLock();
   updateControlUI();
@@ -1191,191 +1194,6 @@ function scaleCoords(clientX, clientY) {
   }) ?? { x: 0, y: 0 };
 }
 
-const RELIABLE_INPUT_QUEUE_LIMIT = 128;
-const IN_FLIGHT_INPUT_RESTORE_RESERVE = 1;
-const RELIABLE_INPUT_ENQUEUE_LIMIT = RELIABLE_INPUT_QUEUE_LIMIT
-  - IN_FLIGHT_INPUT_RESTORE_RESERVE;
-const POINTER_MOTION_BARRIER_RESERVE = 2;
-const RELEASE_INPUT_RESERVE = MAX_HELD_KEYS
-  + MAX_HELD_MOUSE_BUTTONS
-  + POINTER_MOTION_BARRIER_RESERVE;
-const REGULAR_RELIABLE_INPUT_LIMIT = RELIABLE_INPUT_ENQUEUE_LIMIT - RELEASE_INPUT_RESERVE;
-const INPUT_RETRY_MS = 8;
-const reliableInputQueue = [];
-const heldInputs = new HeldInputState();
-const pendingPointerMotion = new PointerMotionBuffer();
-let pendingGamepadInput = null;
-let inputPumpRunning = false;
-let inputPumpScheduled = false;
-
-function clearPendingInput() {
-  reliableInputQueue.length = 0;
-  heldInputs.clear();
-  controllerActivationGate.reset();
-  pendingPointerMotion.clear();
-  pendingGamepadInput = null;
-}
-
-function inputEventAvailable(event) {
-  const capabilities = connectionState.inputCapabilities;
-  if (!capabilities.control) return false;
-  if (event.t === 'mm') return capabilities.absolutePointer;
-  if (event.t === 'mr') return capabilities.relativePointer;
-  if (event.t === 'mp') return capabilities.relativePointer;
-  if (['mc', 'md', 'mu', 'ms'].includes(event.t)) return pointerInputAvailable();
-  if (['kd', 'ku', 'kt'].includes(event.t)) return capabilities.keyboard;
-  if (event.t === 'tx') return capabilities.text;
-  if (event.t === 'gp') return capabilities.gamepad;
-  return false;
-}
-
-function hasPendingInput() {
-  return reliableInputQueue.length > 0
-    || pendingPointerMotion.pending
-    || pendingGamepadInput !== null;
-}
-
-function scheduleInputPump() {
-  if (inputPumpRunning || inputPumpScheduled) return;
-  inputPumpScheduled = true;
-  setTimeout(() => {
-    inputPumpScheduled = false;
-    pumpInputQueue();
-  }, 0);
-}
-
-function sendInput(event, { release = false } = {}) {
-  if (!inputEventAvailable(event)) return false;
-  if (event.t === 'gp') {
-    // Controller samples are state, not transitions. A single latest-value slot
-    // bounds latency and guarantees a neutral snapshot can replace stale input.
-    pendingGamepadInput = event;
-  } else if (event.t === 'mm') {
-    // Absolute pointer motion is latest-value data; stale coordinates are not
-    // useful and must not create an invocation backlog.
-    pendingPointerMotion.setAbsolute(event);
-  } else if (event.t === 'mr') {
-    // Relative motion is displacement. Coalesce every sample into one
-    // constant-size total; the pump emits protocol-bounded chunks so
-    // throttling preserves distance instead of dropping motion.
-    if (!pendingPointerMotion.addRelative(event.dx, event.dy)) return false;
-  } else {
-    const queueLimit = release ? RELIABLE_INPUT_ENQUEUE_LIMIT : REGULAR_RELIABLE_INPUT_LIMIT;
-    const pointerTransition = ['mp', 'mc', 'md', 'mu', 'ms'].includes(event.t);
-    const barrierLength = pointerTransition ? pendingPointerMotion.barrierLength : 0;
-    const tail = reliableInputQueue.at(-1);
-    const coalesceScroll = event.t === 'ms' && barrierLength === 0 && tail?.t === 'ms';
-    const requiredSlots = coalesceScroll ? 0 : barrierLength + 1;
-    if (reliableInputQueue.length + requiredSlots > queueLimit) {
-      console.error(release
-        ? 'input release reserve exhausted; closing control session'
-        : 'reliable input queue full; closing control session');
-      // Defer teardown until the caller has removed any transition it could
-      // not enqueue from held-state tracking.
-      queueMicrotask(() => {
-        if (connectionState.connected) void disconnect();
-      });
-      return false;
-    }
-    if (coalesceScroll) {
-      tail.dx = Math.max(-1000000, Math.min(1000000, tail.dx + event.dx));
-      tail.dy = Math.max(-1000000, Math.min(1000000, tail.dy + event.dy));
-    } else if (pointerTransition) {
-      reliableInputQueue.push(...pendingPointerMotion.takeBarrierBefore(event));
-    } else {
-      reliableInputQueue.push(event);
-    }
-  }
-  scheduleInputPump();
-  return true;
-}
-
-function releaseHeldInputs() {
-  for (const release of heldInputs.releaseEvents()) {
-    // Ordinary reliable events cannot consume this reserved capacity.
-    sendInput(release, { release: true });
-  }
-  heldInputs.clear();
-}
-
-async function waitForInputDrain(timeoutMs) {
-  const deadline = performance.now() + timeoutMs;
-  while ((hasPendingInput() || inputPumpRunning) && performance.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, INPUT_RETRY_MS));
-  }
-}
-
-function takePendingInput() {
-  if (reliableInputQueue.length > 0) {
-    return { event: reliableInputQueue.shift(), reliable: true };
-  }
-  const pointerMotionEvent = pendingPointerMotion.take();
-  if (pointerMotionEvent !== null) {
-    return { event: pointerMotionEvent, reliable: false };
-  }
-  if (pendingGamepadInput !== null) {
-    const event = pendingGamepadInput;
-    pendingGamepadInput = null;
-    return { event, reliable: false };
-  }
-  return null;
-}
-
-function restorePendingInput(item) {
-  if (item.reliable) {
-    if (reliableInputQueue.length >= RELIABLE_INPUT_QUEUE_LIMIT) {
-      throw new Error('reliable input restore reserve exhausted');
-    }
-    reliableInputQueue.unshift(item.event);
-  } else if (item.event.t === 'mm' || item.event.t === 'mr') {
-    // A transition queued during the invoke must remain after the rejected
-    // motion. With no transition, relative displacement merges while stale
-    // absolute state yields to any newer latest position.
-    restoreRejectedPointerMotion(
-      reliableInputQueue,
-      pendingPointerMotion,
-      item.event,
-      RELIABLE_INPUT_QUEUE_LIMIT,
-    );
-  } else if (item.event.t === 'gp') {
-    // Keep a newer controller sample, especially a neutral release state.
-    if (pendingGamepadInput === null) pendingGamepadInput = item.event;
-  }
-}
-
-async function pumpInputQueue() {
-  if (inputPumpRunning) return;
-  inputPumpRunning = true;
-  try {
-    while (hasPendingInput()) {
-      const item = takePendingInput();
-      if (!item) break;
-      let accepted;
-      try {
-        accepted = await invoke('iroh_client_send_input', { event: item.event });
-      } catch (e) {
-        console.warn('input send failed:', e);
-        clearPendingInput();
-        return;
-      }
-      if (!accepted) {
-        try {
-          restorePendingInput(item);
-        } catch (error) {
-          console.error('input restore failed:', error);
-          clearPendingInput();
-          if (connectionState.connected) void disconnect();
-          return;
-        }
-        await new Promise((resolve) => setTimeout(resolve, INPUT_RETRY_MS));
-      }
-    }
-  } finally {
-    inputPumpRunning = false;
-    if (hasPendingInput()) scheduleInputPump();
-  }
-}
-
 window.addEventListener('mousemove', (e) => {
   if (!controlMode || !pointerInputAvailable()) return;
   if (connectionState.inputCapabilities.relativePointer) {
@@ -1383,7 +1201,7 @@ window.addEventListener('mousemove', (e) => {
       e.movementX,
       e.movementY,
     );
-    sendInput({ t: 'mr', ...movement });
+    inputRuntime.send({ t: 'mr', ...movement });
     return;
   }
 }, { capture: true });
@@ -1393,7 +1211,7 @@ canvas.addEventListener('mousemove', (e) => {
     || !connectionState.inputCapabilities.absolutePointer
     || connectionState.inputCapabilities.relativePointer) return;
   const { x, y } = scaleCoords(e.clientX, e.clientY);
-  sendInput({ t: 'mm', x, y });
+  inputRuntime.send({ t: 'mm', x, y });
 });
 
 function handleMouseDown(e) {
@@ -1408,8 +1226,8 @@ function handleMouseDown(e) {
       console.warn('browser pointer lock retry failed:', error);
     });
   }
-  if (!heldInputs.trackMouseButton(btn)) return;
-  if (!sendInput({ t: 'md', b: btn })) heldInputs.takeMouseButtonRelease(btn);
+  if (!inputRuntime.trackMouseButton(btn)) return;
+  if (!inputRuntime.send({ t: 'md', b: btn })) inputRuntime.takeMouseButtonRelease(btn);
 }
 
 window.addEventListener('mousedown', handleMouseDown, { capture: true });
@@ -1418,10 +1236,10 @@ function releaseMouseButton(e) {
   if (!connectionState.connected || !pointerInputAvailable()) return;
   const btn = browserMouseButtonCode(e.button);
   if (btn === null) return;
-  const release = heldInputs.takeMouseButtonRelease(btn);
+  const release = inputRuntime.takeMouseButtonRelease(btn);
   if (!release) return;
   e.preventDefault();
-  sendInput(release, { release: true });
+  inputRuntime.send(release, { release: true });
 }
 
 window.addEventListener('mouseup', (e) => {
@@ -1440,7 +1258,7 @@ window.addEventListener('wheel', (e) => {
   if (!connectionState.inputCapabilities.relativePointer && e.target !== canvas) return;
   e.preventDefault();
   if (connectionState.inputCapabilities.relativePointer) e.stopPropagation();
-  sendInput({ t: 'ms', dx: Math.round(e.deltaX), dy: Math.round(e.deltaY) });
+  inputRuntime.send({ t: 'ms', dx: Math.round(e.deltaX), dy: Math.round(e.deltaY) });
 }, { passive: false, capture: true });
 
 window.addEventListener('keydown', (e) => {
@@ -1449,7 +1267,7 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     controllerActivationGate.reset();
     queueNeutralControllerState();
-    releaseHeldInputs();
+    inputRuntime.releaseHeld();
     controlMode = false;
     releasePointerLock();
     updateControlUI();
@@ -1458,7 +1276,7 @@ window.addEventListener('keydown', (e) => {
   const printableText = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
   if (printableText && connectionState.inputCapabilities.text) {
     e.preventDefault();
-    sendInput({ t: 'tx', s: e.key });
+    inputRuntime.send({ t: 'tx', s: e.key });
     return;
   }
   if (!connectionState.inputCapabilities.keyboard) return;
@@ -1466,22 +1284,22 @@ window.addEventListener('keydown', (e) => {
   if (k) {
     e.preventDefault();
     const keyId = e.code || e.key;
-    const tracking = heldInputs.trackKey(keyId, k);
+    const tracking = inputRuntime.trackKey(keyId, k);
     if (tracking === 'repeat') return;
     if (tracking === 'full') {
       console.error('held key limit reached; refusing additional key transition');
       return;
     }
-    if (!sendInput({ t: 'kd', k })) heldInputs.takeKeyRelease(keyId);
+    if (!inputRuntime.send({ t: 'kd', k })) inputRuntime.takeKeyRelease(keyId);
   }
 });
 
 window.addEventListener('keyup', (e) => {
   const keyId = e.code || e.key;
-  const release = heldInputs.takeKeyRelease(keyId);
+  const release = inputRuntime.takeKeyRelease(keyId);
   if (!release) return;
   e.preventDefault();
-  sendInput(release, { release: true });
+  inputRuntime.send(release, { release: true });
 });
 
 window.addEventListener('blur', () => {
@@ -1490,7 +1308,7 @@ window.addEventListener('blur', () => {
   controlTransitionInProgress = false;
   controllerActivationGate.reset();
   queueNeutralControllerState();
-  releaseHeldInputs();
+  inputRuntime.releaseHeld();
   controlMode = false;
   releasePointerLock();
   updateControlUI();
@@ -1578,7 +1396,7 @@ controllerPublisher.setHandler((state) => {
     || !connectionState.inputCapabilities.gamepad) return;
   const inputState = maskGamepadEscapeChord(toGamepadInputState(state));
   if (!controllerActivationGate.accepts(inputState)) return;
-  sendInput({ t: 'gp', state: inputState });
+  inputRuntime.send({ t: 'gp', state: inputState });
 });
 
 function publishCurrentControllerState() {
@@ -1704,7 +1522,7 @@ function pollControllers(nowMs) {
     if (controllerEscape.update(currentControllerState, nowMs)) {
       controllerActivationGate.reset();
       queueNeutralControllerState();
-      releaseHeldInputs();
+      inputRuntime.releaseHeld();
       controlMode = false;
       releasePointerLock();
       updateControlUI();

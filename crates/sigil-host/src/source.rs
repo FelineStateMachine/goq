@@ -19,6 +19,9 @@ use crate::config::{
     GamescopeEncoderBackend, GamescopePipewireConfig, HostConfig, VaapiRateControl,
 };
 
+#[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]
+use gstreamer::prelude::ObjectExt;
+
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 

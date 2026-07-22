@@ -470,6 +470,27 @@ fn configured_runtime_directory() -> Result<Option<PathBuf>> {
     Ok(Some(root.join("sigil-spark")))
 }
 
+pub(crate) fn resolve_management_runtime_directory(
+    explicit_root: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(root) = explicit_root {
+        ensure!(root.is_absolute(), "--runtime-dir must be absolute");
+        secure_state::validate_private_directory(root)
+            .context("validating --runtime-dir for Sigil appliance management")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            ensure!(
+                fs::symlink_metadata(root)?.permissions().mode() & 0o7777 == 0o700,
+                "--runtime-dir must have mode 0700"
+            );
+        }
+        return Ok(root.join("sigil-spark"));
+    }
+    configured_runtime_directory()?
+        .context("configured Sigil service requires a valid XDG_RUNTIME_DIR")
+}
+
 pub fn collect_status(config_path: &Path) -> Result<ApplianceStatusV2> {
     let loaded = HostConfig::load_document(config_path)?;
     let config = &loaded.config;
@@ -522,7 +543,7 @@ pub fn reset_enrollment(
 ) -> Result<EnrollmentResetV1> {
     let config = HostConfig::load(config_path)?;
     config.ensure_runtime_directory()?;
-    let _lifecycle = LifecycleGuard::acquire(&config.state_path, true)?;
+    let _lifecycle = LifecycleGuard::acquire(&config.state_path, false)?;
     let secret = crate::identity::load(&config.identity_path)?;
     let host = secret.public();
     let host_fingerprint = fingerprint(host);
@@ -718,15 +739,16 @@ fn read_persisted_runtime(state_directory: &Path) -> Result<Option<RuntimeStatus
     }
 }
 
-pub(crate) fn latest_runtime_instance(expected_host: EndpointId) -> Result<Option<String>> {
-    let state_directory = configured_runtime_directory()?
-        .context("configured Sigil service requires a valid XDG_RUNTIME_DIR")?;
-    match fs::symlink_metadata(&state_directory) {
+pub(crate) fn latest_runtime_instance(
+    state_directory: &Path,
+    expected_host: EndpointId,
+) -> Result<Option<String>> {
+    match fs::symlink_metadata(state_directory) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("inspecting Sigil runtime state directory"),
         Ok(_) => {}
     }
-    let Some(persisted) = read_persisted_runtime(&state_directory)? else {
+    let Some(persisted) = read_persisted_runtime(state_directory)? else {
         return Ok(None);
     };
     ensure!(
@@ -796,14 +818,13 @@ fn unavailable_runtime() -> RuntimeStatus {
 }
 
 pub(crate) fn validate_candidate_runtime(
+    state_directory: &Path,
     expected_host: EndpointId,
     expected_revision: &ConfigRevision,
     expected_instance: &str,
 ) -> Result<()> {
-    let state_directory = configured_runtime_directory()?
-        .context("configured Sigil service requires a valid XDG_RUNTIME_DIR")?;
     validate_candidate_runtime_at(
-        &state_directory,
+        state_directory,
         expected_host,
         expected_revision,
         expected_instance,
@@ -982,6 +1003,41 @@ mod tests {
         assert!(LifecycleGuard::acquire_at(second_state.path(), Some(runtime.path())).is_err());
         drop(first);
         LifecycleGuard::acquire_at(second_state.path(), Some(runtime.path())).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_lock_without_runtime_remains_state_scoped() {
+        let first_state = private_directory();
+        let second_state = private_directory();
+        let first = LifecycleGuard::acquire_at(first_state.path(), None).unwrap();
+        assert!(LifecycleGuard::acquire_at(first_state.path(), None).is_err());
+        LifecycleGuard::acquire_at(second_state.path(), None).unwrap();
+        drop(first);
+        LifecycleGuard::acquire_at(first_state.path(), None).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_management_runtime_root_is_strict_and_appends_one_child() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = private_directory();
+        assert_eq!(
+            resolve_management_runtime_directory(Some(root.path())).unwrap(),
+            root.path().join("sigil-spark")
+        );
+        assert!(resolve_management_runtime_directory(Some(Path::new("relative"))).is_err());
+
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(resolve_management_runtime_directory(Some(root.path())).is_err());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o1700)).unwrap();
+        assert!(resolve_management_runtime_directory(Some(root.path())).is_err());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let link_parent = private_directory();
+        let link = link_parent.path().join("runtime-link");
+        symlink(root.path(), &link).unwrap();
+        assert!(resolve_management_runtime_directory(Some(&link)).is_err());
     }
 
     #[test]

@@ -194,6 +194,8 @@ struct TransactionJournalV1 {
     base_revision: ConfigRevision,
     candidate_revision: ConfigRevision,
     baseline_runtime_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_directory_id: Option<ConfigRevision>,
 }
 
 enum RecoveryCompletion {
@@ -260,14 +262,21 @@ pub fn validate(
     })
 }
 
-pub fn set(config_path: &Path, request: &ConfigRequestV1) -> ManagementResult<ConfigSetV1> {
+pub fn set(
+    config_path: &Path,
+    request: &ConfigRequestV1,
+    runtime_root: Option<&Path>,
+) -> ManagementResult<ConfigSetV1> {
     let bootstrap = load_config(config_path)?;
     let state_directory = bootstrap.config.state_path.clone();
+    let runtime_directory = appliance::resolve_management_runtime_directory(runtime_root)
+        .map_err(|error| ManagementError::new(ManagementErrorCode::UnsafeStorage, error))?;
     bootstrap
         .config
         .ensure_runtime_directory()
         .map_err(|error| ManagementError::new(ManagementErrorCode::UnsafeStorage, error))?;
-    let (_lifecycle, _config_lock) = acquire_management_locks(&state_directory)?;
+    let (_lifecycle, _config_lock) =
+        acquire_management_locks_at(&state_directory, Some(&runtime_directory))?;
 
     let mut loaded = load_config(config_path)?;
     ensure_bootstrap_paths_unchanged(&bootstrap, &loaded)?;
@@ -297,8 +306,9 @@ pub fn set(config_path: &Path, request: &ConfigRequestV1) -> ManagementResult<Co
     let host = identity::load(&loaded.config.identity_path)
         .map_err(|error| ManagementError::new(ManagementErrorCode::UnsafeStorage, error))?
         .public();
-    let baseline_runtime_instance = appliance::latest_runtime_instance(host)
+    let baseline_runtime_instance = appliance::latest_runtime_instance(&runtime_directory, host)
         .map_err(|error| ManagementError::new(ManagementErrorCode::UnsafeStorage, error))?;
+    let runtime_directory_id = runtime_directory_id(&runtime_directory)?;
 
     write_artifact(&state_directory, BASE_FILE, &loaded.bytes)?;
     write_artifact(&state_directory, CANDIDATE_FILE, &candidate.bytes)?;
@@ -310,6 +320,7 @@ pub fn set(config_path: &Path, request: &ConfigRequestV1) -> ManagementResult<Co
         base_revision: loaded.revision.clone(),
         candidate_revision: candidate_revision.clone(),
         baseline_runtime_instance,
+        runtime_directory_id: Some(runtime_directory_id),
     };
     write_journal(&state_directory, &journal)?;
     replace_config(config_path, &candidate.bytes)?;
@@ -336,12 +347,33 @@ pub fn commit(
     config_path: &Path,
     transaction: &str,
     expected_instance: &str,
+    runtime_root: Option<&Path>,
 ) -> ManagementResult<ConfigCommitV1> {
     validate_transaction_id(transaction)?;
     validate_transaction_id(expected_instance)?;
     let bootstrap = load_config(config_path)?;
     let state_directory = bootstrap.config.state_path.clone();
-    let (_lifecycle, _config_lock) = acquire_management_locks(&state_directory)?;
+    let runtime_directory = appliance::resolve_management_runtime_directory(runtime_root)
+        .map_err(|error| ManagementError::new(ManagementErrorCode::UnsafeStorage, error))?;
+    let (_lifecycle, _config_lock) =
+        acquire_management_locks_at(&state_directory, Some(&runtime_directory))?;
+    let observed_journal = read_journal(&state_directory)?.ok_or_else(|| {
+        ManagementError::new(
+            ManagementErrorCode::TransactionNotFound,
+            anyhow::anyhow!("no configuration transaction is pending"),
+        )
+    })?;
+    validate_journal(&observed_journal, config_path)?;
+    require_transaction(&observed_journal, transaction)?;
+    let runtime_directory_id = runtime_directory_id(&runtime_directory)?;
+    if observed_journal.runtime_directory_id.as_ref() != Some(&runtime_directory_id) {
+        return Err(ManagementError::new(
+            ManagementErrorCode::HealthNotProven,
+            anyhow::anyhow!(
+                "candidate validation runtime directory does not match the transaction"
+            ),
+        ));
+    }
     let mut loaded = load_config(config_path)?;
     ensure_bootstrap_paths_unchanged(&bootstrap, &loaded)?;
     let recovered = recover(config_path, &mut loaded)?;
@@ -375,6 +407,7 @@ pub fn commit(
     let secret = identity::load(&loaded.config.identity_path)
         .map_err(|error| ManagementError::new(ManagementErrorCode::UnsafeStorage, error))?;
     appliance::validate_candidate_runtime(
+        &runtime_directory,
         secret.public(),
         &journal.candidate_revision,
         expected_instance,
@@ -396,7 +429,7 @@ pub fn rollback(config_path: &Path, transaction: &str) -> ManagementResult<Confi
     validate_transaction_id(transaction)?;
     let bootstrap = load_config(config_path)?;
     let state_directory = bootstrap.config.state_path.clone();
-    let (_lifecycle, _config_lock) = acquire_management_locks(&state_directory)?;
+    let (_lifecycle, _config_lock) = acquire_management_locks(&state_directory, false)?;
     let mut loaded = load_config(config_path)?;
     ensure_bootstrap_paths_unchanged(&bootstrap, &loaded)?;
     let recovered = recover(config_path, &mut loaded)?;
@@ -593,11 +626,30 @@ fn finish_service_prepare(
 
 fn acquire_management_locks(
     state_directory: &Path,
+    require_global: bool,
 ) -> ManagementResult<(LifecycleGuard, fs::File)> {
-    let lifecycle = match LifecycleGuard::try_acquire(state_directory, true) {
+    let lifecycle = match LifecycleGuard::try_acquire(state_directory, require_global) {
         Ok(lifecycle) => lifecycle,
         Err(error) => return Err(classify_lifecycle_error(state_directory, error)),
     };
+    finish_acquire_management_locks(state_directory, lifecycle)
+}
+
+fn acquire_management_locks_at(
+    state_directory: &Path,
+    runtime_directory: Option<&Path>,
+) -> ManagementResult<(LifecycleGuard, fs::File)> {
+    let lifecycle = match LifecycleGuard::try_acquire_at(state_directory, runtime_directory) {
+        Ok(lifecycle) => lifecycle,
+        Err(error) => return Err(classify_lifecycle_error(state_directory, error)),
+    };
+    finish_acquire_management_locks(state_directory, lifecycle)
+}
+
+fn finish_acquire_management_locks(
+    state_directory: &Path,
+    lifecycle: LifecycleGuard,
+) -> ManagementResult<(LifecycleGuard, fs::File)> {
     let config_lock = classify_config_lock(secure_state::try_open_lifetime_lock(
         state_directory,
         CONFIG_LOCK_FILE,
@@ -852,17 +904,29 @@ fn validate_journal(journal: &TransactionJournalV1, config_path: &Path) -> Manag
     if let Some(instance) = &journal.baseline_runtime_instance {
         validate_stored_id(instance)?;
     }
+    if let Some(runtime_directory_id) = &journal.runtime_directory_id {
+        ConfigRevision::parse(runtime_directory_id.as_str())
+            .map_err(|error| ManagementError::new(ManagementErrorCode::UnsafeStorage, error))?;
+    }
     Ok(())
 }
 
 fn config_path_id(path: &Path) -> ManagementResult<ConfigRevision> {
+    canonical_path_id(path, "configuration")
+}
+
+fn runtime_directory_id(path: &Path) -> ManagementResult<ConfigRevision> {
+    canonical_path_id(path, "runtime directory")
+}
+
+fn canonical_path_id(path: &Path, description: &str) -> ManagementResult<ConfigRevision> {
     let canonical = path
         .canonicalize()
         .map_err(|error| ManagementError::new(ManagementErrorCode::UnsafeStorage, error))?;
     let value = canonical.to_str().ok_or_else(|| {
         ManagementError::new(
             ManagementErrorCode::UnsafeStorage,
-            anyhow::anyhow!("configuration path is not valid UTF-8"),
+            anyhow::anyhow!("{description} path is not valid UTF-8"),
         )
     })?;
     Ok(ConfigRevision::from_bytes(value.as_bytes()))
@@ -990,6 +1054,7 @@ mod tests {
                 base_revision: self.base.revision.clone(),
                 candidate_revision: candidate.revision.clone(),
                 baseline_runtime_instance: None,
+                runtime_directory_id: None,
             };
             write_journal(&self.state_directory, &journal).unwrap();
             (journal, candidate)
@@ -1040,6 +1105,23 @@ mod tests {
             fixture.base.config.identity_path
         );
         assert_eq!(candidate.config.state_path, fixture.base.config.state_path);
+    }
+
+    #[test]
+    fn invalid_explicit_runtime_root_fails_before_config_mutation() {
+        let fixture = Fixture::new();
+        let original = fs::read(&fixture.config_path).unwrap();
+        let error = set(
+            &fixture.config_path,
+            &fixture.request(72),
+            Some(Path::new("relative-runtime")),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ManagementErrorCode::UnsafeStorage);
+        assert_eq!(fs::read(&fixture.config_path).unwrap(), original);
+        assert!(read_journal(&fixture.state_directory).unwrap().is_none());
+        assert!(!fixture.state_directory.join(BASE_FILE).exists());
+        assert!(!fixture.state_directory.join(CANDIDATE_FILE).exists());
     }
 
     #[test]
@@ -1148,6 +1230,25 @@ mod tests {
             panic!("malformed protected journal must fail closed");
         };
         assert_eq!(error.code, ManagementErrorCode::UnsafeStorage);
+    }
+
+    #[test]
+    fn malformed_runtime_directory_binding_is_unsafe_storage() {
+        let fixture = Fixture::new();
+        let (journal, _candidate) = fixture.prepared(TransactionState::PendingValidation);
+        let mut value = serde_json::to_value(journal).unwrap();
+        value["runtime_directory_id"] = serde_json::json!("not-a-revision");
+        secure_state::atomic_write(
+            &fixture.state_directory,
+            JOURNAL_FILE,
+            &serde_json::to_vec(&value).unwrap(),
+            MAX_JOURNAL_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            read_journal(&fixture.state_directory).unwrap_err().code,
+            ManagementErrorCode::UnsafeStorage
+        );
     }
 
     #[test]

@@ -12,10 +12,15 @@ sigil appliance enrollment-reset \
 ```
 
 The caller must first stop `sigil-host.service` and wait for it to become
-inactive. The command acquires both daemon-lifetime locks without waiting and
-fails before changing authorization state if a daemon still owns either lock.
-It never stops or starts systemd itself. This keeps service policy in the Decky
-backend and prevents a reset from leaving a live remote session attached.
+inactive. The command always acquires the durable
+`<state_path>/daemon-v1.lock` without waiting. When a valid private
+`XDG_RUNTIME_DIR` is available, it also acquires
+`$XDG_RUNTIME_DIR/sigil-spark/daemon-global-v1.lock`; an unsafe configured
+runtime directory fails closed. If the variable is unset, reset remains
+available from SSH or a recovery shell using only the per-state lock. A live
+daemon for that state still blocks the operation. The command never stops or
+starts systemd itself. This keeps service policy in the Decky backend and
+prevents a reset from leaving a live remote session attached.
 
 The expected fingerprint is the redacted value returned by
 `sigil appliance status`. It is an accidental-target confirmation interlock,

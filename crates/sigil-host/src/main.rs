@@ -143,6 +143,9 @@ enum ApplianceConfigCommand {
     Set {
         #[arg(long)]
         config: PathBuf,
+        /// XDG runtime root used by the stopped service; Sigil appends `sigil-spark`.
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
         #[arg(long, required = true)]
         json: bool,
     },
@@ -154,6 +157,9 @@ enum ApplianceConfigCommand {
         transaction: String,
         #[arg(long)]
         expected_instance: String,
+        /// XDG runtime root used by the candidate service; Sigil appends `sigil-spark`.
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
         #[arg(long, required = true)]
         json: bool,
     },
@@ -387,11 +393,15 @@ fn appliance_command(command: ApplianceCommand) -> CliResult<()> {
                             .map_err(CliFailure::Management)?,
                     )
                 }
-                ApplianceConfigCommand::Set { config, json: _ } => {
+                ApplianceConfigCommand::Set {
+                    config,
+                    runtime_dir,
+                    json: _,
+                } => {
                     let request = config_management::read_request(std::io::stdin().lock())
                         .map_err(CliFailure::Management)?;
                     serde_json::to_value(
-                        config_management::set(&config, &request)
+                        config_management::set(&config, &request, runtime_dir.as_deref())
                             .map_err(CliFailure::Management)?,
                     )
                 }
@@ -399,10 +409,16 @@ fn appliance_command(command: ApplianceCommand) -> CliResult<()> {
                     config,
                     transaction,
                     expected_instance,
+                    runtime_dir,
                     json: _,
                 } => serde_json::to_value(
-                    config_management::commit(&config, &transaction, &expected_instance)
-                        .map_err(CliFailure::Management)?,
+                    config_management::commit(
+                        &config,
+                        &transaction,
+                        &expected_instance,
+                        runtime_dir.as_deref(),
+                    )
+                    .map_err(CliFailure::Management)?,
                 ),
                 ApplianceConfigCommand::Rollback {
                     config,

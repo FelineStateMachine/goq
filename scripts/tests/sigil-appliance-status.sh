@@ -38,6 +38,8 @@ trap cleanup EXIT INT TERM HUP
 identity_directory="$temp_root/identity"
 state_directory="$temp_root/state"
 runtime_directory="$temp_root/runtime"
+alternate_runtime_directory="$temp_root/runtime-alternate"
+invalid_runtime_directory="$temp_root/invalid-runtime"
 identity_path="$identity_directory/host.key"
 config_path="$temp_root/host.toml"
 host_log="$temp_root/host.log"
@@ -51,7 +53,12 @@ config_request="$temp_root/config-request.json"
 config_set="$temp_root/config-set.json"
 candidate_status="$temp_root/candidate-status.json"
 
-mkdir -m 0700 "$identity_directory" "$state_directory" "$runtime_directory"
+mkdir -m 0700 \
+  "$identity_directory" \
+  "$state_directory" \
+  "$runtime_directory" \
+  "$alternate_runtime_directory"
+mkdir -m 0755 "$invalid_runtime_directory"
 "$sigil" identity init --output "$identity_path" >"$temp_root/identity.log"
 host_node_id="$(sed -n 's/^node_id=//p' "$temp_root/identity.log")"
 [[ -n "$host_node_id" ]] || {
@@ -201,7 +208,7 @@ print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["identit
 PY
 )"
 
-if XDG_RUNTIME_DIR="$runtime_directory" \
+if env -u XDG_RUNTIME_DIR \
   "$sigil" appliance enrollment-reset \
     --config "$config_path" \
     --expected-host-fingerprint "$host_fingerprint" \
@@ -226,7 +233,17 @@ if XDG_RUNTIME_DIR="$runtime_directory" \
   exit 1
 fi
 [[ ! -e "$state_directory/authorization-v1.json" ]]
-XDG_RUNTIME_DIR="$runtime_directory" \
+if XDG_RUNTIME_DIR="$invalid_runtime_directory" \
+  "$sigil" appliance enrollment-reset \
+    --config "$config_path" \
+    --expected-host-fingerprint "$host_fingerprint" \
+    --json \
+    >"$temp_root/invalid-runtime-reset.log" 2>&1; then
+  printf 'enrollment reset ignored an unsafe XDG runtime root\n' >&2
+  exit 1
+fi
+[[ ! -e "$state_directory/authorization-v1.json" ]]
+env -u XDG_RUNTIME_DIR \
   "$sigil" appliance enrollment-reset \
     --config "$config_path" \
     --expected-host-fingerprint "$host_fingerprint" \
@@ -307,8 +324,58 @@ import sys
 print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 )" ]]
-XDG_RUNTIME_DIR="$runtime_directory" \
+if env -u XDG_RUNTIME_DIR \
+  "$sigil" appliance config set \
+    --config "$config_path" --runtime-dir "$invalid_runtime_directory" --json \
+    <"$config_request" >"$temp_root/invalid-runtime-set.out" \
+    2>"$temp_root/invalid-runtime-set.error"; then
+  printf 'config set accepted an unsafe explicit runtime root\n' >&2
+  exit 1
+fi
+python3 - "$temp_root/invalid-runtime-set.error" <<'PY'
+import json
+import pathlib
+import sys
+error = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if error != {"schema_version": 1, "error": {"code": "unsafe_storage"}}:
+    raise SystemExit(f"unexpected unsafe runtime-root error: {error}")
+PY
+[[ "$base_hash" == "$(python3 - "$config_path" <<'PY'
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)" ]]
+[[ ! -e "$state_directory/config-transaction-v1.json" ]]
+
+if env -u XDG_RUNTIME_DIR \
   "$sigil" appliance config set --config "$config_path" --json \
+    <"$config_request" >"$temp_root/missing-runtime-set.out" \
+    2>"$temp_root/missing-runtime-set.error"; then
+  printf 'config set unexpectedly accepted no runtime authority\n' >&2
+  exit 1
+fi
+python3 - "$temp_root/missing-runtime-set.error" <<'PY'
+import json
+import pathlib
+import sys
+error = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if error != {"schema_version": 1, "error": {"code": "unsafe_storage"}}:
+    raise SystemExit(f"unexpected missing runtime-root error: {error}")
+PY
+[[ "$base_hash" == "$(python3 - "$config_path" <<'PY'
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)" ]]
+[[ ! -e "$state_directory/config-transaction-v1.json" ]]
+
+env -u XDG_RUNTIME_DIR \
+  "$sigil" appliance config set \
+    --config "$config_path" --runtime-dir "$runtime_directory" --json \
   <"$config_request" >"$config_set"
 
 transaction="$(python3 - "$config_set" <<'PY'
@@ -343,9 +410,41 @@ if status.get("config", {}).get("pending_transaction", {}).get("transaction") !=
 print(runtime["instance_id"])
 PY
 )"
-XDG_RUNTIME_DIR="$runtime_directory" \
+mkdir -m 0700 "$alternate_runtime_directory/sigil-spark"
+cp "$runtime_directory/sigil-spark/daemon-status-v1.json" \
+  "$alternate_runtime_directory/sigil-spark/daemon-status-v1.json"
+chmod 0600 "$alternate_runtime_directory/sigil-spark/daemon-status-v1.json"
+cp "$config_path" "$temp_root/pre-mismatch-config.toml"
+cp "$state_directory/config-transaction-v1.json" "$temp_root/pre-mismatch-journal.json"
+cp "$state_directory/config-base-v1.toml" "$temp_root/pre-mismatch-base.toml"
+cp "$state_directory/config-candidate-v1.toml" "$temp_root/pre-mismatch-candidate.toml"
+if env -u XDG_RUNTIME_DIR \
   "$sigil" appliance config commit \
     --config "$config_path" \
+    --runtime-dir "$alternate_runtime_directory" \
+    --transaction "$transaction" \
+    --expected-instance "$candidate_instance" \
+    --json >"$temp_root/mismatched-runtime-commit.out" \
+    2>"$temp_root/mismatched-runtime-commit.error"; then
+  printf 'config commit accepted candidate evidence from a different runtime namespace\n' >&2
+  exit 1
+fi
+python3 - "$temp_root/mismatched-runtime-commit.error" <<'PY'
+import json
+import pathlib
+import sys
+error = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if error != {"schema_version": 1, "error": {"code": "health_not_proven"}}:
+    raise SystemExit(f"unexpected mismatched runtime error: {error}")
+PY
+cmp "$config_path" "$temp_root/pre-mismatch-config.toml"
+cmp "$state_directory/config-transaction-v1.json" "$temp_root/pre-mismatch-journal.json"
+cmp "$state_directory/config-base-v1.toml" "$temp_root/pre-mismatch-base.toml"
+cmp "$state_directory/config-candidate-v1.toml" "$temp_root/pre-mismatch-candidate.toml"
+env -u XDG_RUNTIME_DIR \
+  "$sigil" appliance config commit \
+    --config "$config_path" \
+    --runtime-dir "$runtime_directory" \
     --transaction "$transaction" \
     --expected-instance "$candidate_instance" \
     --json >"$temp_root/config-commit.json"
@@ -388,7 +487,43 @@ import sys
 print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["transaction"])
 PY
 )"
-XDG_RUNTIME_DIR="$runtime_directory" \
+python3 - "$state_directory/config-transaction-v1.json" <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+journal = json.loads(path.read_text(encoding="utf-8"))
+journal.pop("runtime_directory_id", None)
+path.write_text(json.dumps(journal) + "\n", encoding="utf-8")
+PY
+cp "$config_path" "$temp_root/pre-legacy-commit-config.toml"
+cp "$state_directory/config-transaction-v1.json" "$temp_root/pre-legacy-commit-journal.json"
+cp "$state_directory/config-base-v1.toml" "$temp_root/pre-legacy-commit-base.toml"
+cp "$state_directory/config-candidate-v1.toml" "$temp_root/pre-legacy-commit-candidate.toml"
+if env -u XDG_RUNTIME_DIR \
+  "$sigil" appliance config commit \
+    --config "$config_path" \
+    --runtime-dir "$runtime_directory" \
+    --transaction "$rollback_transaction" \
+    --expected-instance "$candidate_instance" \
+    --json >"$temp_root/legacy-commit.out" \
+    2>"$temp_root/legacy-commit.error"; then
+  printf 'config commit accepted a legacy transaction without runtime binding\n' >&2
+  exit 1
+fi
+python3 - "$temp_root/legacy-commit.error" <<'PY'
+import json
+import pathlib
+import sys
+error = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if error != {"schema_version": 1, "error": {"code": "health_not_proven"}}:
+    raise SystemExit(f"unexpected legacy transaction commit error: {error}")
+PY
+cmp "$config_path" "$temp_root/pre-legacy-commit-config.toml"
+cmp "$state_directory/config-transaction-v1.json" "$temp_root/pre-legacy-commit-journal.json"
+cmp "$state_directory/config-base-v1.toml" "$temp_root/pre-legacy-commit-base.toml"
+cmp "$state_directory/config-candidate-v1.toml" "$temp_root/pre-legacy-commit-candidate.toml"
+env -u XDG_RUNTIME_DIR \
   "$sigil" appliance config rollback \
     --config "$config_path" --transaction "$rollback_transaction" --json \
     >"$temp_root/config-rollback.json"

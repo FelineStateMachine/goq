@@ -17,6 +17,24 @@ sigil appliance config rollback --config ~/.config/sigil-spark/host.toml \
   --transaction <id> --json
 ```
 
+`set` and `commit` use the service's XDG runtime root to share its global
+lifecycle lock and to bind baseline and candidate evidence to one exact runtime
+directory. When `XDG_RUNTIME_DIR` is unavailable (for example, from a recovery
+shell), pass the same owner-only mode-`0700` root to both commands with
+`--runtime-dir /run/user/<uid>`; Sigil appends `sigil-spark`. An explicit root
+takes precedence over the environment and must be absolute, owned by the
+effective user, and not a symlink. Without either source, `set` and `commit`
+fail closed. `rollback` needs no runtime evidence and can use only the durable
+state lock when XDG runtime state is unavailable.
+
+The transaction journal binds `set` to the canonical runtime child with a
+non-secret SHA-256 path identifier. `commit` must resolve to that same child
+before transaction recovery or mutation, so copying otherwise-valid stopped
+status evidence into a different runtime namespace cannot authorize commit.
+Legacy journals without this identifier remain rollback-capable but cannot be
+committed. Do not downgrade Sigil while a configuration transaction is pending;
+older binaries may not understand journals written by this version.
+
 `show` returns the exact-byte SHA-256 revision, editable settings, and a pending
 transaction summary. The editable v1 settings are:
 
@@ -55,7 +73,8 @@ Only a stopped Sigil can be changed. The controller performs:
 
 1. Stop `sigil-host.service` and wait until it is inactive.
 2. Call `set`. Sigil atomically installs the candidate and returns a transaction
-   ID plus candidate revision.
+   ID plus candidate revision. If needed, pass the service's runtime root with
+   `--runtime-dir` and retain that exact value for `commit`.
 3. Start the service and wait for appliance status to report a new instance in
    `ready` state with the candidate revision.
 4. Stop the service cleanly and retain that exact instance ID.

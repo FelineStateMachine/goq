@@ -251,6 +251,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn media_generations_are_nonzero_monotonic_and_checked_for_overflow() {
+        let counter = AtomicU64::new(0);
+        assert_eq!(next_media_generation(&counter).unwrap(), 1);
+        assert_eq!(next_media_generation(&counter).unwrap(), 2);
+
+        let exhausted = AtomicU64::new(u64::MAX);
+        assert!(next_media_generation(&exhausted).is_err());
+    }
+
+    #[test]
     fn binary_frame_envelope_has_exact_stable_layout() {
         let payload = [0, 0, 0, 1, 0x65];
         let envelope = encode_frame_envelope(

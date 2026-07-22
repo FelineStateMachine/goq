@@ -448,6 +448,26 @@ validate_probe_log() {
     awk -F= '$1 == "moq_maximum_group_bytes" && $2 ~ /^[0-9]+$/ && $2 > 0 && $2 <= 33554432 { found=1 } END { exit !found }' \
       "$log_path" || return 1
   fi
+  if [[ "$media_transport" == "iroh-moq" && "$expected_request_id" == 1 ]]; then
+    grep -Fxq 'slow_consumer=ok' "$log_path" || return 1
+    grep -Fxq 'slow_consumer_stall_ms=1500' "$log_path" || return 1
+    grep -Fxq 'slow_consumer_first_post_stall=configured-idr' "$log_path" || return 1
+    grep -Fxq 'slow_consumer_historical_suffix_frames=0' "$log_path" || return 1
+    awk -F= '$1 == "slow_consumer_recovery_micros" && $2 ~ /^[0-9]+$/ && $2 <= 2000000 { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+    awk -F= '$1 == "slow_consumer_cancellation_delta" && $2 ~ /^[0-9]+$/ && $2 > 0 { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+    awk -F= '$1 == "slow_consumer_group_advance" && $2 ~ /^[0-9]+$/ && $2 > 0 { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+    awk -F= '$1 == "slow_consumer_sequence_advance" && $2 ~ /^[0-9]+$/ && $2 > 0 { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+    awk -F= '$1 == "slow_consumer_capture_advance_micros" && $2 ~ /^[0-9]+$/ && $2 >= 750000 { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+    awk -F= '$1 == "slow_consumer_input_ack_micros" && $2 ~ /^[0-9]+$/ && $2 <= 2000000 { found=1 } END { exit !found }' \
+      "$log_path" || return 1
+  else
+    grep -Fxq 'slow_consumer=not-requested' "$log_path" || return 1
+  fi
 }
 
 run_probe() {
@@ -512,13 +532,16 @@ wait_for_log_line "$host_log" 'status=ready' "$host_pid" 'sigil' || die "host di
 host_node_id="$(sed -n 's/^node_id=//p' "$host_log" | tail -n 1)"
 [[ "$host_node_id" == "$node_id" ]] || die "ready host node ID does not match its identity"
 
-run_proof_probe \
-  1 \
-  --node-id "$node_id" \
-  --frames "$primary_frames" \
-  --timeout-seconds "$probe_timeout_seconds" \
-  --expect-size 1280x800 \
-  >"$primary_log" 2>&1 &
+primary_probe_args=(
+  --node-id "$node_id"
+  --frames "$primary_frames"
+  --timeout-seconds "$probe_timeout_seconds"
+  --expect-size 1280x800
+)
+if [[ "$media_v1" == false && "$media_v2" == false && "$media_v3" == false ]]; then
+  primary_probe_args+=(--slow-consumer-ms 1500)
+fi
+run_proof_probe 1 "${primary_probe_args[@]}" >"$primary_log" 2>&1 &
 primary_pid=$!
 start_watchdog "$primary_pid" "$command_timeout_seconds" "$tmp_root/primary.timeout"
 primary_watchdog_pid="$watchdog_pid"
@@ -629,7 +652,7 @@ printf 'probe_binary=%s\n' "$probe_bin"
 printf 'probe_sha256=%s\n' "$(sha256_file "$probe_bin")"
 printf 'node_id=%s\n' "$node_id"
 printf 'primary_frames=%s\n' "$primary_frames"
-grep -E '^(transport|control_alpn|transport_alpn|first_configured_idr|frame_sequence|group_sequence|keyframe_recovery|keyframe_recovery_micros|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|moq_catalog|moq_group_capacity|moq_cancelled_groups|moq_group_gaps|moq_unrecovered_group_gaps|moq_maximum_group_objects|moq_maximum_group_bytes|moq_historical_suffix_frames|recovery_barrier|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
+grep -E '^(transport|control_alpn|transport_alpn|first_configured_idr|frame_sequence|group_sequence|keyframe_recovery|keyframe_recovery_micros|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|moq_catalog|moq_group_capacity|moq_cancelled_groups|moq_group_gaps|moq_unrecovered_group_gaps|moq_maximum_group_objects|moq_maximum_group_bytes|moq_historical_suffix_frames|recovery_barrier|slow_consumer|slow_consumer_stall_ms|slow_consumer_first_post_stall|slow_consumer_historical_suffix_frames|slow_consumer_recovery_micros|slow_consumer_cancellation_delta|slow_consumer_group_advance|slow_consumer_sequence_advance|slow_consumer_capture_advance_micros|slow_consumer_input_ack_micros|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
 printf 'keyframe_request_correlation=%s\n' \
   "$([[ "$media_v1" == false && "$media_v2" == false ]] && printf unique || printf not-requested)"
 printf 'active_client_rejection=ok\n'

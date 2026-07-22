@@ -1,9 +1,6 @@
 use super::auth::derive_iroh_secret_from_key;
 use super::enrollment::{connection_enrollment, mark_invitation_redeemed};
-use super::state::{
-    AppState, CLIENT_INPUT_QUEUE_CAPACITY, FRAME_ALPN, INPUT_ALPN, MediaFeedbackSender,
-    development_direct_node_available,
-};
+use super::state::{AppState, FRAME_ALPN, MediaFeedbackSender, development_direct_node_available};
 pub use crate::media::adaptive_feedback::ClientMediaFeedbackReport;
 use crate::media::adaptive_feedback::{
     CLIENT_MEDIA_FEEDBACK_CONNECT_TIMEOUT, open_negotiated_feedback_stream,
@@ -19,36 +16,41 @@ use crate::media::frame_channel::{
     release_frame_channel_slot_for_generation, try_reserve_frame_channel_slot,
     validate_legacy_media_header,
 };
+use crate::media::input_delivery::{
+    CLIENT_INPUT_QUEUE_CAPACITY, InputSession, open_input_session, run_input_feedback,
+    run_input_forwarder, send_input,
+};
+#[allow(unused_imports)]
+pub use crate::media::input_delivery::{PointerFeedbackPayload, PointerFeedbackTerminalReason};
 use crate::media::metrics::{ClientMediaMetrics, lock_client_media_metrics};
 use crate::media::moq_receiver::{
     MoqMediaReadOutcome, open_upstream_moq_media, retire_upstream_moq_generation,
 };
-use crate::media::network_diagnostics::{NetworkLeg, NetworkSessionDiagnostics};
+use crate::media::network_diagnostics::{
+    NetworkLeg, NetworkSessionDiagnostics, lock_network_diagnostics,
+};
 use crate::media::object_receiver::{
     CLIENT_MEDIA_OBJECT_CAPACITY, CLIENT_MEDIA_OBJECT_READ_TIMEOUT, MediaObjectReadOutcome,
     MediaObjectReceiver, MediaObjectSequence, MediaObjectSequenceDecision,
 };
 use crate::media::transport::{
-    CLIENT_ENDPOINT_CLOSE_TIMEOUT, MediaTransport, NegotiatedV1Stream, negotiate_v1,
-    open_negotiated_media_stream,
+    CLIENT_ENDPOINT_CLOSE_TIMEOUT, MediaTransport, open_negotiated_media_stream,
 };
 use base64::Engine;
 use iroh::{Endpoint, SecretKey, endpoint::presets};
 use openh264::{formats::YUVSource, nal_units};
 use serde::Serialize;
 use sigil_protocol::{
-    Capability, FrameFlags, INPUT_ALPN_V1, InputEvent, InvitationGrants, KeyframeRequestReasonV3,
-    MAX_MEDIA_GROUP_BYTES_V3, MediaCodec, MediaControlRequestV3, MediaObjectV3, PointerPosition,
-    PointerSurfaceDimensions, ProtocolError, RELATIVE_POINTER_DELTA_MAX,
-    RELATIVE_POINTER_DELTA_MIN, read_input_ack, read_media_frame, read_media_object_v3,
-    write_input_event, write_media_control_request_v3,
+    FrameFlags, InputEvent, InvitationGrants, KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3,
+    MediaCodec, MediaControlRequestV3, MediaObjectV3, PointerSurfaceDimensions, ProtocolError,
+    read_media_frame, read_media_object_v3, write_media_control_request_v3,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tauri::{
     AppHandle, Emitter, State,
@@ -59,14 +61,6 @@ use tauri::{
 
 const LEGACY_MEDIA_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_FRAME_STATS_INTERVAL: Duration = Duration::from_millis(250);
-
-fn lock_network_diagnostics(
-    diagnostics: &StdMutex<NetworkSessionDiagnostics>,
-) -> StdMutexGuard<'_, NetworkSessionDiagnostics> {
-    diagnostics
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 struct ClientConnectGuard {
     active: Arc<AtomicBool>,
@@ -390,144 +384,6 @@ impl MediaObjectSequenceV3 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InputAvailability {
-    relative_pointer: bool,
-    pointer_position_feedback: bool,
-    absolute_pointer: bool,
-    keyboard: bool,
-    text: bool,
-    gamepad: bool,
-    input_ack: bool,
-    control: bool,
-}
-
-impl InputAvailability {
-    fn from_capabilities(capabilities: &[Capability]) -> Self {
-        let relative_pointer = capabilities.contains(&Capability::RelativePointer);
-        let pointer_position_feedback = capabilities.contains(&Capability::PointerPositionFeedback);
-        let absolute_pointer = capabilities.contains(&Capability::AbsolutePointer);
-        let keyboard = capabilities.contains(&Capability::Keyboard);
-        let text = capabilities.contains(&Capability::Text);
-        let gamepad = capabilities.contains(&Capability::Gamepad);
-        let input_ack = capabilities.contains(&Capability::InputAck);
-        Self {
-            relative_pointer,
-            pointer_position_feedback,
-            absolute_pointer,
-            keyboard,
-            text,
-            gamepad,
-            input_ack,
-            control: relative_pointer || absolute_pointer || keyboard || text || gamepad,
-        }
-    }
-}
-
-#[derive(Serialize, Clone, Copy)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum PointerFeedbackPayload {
-    Position {
-        sequence: u64,
-        position: Option<PointerPosition>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pointer_visible: Option<bool>,
-    },
-    Terminal {
-        reason: PointerFeedbackTerminalReason,
-    },
-}
-
-#[derive(Serialize, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum PointerFeedbackTerminalReason {
-    Eof,
-    Malformed,
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct RelativePointerAccumulator {
-    dx: i64,
-    dy: i64,
-}
-
-impl RelativePointerAccumulator {
-    fn push(&mut self, dx: i32, dy: i32) {
-        self.dx = self.dx.saturating_add(i64::from(dx));
-        self.dy = self.dy.saturating_add(i64::from(dy));
-    }
-
-    fn take(&mut self) -> Option<InputEvent> {
-        if self.dx == 0 && self.dy == 0 {
-            return None;
-        }
-        let dx = self.dx.clamp(
-            i64::from(RELATIVE_POINTER_DELTA_MIN),
-            i64::from(RELATIVE_POINTER_DELTA_MAX),
-        ) as i32;
-        let dy = self.dy.clamp(
-            i64::from(RELATIVE_POINTER_DELTA_MIN),
-            i64::from(RELATIVE_POINTER_DELTA_MAX),
-        ) as i32;
-        let event = InputEvent::MouseMoveRelative { dx, dy };
-        self.dx -= i64::from(dx);
-        self.dy -= i64::from(dy);
-        Some(event)
-    }
-
-    fn is_pending(&self) -> bool {
-        self.dx != 0 || self.dy != 0
-    }
-}
-
-fn stage_relative_input(
-    pending: &mut RelativePointerAccumulator,
-    event: InputEvent,
-) -> Option<InputEvent> {
-    match event {
-        InputEvent::MouseMoveRelative { dx, dy } => {
-            pending.push(dx, dy);
-            None
-        }
-        event => Some(event),
-    }
-}
-
-async fn open_negotiated_input_stream(
-    endpoint: &Endpoint,
-    address: &iroh::EndpointAddr,
-    nonce: [u8; 16],
-    capabilities: Vec<Capability>,
-) -> Result<
-    (
-        iroh::endpoint::Connection,
-        iroh::endpoint::SendStream,
-        iroh::endpoint::RecvStream,
-        NegotiatedV1Stream,
-    ),
-    String,
-> {
-    let connection = endpoint
-        .connect(address.clone(), INPUT_ALPN_V1)
-        .await
-        .map_err(|error| format!("Failed to connect input stream: {error}"))?;
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|error| format!("Failed to open input stream: {error}"))?;
-    let negotiation = negotiate_v1(
-        &mut send,
-        &mut recv,
-        nonce,
-        capabilities,
-        None,
-        "input",
-        None,
-    )
-    .await?;
-    Ok((connection, send, recv, negotiation))
-}
-
 async fn run_media_control_writer_v3(
     mut stream: iroh::endpoint::SendStream,
     mut requests: tokio::sync::mpsc::Receiver<(KeyframeRequestReasonV3, Option<u64>)>,
@@ -581,123 +437,6 @@ fn try_queue_media_keyframe_request(
     if let Some(sender) = sender {
         let _ = sender.try_send((reason, last_sequence));
     }
-}
-
-fn input_capability_offers(grants: InvitationGrants) -> Vec<Vec<Capability>> {
-    let base = [
-        vec![
-            Capability::RelativePointer,
-            Capability::PointerPositionFeedback,
-            Capability::PointerVisibilityFeedback,
-            Capability::AbsolutePointer,
-            Capability::Keyboard,
-            Capability::Text,
-            Capability::Gamepad,
-        ],
-        vec![
-            Capability::RelativePointer,
-            Capability::PointerPositionFeedback,
-            Capability::AbsolutePointer,
-            Capability::Keyboard,
-            Capability::Text,
-            Capability::Gamepad,
-        ],
-        vec![
-            Capability::RelativePointer,
-            Capability::AbsolutePointer,
-            Capability::Keyboard,
-            Capability::Text,
-            Capability::Gamepad,
-        ],
-        vec![
-            Capability::AbsolutePointer,
-            Capability::Keyboard,
-            Capability::Text,
-            Capability::Gamepad,
-        ],
-    ];
-    let has_input_grant = grants.contains(InvitationGrants::POINTER_KEYBOARD)
-        || grants.contains(InvitationGrants::GAMEPAD);
-    let mut offers = Vec::with_capacity(base.len() * 2);
-    if has_input_grant {
-        for mut offer in base.clone() {
-            offer.push(Capability::InputAck);
-            offers.push(offer);
-        }
-    }
-    offers.extend(base);
-    for offer in &mut offers {
-        offer.retain(|capability| match capability {
-            Capability::Gamepad => grants.contains(InvitationGrants::GAMEPAD),
-            Capability::AbsolutePointer
-            | Capability::RelativePointer
-            | Capability::Keyboard
-            | Capability::Text
-            | Capability::PointerPositionFeedback
-            | Capability::PointerVisibilityFeedback => {
-                grants.contains(InvitationGrants::POINTER_KEYBOARD)
-            }
-            Capability::InputAck => has_input_grant,
-            _ => true,
-        });
-    }
-    offers.dedup();
-    offers
-}
-
-fn input_event_allowed(capabilities: &[Capability], event: &InputEvent) -> bool {
-    match event {
-        InputEvent::Probe => capabilities.contains(&Capability::InputAck),
-        InputEvent::MouseMove { .. } => capabilities.contains(&Capability::AbsolutePointer),
-        InputEvent::MouseMoveRelative { .. } => capabilities.contains(&Capability::RelativePointer),
-        InputEvent::MousePositionSync { .. } => capabilities.contains(&Capability::RelativePointer),
-        InputEvent::MouseClick { .. }
-        | InputEvent::MouseDown { .. }
-        | InputEvent::MouseUp { .. }
-        | InputEvent::MouseScroll { .. } => {
-            capabilities.contains(&Capability::RelativePointer)
-                || capabilities.contains(&Capability::AbsolutePointer)
-        }
-        InputEvent::KeyDown { .. } | InputEvent::KeyUp { .. } | InputEvent::KeyClick { .. } => {
-            capabilities.contains(&Capability::Keyboard)
-        }
-        InputEvent::Text { .. } => capabilities.contains(&Capability::Text),
-        InputEvent::Gamepad { .. } => capabilities.contains(&Capability::Gamepad),
-    }
-}
-
-async fn write_client_input_event(
-    stream: &mut iroh::endpoint::SendStream,
-    event: &InputEvent,
-    use_v1: bool,
-    diagnostics: Option<&Arc<StdMutex<NetworkSessionDiagnostics>>>,
-) -> Result<(), String> {
-    if let Some(diagnostics) = diagnostics {
-        lock_network_diagnostics(diagnostics).begin_input_send(Instant::now());
-    }
-    if use_v1 {
-        write_input_event(stream, event)
-            .await
-            .map_err(|error| error.to_string())
-    } else {
-        let json = serde_json::to_string(event).map_err(|error| error.to_string())?;
-        stream
-            .write_all(format!("{json}\n").as_bytes())
-            .await
-            .map_err(|error| error.to_string())
-    }
-}
-
-fn observe_input_ack_if_negotiated(
-    diagnostics: &StdMutex<NetworkSessionDiagnostics>,
-    negotiated: bool,
-    sequence: u64,
-    now: Instant,
-) -> Result<(), String> {
-    if !negotiated {
-        return Ok(());
-    }
-    lock_network_diagnostics(diagnostics).observe_input_ack(sequence, now)
 }
 
 #[tauri::command]
@@ -781,8 +520,6 @@ pub async fn iroh_client_connect(
     // protocols. The inherited v0 leg is retained below solely as migration
     // code and is no longer selected by an ordinary Portal connection.
     let use_v1 = true;
-    let input_alpn = if use_v1 { INPUT_ALPN_V1 } else { INPUT_ALPN };
-
     let (frame_conn, mut frame_recv, media_control_stream, media_negotiation, media_transport) =
         if use_v1 {
             let first_attempt = open_negotiated_media_stream(
@@ -899,115 +636,38 @@ pub async fn iroh_client_connect(
         (None, None)
     };
 
-    let (input_connection, input_send, input_recv, input_capabilities) = if use_v1 {
-        let mut errors = Vec::new();
-        let mut accepted = None;
-        // Older hosts reject unknown capability enum values. Try all four
-        // pointer feature levels with ACK first, then repeat the exact legacy
-        // offers without ACK so lack of diagnostics never forces absolute
-        // pointer input prematurely.
-        for capabilities in input_capability_offers(grants) {
-            match open_negotiated_input_stream(&endpoint, &addr, handshake_nonce, capabilities)
-                .await
-            {
-                Ok(result) => {
-                    accepted = Some(result);
-                    break;
-                }
-                Err(error) => errors.push(error),
-            }
-        }
-        let (connection, send, recv, input_negotiation) = accepted
-            .ok_or_else(|| format!("All input capability offers failed: {}", errors.join("; ")))?;
-        if Some(input_negotiation.session_id) != media_session_id {
-            return Err("Host returned mismatched media and input sessions".to_string());
-        }
-        (connection, send, recv, input_negotiation.capabilities)
-    } else {
-        let input_conn = endpoint
-            .connect(addr.clone(), input_alpn)
-            .await
-            .map_err(|e| format!("Failed to connect input stream: {}", e))?;
-        let (mut send, recv) = input_conn
-            .open_bi()
-            .await
-            .map_err(|e| format!("Failed to open input stream: {}", e))?;
-        send.write_all(&[1u8])
-            .await
-            .map_err(|e| format!("Failed to send input start: {}", e))?;
-        // The inherited protocol predates negotiation and supports the current
-        // absolute-pointer, keyboard, and text event set.
-        (
-            input_conn,
-            send,
-            recv,
-            vec![
-                Capability::AbsolutePointer,
-                Capability::Keyboard,
-                Capability::Text,
-            ],
-        )
-    };
+    let InputSession {
+        connection: input_connection,
+        send: input_send,
+        recv: input_recv,
+        capabilities: input_capabilities,
+        availability: input_availability,
+    } = open_input_session(
+        &endpoint,
+        &addr,
+        handshake_nonce,
+        media_session_id,
+        grants,
+        use_v1,
+    )
+    .await?;
 
-    let input_availability = InputAvailability::from_capabilities(&input_capabilities);
     let network_diagnostics = Arc::new(StdMutex::new(NetworkSessionDiagnostics::new(
         Instant::now(),
         input_availability.input_ack,
     )));
 
     if input_availability.pointer_position_feedback || input_availability.input_ack {
-        let mut input_feedback = input_recv;
         let feedback_diagnostics = Arc::clone(&network_diagnostics);
-        let mut pointer_feedback_enabled = input_availability.pointer_position_feedback;
+        let pointer_feedback_enabled = input_availability.pointer_position_feedback;
         let input_ack_enabled = input_availability.input_ack;
-        tokio::spawn(async move {
-            let terminal_reason = loop {
-                let response = match read_input_ack(&mut input_feedback).await {
-                    Ok(Some(response)) => response,
-                    Ok(None) => {
-                        lock_network_diagnostics(&feedback_diagnostics)
-                            .mark_input_feedback_closed();
-                        break PointerFeedbackTerminalReason::Eof;
-                    }
-                    Err(error) => {
-                        lock_network_diagnostics(&feedback_diagnostics)
-                            .mark_input_feedback_malformed();
-                        eprintln!("[client] invalid input feedback: {error}");
-                        break PointerFeedbackTerminalReason::Malformed;
-                    }
-                };
-                if let Err(error) = observe_input_ack_if_negotiated(
-                    &feedback_diagnostics,
-                    input_ack_enabled,
-                    response.sequence,
-                    Instant::now(),
-                ) {
-                    eprintln!("[client] invalid input acknowledgement: {error}");
-                    break PointerFeedbackTerminalReason::Malformed;
-                }
-                if pointer_feedback_enabled
-                    && pointer_channel
-                        .send(PointerFeedbackPayload::Position {
-                            sequence: response.sequence,
-                            position: response.pointer_position,
-                            pointer_visible: response.pointer_visible,
-                        })
-                        .is_err()
-                {
-                    // Losing the webview's pointer channel must not stop ACK
-                    // draining and apply backpressure to host input.
-                    pointer_feedback_enabled = false;
-                    if !input_ack_enabled {
-                        return;
-                    }
-                }
-            };
-            // The session-owned channel emits at most one terminal message.
-            // JavaScript rejects deliveries from superseded channel closures.
-            let _ = pointer_channel.send(PointerFeedbackPayload::Terminal {
-                reason: terminal_reason,
-            });
-        });
+        tokio::spawn(run_input_feedback(
+            input_recv,
+            feedback_diagnostics,
+            pointer_feedback_enabled,
+            input_ack_enabled,
+            pointer_channel,
+        ));
     } else {
         drop(input_recv);
     }
@@ -1089,130 +749,14 @@ pub async fn iroh_client_connect(
     // Input forwarder: absolute motion is latest-value state and may be
     // dropped at the 60 Hz boundary. Relative motion is displacement, so it
     // owns a separate accumulator and timer that coalesces rather than drops.
-    let mut input_stream = input_send;
     let input_send_diagnostics = Arc::clone(&network_diagnostics);
-    tokio::spawn(async move {
-        let mut rx = rx;
-        const MOUSE_INTERVAL: Duration = Duration::from_millis(16);
-        let started = Instant::now();
-        let mut last_absolute_mouse_time = started.checked_sub(MOUSE_INTERVAL).unwrap_or(started);
-        let mut last_relative_mouse_time = started.checked_sub(MOUSE_INTERVAL).unwrap_or(started);
-        let mut pending_relative = RelativePointerAccumulator::default();
-        let mut input_open = true;
-
-        while input_open {
-            let event = if pending_relative.is_pending() {
-                let wait = MOUSE_INTERVAL.saturating_sub(last_relative_mouse_time.elapsed());
-                if wait.is_zero() {
-                    let Some(event) = pending_relative.take() else {
-                        continue;
-                    };
-                    if let Err(error) = write_client_input_event(
-                        &mut input_stream,
-                        &event,
-                        use_v1,
-                        Some(&input_send_diagnostics),
-                    )
-                    .await
-                    {
-                        eprintln!("[client] input stream write failed: {error}; disconnecting");
-                        break;
-                    }
-                    last_relative_mouse_time = Instant::now();
-                    continue;
-                }
-                tokio::select! {
-                    event = rx.recv() => event,
-                    () = tokio::time::sleep(wait) => {
-                        let Some(event) = pending_relative.take() else {
-                            continue;
-                        };
-                        if let Err(error) = write_client_input_event(
-                            &mut input_stream,
-                            &event,
-                            use_v1,
-                            Some(&input_send_diagnostics),
-                        ).await {
-                            eprintln!("[client] input stream write failed: {error}; disconnecting");
-                            break;
-                        }
-                        last_relative_mouse_time = Instant::now();
-                        continue;
-                    }
-                }
-            } else {
-                rx.recv().await
-            };
-            let Some(event) = event else {
-                input_open = false;
-                continue;
-            };
-            // The host's accepted capability set is an authorization boundary.
-            // Drop unavailable event classes silently so event contents never
-            // reach logs or the wire even if a compromised webview invokes the
-            // command directly.
-            if !input_event_allowed(&input_capabilities, &event) {
-                continue;
-            }
-            let Some(event) = stage_relative_input(&mut pending_relative, event) else {
-                continue;
-            };
-            let mut flushed_relative_barrier = false;
-            while let Some(relative_barrier) = pending_relative.take() {
-                if let Err(error) = write_client_input_event(
-                    &mut input_stream,
-                    &relative_barrier,
-                    use_v1,
-                    Some(&input_send_diagnostics),
-                )
-                .await
-                {
-                    eprintln!("[client] input stream write failed: {error}; disconnecting");
-                    input_open = false;
-                    break;
-                }
-                flushed_relative_barrier = true;
-            }
-            if !input_open {
-                break;
-            }
-            if flushed_relative_barrier {
-                last_relative_mouse_time = Instant::now();
-            }
-            if matches!(event, InputEvent::MouseMove { .. }) {
-                let now = Instant::now();
-                if now.duration_since(last_absolute_mouse_time) < MOUSE_INTERVAL {
-                    continue;
-                }
-                last_absolute_mouse_time = now;
-            }
-            if let Err(error) = write_client_input_event(
-                &mut input_stream,
-                &event,
-                use_v1,
-                Some(&input_send_diagnostics),
-            )
-            .await
-            {
-                eprintln!("[client] input stream write failed: {error}; disconnecting");
-                break;
-            }
-        }
-        while let Some(event) = pending_relative.take() {
-            if let Err(error) = write_client_input_event(
-                &mut input_stream,
-                &event,
-                use_v1,
-                Some(&input_send_diagnostics),
-            )
-            .await
-            {
-                eprintln!("[client] final relative input write failed: {error}");
-                break;
-            }
-        }
-        let _ = input_stream.finish();
-    });
+    tokio::spawn(run_input_forwarder(
+        input_send,
+        rx,
+        use_v1,
+        input_capabilities,
+        input_send_diagnostics,
+    ));
 
     // Frame reader — dual path: WebCodecs (raw bytes) or software JPEG decode
     let use_webcodecs = state.webcodecs.load(Ordering::SeqCst);
@@ -2006,382 +1550,12 @@ mod tests {
     }
 
     #[test]
-    fn pointer_feedback_channel_has_explicit_bounded_terminal_envelopes() {
-        let position = serde_json::to_value(PointerFeedbackPayload::Position {
-            sequence: 7,
-            position: Some(PointerPosition { x: 1280, y: 800 }),
-            pointer_visible: Some(false),
-        })
-        .unwrap();
-        assert_eq!(position["type"], "position");
-        assert_eq!(position["sequence"], 7);
-        assert_eq!(position["position"]["x"], 1280);
-        assert_eq!(position["pointer_visible"], false);
-
-        let legacy = serde_json::to_value(PointerFeedbackPayload::Position {
-            sequence: 8,
-            position: Some(PointerPosition { x: 640, y: 400 }),
-            pointer_visible: None,
-        })
-        .unwrap();
-        assert!(legacy.get("pointer_visible").is_none());
-
-        let eof = serde_json::to_value(PointerFeedbackPayload::Terminal {
-            reason: PointerFeedbackTerminalReason::Eof,
-        })
-        .unwrap();
-        assert_eq!(
-            eof,
-            serde_json::json!({ "type": "terminal", "reason": "eof" })
-        );
-
-        let malformed = serde_json::to_value(PointerFeedbackPayload::Terminal {
-            reason: PointerFeedbackTerminalReason::Malformed,
-        })
-        .unwrap();
-        assert_eq!(
-            malformed,
-            serde_json::json!({ "type": "terminal", "reason": "malformed" })
-        );
-    }
-
-    #[test]
     fn sequence_checks_reject_duplicates_regressions_and_overflow() {
         assert_eq!(sequence_gap(41, 42).unwrap(), 0);
         assert_eq!(sequence_gap(41, 45).unwrap(), 3);
         assert!(sequence_gap(41, 41).is_err());
         assert!(sequence_gap(41, 40).is_err());
         assert!(sequence_gap(u64::MAX, 0).is_err());
-    }
-
-    #[test]
-    fn input_events_require_their_negotiated_capability() {
-        let pointer = [Capability::AbsolutePointer];
-        assert!(input_event_allowed(
-            &pointer,
-            &InputEvent::MouseMove { x: 1, y: 2 }
-        ));
-        assert!(input_event_allowed(
-            &pointer,
-            &InputEvent::MouseClick { b: 1 }
-        ));
-        assert!(input_event_allowed(
-            &pointer,
-            &InputEvent::MouseDown { b: 1 }
-        ));
-        assert!(input_event_allowed(&pointer, &InputEvent::MouseUp { b: 1 }));
-        assert!(input_event_allowed(
-            &pointer,
-            &InputEvent::MouseScroll { dx: 0, dy: 1 }
-        ));
-        assert!(!input_event_allowed(
-            &pointer,
-            &InputEvent::MouseMoveRelative { dx: 1, dy: -2 }
-        ));
-        assert!(!input_event_allowed(
-            &pointer,
-            &InputEvent::MousePositionSync { x: 640, y: 400 }
-        ));
-        assert!(!input_event_allowed(
-            &pointer,
-            &InputEvent::KeyDown { k: "A".into() }
-        ));
-        assert!(!input_event_allowed(
-            &pointer,
-            &InputEvent::Text { s: "a".into() }
-        ));
-
-        let relative_pointer = [Capability::RelativePointer];
-        assert!(input_event_allowed(
-            &relative_pointer,
-            &InputEvent::MouseMoveRelative { dx: 1, dy: -2 }
-        ));
-        assert!(input_event_allowed(
-            &relative_pointer,
-            &InputEvent::MousePositionSync { x: 640, y: 400 }
-        ));
-        assert!(input_event_allowed(
-            &relative_pointer,
-            &InputEvent::MouseDown { b: 1 }
-        ));
-        assert!(input_event_allowed(
-            &relative_pointer,
-            &InputEvent::MouseUp { b: 1 }
-        ));
-        assert!(input_event_allowed(
-            &relative_pointer,
-            &InputEvent::MouseScroll { dx: 0, dy: 1 }
-        ));
-        assert!(!input_event_allowed(
-            &relative_pointer,
-            &InputEvent::MouseMove { x: 1, y: 2 }
-        ));
-
-        let keyboard = [Capability::Keyboard];
-        assert!(input_event_allowed(
-            &keyboard,
-            &InputEvent::KeyDown { k: "A".into() }
-        ));
-        assert!(input_event_allowed(
-            &keyboard,
-            &InputEvent::KeyUp { k: "A".into() }
-        ));
-        assert!(input_event_allowed(
-            &keyboard,
-            &InputEvent::KeyClick { k: "A".into() }
-        ));
-        assert!(!input_event_allowed(
-            &keyboard,
-            &InputEvent::Text { s: "a".into() }
-        ));
-
-        let text = [Capability::Text];
-        assert!(input_event_allowed(
-            &text,
-            &InputEvent::Text { s: "a".into() }
-        ));
-        assert!(!input_event_allowed(
-            &text,
-            &InputEvent::KeyDown { k: "A".into() }
-        ));
-
-        let gamepad = [Capability::Gamepad];
-        assert!(input_event_allowed(
-            &gamepad,
-            &InputEvent::Gamepad {
-                state: sigil_protocol::GamepadState::default(),
-            }
-        ));
-        assert!(!input_event_allowed(
-            &keyboard,
-            &InputEvent::Gamepad {
-                state: sigil_protocol::GamepadState::default(),
-            }
-        ));
-    }
-
-    #[test]
-    fn empty_input_capabilities_are_view_only() {
-        let capabilities = [];
-        assert!(!input_event_allowed(
-            &capabilities,
-            &InputEvent::MouseMove { x: 1, y: 2 }
-        ));
-        assert!(!input_event_allowed(
-            &capabilities,
-            &InputEvent::KeyDown { k: "A".into() }
-        ));
-        assert!(!input_event_allowed(
-            &capabilities,
-            &InputEvent::Text { s: "a".into() }
-        ));
-        assert_eq!(
-            InputAvailability::from_capabilities(&capabilities),
-            InputAvailability {
-                relative_pointer: false,
-                pointer_position_feedback: false,
-                absolute_pointer: false,
-                keyboard: false,
-                text: false,
-                gamepad: false,
-                input_ack: false,
-                control: false,
-            }
-        );
-    }
-
-    #[test]
-    fn input_availability_reports_each_accepted_capability_exactly() {
-        assert_eq!(
-            InputAvailability::from_capabilities(&[Capability::AbsolutePointer, Capability::Text]),
-            InputAvailability {
-                relative_pointer: false,
-                pointer_position_feedback: false,
-                absolute_pointer: true,
-                keyboard: false,
-                text: true,
-                gamepad: false,
-                input_ack: false,
-                control: true,
-            }
-        );
-        assert_eq!(
-            InputAvailability::from_capabilities(&[Capability::Keyboard]),
-            InputAvailability {
-                relative_pointer: false,
-                pointer_position_feedback: false,
-                absolute_pointer: false,
-                keyboard: true,
-                text: false,
-                gamepad: false,
-                input_ack: false,
-                control: true,
-            }
-        );
-        assert_eq!(
-            InputAvailability::from_capabilities(&[Capability::Gamepad]),
-            InputAvailability {
-                relative_pointer: false,
-                pointer_position_feedback: false,
-                absolute_pointer: false,
-                keyboard: false,
-                text: false,
-                gamepad: true,
-                input_ack: false,
-                control: true,
-            }
-        );
-        assert!(
-            InputAvailability::from_capabilities(&[Capability::Gamepad, Capability::InputAck])
-                .input_ack
-        );
-        assert_eq!(
-            InputAvailability::from_capabilities(&[
-                Capability::RelativePointer,
-                Capability::PointerPositionFeedback,
-            ]),
-            InputAvailability {
-                relative_pointer: true,
-                pointer_position_feedback: true,
-                absolute_pointer: false,
-                keyboard: false,
-                text: false,
-                gamepad: false,
-                input_ack: false,
-                control: true,
-            }
-        );
-    }
-
-    #[test]
-    fn pointer_feedback_without_input_ack_does_not_fail_ack_validation() {
-        let diagnostics = StdMutex::new(NetworkSessionDiagnostics::new(Instant::now(), false));
-        assert!(observe_input_ack_if_negotiated(&diagnostics, false, 0, Instant::now()).is_ok());
-    }
-
-    #[test]
-    fn input_capability_fallbacks_remove_only_one_protocol_extension_at_a_time() {
-        let offers = input_capability_offers(InvitationGrants::ALL);
-        assert_eq!(offers.len(), 8);
-        let visibility = &offers[0];
-        let position = &offers[1];
-        let relative = &offers[2];
-        let inherited = &offers[3];
-
-        assert!(
-            offers[..4]
-                .iter()
-                .all(|offer| offer.contains(&Capability::InputAck))
-        );
-        assert!(
-            offers[4..]
-                .iter()
-                .all(|offer| !offer.contains(&Capability::InputAck))
-        );
-        assert!(visibility.contains(&Capability::PointerVisibilityFeedback));
-        assert!(visibility.contains(&Capability::PointerPositionFeedback));
-        assert!(!position.contains(&Capability::PointerVisibilityFeedback));
-        assert!(position.contains(&Capability::PointerPositionFeedback));
-        assert!(!relative.contains(&Capability::PointerVisibilityFeedback));
-        assert!(!relative.contains(&Capability::PointerPositionFeedback));
-        assert!(relative.contains(&Capability::RelativePointer));
-        assert!(!inherited.contains(&Capability::RelativePointer));
-        assert_eq!(
-            inherited.as_slice(),
-            &[
-                Capability::AbsolutePointer,
-                Capability::Keyboard,
-                Capability::Text,
-                Capability::Gamepad,
-                Capability::InputAck,
-            ]
-        );
-    }
-
-    #[test]
-    fn local_invitation_grants_bound_input_offers_before_the_host_intersection() {
-        let view_only = input_capability_offers(InvitationGrants::VIEW);
-        assert!(view_only.iter().all(Vec::is_empty));
-
-        let pointer = input_capability_offers(
-            InvitationGrants::VIEW.union(InvitationGrants::POINTER_KEYBOARD),
-        );
-        assert!(pointer[0].contains(&Capability::Keyboard));
-        assert!(pointer[0].contains(&Capability::InputAck));
-        assert!(!pointer[0].contains(&Capability::Gamepad));
-
-        let gamepad =
-            input_capability_offers(InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD));
-        assert_eq!(gamepad[0], vec![Capability::Gamepad, Capability::InputAck]);
-        assert_eq!(gamepad[1], vec![Capability::Gamepad]);
-    }
-
-    #[test]
-    fn relative_pointer_accumulator_coalesces_chunks_and_resets() {
-        let mut accumulator = RelativePointerAccumulator::default();
-        accumulator.push(10, -20);
-        accumulator.push(5, 8);
-        assert_eq!(
-            accumulator.take(),
-            Some(InputEvent::MouseMoveRelative { dx: 15, dy: -12 })
-        );
-        assert_eq!(accumulator.take(), None);
-
-        accumulator.push(RELATIVE_POINTER_DELTA_MAX, RELATIVE_POINTER_DELTA_MIN);
-        accumulator.push(1_000, -1_000);
-        assert_eq!(
-            accumulator.take(),
-            Some(InputEvent::MouseMoveRelative {
-                dx: RELATIVE_POINTER_DELTA_MAX,
-                dy: RELATIVE_POINTER_DELTA_MIN,
-            })
-        );
-        assert_eq!(
-            accumulator.take(),
-            Some(InputEvent::MouseMoveRelative {
-                dx: 1_000,
-                dy: -1_000,
-            })
-        );
-        assert_eq!(accumulator.take(), None);
-    }
-
-    #[test]
-    fn relative_motion_chunks_are_staged_immediately_before_a_following_button() {
-        let mut accumulator = RelativePointerAccumulator::default();
-        assert_eq!(
-            stage_relative_input(
-                &mut accumulator,
-                InputEvent::MouseMoveRelative {
-                    dx: RELATIVE_POINTER_DELTA_MAX,
-                    dy: RELATIVE_POINTER_DELTA_MIN,
-                }
-            ),
-            None
-        );
-        assert_eq!(
-            stage_relative_input(
-                &mut accumulator,
-                InputEvent::MouseMoveRelative { dx: 7, dy: -1 }
-            ),
-            None
-        );
-        assert_eq!(
-            stage_relative_input(&mut accumulator, InputEvent::MouseDown { b: 1 }),
-            Some(InputEvent::MouseDown { b: 1 })
-        );
-        assert_eq!(
-            accumulator.take(),
-            Some(InputEvent::MouseMoveRelative {
-                dx: RELATIVE_POINTER_DELTA_MAX,
-                dy: RELATIVE_POINTER_DELTA_MIN,
-            })
-        );
-        assert_eq!(
-            accumulator.take(),
-            Some(InputEvent::MouseMoveRelative { dx: 7, dy: -1 })
-        );
-        assert_eq!(accumulator.take(), None);
     }
 }
 
@@ -2390,19 +1564,7 @@ pub async fn iroh_client_send_input(
     state: State<'_, AppState>,
     event: InputEvent,
 ) -> Result<bool, String> {
-    let tx = state
-        .input_send
-        .lock()
-        .await
-        .clone()
-        .ok_or_else(|| "Not connected to host".to_string())?;
-    match tx.try_send(event) {
-        Ok(()) => Ok(true),
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            Err("Input channel closed".to_string())
-        }
-    }
+    send_input(&state, event).await
 }
 
 #[tauri::command]

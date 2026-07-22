@@ -6,13 +6,16 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::presets};
+use iroh_moq::{Moq, MoqSession};
+use moq_net::{BroadcastConsumer, GroupConsumer, Track, TrackConsumer};
 use sigil_protocol::{
-    Capability, ClientHello, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN, GAMEPAD_TRIGGER_MAX,
-    GamepadState, INPUT_ALPN_V1, InputEvent, KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3,
-    MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3, MediaControlRequestV3, MediaFrame, MediaObjectV3,
-    PointerSurfaceDimensions, ProtocolError, read_host_hello, read_input_ack, read_media_frame,
-    read_media_object, read_media_object_v3, write_client_hello, write_input_event,
-    write_media_control_request_v3,
+    CONTROL_ALPN_V1, Capability, ClientHello, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN,
+    GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, InputEvent, KeyframeRequestReasonV3,
+    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3,
+    MOQ_VIDEO_H264_TRACK, MediaCodec, MediaControlRequestV3, MediaFrame, MediaObjectV3,
+    PointerSurfaceDimensions, ProtocolError, decode_media_frame_object, media_moq_broadcast_name,
+    read_host_hello, read_input_ack, read_media_frame, read_media_object, read_media_object_v3,
+    write_client_hello, write_input_event, write_media_control_request_v3,
 };
 
 const MEDIA_OBJECT_CAPACITY: usize = 4;
@@ -32,16 +35,20 @@ struct Args {
     minimum_fps: Option<f64>,
     #[arg(long, default_value = "1280x800", value_parser = parse_size)]
     expect_size: (u16, u16),
-    /// Exercise independent v2 media objects instead of grouped v3 media
-    /// objects. Intended only for compatibility validation.
-    #[arg(long, conflicts_with = "media_v1")]
+    /// Exercise custom grouped v3 media instead of upstream MoQ. Intended only
+    /// for compatibility validation.
+    #[arg(long, conflicts_with_all = ["media_v2", "media_v1"])]
+    media_v3: bool,
+    /// Exercise independent v2 media objects instead of upstream MoQ.
+    /// Intended only for compatibility validation.
+    #[arg(long, conflicts_with_all = ["media_v3", "media_v1"])]
     media_v2: bool,
-    /// Exercise the reliable ordered v1 media stream instead of grouped v3
-    /// media objects. Intended only for compatibility validation.
-    #[arg(long, conflicts_with = "media_v2")]
+    /// Exercise the reliable ordered v1 media stream instead of upstream MoQ.
+    /// Intended only for compatibility validation.
+    #[arg(long, conflicts_with_all = ["media_v3", "media_v2"])]
     media_v1: bool,
-    /// Request a configured recovery keyframe after three accepted v3 frames,
-    /// then prove no delta history is delivered before the discontinuity.
+    /// Request a configured recovery keyframe after three accepted frames,
+    /// then prove no delta history is delivered before the recovery barrier.
     #[arg(long)]
     keyframe_smoke: bool,
     /// Correlation identifier for `--keyframe-smoke` host evidence.
@@ -59,6 +66,7 @@ struct Args {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaTransport {
+    UpstreamMoq,
     GroupedV3,
     IndependentV2,
     ReliableV1,
@@ -67,6 +75,7 @@ enum MediaTransport {
 impl MediaTransport {
     fn alpn(self) -> &'static [u8] {
         match self {
+            Self::UpstreamMoq => CONTROL_ALPN_V1,
             Self::GroupedV3 => MEDIA_ALPN_V3,
             Self::IndependentV2 => MEDIA_ALPN_V2,
             Self::ReliableV1 => MEDIA_ALPN_V1,
@@ -75,9 +84,20 @@ impl MediaTransport {
 
     fn label(self) -> &'static str {
         match self {
+            Self::UpstreamMoq => "iroh-moq",
             Self::GroupedV3 => "grouped-v3",
             Self::IndependentV2 => "independent-v2",
             Self::ReliableV1 => "reliable-v1",
+        }
+    }
+
+    fn media_alpn_label(self) -> &'static str {
+        match self {
+            Self::UpstreamMoq => std::str::from_utf8(iroh_moq::ALPN)
+                .expect("pinned iroh-moq ALPN must be printable UTF-8"),
+            Self::GroupedV3 => "sigil/media/3",
+            Self::IndependentV2 => "sigil/media/2",
+            Self::ReliableV1 => "sigil/media/1",
         }
     }
 }
@@ -590,6 +610,292 @@ impl MediaObjectSequenceV3 {
     }
 }
 
+#[derive(Debug)]
+enum MoqProbeOutcome {
+    Frame {
+        frame: MediaFrame,
+        group_sequence: u64,
+        recovery: bool,
+    },
+    Dropped,
+}
+
+struct MoqProbeGroupCursor {
+    group: GroupConsumer,
+    sequence: u64,
+    object_count: usize,
+    object_bytes: usize,
+    recovery: bool,
+}
+
+/// Own all upstream handles for the complete proof session. Dropping `Moq`
+/// stops its actor, while dropping the consumers cancels their subscriptions.
+struct MoqProbeLifetime {
+    _moq: Moq,
+    session: MoqSession,
+    _broadcast: BroadcastConsumer,
+}
+
+struct MoqProbeReceiver {
+    lifetime: MoqProbeLifetime,
+    track: TrackConsumer,
+    current_group: Option<MoqProbeGroupCursor>,
+    last_group_sequence: Option<u64>,
+    last_frame_sequence: Option<u64>,
+    waiting_for_keyframe: bool,
+    pending_recovery: bool,
+    cancelled_groups: u64,
+    group_gaps: u64,
+    maximum_group_objects: usize,
+    maximum_group_bytes: usize,
+    historical_suffix_frames: u64,
+}
+
+impl MoqProbeReceiver {
+    async fn connect(
+        endpoint: &Endpoint,
+        address: EndpointAddr,
+        session_id: u64,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let broadcast_name = media_moq_broadcast_name(session_id)
+            .context("deriving session-scoped MoQ broadcast name")?;
+        let moq = Moq::new(endpoint.clone());
+        let mut session = tokio::time::timeout(timeout, moq.connect(address.clone()))
+            .await
+            .context("timed out connecting upstream MoQ media session")?
+            .context("connecting upstream MoQ media session")?;
+        ensure!(
+            session.remote_id() == address.id,
+            "upstream MoQ connected to unexpected peer {} instead of {}",
+            session.remote_id(),
+            address.id
+        );
+        let broadcast = tokio::time::timeout(timeout, session.subscribe(&broadcast_name))
+            .await
+            .with_context(|| {
+                format!("timed out subscribing to upstream MoQ broadcast {broadcast_name}")
+            })?
+            .with_context(|| format!("subscribing to upstream MoQ broadcast {broadcast_name}"))?;
+        let track = broadcast
+            .subscribe_track(&Track::new(MOQ_VIDEO_H264_TRACK))
+            .with_context(|| format!("subscribing to MoQ track {MOQ_VIDEO_H264_TRACK}"))?;
+        Ok(Self {
+            lifetime: MoqProbeLifetime {
+                _moq: moq,
+                session,
+                _broadcast: broadcast,
+            },
+            track,
+            current_group: None,
+            last_group_sequence: None,
+            last_frame_sequence: None,
+            waiting_for_keyframe: true,
+            pending_recovery: false,
+            cancelled_groups: 0,
+            group_gaps: 0,
+            maximum_group_objects: 0,
+            maximum_group_bytes: 0,
+            historical_suffix_frames: 0,
+        })
+    }
+
+    fn connection(&self) -> &iroh::endpoint::Connection {
+        self.lifetime.session.conn()
+    }
+
+    /// Stop consuming the current group immediately. The track cursor already
+    /// advanced when the group was selected, so a subsequent read can only
+    /// enter a newer native group; no cancelled delta suffix can be accepted.
+    fn request_recovery(&mut self) -> Option<u64> {
+        self.waiting_for_keyframe = true;
+        self.pending_recovery = true;
+        self.current_group.take().map(|cursor| {
+            self.cancelled_groups = self.cancelled_groups.saturating_add(1);
+            self.last_group_sequence = Some(cursor.sequence);
+            cursor.sequence
+        })
+    }
+
+    async fn next(&mut self) -> Result<Option<MoqProbeOutcome>> {
+        loop {
+            if self.current_group.is_none() {
+                let group = self
+                    .track
+                    .next_group()
+                    .await
+                    .context("reading the next sequential upstream MoQ group")?;
+                let Some(group) = group else {
+                    return Ok(None);
+                };
+                let sequence = group.sequence;
+                let group_gap = classify_moq_probe_group(self.last_group_sequence, sequence)?;
+                if group_gap {
+                    self.group_gaps = self.group_gaps.saturating_add(1);
+                    self.waiting_for_keyframe = true;
+                    self.pending_recovery = true;
+                }
+                self.current_group = Some(MoqProbeGroupCursor {
+                    group,
+                    sequence,
+                    object_count: 0,
+                    object_bytes: 0,
+                    recovery: self.pending_recovery,
+                });
+                self.pending_recovery = false;
+            }
+
+            let cursor = self
+                .current_group
+                .as_mut()
+                .expect("MoQ group cursor was initialized");
+            let object = match cursor.group.read_frame().await {
+                Ok(object) => object,
+                Err(error) if moq_probe_error_is_recoverable(&error) => {
+                    self.cancelled_groups = self.cancelled_groups.saturating_add(1);
+                    self.last_group_sequence = Some(cursor.sequence);
+                    self.current_group = None;
+                    self.waiting_for_keyframe = true;
+                    self.pending_recovery = true;
+                    return Ok(Some(MoqProbeOutcome::Dropped));
+                }
+                Err(error) => {
+                    bail!(
+                        "upstream MoQ group {} failed terminally: {error}",
+                        cursor.sequence
+                    );
+                }
+            };
+            let Some(object) = object else {
+                ensure!(
+                    cursor.object_count > 0,
+                    "upstream MoQ group {} was empty",
+                    cursor.sequence
+                );
+                self.last_group_sequence = Some(cursor.sequence);
+                self.current_group = None;
+                continue;
+            };
+
+            let next_bytes = validate_moq_probe_object_bounds(
+                cursor.sequence,
+                cursor.object_count,
+                cursor.object_bytes,
+                object.len(),
+            )?;
+            let frame = decode_media_frame_object(&object).with_context(|| {
+                format!(
+                    "decoding upstream MoQ group {} object {}",
+                    cursor.sequence, cursor.object_count
+                )
+            })?;
+            let first_object = cursor.object_count == 0;
+            let contiguous = validate_moq_probe_frame(
+                cursor.sequence,
+                first_object,
+                self.last_frame_sequence,
+                &frame,
+            )?;
+            let recovery = cursor.recovery
+                || self.waiting_for_keyframe
+                || (first_object && !contiguous)
+                || frame.header.flags.contains(FrameFlags::DISCONTINUITY);
+            if self.waiting_for_keyframe && !first_object {
+                self.historical_suffix_frames = self.historical_suffix_frames.saturating_add(1);
+                bail!(
+                    "upstream MoQ delivered a historical delta suffix while recovery was pending"
+                );
+            }
+            cursor.object_count += 1;
+            cursor.object_bytes = next_bytes;
+            self.maximum_group_objects = self.maximum_group_objects.max(cursor.object_count);
+            self.maximum_group_bytes = self.maximum_group_bytes.max(next_bytes);
+            self.last_frame_sequence = Some(frame.header.sequence);
+            self.waiting_for_keyframe = false;
+            return Ok(Some(MoqProbeOutcome::Frame {
+                frame,
+                group_sequence: cursor.sequence,
+                recovery,
+            }));
+        }
+    }
+}
+
+fn classify_moq_probe_group(previous: Option<u64>, current: u64) -> Result<bool> {
+    let Some(previous) = previous else {
+        return Ok(false);
+    };
+    ensure!(
+        current > previous,
+        "upstream MoQ group sequence did not increase: previous={previous}, current={current}"
+    );
+    Ok(previous.checked_add(1) != Some(current))
+}
+
+fn validate_moq_probe_object_bounds(
+    group_sequence: u64,
+    object_count: usize,
+    object_bytes: usize,
+    object_len: usize,
+) -> Result<usize> {
+    let maximum_objects = MAX_MEDIA_OBJECT_ID_V3 as usize + 1;
+    ensure!(
+        object_count < maximum_objects,
+        "upstream MoQ group {group_sequence} exceeded {maximum_objects} objects"
+    );
+    let next_bytes = object_bytes
+        .checked_add(object_len)
+        .context("upstream MoQ group byte count overflowed")?;
+    ensure!(
+        next_bytes <= MAX_MEDIA_GROUP_BYTES_V3,
+        "upstream MoQ group {group_sequence} exceeded {MAX_MEDIA_GROUP_BYTES_V3} bytes"
+    );
+    Ok(next_bytes)
+}
+
+fn validate_moq_probe_frame(
+    group_sequence: u64,
+    first_object: bool,
+    last_frame_sequence: Option<u64>,
+    frame: &MediaFrame,
+) -> Result<bool> {
+    if first_object {
+        ensure!(
+            frame.header.codec == MediaCodec::H264
+                && frame.header.flags.contains(FrameFlags::KEYFRAME)
+                && frame.header.flags.contains(FrameFlags::CODEC_CONFIG),
+            "upstream MoQ group {group_sequence} did not begin with a configured H.264 keyframe"
+        );
+        // A native group cancellation is itself the transport discontinuity.
+        // Portal marks the first configured IDR in the replacement group as a
+        // decoder discontinuity even when the embedded compatibility header
+        // does not redundantly carry the v3 DISCONTINUITY flag.
+    }
+    let contiguous = last_frame_sequence
+        .is_none_or(|previous| previous.checked_add(1) == Some(frame.header.sequence));
+    ensure!(
+        last_frame_sequence.is_none_or(|previous| frame.header.sequence > previous),
+        "upstream MoQ group {group_sequence} contains a non-monotonic frame sequence"
+    );
+    ensure!(
+        first_object || contiguous,
+        "upstream MoQ group {group_sequence} contains a non-contiguous frame sequence"
+    );
+    Ok(contiguous)
+}
+
+fn moq_probe_error_is_recoverable(error: &moq_net::Error) -> bool {
+    matches!(
+        error,
+        moq_net::Error::Cancel
+            | moq_net::Error::Old
+            | moq_net::Error::Timeout
+            | moq_net::Error::Dropped
+            | moq_net::Error::CacheFull
+            | moq_net::Error::Remote(0 | 2 | 3 | 24 | 26)
+    )
+}
+
 struct AcceptedMedia {
     flags: FrameFlags,
     width: u16,
@@ -634,7 +940,7 @@ async fn main() -> Result<()> {
     );
     ensure!(
         !args.keyframe_smoke || (!args.media_v1 && !args.media_v2),
-        "--keyframe-smoke requires grouped v3 media"
+        "--keyframe-smoke requires upstream MoQ or grouped v3 media"
     );
     ensure!(
         !args.keyframe_smoke || args.frames >= KEYFRAME_SMOKE_MINIMUM_FRAMES,
@@ -655,8 +961,10 @@ async fn main() -> Result<()> {
         MediaTransport::ReliableV1
     } else if args.media_v2 {
         MediaTransport::IndependentV2
-    } else {
+    } else if args.media_v3 {
         MediaTransport::GroupedV3
+    } else {
+        MediaTransport::UpstreamMoq
     };
 
     let media_connection = endpoint
@@ -667,22 +975,27 @@ async fn main() -> Result<()> {
         .open_bi()
         .await
         .context("opening media stream")?;
+    let handshake_name = if media_transport == MediaTransport::UpstreamMoq {
+        "control"
+    } else {
+        "media"
+    };
     let media_negotiation = negotiate(
         &mut media_send,
         &mut media_recv,
         nonce,
         vec![Capability::VideoH264],
         Capability::VideoH264,
-        "media",
+        handshake_name,
     )
     .await?;
     let session_id = media_negotiation.session_id;
     let mut media_send = Some(media_send);
     let mut media_recv = Some(media_recv);
     match media_transport {
-        MediaTransport::GroupedV3 => {
+        MediaTransport::UpstreamMoq | MediaTransport::GroupedV3 => {
             // Sigil finishes its response half after HostHello. Keep our send
-            // half alive as the bounded v3 keyframe-control stream.
+            // half alive as the bounded keyframe-control stream.
             drop(media_recv.take());
         }
         MediaTransport::IndependentV2 => {
@@ -696,8 +1009,22 @@ async fn main() -> Result<()> {
         MediaTransport::ReliableV1 => {}
     }
 
+    let mut moq_receiver = if media_transport == MediaTransport::UpstreamMoq {
+        Some(
+            MoqProbeReceiver::connect(
+                &endpoint,
+                address.clone(),
+                session_id,
+                Duration::from_secs(args.timeout_seconds),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     let input_connection = endpoint
-        .connect(address, INPUT_ALPN_V1)
+        .connect(address.clone(), INPUT_ALPN_V1)
         .await
         .context("connecting input protocol")?;
     let (mut input_send, mut input_recv) = input_connection
@@ -829,6 +1156,62 @@ async fn main() -> Result<()> {
 
     while received < args.frames {
         let (frame, recovery_frame): (AcceptedMedia, bool) = match media_transport {
+            MediaTransport::UpstreamMoq => loop {
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(args.timeout_seconds)
+                        .saturating_add(Duration::from_secs(1)),
+                    moq_receiver
+                        .as_mut()
+                        .expect("upstream MoQ receiver is present")
+                        .next(),
+                )
+                .await
+                .context("timed out waiting for an upstream MoQ media object")??
+                .context("host closed the upstream MoQ video track")?;
+                match outcome {
+                    MoqProbeOutcome::Dropped => {
+                        media_objects_dropped = media_objects_dropped.saturating_add(1);
+                    }
+                    MoqProbeOutcome::Frame {
+                        frame,
+                        group_sequence,
+                        recovery,
+                    } => {
+                        let requested_recovery =
+                            keyframe_request_sent && !keyframe_recovery_verified;
+                        if requested_recovery {
+                            ensure!(
+                                recovery
+                                    && frame.header.flags.contains(FrameFlags::KEYFRAME)
+                                    && frame.header.flags.contains(FrameFlags::CODEC_CONFIG),
+                                "MoQ keyframe request recovery did not begin at a configured IDR barrier"
+                            );
+                            ensure!(
+                                keyframe_request_group_id
+                                    .is_some_and(|prior| group_sequence > prior),
+                                "MoQ keyframe request recovery did not advance the native group"
+                            );
+                            ensure!(
+                                keyframe_request_last_sequence
+                                    .is_some_and(|prior| frame.header.sequence > prior),
+                                "MoQ keyframe request recovery did not advance media sequence"
+                            );
+                            keyframe_recovery_verified = true;
+                        }
+                        break (
+                            AcceptedMedia {
+                                flags: frame.header.flags,
+                                width: frame.header.width,
+                                height: frame.header.height,
+                                sequence: frame.header.sequence,
+                                payload_len: frame.payload.len(),
+                                v3_group_id: Some(group_sequence),
+                            },
+                            requested_recovery,
+                        );
+                    }
+                }
+            },
             MediaTransport::ReliableV1 => (
                 tokio::time::timeout(
                     Duration::from_secs(args.timeout_seconds),
@@ -1008,7 +1391,22 @@ async fn main() -> Result<()> {
             keyframe_request_group_id = frame.v3_group_id;
             keyframe_request_last_sequence = Some(frame.sequence);
             keyframe_request_sent = true;
-            object_sequence_v3.request_recovery();
+            match media_transport {
+                MediaTransport::UpstreamMoq => {
+                    let cancelled_group = moq_receiver
+                        .as_mut()
+                        .expect("upstream MoQ receiver is present")
+                        .request_recovery();
+                    ensure!(
+                        cancelled_group == keyframe_request_group_id,
+                        "MoQ recovery did not cancel the currently accepted native group"
+                    );
+                }
+                MediaTransport::GroupedV3 => object_sequence_v3.request_recovery(),
+                MediaTransport::IndependentV2 | MediaTransport::ReliableV1 => {
+                    unreachable!("keyframe smoke excludes v2 and v1")
+                }
+            }
         }
     }
 
@@ -1042,7 +1440,25 @@ async fn main() -> Result<()> {
             "probe sustained only {accepted_fps:.3} accepted fps; required at least {minimum_fps:.3} fps"
         );
     }
-    let (path_mode, path_rtt_ms) = selected_path_diagnostics(&media_connection);
+    let diagnostics_connection = moq_receiver
+        .as_ref()
+        .map_or(&media_connection, MoqProbeReceiver::connection);
+    let (path_mode, path_rtt_ms) = selected_path_diagnostics(diagnostics_connection);
+    let (
+        moq_cancelled_groups,
+        moq_group_gaps,
+        moq_maximum_group_objects,
+        moq_maximum_group_bytes,
+        moq_historical_suffix_frames,
+    ) = moq_receiver.as_ref().map_or((0, 0, 0, 0, 0), |receiver| {
+        (
+            receiver.cancelled_groups,
+            receiver.group_gaps,
+            receiver.maximum_group_objects,
+            receiver.maximum_group_bytes,
+            receiver.historical_suffix_frames,
+        )
+    });
     input_send.finish().context("finishing input stream")?;
     if let Some(mut media_send) = media_send {
         media_send
@@ -1054,6 +1470,9 @@ async fn main() -> Result<()> {
     // short-lived probes, which obscures whether the host released its
     // one-client lease deterministically.
     input_connection.close(0_u32.into(), b"probe complete");
+    if let Some(receiver) = moq_receiver.as_ref() {
+        receiver.connection().close(0_u32.into(), b"probe complete");
+    }
     media_connection.close(0_u32.into(), b"probe complete");
     tokio::time::sleep(Duration::from_millis(50)).await;
     endpoint.close().await;
@@ -1067,6 +1486,54 @@ async fn main() -> Result<()> {
     println!("media_objects_dropped={media_objects_dropped}");
     println!("media_objects_late={media_objects_late}");
     println!("transport={}", media_transport.label());
+    println!(
+        "control_alpn={}",
+        if media_transport == MediaTransport::UpstreamMoq {
+            "sigil/control/1"
+        } else {
+            "not-used"
+        }
+    );
+    println!("transport_alpn={}", media_transport.media_alpn_label());
+    println!("first_configured_idr=ok");
+    println!("frame_sequence=monotonic");
+    println!(
+        "group_sequence={}",
+        if media_transport == MediaTransport::UpstreamMoq {
+            "monotonic"
+        } else {
+            "not-applicable"
+        }
+    );
+    if media_transport == MediaTransport::UpstreamMoq {
+        println!("moq_group_capacity=1");
+        println!("moq_cancelled_groups={moq_cancelled_groups}");
+        println!("moq_group_gaps={moq_group_gaps}");
+        println!("moq_unrecovered_group_gaps=0");
+        println!("moq_maximum_group_objects={moq_maximum_group_objects}");
+        println!("moq_maximum_group_bytes={moq_maximum_group_bytes}");
+        println!("moq_historical_suffix_frames={moq_historical_suffix_frames}");
+    } else {
+        for field in [
+            "moq_group_capacity",
+            "moq_cancelled_groups",
+            "moq_group_gaps",
+            "moq_unrecovered_group_gaps",
+            "moq_maximum_group_objects",
+            "moq_maximum_group_bytes",
+            "moq_historical_suffix_frames",
+        ] {
+            println!("{field}=not-applicable");
+        }
+    }
+    println!(
+        "recovery_barrier={}",
+        if args.keyframe_smoke {
+            "configured-idr"
+        } else {
+            "not-requested"
+        }
+    );
     println!(
         "keyframe_recovery={}",
         if args.keyframe_smoke {
@@ -1626,20 +2093,70 @@ mod tests {
     }
 
     #[test]
+    fn upstream_moq_group_and_object_limits_fail_closed() {
+        assert!(!classify_moq_probe_group(None, 8).unwrap());
+        assert!(!classify_moq_probe_group(Some(8), 9).unwrap());
+        assert!(classify_moq_probe_group(Some(8), 10).unwrap());
+        assert!(classify_moq_probe_group(Some(8), 8).is_err());
+        assert!(classify_moq_probe_group(Some(8), 7).is_err());
+
+        assert_eq!(validate_moq_probe_object_bounds(4, 0, 0, 42).unwrap(), 42);
+        assert!(
+            validate_moq_probe_object_bounds(4, MAX_MEDIA_OBJECT_ID_V3 as usize + 1, 0, 1,)
+                .is_err()
+        );
+        assert!(validate_moq_probe_object_bounds(4, 0, MAX_MEDIA_GROUP_BYTES_V3, 1).is_err());
+        assert!(validate_moq_probe_object_bounds(4, 0, usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn upstream_moq_requires_configured_group_zero_and_idr_recovery() {
+        let keyframe = FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG);
+        let recovery = keyframe.union(FrameFlags::DISCONTINUITY);
+        let delta = media_frame(11, FrameFlags::NONE);
+        let configured = media_frame(10, keyframe);
+        let configured_next = media_frame(12, keyframe);
+        let recovered = media_frame(20, recovery);
+
+        assert!(validate_moq_probe_frame(3, true, None, &delta).is_err());
+        assert!(validate_moq_probe_frame(3, true, None, &configured).is_ok());
+        assert!(validate_moq_probe_frame(4, true, Some(11), &configured).is_err());
+        assert!(validate_moq_probe_frame(4, true, Some(11), &configured_next).is_ok());
+        assert!(validate_moq_probe_frame(4, true, Some(11), &recovered).is_ok());
+        assert!(validate_moq_probe_frame(4, false, Some(10), &delta).is_ok());
+        assert!(validate_moq_probe_frame(4, false, Some(9), &delta).is_err());
+    }
+
+    #[test]
+    fn upstream_moq_transport_reports_the_pinned_native_alpn() {
+        assert_eq!(MediaTransport::UpstreamMoq.label(), "iroh-moq");
+        assert_eq!(MediaTransport::UpstreamMoq.alpn(), CONTROL_ALPN_V1);
+        assert_eq!(
+            MediaTransport::UpstreamMoq.media_alpn_label(),
+            "moq-lite-04"
+        );
+        assert_eq!(
+            MediaTransport::UpstreamMoq.media_alpn_label().as_bytes(),
+            iroh_moq::ALPN
+        );
+    }
+
+    #[test]
     fn media_compatibility_flags_are_mutually_exclusive() {
         let node_id = SecretKey::from_bytes(&[0x2a; 32]).public().to_string();
         let default = Args::try_parse_from(["sigil-probe", "--node-id", &node_id]).unwrap();
         assert!(!default.media_v1);
         assert!(!default.media_v2);
-        assert!(
-            Args::try_parse_from([
-                "sigil-probe",
-                "--node-id",
-                &node_id,
-                "--media-v1",
-                "--media-v2",
-            ])
-            .is_err()
-        );
+        assert!(!default.media_v3);
+        for flags in [
+            ["--media-v1", "--media-v2"],
+            ["--media-v1", "--media-v3"],
+            ["--media-v2", "--media-v3"],
+        ] {
+            assert!(
+                Args::try_parse_from(["sigil-probe", "--node-id", &node_id, flags[0], flags[1],])
+                    .is_err()
+            );
+        }
     }
 }

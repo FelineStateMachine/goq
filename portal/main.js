@@ -19,17 +19,9 @@ import {
   createAudioPipelineSession,
 } from './audio-pipeline.mjs';
 import {
-  ControllerActionRepeater,
-  GamepadEscapeHold,
-  LatestControllerStatePublisher,
   chooseDirectionalIndex,
-  controllerStateSignature,
-  disconnectedControllerState,
-  maskGamepadEscapeChord,
-  normalizeGamepad,
-  selectPreferredController,
-  toGamepadInputState,
 } from './controller-state.mjs';
+import { createControllerRuntime } from './controller-runtime.mjs';
 import {
   constrainStreamWindowResize,
   fitInitialStreamWindow,
@@ -61,6 +53,7 @@ let streamWindowResizeTimer = null;
 let activePointerSession = null;
 let controllerActivationInProgress = false;
 let controlRuntime = null;
+let controllerRuntime = null;
 
 function applyPointerPositionFeedback(message, session) {
   if (session !== activePointerSession || !connectionState.inputCapabilities.pointerPositionFeedback) return;
@@ -651,8 +644,8 @@ controlRuntime = createControlRuntime({
     },
     eventTarget: document,
   },
-  publishController: () => publishCurrentControllerState(),
-  resetControllerEscape: () => controllerEscape.reset(),
+  publishController: () => controllerRuntime?.publishCurrentState(),
+  resetControllerEscape: () => controllerRuntime?.resetEscape(),
   onChange: () => updateControlUI(),
   onReleaseFailure: () => setStatus('err', 'cursor release failed · quit app'),
 });
@@ -1192,31 +1185,6 @@ for (const id of ['enrollment-pin', 'intro-pin', 'pin-input']) {
 }
 
 // ─── Gamepad polling, UI navigation, and latest-state routing ─────────────────
-const controllerPublisher = new LatestControllerStatePublisher();
-const controllerActions = new ControllerActionRepeater();
-const controllerEscape = new GamepadEscapeHold(1000);
-let controllerSequence = 0;
-let selectedControllerIndex = null;
-let currentControllerState = disconnectedControllerState();
-let lastControllerSignature = controllerStateSignature(currentControllerState);
-let externalControllerObserver = null;
-
-controllerPublisher.setHandler((state) => {
-  if (externalControllerObserver) {
-    try { externalControllerObserver(state); } catch (error) { console.warn('controller observer failed:', error); }
-  }
-  if (!connectionState.connected
-    || !controlRuntime.active
-    || !connectionState.inputCapabilities.gamepad) return;
-  const inputState = maskGamepadEscapeChord(toGamepadInputState(state));
-  if (!controlRuntime.acceptsControllerInput(inputState)) return;
-  inputRuntime.send({ t: 'gp', state: inputState });
-});
-
-function publishCurrentControllerState() {
-  controllerPublisher.publish(currentControllerState);
-}
-
 function controllerScope() {
   const tap = document.getElementById('tap-overlay');
   if (!tap.classList.contains('hidden')) return tap;
@@ -1299,55 +1267,24 @@ function updateControllerStatus(state) {
   status.classList.toggle('warning', !standard);
 }
 
-function pollControllers(nowMs) {
-  let gamepads = [];
-  try {
-    gamepads = typeof navigator.getGamepads === 'function'
-      ? Array.from(navigator.getGamepads()).filter(Boolean)
-      : [];
-  } catch (error) {
-    console.warn('gamepad poll failed:', error);
-  }
-  const gamepad = selectPreferredController(gamepads, selectedControllerIndex);
-  const nextIndex = gamepad?.index ?? null;
-  if (nextIndex !== selectedControllerIndex) {
-    selectedControllerIndex = nextIndex;
-    controllerActions.reset();
-    controllerEscape.reset();
-    lastControllerSignature = '';
-  }
-
-  currentControllerState = normalizeGamepad(gamepad, controllerSequence + 1);
-  const signature = controllerStateSignature(currentControllerState);
-  if (signature !== lastControllerSignature) {
-    controllerSequence += 1;
-    currentControllerState = normalizeGamepad(gamepad, controllerSequence);
-    lastControllerSignature = signature;
-    controllerPublisher.publish(currentControllerState);
-    updateControllerStatus(currentControllerState);
-  }
-
-  const remoteRoute = connectionState.connected
+controllerRuntime = createControllerRuntime({
+  schedulePoll: (callback) => requestAnimationFrame(callback),
+  isRemoteRoute: () => connectionState.connected
     && controlRuntime.active
-    && connectionState.inputCapabilities.gamepad
-    && currentControllerState.connected
-    && currentControllerState.mapping === 'standard';
-  if (remoteRoute) {
-    if (controllerEscape.update(currentControllerState, nowMs)) {
-      controlRuntime.exit();
-      controllerActions.reset();
-      setControllerFocus(document.getElementById('control-toggle'));
-    }
-  } else {
-    controllerEscape.reset();
-    for (const action of controllerActions.update(currentControllerState, nowMs)) {
-      if (action.type === 'navigate') navigateControllerFocus(action.direction);
-      else if (action.type === 'activate') activateControllerFocus();
-      else if (action.type === 'back') controllerBack();
-    }
-  }
-  requestAnimationFrame(pollControllers);
-}
+    && connectionState.inputCapabilities.gamepad,
+  sendRemoteState: (state) => {
+    if (!controlRuntime.acceptsControllerInput(state)) return;
+    inputRuntime.send({ t: 'gp', state });
+  },
+  onNavigate: navigateControllerFocus,
+  onActivate: activateControllerFocus,
+  onBack: controllerBack,
+  onStatus: updateControllerStatus,
+  onExit: () => {
+    controlRuntime.exit();
+    setControllerFocus(document.getElementById('control-toggle'));
+  },
+});
 
 document.addEventListener('pointerdown', () => {
   document.querySelectorAll('.controller-focus').forEach((item) => item.classList.remove('controller-focus'));
@@ -1399,11 +1336,8 @@ Object.assign(window, {
   openEnrollmentReset, cancelEnrollmentReset, confirmEnrollmentReset,
   derivePortalIdentity, chooseInvitationFile, confirmInvitation, cancelInvitation,
   sigilController: Object.freeze({
-    getLatestState: () => controllerPublisher.latest,
-    setObserver: (observer) => {
-      if (observer !== null && typeof observer !== 'function') throw new TypeError('observer must be a function or null');
-      externalControllerObserver = observer;
-    },
+    getLatestState: () => controllerRuntime.latest,
+    setObserver: controllerRuntime.setObserver,
   }),
 });
 
@@ -1426,7 +1360,7 @@ async function initialize() {
     status.textContent = 'could not load enrollment';
   }
   if (!connectionState.developmentMode) scanFido();
-  requestAnimationFrame(pollControllers);
+  requestAnimationFrame(controllerRuntime.poll);
 }
 
 initialize();

@@ -1,0 +1,9 @@
+repository=FelineStateMachine/goq
+source_commit=7920c5d214344f859e0cd5987433a3b303eb85f3
+workflow_sha=7920c5d214344f859e0cd5987433a3b303eb85f3
+workflow_ref=FelineStateMachine/goq/.github/workflows/sigil-hardware-uat.yml@refs/heads/main
+workflow_run_id=29919920109
+workflow_run_attempt=1
+run_url=https://github.com/FelineStateMachine/goq/actions/runs/29919920109
+archive=sigil-hardware-uat-7920c5d21434-bazzite-x86_64.tar.gz
+archive_sha256=07e9d317a46b6022ac9065e22e87388eac17495e5fc8be98e3fefb05db4914ae

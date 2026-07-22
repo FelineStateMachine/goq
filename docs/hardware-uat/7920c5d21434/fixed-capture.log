@@ -1,0 +1,10 @@
+resolved_encoded_mode=1280x800@60
+probe=ok
+frames=300
+keyframes=10
+decodable_keyframes=10
+dropped_after_encode_before_probe_consumer=0
+observed_fps=58.701
+max_post_encode_queue_age_micros=370
+encoded_bytes=6006749
+elapsed_ms=5110

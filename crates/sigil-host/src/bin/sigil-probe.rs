@@ -103,6 +103,14 @@ struct Args {
     /// complete left-click. Intended for libinput/Gamescope-backed proof.
     #[arg(long)]
     pointer_smoke: bool,
+    /// Attach the media-feedback stream to the active session, submit one
+    /// complete report, and print the host's bounded decision. Intended for
+    /// validating shadow-only encoder configurations.
+    #[arg(
+        long,
+        conflicts_with_all = ["media_v3", "media_v2", "media_v1", "resolution_stall_smoke"]
+    )]
+    feedback_smoke: bool,
     /// Prove adaptive-resolution liveness across a controlled Gamescope stall.
     /// GATE_DIR coordinates the external SIGSTOP/SIGCONT harness.
     #[arg(
@@ -114,7 +122,8 @@ struct Args {
             "media_v1",
             "keyframe_smoke",
             "slow_consumer_ms",
-            "minimum_fps"
+            "minimum_fps",
+            "feedback_smoke"
         ]
     )]
     resolution_stall_smoke: Option<PathBuf>,
@@ -1047,7 +1056,7 @@ impl ResolutionStallGate {
     }
 }
 
-fn resolution_stall_feedback(
+fn complete_feedback_report(
     report_id: u64,
     flags: MediaFeedbackFlags,
     last_sequence: u64,
@@ -1094,7 +1103,7 @@ fn resolution_stall_reduced_dimensions(native: (u16, u16)) -> Result<(u16, u16)>
     Ok(reduced)
 }
 
-async fn exchange_resolution_stall_feedback(
+async fn exchange_feedback_report(
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
     report: &MediaFeedbackReportV1,
@@ -1104,21 +1113,59 @@ async fn exchange_resolution_stall_feedback(
         write_media_feedback_report_v1(send, report),
     )
     .await
-    .context("timed out writing resolution-stall feedback")??;
+    .context("timed out writing media feedback")??;
     let decision = tokio::time::timeout(
         RESOLUTION_STALL_FEEDBACK_TIMEOUT,
         read_adaptive_bitrate_decision_v1(recv),
     )
     .await
-    .context("timed out waiting for resolution-stall feedback decision")??
-    .context("host closed the resolution-stall feedback stream")?;
+    .context("timed out waiting for media feedback decision")??
+    .context("host closed the media feedback stream")?;
     ensure!(
         decision.report_id == report.report_id,
-        "resolution-stall decision report ID {} does not match report {}",
+        "feedback decision report ID {} does not match report {}",
         decision.report_id,
         report.report_id
     );
     Ok(decision)
+}
+
+async fn run_feedback_smoke(
+    endpoint: &Endpoint,
+    address: EndpointAddr,
+    nonce: [u8; 16],
+    session_id: u64,
+    last_sequence: u64,
+) -> Result<(AdaptiveBitrateDecisionV1, &'static str, Option<f64>)> {
+    let connection = endpoint
+        .connect(address, MEDIA_FEEDBACK_ALPN_V1)
+        .await
+        .context("connecting media feedback protocol")?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("opening media feedback stream")?;
+    let negotiation = negotiate(
+        &mut send,
+        &mut recv,
+        nonce,
+        vec![Capability::VideoH264],
+        Capability::VideoH264,
+        "media feedback",
+        None,
+    )
+    .await?;
+    ensure!(
+        negotiation.session_id == session_id,
+        "media and feedback session IDs differ"
+    );
+
+    let report = complete_feedback_report(1, MediaFeedbackFlags::NONE, last_sequence);
+    let decision = exchange_feedback_report(&mut send, &mut recv, &report).await?;
+    let (path_mode, path_rtt_ms) = selected_path_diagnostics(&connection);
+    send.finish().context("finishing media feedback stream")?;
+    connection.close(0_u32.into(), b"feedback probe complete");
+    Ok((decision, path_mode, path_rtt_ms))
 }
 
 async fn next_resolution_stall_moq_frame(receiver: &mut MoqProbeReceiver) -> Result<AcceptedMedia> {
@@ -1248,18 +1295,18 @@ async fn run_resolution_stall_smoke(
     let reduced_dimensions = resolution_stall_reduced_dimensions(native_dimensions)?;
 
     let mut report_id = 1_u64;
-    let seed = resolution_stall_feedback(report_id, MediaFeedbackFlags::NONE, initial.sequence);
-    let _ = exchange_resolution_stall_feedback(feedback_send, feedback_recv, &seed).await?;
+    let seed = complete_feedback_report(report_id, MediaFeedbackFlags::NONE, initial.sequence);
+    let _ = exchange_feedback_report(feedback_send, feedback_recv, &seed).await?;
     tokio::time::sleep(RESOLUTION_STALL_FEEDBACK_INTERVAL).await;
 
     report_id += 1;
-    let pressure = resolution_stall_feedback(
+    let pressure = complete_feedback_report(
         report_id,
         MediaFeedbackFlags::RESYNC_ACTIVE,
         initial.sequence,
     );
     let pressure_decision =
-        exchange_resolution_stall_feedback(feedback_send, feedback_recv, &pressure).await?;
+        exchange_feedback_report(feedback_send, feedback_recv, &pressure).await?;
     ensure!(
         pressure_decision
             .reasons
@@ -1311,8 +1358,8 @@ async fn run_resolution_stall_smoke(
     wait_for_resolution_stall_marker(&gate.stalled, timeout).await?;
 
     report_id += 1;
-    let reseed = resolution_stall_feedback(report_id, MediaFeedbackFlags::NONE, reduced.sequence);
-    let _ = exchange_resolution_stall_feedback(feedback_send, feedback_recv, &reseed).await?;
+    let reseed = complete_feedback_report(report_id, MediaFeedbackFlags::NONE, reduced.sequence);
+    let _ = exchange_feedback_report(feedback_send, feedback_recv, &reseed).await?;
     let mut last_feedback_at = Instant::now();
     let mut fresh_started = None;
     let mut stall_input_ack_micros = None;
@@ -1323,11 +1370,10 @@ async fn run_resolution_stall_smoke(
         .await;
         report_id += 1;
         let report =
-            resolution_stall_feedback(report_id, MediaFeedbackFlags::NONE, reduced.sequence);
+            complete_feedback_report(report_id, MediaFeedbackFlags::NONE, reduced.sequence);
         let sent_at = Instant::now();
         fresh_started.get_or_insert(sent_at);
-        let decision =
-            exchange_resolution_stall_feedback(feedback_send, feedback_recv, &report).await?;
+        let decision = exchange_feedback_report(feedback_send, feedback_recv, &report).await?;
         ensure!(
             decision.state != AdaptiveBitrateStateV1::Increase,
             "no-progress feedback unexpectedly increased adaptive bitrate"
@@ -2189,6 +2235,20 @@ async fn main() -> Result<()> {
             "probe sustained only {accepted_fps:.3} accepted fps; required at least {minimum_fps:.3} fps"
         );
     }
+    let feedback_evidence = if args.feedback_smoke {
+        Some(
+            run_feedback_smoke(
+                &endpoint,
+                address.clone(),
+                nonce,
+                session_id,
+                last_sequence.context("feedback smoke requires an accepted media sequence")?,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let media_diagnostics_connection = moq_receiver
         .as_ref()
         .map_or(&media_connection, MoqProbeReceiver::connection);
@@ -2201,12 +2261,16 @@ async fn main() -> Result<()> {
         ("not-used", None)
     };
     let (input_path_mode, input_path_rtt_ms) = selected_path_diagnostics(&input_connection);
+    let feedback_path_mode = feedback_evidence
+        .as_ref()
+        .map_or("not-used", |(_, path_mode, _)| *path_mode);
     if args.relay_only {
         ensure!(
             control_path_mode == "relay"
                 && media_path_mode == "relay"
-                && input_path_mode == "relay",
-            "relay-only probe did not keep every transport on relay: control={control_path_mode}, media={media_path_mode}, input={input_path_mode}"
+                && input_path_mode == "relay"
+                && (feedback_evidence.is_none() || feedback_path_mode == "relay"),
+            "relay-only probe did not keep every transport on relay: control={control_path_mode}, media={media_path_mode}, input={input_path_mode}, feedback={feedback_path_mode}"
         );
     }
     let (
@@ -2397,6 +2461,34 @@ async fn main() -> Result<()> {
             "not-requested"
         }
     );
+    if let Some((decision, path_mode, path_rtt_ms)) = &feedback_evidence {
+        println!("feedback_smoke=ok");
+        println!("feedback_report_id={}", decision.report_id);
+        println!("feedback_state={:?}", decision.state);
+        println!("feedback_target_kbps={}", decision.target_kbps);
+        println!("feedback_floor_kbps={}", decision.floor_kbps);
+        println!("feedback_ceiling_kbps={}", decision.ceiling_kbps);
+        println!("feedback_applied={}", decision.applied);
+        println!("feedback_path_mode={path_mode}");
+        match path_rtt_ms {
+            Some(rtt) => println!("feedback_path_rtt_ms={rtt:.3}"),
+            None => println!("feedback_path_rtt_ms=unknown"),
+        }
+    } else {
+        for field in [
+            "feedback_smoke",
+            "feedback_report_id",
+            "feedback_state",
+            "feedback_target_kbps",
+            "feedback_floor_kbps",
+            "feedback_ceiling_kbps",
+            "feedback_applied",
+            "feedback_path_mode",
+            "feedback_path_rtt_ms",
+        ] {
+            println!("{field}=not-requested");
+        }
+    }
     println!("path_mode={media_path_mode}");
     match media_path_rtt_ms {
         Some(rtt) => println!("path_rtt_ms={rtt:.3}"),
@@ -2681,8 +2773,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolution_stall_feedback_is_complete_and_keeps_the_observed_sequence() {
-        let report = resolution_stall_feedback(7, MediaFeedbackFlags::NONE, 42);
+    fn feedback_report_is_complete_and_keeps_the_observed_sequence() {
+        let report = complete_feedback_report(7, MediaFeedbackFlags::NONE, 42);
         report.validate().unwrap();
         assert_eq!(report.report_id, 7);
         assert_eq!(report.interval_ms, 1_000);
@@ -2694,7 +2786,7 @@ mod tests {
         assert_eq!(report.decode_p95_ms, Some(3));
         assert_eq!(report.presentation_p95_ms, Some(5));
 
-        let later = resolution_stall_feedback(8, MediaFeedbackFlags::NONE, 42);
+        let later = complete_feedback_report(8, MediaFeedbackFlags::NONE, 42);
         assert_eq!(later.last_sequence, report.last_sequence);
     }
 
@@ -3372,6 +3464,7 @@ mod tests {
         assert_eq!(default.identity, None);
         assert_eq!(default.invitation, None);
         assert_eq!(default.expect_size, None);
+        assert!(!default.feedback_smoke);
         let strict = Args::try_parse_from([
             "sigil-probe",
             "--node-id",
@@ -3381,6 +3474,10 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(strict.expect_size, Some((2_560, 1_600)));
+        let feedback =
+            Args::try_parse_from(["sigil-probe", "--node-id", &node_id, "--feedback-smoke"])
+                .unwrap();
+        assert!(feedback.feedback_smoke);
         for flags in [
             ["--media-v1", "--media-v2"],
             ["--media-v1", "--media-v3"],
@@ -3391,5 +3488,15 @@ mod tests {
                     .is_err()
             );
         }
+        assert!(
+            Args::try_parse_from([
+                "sigil-probe",
+                "--node-id",
+                &node_id,
+                "--feedback-smoke",
+                "--media-v3",
+            ])
+            .is_err()
+        );
     }
 }

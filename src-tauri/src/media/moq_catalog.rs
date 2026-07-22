@@ -35,13 +35,13 @@ impl GoqCatalogDocument {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MoqCatalogMode {
+pub(crate) enum MoqCatalogMode {
     GoqV1,
     AbsentStaticTrackCompat,
 }
 
 impl MoqCatalogMode {
-    pub(super) const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::GoqV1 => "goq-v1",
             Self::AbsentStaticTrackCompat => "absent-static-track-compat",
@@ -49,9 +49,9 @@ impl MoqCatalogMode {
     }
 }
 
-pub(super) struct MoqCatalogSelection {
-    pub(super) track: TrackConsumer,
-    pub(super) mode: MoqCatalogMode,
+pub(crate) struct MoqCatalogSelection {
+    pub(crate) track: TrackConsumer,
+    pub(crate) mode: MoqCatalogMode,
 }
 
 fn is_track_not_found(error: &MoqError) -> bool {
@@ -73,7 +73,7 @@ fn subscribe_static_video_track(
     })
 }
 
-pub(super) async fn subscribe_goq_video_track(
+pub(crate) async fn subscribe_goq_video_track(
     broadcast: &BroadcastConsumer,
     timeout: Duration,
 ) -> Result<MoqCatalogSelection, String> {

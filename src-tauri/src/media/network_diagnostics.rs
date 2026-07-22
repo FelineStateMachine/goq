@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard},
     time::{Duration, Instant},
 };
 
@@ -8,6 +9,14 @@ use serde::Serialize;
 
 const LATENCY_BUCKETS_MS: usize = 5_001;
 pub(crate) const INPUT_ACK_PENDING_CAPACITY: usize = 1_024;
+
+pub(crate) fn lock_network_diagnostics(
+    diagnostics: &StdMutex<NetworkSessionDiagnostics>,
+) -> StdMutexGuard<'_, NetworkSessionDiagnostics> {
+    diagnostics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

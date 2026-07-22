@@ -6,17 +6,20 @@ use super::state::{
 };
 use base64::Engine;
 use iroh::{Endpoint, SecretKey, endpoint::presets};
+use iroh_moq::{Moq, MoqSession};
+use moq_net::{BroadcastConsumer, GroupConsumer, Track, TrackConsumer};
 use openh264::{formats::YUVSource, nal_units};
 use serde::Serialize;
 use sigil_protocol::{
-    AUDIO_ALPN_V1, AudioFlags, AudioPacket, AudioPacketHeader, Capability, ClientHello, FrameFlags,
-    INPUT_ALPN_V1, InputEvent, InvitationGrants, KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3,
-    MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS, MEDIA_ALPN_V1, MEDIA_ALPN_V2,
-    MEDIA_ALPN_V3, MediaCodec, MediaControlRequestV3, MediaFrame, MediaObjectV3, PointerPosition,
+    AUDIO_ALPN_V1, AudioFlags, AudioPacket, AudioPacketHeader, CONTROL_ALPN_V1, Capability,
+    ClientHello, FrameFlags, INPUT_ALPN_V1, InputEvent, InvitationGrants, KeyframeRequestReasonV3,
+    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION,
+    MAX_VIDEO_PIXELS, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3, MOQ_VIDEO_H264_TRACK,
+    MediaCodec, MediaControlRequestV3, MediaFrame, MediaObjectV3, PointerPosition,
     PointerSurfaceDimensions, ProtocolError, RELATIVE_POINTER_DELTA_MAX,
-    RELATIVE_POINTER_DELTA_MIN, read_host_hello, read_input_ack, read_media_frame,
-    read_media_object, read_media_object_v3, write_client_hello, write_input_event,
-    write_media_control_request_v3,
+    RELATIVE_POINTER_DELTA_MIN, decode_media_frame_object, media_moq_broadcast_name,
+    read_host_hello, read_input_ack, read_media_frame, read_media_object, read_media_object_v3,
+    write_client_hello, write_input_event, write_media_control_request_v3,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Cursor;
@@ -71,6 +74,9 @@ fn emit_frame_error(app: &AppHandle, generation: u64, error: impl Into<String>) 
 const LEGACY_MEDIA_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_MEDIA_OBJECT_CAPACITY: usize = 4;
 const CLIENT_MEDIA_OBJECT_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const CLIENT_MOQ_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CLIENT_MOQ_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLIENT_MOQ_GROUP_RECOVERY_TIMEOUT: Duration = Duration::from_millis(250);
 // Absorb brief webview→Rust acknowledgment jitter without allowing Tauri IPC
 // to grow without bound. Four 60 fps frames cap this handoff at about 67 ms;
 // WebCodecs has a separate, stricter decode-queue bound in the frontend.
@@ -655,6 +661,7 @@ struct NegotiatedV1Stream {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaTransport {
+    UpstreamMoq,
     LegacyV0,
     ReliableStreamV1,
     IndependentObjectsV2,
@@ -664,11 +671,316 @@ enum MediaTransport {
 impl MediaTransport {
     const fn diagnostic_name(self) -> &'static str {
         match self {
+            Self::UpstreamMoq => "iroh-moq",
             Self::LegacyV0 => "reliable-v0",
             Self::ReliableStreamV1 => "reliable-v1",
             Self::IndependentObjectsV2 => "independent-v2",
             Self::GroupedObjectsV3 => "grouped-v3",
         }
+    }
+}
+
+#[derive(Debug)]
+enum MoqMediaReadOutcome {
+    Frame {
+        frame: MediaFrame,
+        discontinuity: bool,
+    },
+    Dropped {
+        reason: KeyframeRequestReasonV3,
+    },
+    Malformed(String),
+}
+
+struct MoqGroupCursor {
+    group: GroupConsumer,
+    sequence: u64,
+    object_count: usize,
+    object_bytes: usize,
+    group_gap: bool,
+    replacement_for_cancelled_group: bool,
+}
+
+/// Own every upstream handle for as long as the Portal frame task is alive.
+/// In particular, dropping `Moq` aborts its actor and dropping the consumers
+/// cancels their subscriptions, so none of these may be scoped only to setup.
+struct MoqMediaLifetime {
+    _moq: Moq,
+    _session: MoqSession,
+    _broadcast: BroadcastConsumer,
+}
+
+struct MoqMediaReceiver {
+    _lifetime: Option<MoqMediaLifetime>,
+    track: TrackConsumer,
+    current_group: Option<MoqGroupCursor>,
+    last_group_sequence: Option<u64>,
+    last_frame_sequence: Option<u64>,
+    waiting_for_keyframe: bool,
+    pending_group_recovery: Option<KeyframeRequestReasonV3>,
+}
+
+impl MoqMediaReceiver {
+    fn new(
+        moq: Moq,
+        session: MoqSession,
+        broadcast: BroadcastConsumer,
+        track: TrackConsumer,
+    ) -> Self {
+        Self {
+            _lifetime: Some(MoqMediaLifetime {
+                _moq: moq,
+                _session: session,
+                _broadcast: broadcast,
+            }),
+            track,
+            current_group: None,
+            last_group_sequence: None,
+            last_frame_sequence: None,
+            waiting_for_keyframe: true,
+            pending_group_recovery: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(track: TrackConsumer) -> Self {
+        Self {
+            _lifetime: None,
+            track,
+            current_group: None,
+            last_group_sequence: None,
+            last_frame_sequence: None,
+            waiting_for_keyframe: true,
+            pending_group_recovery: None,
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<MoqMediaReadOutcome>, String> {
+        loop {
+            if self.current_group.is_none() {
+                let replacement_for_cancelled_group = self.pending_group_recovery.is_some();
+                let group = if replacement_for_cancelled_group {
+                    match tokio::time::timeout(
+                        CLIENT_MOQ_GROUP_RECOVERY_TIMEOUT,
+                        self.track.next_group(),
+                    )
+                    .await
+                    {
+                        Ok(group) => group,
+                        Err(_) => {
+                            let reason = self
+                                .pending_group_recovery
+                                .take()
+                                .expect("pending MoQ recovery reason was present");
+                            return Ok(Some(MoqMediaReadOutcome::Dropped { reason }));
+                        }
+                    }
+                } else {
+                    self.track.next_group().await
+                }
+                .map_err(|error| format!("Upstream MoQ video track failed: {error}"))?;
+                let Some(group) = group else {
+                    return Ok(None);
+                };
+                self.pending_group_recovery = None;
+                let sequence = group.sequence;
+                let group_gap =
+                    match classify_moq_group_sequence(self.last_group_sequence, sequence) {
+                        Ok(group_gap) => group_gap,
+                        Err(error) => return Ok(Some(MoqMediaReadOutcome::Malformed(error))),
+                    };
+                if group_gap {
+                    self.waiting_for_keyframe = true;
+                }
+                self.current_group = Some(MoqGroupCursor {
+                    group,
+                    sequence,
+                    object_count: 0,
+                    object_bytes: 0,
+                    group_gap,
+                    replacement_for_cancelled_group,
+                });
+            }
+
+            let cursor = self
+                .current_group
+                .as_mut()
+                .expect("MoQ group cursor was initialized");
+            let object = match cursor.group.read_frame().await {
+                Ok(object) => object,
+                Err(error) if moq_group_error_is_recoverable(&error) => {
+                    let sequence = cursor.sequence;
+                    self.last_group_sequence = Some(sequence);
+                    self.current_group = None;
+                    self.waiting_for_keyframe = true;
+                    self.pending_group_recovery = Some(moq_group_error_reason(&error));
+                    continue;
+                }
+                Err(error) => {
+                    return Ok(Some(MoqMediaReadOutcome::Malformed(format!(
+                        "Upstream MoQ group {} failed: {error}",
+                        cursor.sequence
+                    ))));
+                }
+            };
+            let Some(object) = object else {
+                if cursor.object_count == 0 {
+                    if cursor.replacement_for_cancelled_group {
+                        self.last_group_sequence = Some(cursor.sequence);
+                        self.current_group = None;
+                        self.waiting_for_keyframe = true;
+                        return Ok(Some(MoqMediaReadOutcome::Dropped {
+                            reason: KeyframeRequestReasonV3::TransportGap,
+                        }));
+                    }
+                    return Ok(Some(MoqMediaReadOutcome::Malformed(format!(
+                        "Upstream MoQ group {} was empty",
+                        cursor.sequence
+                    ))));
+                }
+                self.last_group_sequence = Some(cursor.sequence);
+                self.current_group = None;
+                continue;
+            };
+
+            let next_group_bytes = match validate_moq_object_bounds(
+                cursor.sequence,
+                cursor.object_count,
+                cursor.object_bytes,
+                object.len(),
+            ) {
+                Ok(next_group_bytes) => next_group_bytes,
+                Err(error) => return Ok(Some(MoqMediaReadOutcome::Malformed(error))),
+            };
+            let frame = match decode_media_frame_object(&object) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    return Ok(Some(MoqMediaReadOutcome::Malformed(format!(
+                        "Invalid upstream MoQ media object in group {} object {}: {error}",
+                        cursor.sequence, cursor.object_count
+                    ))));
+                }
+            };
+
+            let first_object = cursor.object_count == 0;
+            let frame_contiguous = match validate_moq_group_frame(
+                cursor.sequence,
+                first_object,
+                self.last_frame_sequence,
+                &frame,
+            ) {
+                Ok(frame_contiguous) => frame_contiguous,
+                Err(_error) if first_object && cursor.replacement_for_cancelled_group => {
+                    self.last_group_sequence = Some(cursor.sequence);
+                    self.current_group = None;
+                    self.waiting_for_keyframe = true;
+                    return Ok(Some(MoqMediaReadOutcome::Dropped {
+                        reason: KeyframeRequestReasonV3::TransportGap,
+                    }));
+                }
+                Err(_error) if !first_object => {
+                    self.last_group_sequence = Some(cursor.sequence);
+                    self.current_group = None;
+                    self.waiting_for_keyframe = true;
+                    return Ok(Some(MoqMediaReadOutcome::Dropped {
+                        reason: KeyframeRequestReasonV3::TransportGap,
+                    }));
+                }
+                Err(error) => return Ok(Some(MoqMediaReadOutcome::Malformed(error))),
+            };
+            let discontinuity = self.waiting_for_keyframe
+                || (first_object && cursor.group_gap)
+                || (first_object && !frame_contiguous)
+                || frame.header.flags.contains(FrameFlags::DISCONTINUITY);
+            cursor.object_count += 1;
+            cursor.object_bytes = next_group_bytes;
+            self.last_frame_sequence = Some(frame.header.sequence);
+            self.waiting_for_keyframe = false;
+            return Ok(Some(MoqMediaReadOutcome::Frame {
+                frame,
+                discontinuity,
+            }));
+        }
+    }
+}
+
+fn classify_moq_group_sequence(previous: Option<u64>, current: u64) -> Result<bool, String> {
+    let Some(previous) = previous else {
+        return Ok(false);
+    };
+    if current <= previous {
+        return Err(format!(
+            "Upstream MoQ group sequence did not increase: previous={previous}, current={current}"
+        ));
+    }
+    Ok(previous.checked_add(1) != Some(current))
+}
+
+fn validate_moq_object_bounds(
+    group_sequence: u64,
+    object_count: usize,
+    object_bytes: usize,
+    object_len: usize,
+) -> Result<usize, String> {
+    let max_objects = MAX_MEDIA_OBJECT_ID_V3 as usize + 1;
+    if object_count >= max_objects {
+        return Err(format!(
+            "Upstream MoQ group {group_sequence} exceeded {max_objects} media objects"
+        ));
+    }
+    let next_group_bytes = object_bytes
+        .checked_add(object_len)
+        .ok_or_else(|| "Upstream MoQ group byte count overflowed".to_string())?;
+    if next_group_bytes > MAX_MEDIA_GROUP_BYTES_V3 {
+        return Err(format!(
+            "Upstream MoQ group {group_sequence} exceeded the {MAX_MEDIA_GROUP_BYTES_V3} byte limit"
+        ));
+    }
+    Ok(next_group_bytes)
+}
+
+fn validate_moq_group_frame(
+    group_sequence: u64,
+    first_object: bool,
+    last_frame_sequence: Option<u64>,
+    frame: &MediaFrame,
+) -> Result<bool, String> {
+    if first_object
+        && !(frame.header.codec == MediaCodec::H264
+            && frame.header.flags.contains(FrameFlags::KEYFRAME)
+            && frame.header.flags.contains(FrameFlags::CODEC_CONFIG))
+    {
+        return Err(format!(
+            "Upstream MoQ group {group_sequence} did not begin with a configured H.264 keyframe"
+        ));
+    }
+    let contiguous = last_frame_sequence
+        .is_none_or(|previous| previous.checked_add(1) == Some(frame.header.sequence));
+    if !first_object && !contiguous {
+        return Err(format!(
+            "Upstream MoQ group {group_sequence} contains a non-contiguous access-unit sequence"
+        ));
+    }
+    Ok(contiguous)
+}
+
+fn moq_group_error_is_recoverable(error: &moq_net::Error) -> bool {
+    matches!(
+        error,
+        moq_net::Error::Cancel
+            | moq_net::Error::Old
+            | moq_net::Error::Timeout
+            | moq_net::Error::Dropped
+            | moq_net::Error::CacheFull
+            | moq_net::Error::Remote(0 | 2 | 3 | 24 | 26)
+    )
+}
+
+fn moq_group_error_reason(error: &moq_net::Error) -> KeyframeRequestReasonV3 {
+    if matches!(error, moq_net::Error::Timeout | moq_net::Error::Remote(3)) {
+        KeyframeRequestReasonV3::DeliveryTimeout
+    } else {
+        KeyframeRequestReasonV3::TransportGap
     }
 }
 
@@ -1386,7 +1698,7 @@ fn connect_error_is_unsupported_alpn(error: &iroh::endpoint::ConnectError) -> bo
     }
 }
 
-async fn open_negotiated_media_stream(
+async fn open_legacy_negotiated_media_stream(
     endpoint: &Endpoint,
     address: &iroh::EndpointAddr,
     nonce: [u8; 16],
@@ -1494,6 +1806,99 @@ async fn open_negotiated_media_stream(
             "Media v3 connection failed without an explicit unsupported-ALPN signal; refusing an unsafe compatibility downgrade: {v3_error}"
         )),
     }
+}
+
+async fn open_negotiated_media_stream(
+    endpoint: &Endpoint,
+    address: &iroh::EndpointAddr,
+    nonce: [u8; 16],
+    invitation: Option<&str>,
+) -> Result<
+    (
+        iroh::endpoint::Connection,
+        iroh::endpoint::RecvStream,
+        Option<iroh::endpoint::SendStream>,
+        NegotiatedV1Stream,
+        MediaTransport,
+    ),
+    String,
+> {
+    match endpoint.connect(address.clone(), CONTROL_ALPN_V1).await {
+        Ok(connection) => {
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .map_err(|error| format!("Failed to open control handshake: {error}"))?;
+            let negotiation = negotiate_v1(
+                &mut send,
+                &mut recv,
+                nonce,
+                vec![Capability::VideoH264],
+                Some(Capability::VideoH264),
+                "control",
+                invitation,
+            )
+            .await?;
+            // CONTROL owns the authenticated host lease. Keep both the
+            // connection and the client->host send leg alive for keyframe
+            // requests while media uses a separate upstream MoQ session.
+            Ok((
+                connection,
+                recv,
+                Some(send),
+                negotiation,
+                MediaTransport::UpstreamMoq,
+            ))
+        }
+        Err(control_error) if connect_error_is_unsupported_alpn(&control_error) => {
+            open_legacy_negotiated_media_stream(endpoint, address, nonce, invitation).await
+        }
+        Err(control_error) => Err(format!(
+            "Control connection failed without an explicit unsupported-ALPN signal; refusing an unsafe media downgrade: {control_error}"
+        )),
+    }
+}
+
+async fn open_upstream_moq_media(
+    endpoint: &Endpoint,
+    address: &iroh::EndpointAddr,
+    session_id: u64,
+) -> Result<(MoqMediaReceiver, iroh::endpoint::Connection), String> {
+    let broadcast_name = media_moq_broadcast_name(session_id)
+        .map_err(|error| format!("Invalid MoQ media session name: {error}"))?;
+    let moq = Moq::new(endpoint.clone());
+    let mut session =
+        tokio::time::timeout(CLIENT_MOQ_CONNECT_TIMEOUT, moq.connect(address.clone()))
+            .await
+            .map_err(|_| "Timed out connecting upstream MoQ media session".to_string())?
+            .map_err(|error| format!("Failed to connect upstream MoQ media session: {error:#}"))?;
+    if session.remote_id() != address.id {
+        session.close(1, b"remote identity mismatch");
+        return Err(format!(
+            "Upstream MoQ connected to unexpected peer {}; expected {}",
+            session.remote_id(),
+            address.id
+        ));
+    }
+    let diagnostics_connection = session.conn().clone();
+    let broadcast = tokio::time::timeout(
+        CLIENT_MOQ_SUBSCRIBE_TIMEOUT,
+        session.subscribe(&broadcast_name),
+    )
+    .await
+    .map_err(|_| format!("Timed out waiting for upstream MoQ broadcast {broadcast_name}"))?
+    .map_err(|error| {
+        format!("Failed to subscribe to upstream MoQ broadcast {broadcast_name}: {error}")
+    })?;
+    let track = broadcast
+        .subscribe_track(&Track::new(MOQ_VIDEO_H264_TRACK))
+        .map_err(|error| {
+            format!("Failed to subscribe to upstream MoQ track {MOQ_VIDEO_H264_TRACK}: {error}")
+        })?;
+    Ok((
+        MoqMediaReceiver::new(moq, session, broadcast, track),
+        diagnostics_connection,
+    ))
 }
 
 async fn run_media_control_writer_v3(
@@ -2082,10 +2487,32 @@ pub async fn iroh_client_connect(
                 .map_err(|e| format!("Failed to finish frame start stream: {e}"))?;
             (connection, recv, None, None, MediaTransport::LegacyV0)
         };
-    let frame_connection_for_stats = frame_conn.clone();
     let media_session_id = media_negotiation
         .as_ref()
         .map(|negotiation| negotiation.session_id);
+    let (upstream_moq_media, frame_connection_for_stats) = if media_transport
+        == MediaTransport::UpstreamMoq
+    {
+        let session_id = media_session_id
+            .ok_or_else(|| "Host omitted the control session ID required by MoQ".to_string())?;
+        let (receiver, diagnostics_connection) =
+            match open_upstream_moq_media(&endpoint, &addr, session_id).await {
+                Ok(media) => media,
+                Err(error) => {
+                    // CONTROL already authenticated and owns the host's
+                    // one-client lease. A post-auth MoQ failure is
+                    // terminal, and must explicitly release that lease;
+                    // it must never fall through to a legacy media ALPN.
+                    frame_conn.close(1_u32.into(), b"upstream MoQ setup failed");
+                    let _ =
+                        tokio::time::timeout(CLIENT_ENDPOINT_CLOSE_TIMEOUT, endpoint.close()).await;
+                    return Err(error);
+                }
+            };
+        (Some(receiver), diagnostics_connection)
+    } else {
+        (None, frame_conn.clone())
+    };
     let pointer_surface_dimensions = media_negotiation
         .as_ref()
         .and_then(|negotiation| negotiation.pointer_surface_dimensions);
@@ -2264,7 +2691,9 @@ pub async fn iroh_client_connect(
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
         *state.media_control.lock().await = Some((media_generation, control_tx.clone()));
         tokio::spawn(run_media_control_writer_v3(control_stream, control_rx));
-        let _ = control_tx.try_send((KeyframeRequestReasonV3::Join, None));
+        if media_transport == MediaTransport::GroupedObjectsV3 {
+            let _ = control_tx.try_send((KeyframeRequestReasonV3::Join, None));
+        }
         Some(control_tx)
     } else {
         *state.media_control.lock().await = None;
@@ -2390,6 +2819,7 @@ pub async fn iroh_client_connect(
         let mut media_objects_v3 = (media_transport == MediaTransport::GroupedObjectsV3)
             .then(|| MediaObjectReceiverV3::new(frame_connection_for_stats.clone()));
         let mut media_object_sequence_v3 = MediaObjectSequenceV3::new();
+        let mut upstream_moq_media = upstream_moq_media;
 
         let mut decoder = if use_webcodecs {
             None
@@ -2456,6 +2886,64 @@ pub async fn iroh_client_connect(
                 pts_micros,
                 discontinuity,
             ) = match media_transport {
+                MediaTransport::UpstreamMoq => {
+                    let receiver = upstream_moq_media
+                        .as_mut()
+                        .expect("upstream MoQ receiver must exist for MoQ transport");
+                    loop {
+                        let outcome = match receiver.next().await {
+                            Ok(Some(outcome)) => outcome,
+                            Ok(None) => {
+                                emit_frame_error(
+                                    &app,
+                                    media_generation,
+                                    "Upstream MoQ video track closed",
+                                );
+                                break 'frames;
+                            }
+                            Err(error) => {
+                                emit_frame_error(&app, media_generation, error);
+                                break 'frames;
+                            }
+                        };
+                        match outcome {
+                            MoqMediaReadOutcome::Dropped { reason } => {
+                                frontend_waiting_for_keyframe = true;
+                                let mut metrics = lock_client_media_metrics(&metrics);
+                                metrics.observe_transport_object_drop(false);
+                                metrics.begin_frontend_resync(metrics_started.elapsed());
+                                try_queue_media_keyframe_request(
+                                    media_control_requests.as_ref(),
+                                    reason,
+                                    receiver.last_frame_sequence,
+                                );
+                            }
+                            MoqMediaReadOutcome::Malformed(error) => {
+                                emit_frame_error(&app, media_generation, error);
+                                break 'frames;
+                            }
+                            MoqMediaReadOutcome::Frame {
+                                frame,
+                                discontinuity,
+                            } => {
+                                let codec = match frame.header.codec {
+                                    MediaCodec::H264 => "h264".to_string(),
+                                };
+                                break (
+                                    u32::from(frame.header.width),
+                                    u32::from(frame.header.height),
+                                    frame.payload,
+                                    frame.header.flags.contains(FrameFlags::KEYFRAME),
+                                    codec,
+                                    Some(frame.header.sequence),
+                                    Some(frame.header.capture_timestamp_us),
+                                    Some(frame.header.pts_us),
+                                    discontinuity,
+                                );
+                            }
+                        }
+                    }
+                }
                 MediaTransport::GroupedObjectsV3 => {
                     let receiver = media_objects_v3
                         .as_mut()
@@ -2977,6 +3465,178 @@ mod tests {
             accept_index,
             object: media_object_v3(group_id, object_id, sequence, flags),
         }
+    }
+
+    #[test]
+    fn upstream_moq_group_ids_detect_only_real_transport_gaps() {
+        assert!(!classify_moq_group_sequence(None, 41).unwrap());
+        assert!(!classify_moq_group_sequence(Some(41), 42).unwrap());
+        assert!(classify_moq_group_sequence(Some(42), 44).unwrap());
+        assert!(classify_moq_group_sequence(Some(44), 44).is_err());
+        assert!(classify_moq_group_sequence(Some(44), 43).is_err());
+    }
+
+    #[test]
+    fn upstream_moq_group_gap_keyframe_is_the_recovery_barrier() {
+        let keyframe = media_object_frame(80, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        let contiguous = validate_moq_group_frame(9, true, Some(42), &keyframe).unwrap();
+        assert!(!contiguous);
+
+        // A native group-id gap puts the decoder into resync, but this exact
+        // configured frame 0 exits it immediately. There is deliberately no
+        // keyframe-request action on MoqMediaReadOutcome::Frame: requesting a
+        // replacement here would recreate the grouped-v3 feedback loop.
+        let group_gap = classify_moq_group_sequence(Some(7), 9).unwrap();
+        let discontinuity = group_gap || !contiguous;
+        assert!(discontinuity);
+    }
+
+    #[tokio::test]
+    async fn upstream_moq_idr_abort_to_next_frame_zero_has_no_feedback_loop() {
+        let mut producer = Track::new(MOQ_VIDEO_H264_TRACK).produce();
+        let mut receiver = MoqMediaReceiver::for_test(producer.consume());
+
+        let mut prior_group = producer.append_group().unwrap();
+        let prior_keyframe =
+            media_object_frame(40, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        prior_group
+            .write_frame(sigil_protocol::encode_media_frame_object(&prior_keyframe).unwrap())
+            .unwrap();
+        assert!(matches!(
+            receiver.next().await.unwrap(),
+            Some(MoqMediaReadOutcome::Frame { .. })
+        ));
+
+        prior_group.abort(moq_net::Error::Cancel).unwrap();
+        let mut replacement = producer.append_group().unwrap();
+        let replacement_keyframe =
+            media_object_frame(80, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        replacement
+            .write_frame(sigil_protocol::encode_media_frame_object(&replacement_keyframe).unwrap())
+            .unwrap();
+        replacement.finish().unwrap();
+
+        // `next` consumes the expected Cancel internally and returns the
+        // replacement frame directly. A Dropped outcome here would enqueue a
+        // needless keyframe request and recreate the recovery feedback loop.
+        assert!(matches!(
+            receiver.next().await.unwrap(),
+            Some(MoqMediaReadOutcome::Frame {
+                discontinuity: true,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn upstream_moq_cancel_without_bounded_replacement_requests_recovery() {
+        let mut producer = Track::new(MOQ_VIDEO_H264_TRACK).produce();
+        let mut receiver = MoqMediaReceiver::for_test(producer.consume());
+        let mut group = producer.append_group().unwrap();
+        let keyframe = media_object_frame(1, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        group
+            .write_frame(sigil_protocol::encode_media_frame_object(&keyframe).unwrap())
+            .unwrap();
+        assert!(matches!(
+            receiver.next().await.unwrap(),
+            Some(MoqMediaReadOutcome::Frame { .. })
+        ));
+        group.abort(moq_net::Error::Cancel).unwrap();
+
+        assert!(matches!(
+            receiver.next().await.unwrap(),
+            Some(MoqMediaReadOutcome::Dropped {
+                reason: KeyframeRequestReasonV3::TransportGap
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn upstream_moq_invalid_cancel_replacement_requests_recovery() {
+        let mut producer = Track::new(MOQ_VIDEO_H264_TRACK).produce();
+        let mut receiver = MoqMediaReceiver::for_test(producer.consume());
+        let mut prior = producer.append_group().unwrap();
+        let keyframe = media_object_frame(10, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        prior
+            .write_frame(sigil_protocol::encode_media_frame_object(&keyframe).unwrap())
+            .unwrap();
+        assert!(matches!(
+            receiver.next().await.unwrap(),
+            Some(MoqMediaReadOutcome::Frame { .. })
+        ));
+        prior.abort(moq_net::Error::Cancel).unwrap();
+
+        let mut invalid_replacement = producer.append_group().unwrap();
+        let delta = media_object_frame(11, FrameFlags::NONE);
+        invalid_replacement
+            .write_frame(sigil_protocol::encode_media_frame_object(&delta).unwrap())
+            .unwrap();
+        invalid_replacement.finish().unwrap();
+        assert!(matches!(
+            receiver.next().await.unwrap(),
+            Some(MoqMediaReadOutcome::Dropped {
+                reason: KeyframeRequestReasonV3::TransportGap
+            })
+        ));
+    }
+
+    #[test]
+    fn upstream_moq_requires_configured_keyframe_zero_and_contiguous_deltas() {
+        let delta = media_object_frame(10, FrameFlags::NONE);
+        assert!(validate_moq_group_frame(3, true, None, &delta).is_err());
+
+        let unconfigured_keyframe = media_object_frame(10, FrameFlags::KEYFRAME);
+        assert!(validate_moq_group_frame(3, true, None, &unconfigured_keyframe).is_err());
+
+        let configured =
+            media_object_frame(10, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        assert!(validate_moq_group_frame(3, true, None, &configured).is_ok());
+        assert!(validate_moq_group_frame(3, false, Some(8), &delta).is_err());
+        assert!(validate_moq_group_frame(3, false, Some(9), &delta).is_ok());
+    }
+
+    #[test]
+    fn upstream_moq_bounds_objects_and_group_bytes_before_growth() {
+        assert_eq!(validate_moq_object_bounds(1, 0, 0, 40).unwrap(), 40);
+        assert!(validate_moq_object_bounds(1, MAX_MEDIA_OBJECT_ID_V3 as usize + 1, 0, 1,).is_err());
+        assert!(validate_moq_object_bounds(1, 0, MAX_MEDIA_GROUP_BYTES_V3, 1).is_err());
+        assert!(validate_moq_object_bounds(1, 0, usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn upstream_moq_cancellation_is_resync_but_protocol_errors_are_terminal() {
+        for recoverable in [
+            moq_net::Error::Cancel,
+            moq_net::Error::Old,
+            moq_net::Error::Timeout,
+            moq_net::Error::Dropped,
+            moq_net::Error::CacheFull,
+            moq_net::Error::Remote(3),
+        ] {
+            assert!(moq_group_error_is_recoverable(&recoverable));
+        }
+        assert!(!moq_group_error_is_recoverable(
+            &moq_net::Error::ProtocolViolation
+        ));
+        assert!(!moq_group_error_is_recoverable(&moq_net::Error::WrongSize));
+        assert_eq!(
+            moq_group_error_reason(&moq_net::Error::Timeout),
+            KeyframeRequestReasonV3::DeliveryTimeout
+        );
+        assert_eq!(
+            moq_group_error_reason(&moq_net::Error::Cancel),
+            KeyframeRequestReasonV3::TransportGap
+        );
+    }
+
+    #[test]
+    fn upstream_moq_transport_is_distinct_from_legacy_compatibility() {
+        assert_eq!(MediaTransport::UpstreamMoq.diagnostic_name(), "iroh-moq");
+        assert_ne!(
+            MediaTransport::UpstreamMoq,
+            MediaTransport::GroupedObjectsV3
+        );
+        assert!(decode_media_frame_object(&[0_u8; 8]).is_err());
     }
 
     fn completed_object_index(outcome: &MediaObjectReadOutcome) -> Option<u64> {

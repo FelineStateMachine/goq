@@ -7,16 +7,20 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::presets};
 use iroh_moq::{Moq, MoqSession};
-use moq_net::{BroadcastConsumer, GroupConsumer, Track, TrackConsumer};
+use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
 use sigil_protocol::{
     CONTROL_ALPN_V1, Capability, ClientHello, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN,
     GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, InputEvent, KeyframeRequestReasonV3,
     MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3,
-    MOQ_VIDEO_H264_TRACK, MediaCodec, MediaControlRequestV3, MediaFrame, MediaObjectV3,
-    PointerSurfaceDimensions, ProtocolError, decode_media_frame_object, media_moq_broadcast_name,
-    read_host_hello, read_input_ack, read_media_frame, read_media_object, read_media_object_v3,
-    write_client_hello, write_input_event, write_media_control_request_v3,
+    MediaCodec, MediaControlRequestV3, MediaFrame, MediaObjectV3, PointerSurfaceDimensions,
+    ProtocolError, decode_media_frame_object, media_moq_broadcast_name, read_host_hello,
+    read_input_ack, read_media_frame, read_media_object, read_media_object_v3, write_client_hello,
+    write_input_event, write_media_control_request_v3,
 };
+
+mod moq_catalog;
+
+use moq_catalog::{MoqCatalogMode, subscribe_goq_video_track};
 
 const MEDIA_OBJECT_CAPACITY: usize = 4;
 
@@ -641,6 +645,7 @@ struct MoqProbeLifetime {
 struct MoqProbeReceiver {
     lifetime: MoqProbeLifetime,
     track: TrackConsumer,
+    catalog_mode: MoqCatalogMode,
     current_group: Option<MoqProbeGroupCursor>,
     last_group_sequence: Option<u64>,
     last_frame_sequence: Option<u64>,
@@ -679,16 +684,17 @@ impl MoqProbeReceiver {
                 format!("timed out subscribing to upstream MoQ broadcast {broadcast_name}")
             })?
             .with_context(|| format!("subscribing to upstream MoQ broadcast {broadcast_name}"))?;
-        let track = broadcast
-            .subscribe_track(&Track::new(MOQ_VIDEO_H264_TRACK))
-            .with_context(|| format!("subscribing to MoQ track {MOQ_VIDEO_H264_TRACK}"))?;
+        let catalog = subscribe_goq_video_track(&broadcast, timeout)
+            .await
+            .context("resolving Goq MoQ catalog")?;
         Ok(Self {
             lifetime: MoqProbeLifetime {
                 _moq: moq,
                 session,
                 _broadcast: broadcast,
             },
-            track,
+            track: catalog.track,
+            catalog_mode: catalog.mode,
             current_group: None,
             last_group_sequence: None,
             last_frame_sequence: None,
@@ -1508,6 +1514,14 @@ async fn main() -> Result<()> {
         }
     );
     if media_transport == MediaTransport::UpstreamMoq {
+        println!(
+            "moq_catalog={}",
+            moq_receiver
+                .as_ref()
+                .expect("upstream MoQ receiver is present")
+                .catalog_mode
+                .label()
+        );
         println!("moq_group_capacity=1");
         println!("moq_cancelled_groups={moq_cancelled_groups}");
         println!("moq_group_gaps={moq_group_gaps}");
@@ -1516,6 +1530,7 @@ async fn main() -> Result<()> {
         println!("moq_maximum_group_bytes={moq_maximum_group_bytes}");
         println!("moq_historical_suffix_frames={moq_historical_suffix_frames}");
     } else {
+        println!("moq_catalog=not-applicable");
         for field in [
             "moq_group_capacity",
             "moq_cancelled_groups",

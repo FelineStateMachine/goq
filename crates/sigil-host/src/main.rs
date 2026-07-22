@@ -5,6 +5,7 @@ mod config;
 mod cursor;
 mod identity;
 mod input;
+mod moq_catalog;
 mod server;
 mod source;
 

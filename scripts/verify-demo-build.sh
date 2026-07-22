@@ -101,6 +101,16 @@ if grep -Eiq '(^|[[:space:]├└│─])(tauri|wry|webkit)([[:space:]-]|$)' <<<
   exit 1
 fi
 
+catalog_dependencies="$({
+  cargo tree --locked -p sigil-host --edges normal
+  cargo tree --locked -p portal --edges normal
+})"
+if grep -Eiq '(^|[[:space:]├└│─])(moq-media|moq-mux)([[:space:]-]|$)' <<<"$catalog_dependencies"; then
+  echo 'MoQ catalog boundary failed: standard-media dependency detected' >&2
+  grep -Ei 'moq-media|moq-mux' <<<"$catalog_dependencies" >&2
+  exit 1
+fi
+
 ./scripts/loopback-proof.sh
 
 cargo test --locked -p portal --release \

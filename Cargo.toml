@@ -6,6 +6,8 @@ resolver = "2"
 bytes = "1.11"
 iroh = { version = "=1.0.3", default-features = false, features = ["metrics", "portmapper", "fast-apple-datapath", "tls-aws-lc-rs"] }
 iroh-moq = { version = "=0.1.0", git = "https://github.com/n0-computer/iroh-live", rev = "5f95758fcd1450e443a9134c9d9342bcc3957b85" }
+hang = "=0.19.1"
+moq-json = "=0.0.3"
 moq-net = "=0.1.11"
 web-transport-iroh = "=0.6.0"
 

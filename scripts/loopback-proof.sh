@@ -429,6 +429,7 @@ validate_probe_log() {
     grep -Fxq 'control_alpn=sigil/control/1' "$log_path" || return 1
     grep -Fxq 'group_sequence=monotonic' "$log_path" || return 1
     grep -Fxq 'moq_group_capacity=1' "$log_path" || return 1
+    grep -Fxq 'moq_catalog=goq-v1' "$log_path" || return 1
     grep -Fxq 'moq_unrecovered_group_gaps=0' "$log_path" || return 1
     grep -Fxq 'moq_historical_suffix_frames=0' "$log_path" || return 1
     grep -Fxq 'recovery_barrier=configured-idr' "$log_path" || return 1
@@ -622,7 +623,7 @@ printf 'probe_binary=%s\n' "$probe_bin"
 printf 'probe_sha256=%s\n' "$(sha256_file "$probe_bin")"
 printf 'node_id=%s\n' "$node_id"
 printf 'primary_frames=%s\n' "$primary_frames"
-grep -E '^(transport|control_alpn|transport_alpn|first_configured_idr|frame_sequence|group_sequence|keyframe_recovery|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|moq_group_capacity|moq_cancelled_groups|moq_group_gaps|moq_unrecovered_group_gaps|moq_maximum_group_objects|moq_maximum_group_bytes|moq_historical_suffix_frames|recovery_barrier|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
+grep -E '^(transport|control_alpn|transport_alpn|first_configured_idr|frame_sequence|group_sequence|keyframe_recovery|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|moq_catalog|moq_group_capacity|moq_cancelled_groups|moq_group_gaps|moq_unrecovered_group_gaps|moq_maximum_group_objects|moq_maximum_group_bytes|moq_historical_suffix_frames|recovery_barrier|input_ack_micros|path_mode|path_rtt_ms)=' "$primary_log"
 printf 'keyframe_request_correlation=%s\n' \
   "$([[ "$media_v1" == false && "$media_v2" == false ]] && printf unique || printf not-requested)"
 printf 'active_client_rejection=ok\n'

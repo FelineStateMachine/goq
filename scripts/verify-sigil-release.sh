@@ -248,7 +248,7 @@ expected_values = {
     "version": release_tag[1:],
     "target": "x86_64-unknown-linux-gnu.2.17",
     "profile": "release",
-    "features": ["default"],
+    "features": ["default", "in-process-gstreamer"],
     "demo_direct_node": False,
     "git_dirty": False,
     "binary_provenance": "self-built-clean-head",

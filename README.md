@@ -139,11 +139,11 @@ Requirements:
 - Tauri v2 system dependencies
 - A FIDO2 key with `hmac-secret` support for the normal identity flow
 
-The optional Linux `in-process-gstreamer` host feature additionally needs the
-GStreamer core, app, and video development libraries. Its matching runtime
-libraries and plugins, including `appsink`, must be installed on the host. The
-published Sigil package remains a default-feature build until native Bazzite
-and cross-build linking are proven.
+The Linux `in-process-gstreamer` host feature additionally needs the GStreamer
+core, app, and video development libraries at build time. Its matching runtime
+libraries and plugins, including `appsink`, must be installed on the host.
+Published Sigil packages include this feature while retaining the external
+pipeline as the runtime default until a host opts into the in-process backend.
 
 ### Enroll one Portal
 

@@ -71,7 +71,13 @@ if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
   echo 'in_process_gstreamer_gate=ok'
 fi
 if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
-  cargo zigbuild --locked -p sigil-host --target x86_64-unknown-linux-gnu.2.17
+  if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
+    PKG_CONFIG_ALLOW_CROSS=1 cargo zigbuild --locked -p sigil-host --bins \
+      --target x86_64-unknown-linux-gnu.2.17 --features in-process-gstreamer
+  else
+    cargo zigbuild --locked -p sigil-host --bins \
+      --target x86_64-unknown-linux-gnu.2.17
+  fi
   echo 'linux_cross_build=ok'
 else
   echo 'linux_cross_build=skipped (cargo-zigbuild and zig are both required)'

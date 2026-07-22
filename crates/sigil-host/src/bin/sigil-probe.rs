@@ -33,8 +33,10 @@ struct Args {
     /// cadence. Intended for live appliance performance gates.
     #[arg(long, value_parser = parse_minimum_fps)]
     minimum_fps: Option<f64>,
-    #[arg(long, default_value = "1280x800", value_parser = parse_size)]
-    expect_size: (u16, u16),
+    /// Optional strict encoded-size assertion. When omitted, accept and report
+    /// the host's observed bounded dimensions.
+    #[arg(long, value_parser = parse_size)]
+    expect_size: Option<(u16, u16)>,
     /// Exercise custom grouped v3 media instead of upstream MoQ. Intended only
     /// for compatibility validation.
     #[arg(long, conflicts_with_all = ["media_v2", "media_v1"])]
@@ -1413,12 +1415,12 @@ async fn main() -> Result<()> {
     let Some((width, height)) = dimensions else {
         bail!("probe received no frames");
     };
-    ensure!(
-        (width, height) == args.expect_size,
-        "expected {}x{} but received {width}x{height}",
-        args.expect_size.0,
-        args.expect_size.1
-    );
+    if let Some((expected_width, expected_height)) = args.expect_size {
+        ensure!(
+            (width, height) == (expected_width, expected_height),
+            "expected {expected_width}x{expected_height} but received {width}x{height}"
+        );
+    }
     ensure!(keyframes > 0, "probe received no H.264 keyframe");
     ensure!(gaps == 0, "probe observed {gaps} media sequence gaps");
     ensure!(
@@ -2148,6 +2150,16 @@ mod tests {
         assert!(!default.media_v1);
         assert!(!default.media_v2);
         assert!(!default.media_v3);
+        assert_eq!(default.expect_size, None);
+        let strict = Args::try_parse_from([
+            "sigil-probe",
+            "--node-id",
+            &node_id,
+            "--expect-size",
+            "2560x1600",
+        ])
+        .unwrap();
+        assert_eq!(strict.expect_size, Some((2_560, 1_600)));
         for flags in [
             ["--media-v1", "--media-v2"],
             ["--media-v1", "--media-v3"],

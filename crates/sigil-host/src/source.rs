@@ -354,6 +354,45 @@ pub struct GamescopePreflight {
     pub target_object: String,
     /// Native Gamescope surface used by the relative-pointer coordinate space.
     pub pointer_surface_dimensions: PointerSurfaceDimensions,
+    /// Bounded encoded mode after applying an optional explicit size override.
+    pub video_mode: CaptureVideoMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureVideoMode {
+    pub width: u16,
+    pub height: u16,
+    pub framerate: u32,
+}
+
+impl CaptureVideoMode {
+    fn resolve(config: &HostConfig, native: PointerSurfaceDimensions) -> Result<Self> {
+        let configured = config.configured_dimensions();
+        let (width, height) =
+            configured.unwrap_or((u32::from(native.width), u32::from(native.height)));
+        ensure!(
+            (64..=7_680).contains(&width) && (64..=4_320).contains(&height),
+            "resolved Gamescope encoded dimensions {width}x{height} are outside H.264 bounds"
+        );
+        ensure!(
+            width.is_multiple_of(2) && height.is_multiple_of(2),
+            "resolved Gamescope encoded dimensions {width}x{height} must be even"
+        );
+        if configured.is_some() {
+            ensure!(
+                u64::from(width) * u64::from(native.height)
+                    == u64::from(height) * u64::from(native.width),
+                "configured Gamescope encoded dimensions {width}x{height} must preserve native {}x{} aspect ratio",
+                native.width,
+                native.height
+            );
+        }
+        Ok(Self {
+            width: u16::try_from(width).context("resolved Gamescope width exceeds metadata")?,
+            height: u16::try_from(height).context("resolved Gamescope height exceeds metadata")?,
+            framerate: config.framerate,
+        })
+    }
 }
 
 pub async fn preflight_gamescope_pipewire(config: &HostConfig) -> Result<GamescopePreflight> {
@@ -418,7 +457,7 @@ async fn resolve_gamescope_pipewire_target(config: &HostConfig) -> Result<Gamesc
         "pw-dump failed: {}",
         diagnostic(&output.stderr)
     );
-    resolve_pipewire_node(&output.stdout, pipewire)
+    resolve_pipewire_node(&output.stdout, config)
 }
 
 pub async fn spawn_gamescope_pipewire(
@@ -473,11 +512,13 @@ fn spawn_gamescope_pipewire_with_target(
     let (sender, receiver) = watch::channel(None);
     let (current_gop_sender, current_gop) = watch::channel(None);
     let target_object = preflight.target_object;
+    let video_mode = preflight.video_mode;
     let task = tokio::spawn(async move {
         run_gamescope_pipewire(
             config,
             session_clock,
             target_object,
+            video_mode,
             sender,
             current_gop_sender,
         )
@@ -498,8 +539,12 @@ fn spawn_gamescope_pipewire_in_process_with_target(
     session_clock: SessionClock,
     preflight: GamescopePreflight,
 ) -> Result<EncodedSource> {
-    let description = gamescope_in_process_pipeline_description(&config, &preflight.target_object)?;
-    let max_gop_frames = interactive_gop_frames(config.framerate) as usize;
+    let description = gamescope_in_process_pipeline_description(
+        &config,
+        &preflight.target_object,
+        preflight.video_mode,
+    )?;
+    let max_gop_frames = interactive_gop_frames(preflight.video_mode.framerate) as usize;
     let expected_device_path = Some(
         gamescope_config(&config)?
             .vaapi_render_node
@@ -512,8 +557,8 @@ fn spawn_gamescope_pipewire_in_process_with_target(
         max_gop_frames,
         Some(preflight.pointer_surface_dimensions),
         expected_device_path,
-        u16::try_from(config.width).context("configured width exceeds encoder metadata")?,
-        u16::try_from(config.height).context("configured height exceeds encoder metadata")?,
+        preflight.video_mode.width,
+        preflight.video_mode.height,
     )
 }
 
@@ -561,6 +606,7 @@ fn spawn_in_process_pipeline(
 fn gamescope_in_process_pipeline_description(
     config: &HostConfig,
     target_object: &str,
+    video_mode: CaptureVideoMode,
 ) -> Result<String> {
     let pipewire = gamescope_config(config)?;
     validate_pipewire_target_object(target_object)?;
@@ -573,7 +619,7 @@ fn gamescope_in_process_pipeline_description(
         .context("CBR bitrate is missing after validation")?;
     let raw_caps = format!(
         "video/x-raw,format=NV12,width={},height={},framerate={}/1",
-        config.width, config.height, config.framerate
+        video_mode.width, video_mode.height, video_mode.framerate
     );
     Ok(format!(
         "pipewiresrc do-timestamp=true min-buffers=1 max-buffers=4 use-bufferpool=false target-object={target_object} \
@@ -585,9 +631,9 @@ fn gamescope_in_process_pipeline_description(
          ! h264parse config-interval=-1 \
          ! video/x-h264,stream-format=byte-stream,alignment=au \
          ! appsink name=sigil_sink max-buffers=1 drop=false sync=false",
-        config.framerate,
+        video_mode.framerate,
         pipewire.vaapi_encoder,
-        interactive_gop_frames(config.framerate),
+        interactive_gop_frames(video_mode.framerate),
     ))
 }
 
@@ -606,11 +652,12 @@ async fn run_gamescope_pipewire(
     config: HostConfig,
     session_clock: SessionClock,
     target_object: String,
+    video_mode: CaptureVideoMode,
     sender: watch::Sender<Option<EncodedFrame>>,
     current_gop_sender: watch::Sender<Option<EncodedGop>>,
 ) -> Result<()> {
     let pipewire = gamescope_config(&config)?;
-    let args = gamescope_pipeline_args(&config, &target_object)?;
+    let args = gamescope_pipeline_args(&config, &target_object, video_mode)?;
     let mut command = Command::new(&pipewire.gst_launch_path);
     command
         .args(args)
@@ -644,9 +691,9 @@ async fn run_gamescope_pipewire(
         &mut stdout,
         &sender,
         &current_gop_sender,
-        interactive_gop_frames(config.framerate) as usize,
-        u16::try_from(config.width).context("configured width exceeds encoder metadata")?,
-        u16::try_from(config.height).context("configured height exceeds encoder metadata")?,
+        interactive_gop_frames(video_mode.framerate) as usize,
+        video_mode.width,
+        video_mode.height,
     )
     .await;
     let _ = child.kill().await;
@@ -671,9 +718,10 @@ async fn run_test_pattern(
     sender: watch::Sender<Option<EncodedFrame>>,
     current_gop_sender: watch::Sender<Option<EncodedGop>>,
 ) -> Result<()> {
+    let (width, height) = config.test_pattern_dimensions()?;
     let input = format!(
         "testsrc2=size={}x{}:rate={}",
-        config.width, config.height, config.framerate
+        width, height, config.framerate
     );
     let gop = interactive_gop_frames(config.framerate).to_string();
 
@@ -727,8 +775,8 @@ async fn run_test_pattern(
         &sender,
         &current_gop_sender,
         interactive_gop_frames(config.framerate) as usize,
-        u16::try_from(config.width).context("configured width exceeds encoder metadata")?,
-        u16::try_from(config.height).context("configured height exceeds encoder metadata")?,
+        u16::try_from(width).context("configured width exceeds encoder metadata")?,
+        u16::try_from(height).context("configured height exceeds encoder metadata")?,
     )
     .await;
     if result.is_ok() {
@@ -1392,7 +1440,11 @@ fn gamescope_config(config: &HostConfig) -> Result<&GamescopePipewireConfig> {
         .context("gamescope_pipewire configuration is missing")
 }
 
-fn gamescope_pipeline_args(config: &HostConfig, target_object: &str) -> Result<Vec<OsString>> {
+fn gamescope_pipeline_args(
+    config: &HostConfig,
+    target_object: &str,
+    video_mode: CaptureVideoMode,
+) -> Result<Vec<OsString>> {
     let pipewire = gamescope_config(config)?;
     ensure!(
         !target_object.is_empty()
@@ -1402,7 +1454,7 @@ fn gamescope_pipeline_args(config: &HostConfig, target_object: &str) -> Result<V
     );
     let caps = format!(
         "video/x-raw,format=NV12,width={},height={},framerate={}/1",
-        config.width, config.height, config.framerate
+        video_mode.width, video_mode.height, video_mode.framerate
     );
     let encoded_caps = "video/x-h264,stream-format=byte-stream,alignment=au";
     let mut args = vec![
@@ -1430,7 +1482,7 @@ fn gamescope_pipeline_args(config: &HostConfig, target_object: &str) -> Result<V
         // Gamescope is damage-driven. Never manufacture replacement frames:
         // doing so can turn an irregular live source into stale catch-up work.
         "drop-only=true".to_owned(),
-        format!("max-rate={}", config.framerate),
+        format!("max-rate={}", video_mode.framerate),
         "!".to_owned(),
         "videoconvert".to_owned(),
         "!".to_owned(),
@@ -1464,7 +1516,10 @@ fn gamescope_pipeline_args(config: &HostConfig, target_object: &str) -> Result<V
     }
     args.extend([
         "target-usage=7".to_owned(),
-        format!("key-int-max={}", interactive_gop_frames(config.framerate)),
+        format!(
+            "key-int-max={}",
+            interactive_gop_frames(video_mode.framerate)
+        ),
         "b-frames=0".to_owned(),
         "ref-frames=1".to_owned(),
         "aud=true".to_owned(),
@@ -1510,26 +1565,26 @@ pub(crate) async fn resolve_pipewire_node_by_properties(
     resolve_pipewire_node_exact(&output.stdout, node_name, media_class, match_properties)
 }
 
-fn resolve_pipewire_node(
-    output: &[u8],
-    config: &GamescopePipewireConfig,
-) -> Result<GamescopePreflight> {
+fn resolve_pipewire_node(output: &[u8], config: &HostConfig) -> Result<GamescopePreflight> {
+    let pipewire = gamescope_config(config)?;
     let target_object = resolve_pipewire_node_exact(
         output,
-        &config.node_name,
-        &config.media_class,
-        &config.match_properties,
+        &pipewire.node_name,
+        &pipewire.media_class,
+        &pipewire.match_properties,
     )?;
     let pointer_surface_dimensions = resolve_pointer_surface_dimensions(
         output,
         &target_object,
-        &config.node_name,
-        &config.media_class,
-        &config.match_properties,
+        &pipewire.node_name,
+        &pipewire.media_class,
+        &pipewire.match_properties,
     )?;
+    let video_mode = CaptureVideoMode::resolve(config, pointer_surface_dimensions)?;
     Ok(GamescopePreflight {
         target_object,
         pointer_surface_dimensions,
+        video_mode,
     })
 }
 
@@ -2004,8 +2059,8 @@ mod tests {
             identity_path: PathBuf::from("/tmp/host.key"),
             state_path: PathBuf::from("/tmp/state"),
             source: VideoSource::GamescopePipewire,
-            width: 1280,
-            height: 800,
+            width: Some(1280),
+            height: Some(800),
             framerate: 60,
             codec: "h264".into(),
             input_mode: InputMode::Disabled,
@@ -2030,6 +2085,14 @@ mod tests {
                 quantizer: None,
             }),
             audio: None,
+        }
+    }
+
+    fn configured_video_mode() -> CaptureVideoMode {
+        CaptureVideoMode {
+            width: 1_280,
+            height: 800,
+            framerate: 60,
         }
     }
 
@@ -2260,7 +2323,9 @@ mod tests {
         let mut config = gamescope_config();
         config.gamescope_pipewire.as_mut().unwrap().encoder_backend =
             GamescopeEncoderBackend::InProcessGstreamer;
-        let description = gamescope_in_process_pipeline_description(&config, "1234").unwrap();
+        let description =
+            gamescope_in_process_pipeline_description(&config, "1234", configured_video_mode())
+                .unwrap();
 
         assert!(description.contains(
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream"
@@ -2452,7 +2517,7 @@ mod tests {
     #[test]
     fn builds_bounded_low_latency_gamescope_pipeline() {
         let config = gamescope_config();
-        let args: Vec<String> = gamescope_pipeline_args(&config, "1234")
+        let args: Vec<String> = gamescope_pipeline_args(&config, "1234", configured_video_mode())
             .unwrap()
             .into_iter()
             .map(|arg| arg.into_string().unwrap())
@@ -2497,7 +2562,30 @@ mod tests {
         let videoconvert = args.iter().position(|arg| arg == "videoconvert").unwrap();
         let videoscale = args.iter().position(|arg| arg == "videoscale").unwrap();
         assert!(queue < videorate && videorate < videoconvert && videoconvert < videoscale);
-        assert!(gamescope_pipeline_args(&config, "gamescope").is_err());
+        assert!(gamescope_pipeline_args(&config, "gamescope", configured_video_mode()).is_err());
+    }
+
+    #[test]
+    fn builds_pipeline_for_resolved_non_fixture_mode() {
+        let config = gamescope_config();
+        let mode = CaptureVideoMode {
+            width: 1_920,
+            height: 1_080,
+            framerate: 72,
+        };
+        let args: Vec<String> = gamescope_pipeline_args(&config, "1234", mode)
+            .unwrap()
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect();
+
+        assert!(
+            args.contains(
+                &"video/x-raw,format=NV12,width=1920,height=1080,framerate=72/1".to_owned()
+            )
+        );
+        assert!(args.contains(&"max-rate=72".to_owned()));
+        assert!(args.contains(&"key-int-max=36".to_owned()));
     }
 
     #[test]
@@ -2517,7 +2605,7 @@ mod tests {
         pipewire.quantizer = Some(24);
         config.validate().unwrap();
 
-        let args: Vec<String> = gamescope_pipeline_args(&config, "1234")
+        let args: Vec<String> = gamescope_pipeline_args(&config, "1234", configured_video_mode())
             .unwrap()
             .into_iter()
             .map(|arg| arg.into_string().unwrap())
@@ -2532,7 +2620,6 @@ mod tests {
     #[test]
     fn resolves_exactly_one_pipewire_node_by_properties() {
         let config = gamescope_config();
-        let pipewire = config.gamescope_pipewire.as_ref().unwrap();
         let dump = br#"[
           {"type":"PipeWire:Interface:Node","info":{"props":{
             "node.name":"gamescope","media.class":"Video/Source",
@@ -2549,10 +2636,11 @@ mod tests {
           }}}
         ]"#;
         assert_eq!(
-            resolve_pipewire_node(dump, pipewire).unwrap(),
+            resolve_pipewire_node(dump, &config).unwrap(),
             GamescopePreflight {
                 target_object: "731".into(),
                 pointer_surface_dimensions: PointerSurfaceDimensions::new(2_560, 1_600).unwrap(),
+                video_mode: configured_video_mode(),
             }
         );
 
@@ -2566,13 +2654,48 @@ mod tests {
             "device.bus-path":"pci-0000:04:00.0","object.serial":"732"
           }}}
         ]"#;
-        assert!(resolve_pipewire_node(duplicate, pipewire).is_err());
+        assert!(resolve_pipewire_node(duplicate, &config).is_err());
+
+        let mut native_config = config.clone();
+        native_config.width = None;
+        native_config.height = None;
+        let native = resolve_pipewire_node(dump, &native_config).unwrap();
+        assert_eq!(
+            native.video_mode,
+            CaptureVideoMode {
+                width: 2_560,
+                height: 1_600,
+                framerate: 60,
+            }
+        );
+        assert_eq!(native.pointer_surface_dimensions.width, 2_560);
+        assert_eq!(native.pointer_surface_dimensions.height, 1_600);
+
+        let mut distorted = config.clone();
+        distorted.width = Some(1_920);
+        distorted.height = Some(1_080);
+        assert!(
+            resolve_pipewire_node(dump, &distorted)
+                .unwrap_err()
+                .to_string()
+                .contains("must preserve native 2560x1600 aspect ratio")
+        );
+
+        let portrait_dump = std::str::from_utf8(dump)
+            .unwrap()
+            .replace("2560", "WIDTH")
+            .replace("1600", "2560")
+            .replace("WIDTH", "1600");
+        let portrait = resolve_pipewire_node(portrait_dump.as_bytes(), &native_config).unwrap();
+        assert_eq!(
+            (portrait.video_mode.width, portrait.video_mode.height),
+            (1_600, 2_560)
+        );
     }
 
     #[test]
     fn rejects_ambiguous_or_unbounded_gamescope_native_size() {
         let config = gamescope_config();
-        let pipewire = config.gamescope_pipewire.as_ref().unwrap();
         let dump = br#"[{"type":"PipeWire:Interface:Node","info":{"props":{
           "node.name":"gamescope","media.class":"Video/Source",
           "device.bus-path":"pci-0000:04:00.0","object.serial":731
@@ -2580,7 +2703,7 @@ mod tests {
           {"mediaType":"video","mediaSubtype":"raw","size":{"width":2560,"height":1600}},
           {"mediaType":"video","mediaSubtype":"raw","size":{"width":1280,"height":800}}
         ]}}}]"#;
-        assert!(resolve_pipewire_node(dump, pipewire).is_err());
+        assert!(resolve_pipewire_node(dump, &config).is_err());
 
         let unbounded = std::str::from_utf8(dump)
             .unwrap()
@@ -2589,7 +2712,19 @@ mod tests {
                 r#",{"mediaType":"video","mediaSubtype":"raw","size":{"width":1280,"height":800}}"#,
                 "",
             );
-        assert!(resolve_pipewire_node(unbounded.as_bytes(), pipewire).is_err());
+        assert!(resolve_pipewire_node(unbounded.as_bytes(), &config).is_err());
+
+        let mut native_config = config.clone();
+        native_config.width = None;
+        native_config.height = None;
+        let odd = br#"[{"type":"PipeWire:Interface:Node","info":{"props":{
+          "node.name":"gamescope","media.class":"Video/Source",
+          "device.bus-path":"pci-0000:04:00.0","object.serial":731
+        },"params":{"EnumFormat":[
+          {"mediaType":"video","mediaSubtype":"raw","size":{"width":1365,"height":768}}
+        ]}}}]"#;
+        let error = resolve_pipewire_node(odd, &native_config).unwrap_err();
+        assert!(error.to_string().contains("must be even"), "{error:#}");
     }
 
     #[test]

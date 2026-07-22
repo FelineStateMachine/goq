@@ -43,14 +43,6 @@ pub enum GamescopeEncoderBackend {
     InProcessGstreamer,
 }
 
-fn default_width() -> u32 {
-    1280
-}
-
-fn default_height() -> u32 {
-    800
-}
-
 fn default_framerate() -> u32 {
     60
 }
@@ -294,10 +286,13 @@ pub struct HostConfig {
     pub state_path: PathBuf,
     #[serde(default = "default_source")]
     pub source: VideoSource,
-    #[serde(default = "default_width")]
-    pub width: u32,
-    #[serde(default = "default_height")]
-    pub height: u32,
+    /// Optional encoded-size override. Gamescope uses its advertised native
+    /// size when both fields are absent; the test-pattern proof retains its
+    /// 1280x800 fixture default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
     #[serde(default = "default_framerate")]
     pub framerate: u32,
     #[serde(default = "default_codec")]
@@ -318,6 +313,9 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
+    pub const TEST_PATTERN_WIDTH: u32 = 1_280;
+    pub const TEST_PATTERN_HEIGHT: u32 = 800;
+
     pub fn load(path: &Path) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true);
@@ -351,18 +349,11 @@ impl HostConfig {
             !self.state_path.as_os_str().is_empty(),
             "state_path is required"
         );
-        ensure!(
-            (64..=7680).contains(&self.width),
-            "width must be between 64 and 7680"
-        );
-        ensure!(
-            (64..=4320).contains(&self.height),
-            "height must be between 64 and 4320"
-        );
-        ensure!(
-            self.width.is_multiple_of(2) && self.height.is_multiple_of(2),
-            "H.264 dimensions must be even"
-        );
+        match (self.width, self.height) {
+            (Some(width), Some(height)) => validate_video_dimensions(width, height)?,
+            (None, None) => {}
+            _ => anyhow::bail!("width and height must either both be set or both be absent"),
+        }
         ensure!(
             (1..=240).contains(&self.framerate),
             "framerate must be between 1 and 240"
@@ -407,6 +398,32 @@ impl HostConfig {
         Ok(())
     }
 
+    pub fn configured_dimensions(&self) -> Option<(u32, u32)> {
+        self.width.zip(self.height)
+    }
+
+    pub fn resolved_dimensions(&self) -> Result<(u32, u32)> {
+        self.configured_dimensions()
+            .context("video dimensions have not been resolved")
+    }
+
+    pub fn test_pattern_dimensions(&self) -> Result<(u32, u32)> {
+        ensure!(
+            self.source == VideoSource::TestPattern,
+            "test-pattern dimensions requested for a non-test source"
+        );
+        Ok(self
+            .configured_dimensions()
+            .unwrap_or((Self::TEST_PATTERN_WIDTH, Self::TEST_PATTERN_HEIGHT)))
+    }
+
+    pub fn apply_resolved_dimensions(&mut self, width: u32, height: u32) -> Result<()> {
+        validate_video_dimensions(width, height)?;
+        self.width = Some(width);
+        self.height = Some(height);
+        Ok(())
+    }
+
     pub fn ensure_runtime_directory(&self) -> Result<()> {
         if self.state_path.exists() {
             let metadata = fs::symlink_metadata(&self.state_path)
@@ -444,6 +461,22 @@ impl HostConfig {
         }
         Ok(())
     }
+}
+
+fn validate_video_dimensions(width: u32, height: u32) -> Result<()> {
+    ensure!(
+        (64..=7680).contains(&width),
+        "width must be between 64 and 7680"
+    );
+    ensure!(
+        (64..=4320).contains(&height),
+        "height must be between 64 and 4320"
+    );
+    ensure!(
+        width.is_multiple_of(2) && height.is_multiple_of(2),
+        "H.264 dimensions must be even"
+    );
+    Ok(())
 }
 
 fn validate_file_security(path: &Path, metadata: &fs::Metadata) -> Result<()> {
@@ -491,6 +524,21 @@ codec = "h264"
 "#;
         let config: HostConfig = toml::from_str(input).unwrap();
         config.validate().unwrap();
+        assert_eq!(config.test_pattern_dimensions().unwrap(), (1_280, 800));
+    }
+
+    #[test]
+    fn test_pattern_omission_retains_the_proof_fixture() {
+        let config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.configured_dimensions(), None);
+        assert_eq!(config.test_pattern_dimensions().unwrap(), (1_280, 800));
     }
 
     #[test]
@@ -499,8 +547,6 @@ codec = "h264"
 identity_path = "/tmp/host.key"
 state_path = "/tmp/state"
 source = "gamescope-pipewire"
-width = 1280
-height = 800
 framerate = 60
 codec = "h264"
 
@@ -530,6 +576,7 @@ bitrate_bps = 96000
 "#;
         let config: HostConfig = toml::from_str(input).unwrap();
         config.validate().unwrap();
+        assert_eq!(config.configured_dimensions(), None);
         assert_eq!(
             config
                 .gamescope_pipewire
@@ -751,11 +798,30 @@ state_path = "/tmp/state"
 "#,
         )
         .unwrap();
-        config.width = 1279;
+        config.width = Some(1279);
         assert!(config.validate().is_err());
-        config.width = 1280;
+        config.width = Some(1280);
         config.codec = "av1".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_partial_dimension_override() {
+        let config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+width = 1280
+"#,
+        )
+        .unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("width and height must either both be set or both be absent")
+        );
     }
 
     #[test]

@@ -29,12 +29,12 @@ use tracing::{debug, error, info, warn};
 use crate::audio::spawn_pipewire_audio;
 use crate::authorization::{AuthorizationPolicy, unix_timestamp_now};
 use crate::clock::SessionClock;
-use crate::config::{HostConfig, VideoSource};
+use crate::config::{GamescopeEncoderBackend, HostConfig, VaapiRateControl, VideoSource};
 use crate::cursor::{PointerPositionTracker, PointerState};
 use crate::input::{InputBackend, InputDisposition};
 use crate::source::{
-    EncodedFrame, EncodedGop, EncodedSource, spawn_gamescope_pipewire_after_static_preflight,
-    spawn_test_pattern,
+    EncodedFrame, EncodedGop, EncodedSource, EncoderControl,
+    spawn_gamescope_pipewire_after_static_preflight, spawn_test_pattern,
 };
 
 const MEDIA_CAPABILITIES: &[Capability] = &[Capability::VideoH264];
@@ -83,6 +83,7 @@ const FEEDBACK_FRESH_ARRIVAL_GAP_MIN: Duration = Duration::from_millis(750);
 const FEEDBACK_STALE_ARRIVAL_GAP: Duration = Duration::from_millis(2_500);
 const FEEDBACK_MIN_READ_INTERVAL: Duration = Duration::from_millis(250);
 const FEEDBACK_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const ENCODER_CONTROL_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FeedbackSeverity {
@@ -93,7 +94,7 @@ enum FeedbackSeverity {
     Stale,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ShadowBitrateController {
     floor_kbps: u32,
     ceiling_kbps: u32,
@@ -433,6 +434,15 @@ impl ShadowBitrateController {
         }
         (severity, reasons, false, trusted_host_pressure)
     }
+
+    fn commit_observation_from(&mut self, candidate: &Self) {
+        self.next_decision_id = candidate.next_decision_id;
+        self.last_report_id = candidate.last_report_id;
+        self.last_report_received_at = candidate.last_report_received_at;
+        self.previous_telemetry = candidate.previous_telemetry;
+        self.baseline_rtt_micros = candidate.baseline_rtt_micros;
+        self.last_sequence = candidate.last_sequence;
+    }
 }
 
 fn add_feedback_signal(
@@ -515,6 +525,7 @@ struct ActiveSession {
     audio_claimed: bool,
     feedback_claimed: bool,
     media_v3_telemetry: Arc<MediaV3Telemetry>,
+    encoder_control: Option<EncoderControl>,
 }
 
 #[derive(Debug, Default)]
@@ -533,6 +544,14 @@ struct MediaV3TelemetrySnapshot {
     selected_path_rtt_micros: u64,
     selected_path_lost_packets: u64,
     selected_path_congestion_events: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AdaptiveEncoderProposal {
+    control: EncoderControl,
+    target_kbps: u32,
+    bitrate_revision: u64,
+    force_keyframe_revision: Option<u64>,
 }
 
 impl MediaV3Telemetry {
@@ -602,6 +621,7 @@ impl SessionRegistry {
             audio_claimed: false,
             feedback_claimed: false,
             media_v3_telemetry: Arc::clone(&media_v3_telemetry),
+            encoder_control: None,
         });
         Ok(SessionLease {
             registry: Arc::clone(self),
@@ -633,6 +653,56 @@ impl SessionRegistry {
         })
     }
 
+    fn install_encoder_control(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        encoder_control: Option<EncoderControl>,
+    ) -> Result<()> {
+        let mut active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_mut()
+            .filter(|session| {
+                session.media_active && session.remote == remote && session.session_id == session_id
+            })
+            .context("encoder control does not match the active media session")?;
+        ensure!(
+            session.encoder_control.is_none(),
+            "active media session already has encoder control"
+        );
+        session.encoder_control = encoder_control;
+        Ok(())
+    }
+
+    fn propose_adaptive_encoder_update(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        target_kbps: u32,
+        force_keyframe: bool,
+    ) -> Result<Option<AdaptiveEncoderProposal>> {
+        let active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_ref()
+            .filter(|session| {
+                session.media_active && session.remote == remote && session.session_id == session_id
+            })
+            .context("adaptive encoder update does not match the active media session")?;
+        let Some(control) = session.encoder_control.clone() else {
+            return Ok(None);
+        };
+        let bitrate_revision = control.request_bitrate_kbps(target_kbps)?;
+        let force_keyframe_revision = force_keyframe
+            .then(|| control.request_force_keyframe())
+            .transpose()?;
+        Ok(Some(AdaptiveEncoderProposal {
+            control,
+            target_kbps,
+            bitrate_revision,
+            force_keyframe_revision,
+        }))
+    }
+
     fn claim_feedback(
         self: &Arc<Self>,
         remote: EndpointId,
@@ -659,6 +729,7 @@ impl SessionRegistry {
             remote,
             session_id: session.session_id,
             telemetry: Arc::clone(&session.media_v3_telemetry),
+            encoder_control: session.encoder_control.clone(),
         })
     }
 
@@ -765,6 +836,7 @@ impl SessionRegistry {
             // prevents a reconnect from sharing the device with a draining
             // predecessor session.
             session.media_active = false;
+            session.encoder_control = None;
             if !session.input_claimed && !session.audio_claimed && !session.feedback_claimed {
                 *active = None;
             }
@@ -861,6 +933,7 @@ struct FeedbackLease {
     remote: EndpointId,
     session_id: u64,
     telemetry: Arc<MediaV3Telemetry>,
+    encoder_control: Option<EncoderControl>,
 }
 
 #[derive(Debug)]
@@ -2122,7 +2195,7 @@ async fn serve_control_moq(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
-        encoder_control: _encoder_control,
+        encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -2131,6 +2204,8 @@ async fn serve_control_moq(
         }
     };
     let source_task = SourceTaskGuard::new(source_task);
+    sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
+    let _encoder_control = encoder_control;
 
     let mut broadcast = Broadcast::new().produce();
     let track = broadcast
@@ -2421,6 +2496,8 @@ async fn serve_media_feedback(
             return Err(error);
         }
     };
+    let encoder_actuation_available =
+        adaptive_bitrate_actuation_enabled(config) && lease.encoder_control.is_some();
 
     write_host_hello(
         &mut send,
@@ -2435,7 +2512,8 @@ async fn serve_media_feedback(
         session_id = lease.session_id,
         ceiling_kbps,
         applied = false,
-        "media feedback client accepted for shadow bitrate control"
+        mode = if encoder_actuation_available { "active" } else { "shadow" },
+        "media feedback client accepted for bitrate control"
     );
 
     let (feedback_sender, mut feedback_receiver) = tokio::sync::watch::channel(None);
@@ -2479,7 +2557,94 @@ async fn serve_media_feedback(
                     continue;
                 };
                 let telemetry = lease.telemetry.snapshot();
-                let decision = controller.decide(&report, telemetry, Instant::now())?;
+                let mut candidate = controller.clone();
+                let mut decision = candidate.decide(&report, telemetry, Instant::now())?;
+                let changes_bitrate = decision.state != AdaptiveBitrateStateV1::Hold;
+                let can_actuate = changes_bitrate && encoder_actuation_available;
+                let mut recovery_acknowledged = None;
+                if can_actuate {
+                    let force_keyframe =
+                        adaptive_recovery_keyframe_required(&report, &decision);
+                    let proposal = match sessions.propose_adaptive_encoder_update(
+                        remote,
+                        lease.session_id,
+                        decision.target_kbps,
+                        force_keyframe,
+                    ) {
+                        Ok(Some(proposal)) => Some(proposal),
+                        Ok(None) => {
+                            warn!(
+                                %remote,
+                                session_id = lease.session_id,
+                                "active adaptive session lost encoder control; retaining committed bitrate"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            warn!(
+                                %remote,
+                                session_id = lease.session_id,
+                                %error,
+                                "adaptive encoder proposal failed; retaining committed bitrate"
+                            );
+                            None
+                        }
+                    };
+                    if let Some(proposal) = proposal {
+                        match commit_adaptive_encoder_proposal(
+                            sessions,
+                            remote,
+                            lease.session_id,
+                            &proposal,
+                        )
+                        .await
+                        {
+                            AdaptiveEncoderCommit::GenerationEnded => break Ok(()),
+                            AdaptiveEncoderCommit::NotApplied(error) => {
+                                warn!(
+                                    %remote,
+                                    session_id = lease.session_id,
+                                    %error,
+                                    "adaptive encoder application failed; retaining committed bitrate"
+                                );
+                            }
+                            AdaptiveEncoderCommit::Applied => {
+                                decision.applied = true;
+                                controller = candidate.clone();
+                                if proposal.force_keyframe_revision.is_some() {
+                                    match await_adaptive_recovery_keyframe(
+                                        sessions,
+                                        remote,
+                                        lease.session_id,
+                                        &proposal,
+                                    )
+                                    .await
+                                    {
+                                        None => break Ok(()),
+                                        Some(Ok(())) => recovery_acknowledged = Some(true),
+                                        Some(Err(error)) => {
+                                            recovery_acknowledged = Some(false);
+                                            warn!(
+                                                %remote,
+                                                session_id = lease.session_id,
+                                                %error,
+                                                "adaptive bitrate applied but forced-IDR recovery was not acknowledged"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !decision.applied {
+                        controller.commit_observation_from(&candidate);
+                    }
+                } else {
+                    // External gst-launch and sources without EncoderControl
+                    // remain intentionally shadow-only. Hold decisions do not
+                    // need encoder actuation.
+                    controller = candidate;
+                }
                 tokio::time::timeout(
                     FEEDBACK_WRITE_TIMEOUT,
                     write_adaptive_bitrate_decision_v1(&mut send, &decision),
@@ -2495,12 +2660,14 @@ async fn serve_media_feedback(
                     ?decision.state,
                     reasons = decision.reasons.bits(),
                     applied = decision.applied,
+                    ?recovery_acknowledged,
                     path_rtt_micros = telemetry.selected_path_rtt_micros,
                     path_lost_packets = telemetry.selected_path_lost_packets,
                     path_congestion_events = telemetry.selected_path_congestion_events,
                     scheduler_cancellations = telemetry.scheduler_cancellations,
                     send_failures = telemetry.send_failures,
-                    "adaptive bitrate shadow decision"
+                    mode = if can_actuate { "active" } else { "shadow" },
+                    "adaptive bitrate decision"
                 );
             }
             _ = &mut session_changed => {
@@ -2569,6 +2736,110 @@ fn adaptive_bitrate_ceiling_kbps(config: &HostConfig) -> Result<u32> {
     Ok(ceiling)
 }
 
+fn adaptive_bitrate_actuation_enabled(config: &HostConfig) -> bool {
+    config.source == VideoSource::GamescopePipewire
+        && config.gamescope_pipewire.as_ref().is_some_and(|gamescope| {
+            gamescope.encoder_backend == GamescopeEncoderBackend::InProcessGstreamer
+                && gamescope.rate_control == VaapiRateControl::Cbr
+        })
+}
+
+fn adaptive_recovery_keyframe_required(
+    report: &MediaFeedbackReportV1,
+    decision: &AdaptiveBitrateDecisionV1,
+) -> bool {
+    decision.state != AdaptiveBitrateStateV1::Hold
+        && report.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE)
+}
+
+#[derive(Debug)]
+enum AdaptiveEncoderCommit {
+    GenerationEnded,
+    NotApplied(anyhow::Error),
+    Applied,
+}
+
+async fn await_while_session_active<F, T>(
+    sessions: &SessionRegistry,
+    remote: EndpointId,
+    session_id: u64,
+    future: F,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        let session_changed = sessions.session_changed.notified();
+        tokio::pin!(session_changed);
+        session_changed.as_mut().enable();
+        if !sessions.is_active(remote, session_id) {
+            return None;
+        }
+        tokio::select! {
+            result = &mut future => return sessions.is_active(remote, session_id).then_some(result),
+            _ = &mut session_changed => {}
+        }
+    }
+}
+
+async fn commit_adaptive_encoder_proposal(
+    sessions: &SessionRegistry,
+    remote: EndpointId,
+    session_id: u64,
+    proposal: &AdaptiveEncoderProposal,
+) -> AdaptiveEncoderCommit {
+    let bitrate_result = await_while_session_active(
+        sessions,
+        remote,
+        session_id,
+        proposal
+            .control
+            .wait_for_bitrate_applied(proposal.bitrate_revision, ENCODER_CONTROL_COMMIT_TIMEOUT),
+    )
+    .await;
+    let Some(bitrate_result) = bitrate_result else {
+        return AdaptiveEncoderCommit::GenerationEnded;
+    };
+    let status = match bitrate_result {
+        Ok(status) => status,
+        Err(error) => return AdaptiveEncoderCommit::NotApplied(error),
+    };
+    if status.applied_bitrate_revision != Some(proposal.bitrate_revision)
+        || status.applied_bitrate_kbps != Some(proposal.target_kbps)
+    {
+        return AdaptiveEncoderCommit::NotApplied(anyhow::anyhow!(
+            "encoder bitrate commit mismatch: revision {:?}, readback {:?}, expected revision {} at {} kbps",
+            status.applied_bitrate_revision,
+            status.applied_bitrate_kbps,
+            proposal.bitrate_revision,
+            proposal.target_kbps
+        ));
+    }
+
+    AdaptiveEncoderCommit::Applied
+}
+
+async fn await_adaptive_recovery_keyframe(
+    sessions: &SessionRegistry,
+    remote: EndpointId,
+    session_id: u64,
+    proposal: &AdaptiveEncoderProposal,
+) -> Option<Result<()>> {
+    let force_keyframe_revision = proposal.force_keyframe_revision?;
+    await_while_session_active(
+        sessions,
+        remote,
+        session_id,
+        proposal.control.wait_for_force_keyframe_acknowledged(
+            force_keyframe_revision,
+            ENCODER_CONTROL_COMMIT_TIMEOUT,
+        ),
+    )
+    .await
+    .map(|result| result.map(|_| ()))
+}
+
 async fn serve_media(
     connection: Connection,
     config: HostConfig,
@@ -2632,7 +2903,7 @@ async fn serve_media(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
-        encoder_control: _encoder_control,
+        encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -2641,6 +2912,8 @@ async fn serve_media(
         }
     };
     let source_task = SourceTaskGuard::new(source_task);
+    sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
+    let _encoder_control = encoder_control;
 
     let mut media_hello = HostHello::accepted(
         lease.session_id,
@@ -2805,7 +3078,7 @@ async fn serve_media_v2(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
-        encoder_control: _encoder_control,
+        encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -2814,6 +3087,8 @@ async fn serve_media_v2(
         }
     };
     let source_task = SourceTaskGuard::new(source_task);
+    sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
+    let _encoder_control = encoder_control;
 
     let mut media_hello = HostHello::accepted(
         lease.session_id,
@@ -2899,7 +3174,7 @@ async fn serve_media_v3(
         current_gop: mut current_gop_receiver,
         task: source_task,
         pointer_surface_dimensions,
-        encoder_control: _encoder_control,
+        encoder_control,
     } = match source {
         Ok(source) => source,
         Err(error) => {
@@ -2908,6 +3183,8 @@ async fn serve_media_v3(
         }
     };
     let source_task = SourceTaskGuard::new(source_task);
+    sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
+    let _encoder_control = encoder_control;
 
     let mut media_hello = HostHello::accepted(
         lease.session_id,
@@ -5278,6 +5555,7 @@ mod tests {
         assert!(sessions.claim_feedback(endpoint(1), [8; 16]).is_err());
         let feedback = sessions.claim_feedback(endpoint(1), nonce).unwrap();
         assert_eq!(feedback.session_id, media.session_id);
+        assert!(feedback.encoder_control.is_none());
         assert!(sessions.claim_feedback(endpoint(1), nonce).is_err());
 
         drop(media);
@@ -5293,6 +5571,154 @@ mod tests {
                 .claim(endpoint(2), nonce, InvitationGrants::VIEW)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn adaptive_encoder_proposals_are_bound_to_the_exact_active_generation() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let media = sessions
+            .claim(remote, [3; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let harness = crate::source::EncoderControlTestHarness::new();
+
+        assert!(
+            sessions
+                .install_encoder_control(
+                    endpoint(2),
+                    media.session_id,
+                    Some(harness.control.clone())
+                )
+                .is_err()
+        );
+        sessions
+            .install_encoder_control(remote, media.session_id, Some(harness.control.clone()))
+            .unwrap();
+        let feedback = sessions.claim_feedback(remote, [3; 16]).unwrap();
+        assert!(feedback.encoder_control.is_some());
+        let proposal = sessions
+            .propose_adaptive_encoder_update(remote, media.session_id, 8_000, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.target_kbps, 8_000);
+        assert!(proposal.force_keyframe_revision > Some(proposal.bitrate_revision));
+
+        let old_session_id = media.session_id;
+        drop(media);
+        assert!(
+            sessions
+                .propose_adaptive_encoder_update(remote, old_session_id, 7_000, false)
+                .is_err(),
+            "a draining generation must not issue another encoder proposal"
+        );
+        drop(feedback);
+    }
+
+    #[tokio::test]
+    async fn adaptive_encoder_commit_requires_exact_readback_and_tracks_recovery_separately() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let media = sessions
+            .claim(remote, [4; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let harness = crate::source::EncoderControlTestHarness::new();
+        sessions
+            .install_encoder_control(remote, media.session_id, Some(harness.control.clone()))
+            .unwrap();
+
+        let proposal = sessions
+            .propose_adaptive_encoder_update(remote, media.session_id, 8_000, true)
+            .unwrap()
+            .unwrap();
+        harness.status.send_modify(|status| {
+            status.applied_bitrate_revision = Some(proposal.bitrate_revision);
+            status.applied_bitrate_kbps = Some(8_000);
+            status.requested_force_keyframe_revision = proposal.force_keyframe_revision;
+            status.acknowledged_force_keyframe_revision = proposal.force_keyframe_revision;
+        });
+        assert!(matches!(
+            commit_adaptive_encoder_proposal(&sessions, remote, media.session_id, &proposal).await,
+            AdaptiveEncoderCommit::Applied
+        ));
+        assert!(matches!(
+            await_adaptive_recovery_keyframe(&sessions, remote, media.session_id, &proposal).await,
+            Some(Ok(()))
+        ));
+
+        let mismatch = sessions
+            .propose_adaptive_encoder_update(remote, media.session_id, 7_000, false)
+            .unwrap()
+            .unwrap();
+        harness.status.send_modify(|status| {
+            status.applied_bitrate_revision = Some(mismatch.bitrate_revision);
+            status.applied_bitrate_kbps = Some(7_250);
+        });
+        assert!(matches!(
+            commit_adaptive_encoder_proposal(&sessions, remote, media.session_id, &mismatch).await,
+            AdaptiveEncoderCommit::NotApplied(_)
+        ));
+
+        let stale_generation = sessions
+            .propose_adaptive_encoder_update(remote, media.session_id, 6_000, false)
+            .unwrap()
+            .unwrap();
+        let session_id = media.session_id;
+        drop(media);
+        assert!(matches!(
+            commit_adaptive_encoder_proposal(&sessions, remote, session_id, &stale_generation)
+                .await,
+            AdaptiveEncoderCommit::GenerationEnded
+        ));
+    }
+
+    #[test]
+    fn failed_adaptive_application_commits_observation_but_not_target() {
+        let mut committed =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        controller_decide(&mut committed, &clean_feedback(1), 0);
+        let old_target = committed.target_kbps;
+        let old_decision_id = committed.next_decision_id;
+        let mut severe = clean_feedback(2);
+        severe.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+
+        let mut candidate = committed.clone();
+        let decision = controller_decide(&mut candidate, &severe, 1);
+        assert_eq!(decision.state, AdaptiveBitrateStateV1::Decrease);
+        assert!(candidate.target_kbps < old_target);
+        committed.commit_observation_from(&candidate);
+
+        assert_eq!(committed.target_kbps, old_target);
+        assert_eq!(committed.last_report_id, Some(2));
+        assert_eq!(committed.next_decision_id, old_decision_id + 1);
+        assert!(
+            committed
+                .decide(
+                    &clean_feedback(3),
+                    MediaV3TelemetrySnapshot::default(),
+                    Instant::now() + Duration::from_secs(2)
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn adaptive_recovery_idr_is_only_requested_for_a_bitrate_change_during_resync() {
+        let mut report = clean_feedback(1);
+        let mut decision = AdaptiveBitrateDecisionV1 {
+            decision_id: 1,
+            report_id: 1,
+            target_kbps: 8_000,
+            floor_kbps: 1_000,
+            ceiling_kbps: 12_000,
+            state: AdaptiveBitrateStateV1::Decrease,
+            reasons: AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE,
+            applied: false,
+        };
+        assert!(!adaptive_recovery_keyframe_required(&report, &decision));
+        report.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+        assert!(adaptive_recovery_keyframe_required(&report, &decision));
+        decision.state = AdaptiveBitrateStateV1::Hold;
+        assert!(!adaptive_recovery_keyframe_required(&report, &decision));
     }
 
     #[test]

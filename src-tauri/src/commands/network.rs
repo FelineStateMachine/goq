@@ -1,6 +1,11 @@
 use super::auth::derive_iroh_secret_from_key;
 use super::enrollment::{connection_enrollment, mark_invitation_redeemed};
 use super::moq_catalog::subscribe_goq_video_track;
+#[cfg(test)]
+use super::network_diagnostics::PathMode;
+use super::network_diagnostics::{
+    NetworkDiagnosticsSnapshot, NetworkLeg, NetworkSessionDiagnostics,
+};
 use super::state::{
     AUDIO_DELIVERY_CAPACITY, AccumulatedMediaFeedback, AppState, AudioDeliveryState,
     CLIENT_INPUT_QUEUE_CAPACITY, FRAME_ALPN, INPUT_ALPN, MediaFeedbackSender,
@@ -330,8 +335,7 @@ impl ClientMediaMetrics {
         &mut self,
         elapsed: Duration,
         frontend_queue_depth: usize,
-        path_mode: &'static str,
-        path_rtt_ms: Option<f64>,
+        network_diagnostics: NetworkDiagnosticsSnapshot,
         generation: u64,
     ) -> FrameStatsPayload {
         let transport_receive_fps = self.transport_rate.rate(elapsed);
@@ -352,7 +356,7 @@ impl ClientMediaMetrics {
             .max(frontend_resync_current_duration.unwrap_or_default());
         FrameStatsPayload {
             generation,
-            stats_version: 3,
+            stats_version: 4,
             transport_receive_fps,
             frontend_send_fps,
             transport_received_total: self.transport_received_total,
@@ -381,8 +385,9 @@ impl ClientMediaMetrics {
             frontend_ipc_send_duration_p50_ms: frontend_ipc_send_durations.p50_ms,
             frontend_ipc_send_duration_p95_ms: frontend_ipc_send_durations.p95_ms,
             frontend_ipc_send_duration_max_ms: frontend_ipc_send_durations.max_ms,
-            path_mode,
-            path_rtt_ms,
+            path_mode: network_diagnostics.media.mode.as_str(),
+            path_rtt_ms: network_diagnostics.media.rtt_current_ms,
+            network_diagnostics,
             sequence: self.last_sequence,
             keyframe: self.last_keyframe,
             // Compatibility aliases for the currently bundled frontend. New
@@ -401,6 +406,14 @@ fn lock_client_media_metrics(
     metrics: &StdMutex<ClientMediaMetrics>,
 ) -> StdMutexGuard<'_, ClientMediaMetrics> {
     metrics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_network_diagnostics(
+    diagnostics: &StdMutex<NetworkSessionDiagnostics>,
+) -> StdMutexGuard<'_, NetworkSessionDiagnostics> {
+    diagnostics
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -562,6 +575,7 @@ struct FrameStatsPayload {
     frontend_ipc_send_duration_max_ms: Option<f64>,
     path_mode: &'static str,
     path_rtt_ms: Option<f64>,
+    network_diagnostics: NetworkDiagnosticsSnapshot,
     sequence: Option<u64>,
     keyframe: bool,
     fps: f64,
@@ -1726,6 +1740,7 @@ struct InputAvailability {
     keyboard: bool,
     text: bool,
     gamepad: bool,
+    input_ack: bool,
     control: bool,
 }
 
@@ -1737,6 +1752,7 @@ impl InputAvailability {
         let keyboard = capabilities.contains(&Capability::Keyboard);
         let text = capabilities.contains(&Capability::Text);
         let gamepad = capabilities.contains(&Capability::Gamepad);
+        let input_ack = capabilities.contains(&Capability::InputAck);
         Self {
             relative_pointer,
             pointer_position_feedback,
@@ -1744,6 +1760,7 @@ impl InputAvailability {
             keyboard,
             text,
             gamepad,
+            input_ack,
             control: relative_pointer || absolute_pointer || keyboard || text || gamepad,
         }
     }
@@ -1878,6 +1895,7 @@ async fn open_negotiated_input_stream(
     capabilities: Vec<Capability>,
 ) -> Result<
     (
+        iroh::endpoint::Connection,
         iroh::endpoint::SendStream,
         iroh::endpoint::RecvStream,
         NegotiatedV1Stream,
@@ -1902,7 +1920,7 @@ async fn open_negotiated_input_stream(
         None,
     )
     .await?;
-    Ok((send, recv, negotiation))
+    Ok((connection, send, recv, negotiation))
 }
 
 fn connection_error_is_unsupported_alpn(error: &iroh::endpoint::ConnectionError) -> bool {
@@ -2424,8 +2442,8 @@ fn try_queue_media_keyframe_request(
     }
 }
 
-fn input_capability_offers(grants: InvitationGrants) -> [Vec<Capability>; 4] {
-    let mut offers = [
+fn input_capability_offers(grants: InvitationGrants) -> Vec<Vec<Capability>> {
+    let base = [
         vec![
             Capability::RelativePointer,
             Capability::PointerPositionFeedback,
@@ -2457,6 +2475,16 @@ fn input_capability_offers(grants: InvitationGrants) -> [Vec<Capability>; 4] {
             Capability::Gamepad,
         ],
     ];
+    let has_input_grant = grants.contains(InvitationGrants::POINTER_KEYBOARD)
+        || grants.contains(InvitationGrants::GAMEPAD);
+    let mut offers = Vec::with_capacity(base.len() * 2);
+    if has_input_grant {
+        for mut offer in base.clone() {
+            offer.push(Capability::InputAck);
+            offers.push(offer);
+        }
+    }
+    offers.extend(base);
     for offer in &mut offers {
         offer.retain(|capability| match capability {
             Capability::Gamepad => grants.contains(InvitationGrants::GAMEPAD),
@@ -2468,9 +2496,11 @@ fn input_capability_offers(grants: InvitationGrants) -> [Vec<Capability>; 4] {
             | Capability::PointerVisibilityFeedback => {
                 grants.contains(InvitationGrants::POINTER_KEYBOARD)
             }
+            Capability::InputAck => has_input_grant,
             _ => true,
         });
     }
+    offers.dedup();
     offers
 }
 
@@ -2499,7 +2529,11 @@ async fn write_client_input_event(
     stream: &mut iroh::endpoint::SendStream,
     event: &InputEvent,
     use_v1: bool,
+    diagnostics: Option<&Arc<StdMutex<NetworkSessionDiagnostics>>>,
 ) -> Result<(), String> {
+    if let Some(diagnostics) = diagnostics {
+        lock_network_diagnostics(diagnostics).begin_input_send(Instant::now());
+    }
     if use_v1 {
         write_input_event(stream, event)
             .await
@@ -2511,6 +2545,18 @@ async fn write_client_input_event(
             .await
             .map_err(|error| error.to_string())
     }
+}
+
+fn observe_input_ack_if_negotiated(
+    diagnostics: &StdMutex<NetworkSessionDiagnostics>,
+    negotiated: bool,
+    sequence: u64,
+    now: Instant,
+) -> Result<(), String> {
+    if !negotiated {
+        return Ok(());
+    }
+    lock_network_diagnostics(diagnostics).observe_input_ack(sequence, now)
 }
 
 #[derive(Debug, Default)]
@@ -3024,70 +3070,30 @@ pub async fn iroh_client_connect(
         (None, None)
     };
 
-    let (input_send, input_recv, input_capabilities) = if use_v1 {
-        let [
-            visibility_capabilities,
-            position_capabilities,
-            relative_capabilities,
-            legacy_capabilities,
-        ] = input_capability_offers(grants);
-        let feedback_offer = open_negotiated_input_stream(
-            &endpoint,
-            &addr,
-            handshake_nonce,
-            visibility_capabilities,
-        )
-        .await;
-        let (send, recv, input_negotiation) = match feedback_offer {
-            Ok(result) => result,
-            Err(feedback_error) => {
-                // Capability variants are a strict enum on older hosts. First
-                // retry without visibility so the immediately preceding host
-                // retains compositor-position feedback.
-                let position_offer = open_negotiated_input_stream(
-                    &endpoint,
-                    &addr,
-                    handshake_nonce,
-                    position_capabilities,
-                )
-                .await;
-                match position_offer {
-                    Ok(result) => result,
-                    Err(position_error) => {
-                        let relative_offer = open_negotiated_input_stream(
-                            &endpoint,
-                            &addr,
-                            handshake_nonce,
-                            relative_capabilities,
-                        )
-                        .await;
-                        match relative_offer {
-                            Ok(result) => result,
-                            Err(relative_error) => {
-                                // A pre-relative-pointer host needs the exact
-                                // inherited absolute-pointer compatibility leg.
-                                open_negotiated_input_stream(
-                                    &endpoint,
-                                    &addr,
-                                    handshake_nonce,
-                                    legacy_capabilities,
-                                )
-                                .await
-                                .map_err(|legacy_error| {
-                                    format!(
-                                        "Pointer-visibility negotiation failed ({feedback_error}); pointer-position fallback failed ({position_error}); relative input fallback failed ({relative_error}); inherited input fallback failed ({legacy_error})"
-                                    )
-                                })?
-                            }
-                        }
-                    }
+    let (input_connection, input_send, input_recv, input_capabilities) = if use_v1 {
+        let mut errors = Vec::new();
+        let mut accepted = None;
+        // Older hosts reject unknown capability enum values. Try all four
+        // pointer feature levels with ACK first, then repeat the exact legacy
+        // offers without ACK so lack of diagnostics never forces absolute
+        // pointer input prematurely.
+        for capabilities in input_capability_offers(grants) {
+            match open_negotiated_input_stream(&endpoint, &addr, handshake_nonce, capabilities)
+                .await
+            {
+                Ok(result) => {
+                    accepted = Some(result);
+                    break;
                 }
+                Err(error) => errors.push(error),
             }
-        };
+        }
+        let (connection, send, recv, input_negotiation) = accepted
+            .ok_or_else(|| format!("All input capability offers failed: {}", errors.join("; ")))?;
         if Some(input_negotiation.session_id) != media_session_id {
             return Err("Host returned mismatched media and input sessions".to_string());
         }
-        (send, recv, input_negotiation.capabilities)
+        (connection, send, recv, input_negotiation.capabilities)
     } else {
         let input_conn = endpoint
             .connect(addr.clone(), input_alpn)
@@ -3103,6 +3109,7 @@ pub async fn iroh_client_connect(
         // The inherited protocol predates negotiation and supports the current
         // absolute-pointer, keyboard, and text event set.
         (
+            input_conn,
             send,
             recv,
             vec![
@@ -3114,28 +3121,56 @@ pub async fn iroh_client_connect(
     };
 
     let input_availability = InputAvailability::from_capabilities(&input_capabilities);
+    let network_diagnostics = Arc::new(StdMutex::new(NetworkSessionDiagnostics::new(
+        Instant::now(),
+        input_availability.input_ack,
+    )));
 
-    if input_availability.pointer_position_feedback {
+    if input_availability.pointer_position_feedback || input_availability.input_ack {
         let mut input_feedback = input_recv;
+        let feedback_diagnostics = Arc::clone(&network_diagnostics);
+        let mut pointer_feedback_enabled = input_availability.pointer_position_feedback;
+        let input_ack_enabled = input_availability.input_ack;
         tokio::spawn(async move {
             let terminal_reason = loop {
                 let response = match read_input_ack(&mut input_feedback).await {
                     Ok(Some(response)) => response,
-                    Ok(None) => break PointerFeedbackTerminalReason::Eof,
+                    Ok(None) => {
+                        lock_network_diagnostics(&feedback_diagnostics)
+                            .mark_input_feedback_closed();
+                        break PointerFeedbackTerminalReason::Eof;
+                    }
                     Err(error) => {
-                        eprintln!("[client] invalid pointer-position feedback: {error}");
+                        lock_network_diagnostics(&feedback_diagnostics)
+                            .mark_input_feedback_malformed();
+                        eprintln!("[client] invalid input feedback: {error}");
                         break PointerFeedbackTerminalReason::Malformed;
                     }
                 };
-                if pointer_channel
-                    .send(PointerFeedbackPayload::Position {
-                        sequence: response.sequence,
-                        position: response.pointer_position,
-                        pointer_visible: response.pointer_visible,
-                    })
-                    .is_err()
+                if let Err(error) = observe_input_ack_if_negotiated(
+                    &feedback_diagnostics,
+                    input_ack_enabled,
+                    response.sequence,
+                    Instant::now(),
+                ) {
+                    eprintln!("[client] invalid input acknowledgement: {error}");
+                    break PointerFeedbackTerminalReason::Malformed;
+                }
+                if pointer_feedback_enabled
+                    && pointer_channel
+                        .send(PointerFeedbackPayload::Position {
+                            sequence: response.sequence,
+                            position: response.pointer_position,
+                            pointer_visible: response.pointer_visible,
+                        })
+                        .is_err()
                 {
-                    return;
+                    // Losing the webview's pointer channel must not stop ACK
+                    // draining and apply backpressure to host input.
+                    pointer_feedback_enabled = false;
+                    if !input_ack_enabled {
+                        return;
+                    }
                 }
             };
             // The session-owned channel emits at most one terminal message.
@@ -3165,8 +3200,10 @@ pub async fn iroh_client_connect(
         },
     )
     .await;
+    let mut audio_connection_for_stats = None;
     let (audio_available, connected_audio_generation, audio_error) = match audio_result {
         Ok(connection) => {
+            audio_connection_for_stats = Some(connection.clone());
             *state.audio_connection.lock().await = Some((audio_generation, connection));
             (true, Some(audio_generation), None)
         }
@@ -3224,6 +3261,7 @@ pub async fn iroh_client_connect(
     // dropped at the 60 Hz boundary. Relative motion is displacement, so it
     // owns a separate accumulator and timer that coalesces rather than drops.
     let mut input_stream = input_send;
+    let input_send_diagnostics = Arc::clone(&network_diagnostics);
     tokio::spawn(async move {
         let mut rx = rx;
         const MOUSE_INTERVAL: Duration = Duration::from_millis(16);
@@ -3240,8 +3278,13 @@ pub async fn iroh_client_connect(
                     let Some(event) = pending_relative.take() else {
                         continue;
                     };
-                    if let Err(error) =
-                        write_client_input_event(&mut input_stream, &event, use_v1).await
+                    if let Err(error) = write_client_input_event(
+                        &mut input_stream,
+                        &event,
+                        use_v1,
+                        Some(&input_send_diagnostics),
+                    )
+                    .await
                     {
                         eprintln!("[client] input stream write failed: {error}; disconnecting");
                         break;
@@ -3255,7 +3298,12 @@ pub async fn iroh_client_connect(
                         let Some(event) = pending_relative.take() else {
                             continue;
                         };
-                        if let Err(error) = write_client_input_event(&mut input_stream, &event, use_v1).await {
+                        if let Err(error) = write_client_input_event(
+                            &mut input_stream,
+                            &event,
+                            use_v1,
+                            Some(&input_send_diagnostics),
+                        ).await {
                             eprintln!("[client] input stream write failed: {error}; disconnecting");
                             break;
                         }
@@ -3282,8 +3330,13 @@ pub async fn iroh_client_connect(
             };
             let mut flushed_relative_barrier = false;
             while let Some(relative_barrier) = pending_relative.take() {
-                if let Err(error) =
-                    write_client_input_event(&mut input_stream, &relative_barrier, use_v1).await
+                if let Err(error) = write_client_input_event(
+                    &mut input_stream,
+                    &relative_barrier,
+                    use_v1,
+                    Some(&input_send_diagnostics),
+                )
+                .await
                 {
                     eprintln!("[client] input stream write failed: {error}; disconnecting");
                     input_open = false;
@@ -3304,13 +3357,27 @@ pub async fn iroh_client_connect(
                 }
                 last_absolute_mouse_time = now;
             }
-            if let Err(error) = write_client_input_event(&mut input_stream, &event, use_v1).await {
+            if let Err(error) = write_client_input_event(
+                &mut input_stream,
+                &event,
+                use_v1,
+                Some(&input_send_diagnostics),
+            )
+            .await
+            {
                 eprintln!("[client] input stream write failed: {error}; disconnecting");
                 break;
             }
         }
         while let Some(event) = pending_relative.take() {
-            if let Err(error) = write_client_input_event(&mut input_stream, &event, use_v1).await {
+            if let Err(error) = write_client_input_event(
+                &mut input_stream,
+                &event,
+                use_v1,
+                Some(&input_send_diagnostics),
+            )
+            .await
+            {
                 eprintln!("[client] final relative input write failed: {error}");
                 break;
             }
@@ -3363,29 +3430,36 @@ pub async fn iroh_client_connect(
         let stats_metrics = Arc::clone(&metrics);
         let stats_in_flight = Arc::clone(&frame_events_in_flight);
         let stats_connection = frame_connection_for_stats.clone();
+        let stats_input_connection = input_connection.clone();
+        let stats_audio_connection = audio_connection_for_stats.clone();
+        let stats_network_diagnostics = Arc::clone(&network_diagnostics);
         let stats_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(CLIENT_FRAME_STATS_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Tokio intervals tick immediately once. Consume that tick so the
             // first payload represents a full diagnostics interval.
             interval.tick().await;
-            let mut path_mode = "unknown";
-            let mut path_rtt_ms = None;
             let mut last_path_sample = Instant::now() - Duration::from_secs(1);
 
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
                         if last_path_sample.elapsed() >= Duration::from_secs(1) {
-                            (path_mode, path_rtt_ms) = selected_path_diagnostics(&stats_connection);
+                            let mut diagnostics = lock_network_diagnostics(&stats_network_diagnostics);
+                            diagnostics.observe_connection(NetworkLeg::Media, &stats_connection);
+                            diagnostics.observe_connection(NetworkLeg::Input, &stats_input_connection);
+                            if let Some(audio_connection) = stats_audio_connection.as_ref() {
+                                diagnostics.observe_connection(NetworkLeg::Audio, audio_connection);
+                            }
                             last_path_sample = Instant::now();
                         }
                         let queue_depth = stats_in_flight.load(Ordering::SeqCst);
+                        let network_snapshot = lock_network_diagnostics(&stats_network_diagnostics)
+                            .snapshot(Instant::now());
                         let payload = lock_client_media_metrics(&stats_metrics).snapshot(
                             metrics_started.elapsed(),
                             queue_depth,
-                            path_mode,
-                            path_rtt_ms,
+                            network_snapshot,
                             media_generation,
                         );
                         let _ = stats_app.emit("frame-stats", payload);
@@ -3929,23 +4003,6 @@ fn sequence_gap(previous: u64, current: u64) -> Result<u64, String> {
         ));
     }
     Ok(current - expected)
-}
-
-fn selected_path_diagnostics(
-    connection: &iroh::endpoint::Connection,
-) -> (&'static str, Option<f64>) {
-    let paths = connection.paths();
-    let Some(path) = paths.iter().find(|path| path.is_selected()) else {
-        return ("unknown", None);
-    };
-    let mode = if path.is_ip() {
-        "direct"
-    } else if path.is_relay() {
-        "relay"
-    } else {
-        "custom"
-    };
-    (mode, Some(path.rtt().as_secs_f64() * 1000.0))
 }
 
 #[cfg(test)]
@@ -5118,11 +5175,19 @@ mod tests {
         );
         metrics.finish_frontend_resync(Duration::from_millis(230));
 
-        let payload = metrics.snapshot(Duration::from_millis(250), 2, "direct", Some(7.5), 9);
+        let payload = metrics.snapshot(
+            Duration::from_millis(250),
+            2,
+            NetworkDiagnosticsSnapshot::test_fixture(
+                PathMode::Direct,
+                Some(Duration::from_millis(8)),
+            ),
+            9,
+        );
         let json = serde_json::to_value(payload).unwrap();
 
         assert_eq!(json["generation"], 9);
-        assert_eq!(json["stats_version"], 3);
+        assert_eq!(json["stats_version"], 4);
         assert_eq!(json["transport_received_total"], 2);
         assert_eq!(json["frontend_sent_total"], 1);
         assert_eq!(json["sequence_dropped_total"], 2);
@@ -5155,7 +5220,8 @@ mod tests {
         assert_eq!(json["sequence"], 43);
         assert_eq!(json["keyframe"], true);
         assert_eq!(json["path_mode"], "direct");
-        assert_eq!(json["path_rtt_ms"], 7.5);
+        assert_eq!(json["path_rtt_ms"], 8.0);
+        assert_eq!(json["network_diagnostics"]["version"], 1);
 
         assert_eq!(json["count"], json["frontend_sent_total"]);
         assert_eq!(json["host_dropped_frames"], json["sequence_dropped_total"]);
@@ -5175,7 +5241,12 @@ mod tests {
         metrics.begin_frontend_resync(Duration::from_millis(50));
         metrics.observe_frontend_resync_drop();
 
-        let active = metrics.snapshot(Duration::from_millis(75), 4, "direct", None, 1);
+        let active = metrics.snapshot(
+            Duration::from_millis(75),
+            4,
+            NetworkDiagnosticsSnapshot::test_fixture(PathMode::Direct, None),
+            1,
+        );
         assert_eq!(active.generation, 1);
         assert_eq!(active.frontend_resync_episode_total, 1);
         assert!(active.frontend_resync_active);
@@ -5185,7 +5256,12 @@ mod tests {
         assert_eq!(active.frontend_resync_dropped_total, 1);
 
         metrics.finish_frontend_resync(Duration::from_millis(100));
-        let completed = metrics.snapshot(Duration::from_millis(150), 0, "direct", None, 1);
+        let completed = metrics.snapshot(
+            Duration::from_millis(150),
+            0,
+            NetworkDiagnosticsSnapshot::test_fixture(PathMode::Direct, None),
+            1,
+        );
         assert_eq!(completed.frontend_resync_episode_total, 1);
         assert!(!completed.frontend_resync_active);
         assert_eq!(completed.frontend_resync_duration_ms_total, 100.0);
@@ -5202,11 +5278,21 @@ mod tests {
             metrics.observe_frontend_send(elapsed);
         }
 
-        let active = metrics.snapshot(Duration::from_secs(1), 0, "relay", None, 1);
+        let active = metrics.snapshot(
+            Duration::from_secs(1),
+            0,
+            NetworkDiagnosticsSnapshot::test_fixture(PathMode::Relay, None),
+            1,
+        );
         assert!((active.transport_receive_fps - 60.0).abs() < 0.001);
         assert!((active.frontend_send_fps - 60.0).abs() < 0.001);
 
-        let idle = metrics.snapshot(Duration::from_secs(3), 0, "relay", None, 1);
+        let idle = metrics.snapshot(
+            Duration::from_secs(3),
+            0,
+            NetworkDiagnosticsSnapshot::test_fixture(PathMode::Relay, None),
+            1,
+        );
         assert_eq!(idle.transport_receive_fps, 0.0);
         assert_eq!(idle.frontend_send_fps, 0.0);
         assert_eq!(idle.transport_received_total, 60);
@@ -5390,6 +5476,7 @@ mod tests {
                 keyboard: false,
                 text: false,
                 gamepad: false,
+                input_ack: false,
                 control: false,
             }
         );
@@ -5406,6 +5493,7 @@ mod tests {
                 keyboard: false,
                 text: true,
                 gamepad: false,
+                input_ack: false,
                 control: true,
             }
         );
@@ -5418,6 +5506,7 @@ mod tests {
                 keyboard: true,
                 text: false,
                 gamepad: false,
+                input_ack: false,
                 control: true,
             }
         );
@@ -5430,8 +5519,13 @@ mod tests {
                 keyboard: false,
                 text: false,
                 gamepad: true,
+                input_ack: false,
                 control: true,
             }
+        );
+        assert!(
+            InputAvailability::from_capabilities(&[Capability::Gamepad, Capability::InputAck])
+                .input_ack
         );
         assert_eq!(
             InputAvailability::from_capabilities(&[
@@ -5445,16 +5539,37 @@ mod tests {
                 keyboard: false,
                 text: false,
                 gamepad: false,
+                input_ack: false,
                 control: true,
             }
         );
     }
 
     #[test]
-    fn input_capability_fallbacks_remove_only_one_protocol_extension_at_a_time() {
-        let [visibility, position, relative, inherited] =
-            input_capability_offers(InvitationGrants::ALL);
+    fn pointer_feedback_without_input_ack_does_not_fail_ack_validation() {
+        let diagnostics = StdMutex::new(NetworkSessionDiagnostics::new(Instant::now(), false));
+        assert!(observe_input_ack_if_negotiated(&diagnostics, false, 0, Instant::now()).is_ok());
+    }
 
+    #[test]
+    fn input_capability_fallbacks_remove_only_one_protocol_extension_at_a_time() {
+        let offers = input_capability_offers(InvitationGrants::ALL);
+        assert_eq!(offers.len(), 8);
+        let visibility = &offers[0];
+        let position = &offers[1];
+        let relative = &offers[2];
+        let inherited = &offers[3];
+
+        assert!(
+            offers[..4]
+                .iter()
+                .all(|offer| offer.contains(&Capability::InputAck))
+        );
+        assert!(
+            offers[4..]
+                .iter()
+                .all(|offer| !offer.contains(&Capability::InputAck))
+        );
         assert!(visibility.contains(&Capability::PointerVisibilityFeedback));
         assert!(visibility.contains(&Capability::PointerPositionFeedback));
         assert!(!position.contains(&Capability::PointerVisibilityFeedback));
@@ -5464,12 +5579,13 @@ mod tests {
         assert!(relative.contains(&Capability::RelativePointer));
         assert!(!inherited.contains(&Capability::RelativePointer));
         assert_eq!(
-            inherited,
-            vec![
+            inherited.as_slice(),
+            &[
                 Capability::AbsolutePointer,
                 Capability::Keyboard,
                 Capability::Text,
                 Capability::Gamepad,
+                Capability::InputAck,
             ]
         );
     }
@@ -5501,11 +5617,13 @@ mod tests {
             InvitationGrants::VIEW.union(InvitationGrants::POINTER_KEYBOARD),
         );
         assert!(pointer[0].contains(&Capability::Keyboard));
+        assert!(pointer[0].contains(&Capability::InputAck));
         assert!(!pointer[0].contains(&Capability::Gamepad));
 
         let gamepad =
             input_capability_offers(InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD));
-        assert_eq!(gamepad[0], vec![Capability::Gamepad]);
+        assert_eq!(gamepad[0], vec![Capability::Gamepad, Capability::InputAck]);
+        assert_eq!(gamepad[1], vec![Capability::Gamepad]);
     }
 
     #[test]

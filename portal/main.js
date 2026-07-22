@@ -31,6 +31,7 @@ import {
   isCurrentFrameGeneration,
   normalizeFrameStatsPayload,
 } from './frame-stats.mjs';
+import { networkDiagnosticsPresentation } from './network-diagnostics.mjs';
 import {
   FRAME_CHANNEL_CAPACITY,
   activateFrameSession,
@@ -1088,6 +1089,7 @@ let frontendResyncStats = null;
 let transportIntervalStats = null;
 let frontendIpcSendDurationStats = null;
 let rustTimingWindow = null;
+let networkDiagnostics = null;
 let receivedFrames = 0;
 let decoderInputFrames = 0;
 let decoderOutputFrames = 0;
@@ -1252,6 +1254,7 @@ function resetStreamTelemetry() {
   transportIntervalStats = null;
   frontendIpcSendDurationStats = null;
   rustTimingWindow = null;
+  networkDiagnostics = null;
   receivedFrames = 0;
   decoderInputFrames = 0;
   decoderOutputFrames = 0;
@@ -1364,6 +1367,7 @@ function updateStreamStats() {
   const decoderOutputIntervals = decoderOutputCadence.summary(now);
   const presentationIntervals = presentationCadence.summary(now);
   const avSkewPercentiles = avSkew.summary(now);
+  const networkPresentation = networkDiagnosticsPresentation(networkDiagnostics);
   document.getElementById('stream-received').textContent = receivedFrames;
   document.getElementById('stream-decoder-input').textContent = decoderInputFrames;
   document.getElementById('stream-decoder-output').textContent = decoderOutputFrames;
@@ -1429,6 +1433,11 @@ function updateStreamStats() {
   document.getElementById('stream-rtt').textContent = Number.isFinite(streamRttMs)
     ? `${streamRttMs.toFixed(1)} ms`
     : '— ms';
+  document.getElementById('stream-network-session').textContent = networkPresentation.session;
+  document.getElementById('stream-network-media').textContent = networkPresentation.media;
+  document.getElementById('stream-network-input').textContent = networkPresentation.input;
+  document.getElementById('stream-network-audio').textContent = networkPresentation.audio;
+  document.getElementById('stream-network-input-ack').textContent = networkPresentation.inputAck;
   document.getElementById('stream-adaptive-feedback').textContent = adaptiveFeedbackAvailable
     ? 'authenticated · 1 Hz bounded reports'
     : adaptiveFeedbackError || 'unavailable';
@@ -1956,6 +1965,7 @@ listen('frame-stats', (event) => {
   transportIntervalStats = diagnostics.transportIntervals;
   frontendIpcSendDurationStats = diagnostics.ipcSendDurations;
   rustTimingWindow = diagnostics.timingWindow;
+  networkDiagnostics = diagnostics.networkDiagnostics;
   streamPathMode = typeof event.payload.path_mode === 'string'
     ? event.payload.path_mode
     : streamPathMode;

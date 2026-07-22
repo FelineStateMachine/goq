@@ -90,6 +90,7 @@ test('normalizes exact v2 drop, queue, timing, and resync units', () => {
     transportIntervals: { count: 3, p50Ms: 16.6, p95Ms: 25.1, maxMs: 40.2 },
     ipcSendDurations: { count: 2, p50Ms: 0.1, p95Ms: 0.4, maxMs: 0.4 },
     timingWindow: { windowMs: 5000, sampleCapacity: 512 },
+    networkDiagnostics: null,
   });
 });
 
@@ -110,6 +111,76 @@ test('uses legacy aggregate drop aliases without inventing v2 splits', () => {
   assert.equal(stats.transportIntervals, null);
   assert.equal(stats.ipcSendDurations, null);
   assert.equal(stats.timingWindow, null);
+  assert.equal(stats.networkDiagnostics, null);
+});
+
+test('normalizes v4 network diagnostics without changing v1-v3 behavior', () => {
+  const leg = {
+    mode: 'direct',
+    sample_count: 1,
+    direct_samples: 1,
+    relay_samples: 0,
+    custom_samples: 0,
+    unknown_samples: 0,
+    path_epoch: 1,
+    path_switch_total: 0,
+    mode_transition_total: 0,
+    rtt_sample_count: 1,
+    rtt_current_ms: 0.8,
+    rtt_p50_ms: 5,
+    rtt_p95_ms: 5,
+    rtt_max_ms: 5,
+    rtt_overflow_total: 0,
+    tx_datagrams: 1,
+    tx_bytes: 100,
+    rx_datagrams: 1,
+    rx_bytes: 100,
+    lost_packets: 0,
+    lost_bytes: 0,
+    cwnd_bytes: 12000,
+    mtu: 1200,
+    congestion_events: 0,
+    black_holes_detected: 0,
+    counter_regression_total: 0,
+    complete: true,
+  };
+  const inputAck = {
+    negotiated: true,
+    sent_total: 1,
+    acknowledged_total: 1,
+    pending_count: 0,
+    pending_capacity: 64,
+    duplicate_total: 0,
+    untracked_total: 0,
+    malformed: false,
+    closed: false,
+    latency_sample_count: 1,
+    latency_p50_ms: 2,
+    latency_p95_ms: 2,
+    latency_max_ms: 2,
+    latency_overflow_total: 0,
+    complete: true,
+  };
+  const raw = {
+    version: 1,
+    session_elapsed_ms: 1000,
+    media: leg,
+    input: leg,
+    audio: null,
+    input_ack: inputAck,
+  };
+
+  const v4 = normalizeFrameStatsPayload({ stats_version: 4, network_diagnostics: raw });
+  assert.equal(v4.networkDiagnostics.media.mode, 'direct');
+  assert.equal(v4.networkDiagnostics.inputAck.acknowledgedTotal, 1);
+
+  const v3 = normalizeFrameStatsPayload({ stats_version: 3, network_diagnostics: raw });
+  assert.equal(v3.networkDiagnostics, null);
+  const malformed = normalizeFrameStatsPayload({
+    stats_version: 4,
+    network_diagnostics: { ...raw, media: { ...leg, complete: 'yes' } },
+  });
+  assert.equal(malformed.networkDiagnostics, null);
 });
 
 test('normalizes bounded v3 independent-object discard counters', () => {

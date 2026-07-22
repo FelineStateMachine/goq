@@ -1,3 +1,5 @@
+import { normalizeNetworkDiagnostics } from './network-diagnostics.mjs';
+
 function exactUnsigned(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
@@ -82,6 +84,7 @@ export function normalizeFrameStatsPayload(payload) {
   const statsVersion = exactUnsigned(payload.stats_version) ?? 1;
   const v2 = statsVersion >= 2;
   const v3 = statsVersion >= 3;
+  const v4 = statsVersion >= 4;
   const queueDroppedFrames = v2 ? exactUnsigned(payload.frontend_queue_dropped_total) : null;
   const resyncDroppedFrames = v2 ? exactUnsigned(payload.frontend_resync_dropped_total) : null;
   const splitFrontendTotal = queueDroppedFrames !== null && resyncDroppedFrames !== null
@@ -101,6 +104,7 @@ export function normalizeFrameStatsPayload(payload) {
   let transportIntervals = null;
   let ipcSendDurations = null;
   let timingWindow = null;
+  let networkDiagnostics = null;
   if (v2) {
     const depth = exactUnsigned(payload.frontend_queue_depth);
     const peak = exactUnsigned(payload.frontend_queue_peak);
@@ -130,6 +134,16 @@ export function normalizeFrameStatsPayload(payload) {
     }
   }
 
+  if (v4 && payload.network_diagnostics !== null && payload.network_diagnostics !== undefined) {
+    try {
+      networkDiagnostics = normalizeNetworkDiagnostics(payload.network_diagnostics);
+    } catch (_) {
+      // Network diagnostics are supplemental. A malformed snapshot must not
+      // discard otherwise valid frame statistics or be partially displayed.
+      networkDiagnostics = null;
+    }
+  }
+
   return {
     statsVersion,
     transportDroppedFrames: firstExactUnsigned(
@@ -150,5 +164,6 @@ export function normalizeFrameStatsPayload(payload) {
     transportIntervals,
     ipcSendDurations,
     timingWindow,
+    networkDiagnostics,
   };
 }

@@ -45,6 +45,9 @@ fi
 node --check "$site_dir/dither.js"
 python3 "$repo_dir/scripts/verify-portal-release.py" website \
   --manifest "$site_dir/portal-release.json" >/dev/null
+python3 "$repo_dir/scripts/verify-sigil-bootstrap.py" \
+  --bootstrap "$site_dir/install-sigil" \
+  --public-key-file "$repo_dir/release/sigil-minisign.pub" >/dev/null
 bash -n "$site_dir/install-sigil"
 [[ -x "$site_dir/install-sigil" ]] || {
   echo 'Sigil bootstrap must be executable' >&2

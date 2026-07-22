@@ -26,7 +26,8 @@ for command_name in awk curl find grep install minisign mktemp rm sha256sum tar 
     || die "$command_name is required"
 done
 
-[[ "$release_tag" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || die "the release tag is malformed"
+[[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] \
+  || die "the release tag is malformed"
 
 asset_name="sigil-$release_tag-bazzite-x86_64.tar.gz"
 asset_base="https://github.com/$repository/releases/download/$release_tag/$asset_name"
@@ -52,7 +53,9 @@ trap cleanup EXIT INT TERM HUP
 
 for suffix in '' .sha256 .minisig; do
   curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-    --retry 3 --retry-all-errors --output "$archive_path$suffix" "$asset_base$suffix"
+    --retry 3 --retry-all-errors --output "$archive_path$suffix" "$asset_base$suffix" \
+    || die "a signed release asset download failed"
+  [[ -s "$archive_path$suffix" ]] || die "a signed release asset download is empty"
 done
 
 minisign -Vm "$archive_path" -x "$signature_path" -P "$publisher_key" \

@@ -5,6 +5,10 @@
 # Node (if added later)
 node_modules/
 
+# Python release verifiers/tests
+__pycache__/
+*.py[cod]
+
 # OS
 .DS_Store
 Thumbs.db

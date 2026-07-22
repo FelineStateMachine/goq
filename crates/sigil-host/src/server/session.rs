@@ -9,9 +9,11 @@ use moq_net::BroadcastConsumer;
 use sigil_protocol::{InvitationGrants, KeyframeRequestReasonV3};
 use tracing::{debug, warn};
 
-use super::{ENCODER_CONTROL_COMMIT_TIMEOUT, MAX_PENDING_HANDSHAKES, VideoDimensions};
+use super::{ENCODER_CONTROL_COMMIT_TIMEOUT, VideoDimensions};
 use crate::clock::SessionClock;
 use crate::source::EncoderControl;
+
+const MAX_PENDING_HANDSHAKES: usize = 4;
 
 #[derive(Debug)]
 pub struct SessionRegistry {

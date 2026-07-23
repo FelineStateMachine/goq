@@ -1,0 +1,1 @@
+KERNEL=="uinput", SUBSYSTEM=="misc", OWNER="root", GROUP="sigil-uinput", MODE="0660", TAG-="uaccess", RUN+="/usr/bin/setfacl --remove-all $env{DEVNAME}"

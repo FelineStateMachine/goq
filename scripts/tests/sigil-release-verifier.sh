@@ -71,7 +71,10 @@ release = {
     "sigil-probe": b"fixture probe\n",
     "assets/50-sigil-spark-audio.conf": b"audio\n",
     "assets/70-sigil-remote-input.rules": b"udev\n",
+    "assets/72-sigil-uinput.rules": b"early uinput\n",
+    "assets/99-sigil-uinput.rules": b"final uinput\n",
     "assets/sigil-host.service": b"[Service]\nExecStart=/fixture\n",
+    "docs/sigil-host-activation.md": b"# Activation fixture\n",
     "tools/rollback-bazzite-release.sh": b"#!/usr/bin/env bash\nexit 0\n",
     "LICENSE": b"MIT\n",
     "release-manifest.json": (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode(),
@@ -92,7 +95,12 @@ package_sums = sums(payload)
 files = {"payload/PACKAGE-SHA256SUMS": package_sums}
 files.update({f"payload/{name}": data for name, data in payload.items()})
 files.update({f"payload/release/{name}": data for name, data in release.items()})
-dirs = ["payload/release", "payload/release/assets", "payload/release/tools"]
+dirs = [
+    "payload/release",
+    "payload/release/assets",
+    "payload/release/docs",
+    "payload/release/tools",
+]
 if variant == "unexpected":
     files["payload/unexpected"] = b"unexpected\n"
 

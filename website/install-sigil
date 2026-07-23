@@ -162,5 +162,5 @@ payload_path="$unpack_path/payload"
 "$payload_path/stage-this-release.sh"
 printf '%s\n' \
   "Sigil runtime $release_tag is installed." \
-  "Continue with the hardware and identity gates in the fresh Bazzite runbook." \
+  "Continue with $HOME/.local/libexec/sigil-spark/current/docs/sigil-host-activation.md." \
   "The installer did not start or restart the active Sigil service."

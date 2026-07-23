@@ -618,6 +618,11 @@ done
         self.assertEqual(self.minisign_marker.read_text(encoding="utf-8"), "invoked\n")
         self.assertFalse(self.forbidden_marker.exists())
         self.assertIn(f"Sigil runtime {RELEASE_TAG} is installed.", result.stdout)
+        self.assertIn(
+            ".local/libexec/sigil-spark/current/docs/sigil-host-activation.md",
+            result.stdout,
+        )
+        self.assertNotIn("fresh Bazzite runbook", result.stdout)
         self.assertEqual(list(self.tmp_dir.glob("goq-sigil-install.*")), [])
 
 

@@ -1,4 +1,10 @@
-# Fresh Bazzite AMD host setup
+# Fresh Bazzite AMD host engineering setup
+
+This document is the maintainer lab log and hardware-acceptance source. It
+intentionally contains historical machine names, checkout paths, evidence, and
+development workflows. A user activating an installed package should follow
+the portable [Sigil host activation guide](sigil-host-activation.md) shipped in
+that package instead.
 
 This runbook takes a dedicated AMD x86_64 machine from a fresh Bazzite install
 to a remotely managed Sigil host. It also defines how `slate` is used as

@@ -133,6 +133,7 @@ source_commit = sys.argv[4]
 expected_dirs = {
     "payload/release",
     "payload/release/assets",
+    "payload/release/docs",
     "payload/release/tools",
 }
 release_files = {
@@ -140,7 +141,10 @@ release_files = {
     "SHA256SUMS",
     "assets/50-sigil-spark-audio.conf",
     "assets/70-sigil-remote-input.rules",
+    "assets/72-sigil-uinput.rules",
+    "assets/99-sigil-uinput.rules",
     "assets/sigil-host.service",
+    "docs/sigil-host-activation.md",
     "release-manifest.json",
     "sigil",
     "sigil-host",

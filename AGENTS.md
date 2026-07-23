@@ -170,16 +170,6 @@ Sigil host.
 - Treat `docs/fresh-bazzite-host.md`, `docs/public-release-delivery.md`, and
   GitHub issues #3-#10 as the current acceptance sources. Distinguish local
   tests from hardware proof and from still-pending operator acceptance.
-- For any change that can affect startup, capture, encoding, transport,
-  decoding/presentation, audio/video, input, or session behavior, hardware
-  proof requires an actual exact-commit Portal connection to the UMPC
-  Gamescope host. Capture probes and loopback tests are supporting evidence;
-  they do not replace exercising the real client/server session.
-- Fresh exact-commit test builds are not expected to be enrolled. Use the
-  visibly labeled, build-time-contained development authorization bypass for
-  the bounded Portal-to-Sigil hardware session instead of skipping the
-  connection test or weakening production authentication. Stop the development
-  service afterward and restore the normal authenticated Sigil service.
 - Use the strict live capture gate on Bazzite when capture changes:
 
   ```bash
@@ -195,8 +185,10 @@ Sigil host.
   decoding, A/V, input, or session behavior requires a real Portal -> UMPC
   Gamescope connection from the exact candidate commit. A successful config
   check, capture probe, headless probe, or loopback is supporting evidence, not
-  a substitute for that end-to-end session. For development hardware testing,
-  build Sigil with `demo-auth-bypass`, run it with
+  a substitute for that end-to-end session. Fresh exact-commit builds are not
+  expected to be enrolled: do not skip the connection because ordinary
+  authentication blocks it. For development hardware testing, build Sigil with
+  `demo-auth-bypass`, run it with
   `--dev-allow-unauthorized` and a bounded `--max-runtime-seconds`, and connect
   a debug Portal with `--dev-connect`. Verify the affected live diagnostics
   and interaction path, then stop the bypass process, undo temporary Gamescope

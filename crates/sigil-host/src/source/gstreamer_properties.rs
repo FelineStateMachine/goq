@@ -11,7 +11,7 @@ mod linux {
     use std::ptr;
 
     use anyhow::{Context, Result, ensure};
-    use libloading::{Library, Symbol};
+    use libloading::Library;
 
     use super::{Path, VaapiRateControl};
 
@@ -95,25 +95,25 @@ mod linux {
     type GTypeClassUnref = unsafe extern "C" fn(*mut c_void);
     type GErrorFree = unsafe extern "C" fn(*mut GError);
 
-    struct GstreamerApi<'a> {
+    struct GstreamerApi {
         _gstreamer: Library,
         _gobject: Library,
         _glib: Library,
-        gst_init_check: Symbol<'a, GstInitCheck>,
-        gst_element_factory_make: Symbol<'a, GstElementFactoryMake>,
-        gst_object_unref: Symbol<'a, GstObjectUnref>,
-        g_object_class_find_property: Symbol<'a, GObjectClassFindProperty>,
-        g_object_get_property: Symbol<'a, GObjectGetProperty>,
-        g_value_init: Symbol<'a, GValueInit>,
-        g_value_get_string: Symbol<'a, GValueGetString>,
-        g_value_unset: Symbol<'a, GValueUnset>,
-        g_type_fundamental: Symbol<'a, GTypeFundamental>,
-        g_type_class_ref: Symbol<'a, GTypeClassRef>,
-        g_type_class_unref: Symbol<'a, GTypeClassUnref>,
-        g_error_free: Symbol<'a, GErrorFree>,
+        gst_init_check: GstInitCheck,
+        gst_element_factory_make: GstElementFactoryMake,
+        gst_object_unref: GstObjectUnref,
+        g_object_class_find_property: GObjectClassFindProperty,
+        g_object_get_property: GObjectGetProperty,
+        g_value_init: GValueInit,
+        g_value_get_string: GValueGetString,
+        g_value_unset: GValueUnset,
+        g_type_fundamental: GTypeFundamental,
+        g_type_class_ref: GTypeClassRef,
+        g_type_class_unref: GTypeClassUnref,
+        g_error_free: GErrorFree,
     }
 
-    impl GstreamerApi<'_> {
+    impl GstreamerApi {
         unsafe fn load() -> Result<Self> {
             let gstreamer = unsafe { Library::new("libgstreamer-1.0.so.0") }
                 .context("loading libgstreamer-1.0.so.0")?;
@@ -127,18 +127,19 @@ mod linux {
             // for at least as long as all function symbols below.
             unsafe {
                 Ok(Self {
-                    gst_init_check: gstreamer.get(b"gst_init_check\0")?,
-                    gst_element_factory_make: gstreamer.get(b"gst_element_factory_make\0")?,
-                    gst_object_unref: gstreamer.get(b"gst_object_unref\0")?,
-                    g_object_class_find_property: gobject.get(b"g_object_class_find_property\0")?,
-                    g_object_get_property: gobject.get(b"g_object_get_property\0")?,
-                    g_value_init: gobject.get(b"g_value_init\0")?,
-                    g_value_get_string: gobject.get(b"g_value_get_string\0")?,
-                    g_value_unset: gobject.get(b"g_value_unset\0")?,
-                    g_type_fundamental: gobject.get(b"g_type_fundamental\0")?,
-                    g_type_class_ref: gobject.get(b"g_type_class_ref\0")?,
-                    g_type_class_unref: gobject.get(b"g_type_class_unref\0")?,
-                    g_error_free: glib.get(b"g_error_free\0")?,
+                    gst_init_check: *gstreamer.get(b"gst_init_check\0")?,
+                    gst_element_factory_make: *gstreamer.get(b"gst_element_factory_make\0")?,
+                    gst_object_unref: *gstreamer.get(b"gst_object_unref\0")?,
+                    g_object_class_find_property: *gobject
+                        .get(b"g_object_class_find_property\0")?,
+                    g_object_get_property: *gobject.get(b"g_object_get_property\0")?,
+                    g_value_init: *gobject.get(b"g_value_init\0")?,
+                    g_value_get_string: *gobject.get(b"g_value_get_string\0")?,
+                    g_value_unset: *gobject.get(b"g_value_unset\0")?,
+                    g_type_fundamental: *gobject.get(b"g_type_fundamental\0")?,
+                    g_type_class_ref: *gobject.get(b"g_type_class_ref\0")?,
+                    g_type_class_unref: *gobject.get(b"g_type_class_unref\0")?,
+                    g_error_free: *glib.get(b"g_error_free\0")?,
                     _gstreamer: gstreamer,
                     _gobject: gobject,
                     _glib: glib,

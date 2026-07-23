@@ -73,8 +73,9 @@ Sigil host.
 - Relative pointer movement, scroll, keyboard, virtual gamepad reports, Opus
   audio, reconnects, and second-client rejection have focused and loopback
   coverage. Hardware acceptance that remains incomplete is listed below.
-- Portal's window scales to the incoming stream while preserving aspect ratio;
-  larger client screens do not stretch the host image.
+- Portal preserves the user's native window geometry across sessions and
+  relaunches. The stream surface scales and letterboxes within those bounds so
+  larger or differently shaped client windows never stretch the host image.
 - Portal's proven relative-pointer capture path is macOS-only. Non-macOS
   builds must mask relative-pointer negotiation unless explicitly built with
   `experimental-non-macos-pointer-capture`; that feature is for platform UAT

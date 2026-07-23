@@ -15,6 +15,21 @@ CACHE_PATH = "~/.cargo/bin/cargo-zigbuild"
 CACHE_KEY = "cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.0"
 LINUX_CROSS_BUILD_GATE = "./scripts/run-linux-cross-build-gate.sh"
 MAPPING_KEY = r"""(?:[A-Za-z0-9_-]+|"[A-Za-z0-9_-]+"|'[A-Za-z0-9_-]+')"""
+GATE_SCRIPT_PREFIX = """\
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_dir="$(cd -- "$script_dir/.." && pwd -P)"
+cd "$repo_dir"
+
+if [[ -f "$HOME/.cargo/env" ]]; then
+  # shellcheck source=/dev/null
+  source "$HOME/.cargo/env"
+fi
+
+./scripts/run-linux-cross-build-gate.sh
+"""
 
 INSTALL_RUN = """\
 python3 -m venv "$RUNNER_TEMP/zig-venv"
@@ -131,14 +146,31 @@ def _validate_workflow_layout(workflow: str) -> None:
     if _scalar(on_value):
         raise PolicyError("workflow on field must be a trigger mapping")
     on_end = _block_end(lines, on_start, 0)
-    pull_request_entries = [
-        _mapping_entry(line, 2)
-        for line in lines[on_start + 1 : on_end]
-        if _mapping_key(line, 2) == "pull_request"
+    pull_request_indices = [
+        index
+        for index in range(on_start + 1, on_end)
+        if _mapping_key(lines[index], 2) == "pull_request"
     ]
-    if len(pull_request_entries) != 1 or _scalar(pull_request_entries[0][1]):
+    if len(pull_request_indices) != 1:
         raise PolicyError(
-            "ordinary CI must contain exactly one unconditional pull_request trigger"
+            "ordinary CI must contain exactly one empty pull_request trigger"
+        )
+    pull_request_index = pull_request_indices[0]
+    pull_request_entry = _mapping_entry(lines[pull_request_index], 2)
+    if pull_request_entry is None or _scalar(pull_request_entry[1]):
+        raise PolicyError("ordinary CI pull_request trigger must be exactly empty")
+
+    pull_request_end = on_end
+    for index in range(pull_request_index + 1, on_end):
+        if _is_content(lines[index]) and _indent(lines[index]) <= 2:
+            pull_request_end = index
+            break
+    if any(
+        _is_content(line)
+        for line in lines[pull_request_index + 1 : pull_request_end]
+    ):
+        raise PolicyError(
+            "ordinary CI pull_request trigger must be exactly empty and unfiltered"
         )
 
 
@@ -279,6 +311,45 @@ def _parse_steps(job: list[str]) -> list[Step]:
         )
     if job_fields != {"name", "runs-on", "timeout-minutes", "env", "steps"}:
         raise PolicyError("jobs.demo-gate fields changed from the CI policy contract")
+    job_values = {key: value for key, value in job_entries}
+    if _scalar(job_values["name"]) != "Complete demo gate":
+        raise PolicyError("jobs.demo-gate must retain its required name")
+    if _scalar(job_values["runs-on"]) != "ubuntu-24.04":
+        raise PolicyError("jobs.demo-gate must run on ubuntu-24.04")
+    if _scalar(job_values["timeout-minutes"]) != "45":
+        raise PolicyError("jobs.demo-gate timeout must remain 45 minutes")
+    if _scalar(job_values["env"]):
+        raise PolicyError("jobs.demo-gate env field must be an exact mapping")
+    if _scalar(job_values["steps"]):
+        raise PolicyError("jobs.demo-gate steps field must be a list")
+
+    env_indices = [
+        index
+        for index, line in enumerate(job)
+        if _mapping_key(line, 4) == "env"
+    ]
+    if len(env_indices) != 1:
+        raise PolicyError("jobs.demo-gate must contain exactly one env mapping")
+    env_start = env_indices[0]
+    env_end = len(job)
+    for index in range(env_start + 1, len(job)):
+        if _is_content(job[index]) and _indent(job[index]) <= 4:
+            env_end = index
+            break
+    env_entries: list[tuple[str, str]] = []
+    for line in job[env_start + 1 : env_end]:
+        if not _is_content(line):
+            continue
+        entry = _mapping_entry(line, 6)
+        if entry is None:
+            raise PolicyError(f"cannot parse jobs.demo-gate env field: {line}")
+        env_entries.append(entry)
+    env_names = [key for key, _ in env_entries]
+    if len(env_names) != len(set(env_names)):
+        raise PolicyError("jobs.demo-gate env contains a duplicate field")
+    env = {key: _scalar(value) for key, value in env_entries}
+    if env != {"CARGO_TERM_COLOR": "always", "RUST_BACKTRACE": "1"}:
+        raise PolicyError("jobs.demo-gate env changed from the CI policy contract")
 
     steps_indices = [
         index
@@ -315,91 +386,15 @@ def _named_step(steps: list[Step], name: str) -> tuple[int, Step]:
     return matches[0]
 
 
-def _shell_compound_stack(lines: list[str], stop: int) -> list[str]:
-    stack: list[str] = []
-    closers = {
-        "fi": "if",
-        "done": "loop",
-        "esac": "case",
-        "}": "brace",
-        ")": "subshell",
-    }
-
-    for number, line in enumerate(lines[:stop], start=1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-
-        if stripped in closers:
-            expected = closers[stripped]
-            if not stack or stack[-1] != expected:
-                raise PolicyError(
-                    f"cannot prove shell control flow before cross-build gate at line {number}"
-                )
-            stack.pop()
-            continue
-
-        if re.match(
-            r"^(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*(?:\(\))?\s*\{\s*$",
-            stripped,
-        ):
-            stack.append("brace")
-        elif re.search(r"(?:^|\|\||&&)\s*\{\s*$", stripped):
-            stack.append("brace")
-        elif re.search(r"(?:^|\|\||&&)\s*\(\s*$", stripped):
-            stack.append("subshell")
-        elif re.match(r"^if\b", stripped):
-            stack.append("if")
-        elif re.match(r"^(?:for|while|until|select)\b", stripped):
-            stack.append("loop")
-        elif re.match(r"^case\b", stripped):
-            stack.append("case")
-
-    return stack
-
-
 def verify_gate_script(gate_script: str) -> None:
-    lines = gate_script.splitlines()
-    calls = [
-        index
-        for index, line in enumerate(lines)
-        if line.strip() == LINUX_CROSS_BUILD_GATE
-    ]
-    if len(calls) != 1:
+    if not gate_script.startswith(GATE_SCRIPT_PREFIX):
+        raise PolicyError(
+            "complete repository gate executable prefix changed before the required Linux cross build"
+        )
+
+    if gate_script.count(LINUX_CROSS_BUILD_GATE) != 1:
         raise PolicyError(
             "complete repository gate must invoke the Linux cross-build gate exactly once"
-        )
-
-    call = calls[0]
-    if lines[call] != LINUX_CROSS_BUILD_GATE:
-        raise PolicyError(
-            "Linux cross-build gate must be an unindented top-level simple command"
-        )
-    if _shell_compound_stack(lines, call):
-        raise PolicyError(
-            "Linux cross-build gate must not be nested in conditional or compound shell control flow"
-        )
-
-    content_before = [
-        line.strip()
-        for line in lines[:call]
-        if _is_content(line)
-    ]
-    content_after = [
-        line.strip()
-        for line in lines[call + 1 :]
-        if _is_content(line)
-    ]
-    if not content_before or content_before[-1] != "fi":
-        raise PolicyError(
-            "Linux cross-build gate placement changed before the required frontend gates"
-        )
-    if (
-        not content_after
-        or content_after[0] != "while IFS= read -r frontend_source; do"
-    ):
-        raise PolicyError(
-            "Linux cross-build gate placement changed before the required frontend gates"
         )
 
 

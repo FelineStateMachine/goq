@@ -10,6 +10,8 @@ if [[ -f "$HOME/.cargo/env" ]]; then
   source "$HOME/.cargo/env"
 fi
 
+./scripts/run-linux-cross-build-gate.sh
+
 for command_name in cargo rustc node git ffmpeg shellcheck; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     printf 'required command is missing: %s\n' "$command_name" >&2
@@ -90,7 +92,6 @@ if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
     "$gstreamer_test" -- --ignored --nocapture
   echo 'in_process_gstreamer_gate=ok'
 fi
-./scripts/run-linux-cross-build-gate.sh
 while IFS= read -r frontend_source; do
   node --check "$frontend_source"
 done < <(find portal -maxdepth 1 -type f \( -name '*.js' -o -name '*.mjs' \) -print | sort)

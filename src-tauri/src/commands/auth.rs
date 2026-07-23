@@ -77,14 +77,27 @@ pub fn derive_secret_from_key(pin: &str) -> anyhow::Result<[u8; 32]> {
 }
 
 pub fn extract_hmac_secret(assertions: &[Assertion]) -> anyhow::Result<[u8; 32]> {
-    for ext in &assertions[0].extensions {
+    let assertion = assertions.first().context(
+        "Security key returned no assertions. Reconnect the key and try the PIN and tap again.",
+    )?;
+
+    for ext in &assertion.extensions {
         if let Gext::HmacSecret(Some(output)) = ext {
-            let mut secret = [0u8; 32];
-            secret.copy_from_slice(&output[..]);
-            return Ok(secret);
+            return validate_hmac_secret_output(output);
         }
     }
-    anyhow::bail!("No hmac-secret in assertion response")
+    anyhow::bail!(
+        "Security key assertion did not contain hmac-secret output. Use a compatible FIDO2 key and try again."
+    )
+}
+
+fn validate_hmac_secret_output(output: &[u8]) -> anyhow::Result<[u8; 32]> {
+    output.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "Security key returned malformed hmac-secret output: expected 32 bytes, received {}. Reconnect the key or try a compatible FIDO2 key.",
+            output.len()
+        )
+    })
 }
 
 pub fn derive_iroh_secret_from_key(pin: &str) -> anyhow::Result<SecretKey> {
@@ -244,6 +257,39 @@ pub async fn key_derive_identity(pin: String) -> KeyIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_hmac_secret_rejects_empty_assertion_list() {
+        let error = extract_hmac_secret(&[]).expect_err("empty assertions must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Security key returned no assertions. Reconnect the key and try the PIN and tap again."
+        );
+    }
+
+    #[test]
+    fn validate_hmac_secret_output_rejects_non_32_byte_values() {
+        for output in [&[0x2a; 31][..], &[0x2a; 33][..]] {
+            let error =
+                validate_hmac_secret_output(output).expect_err("invalid length must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("expected 32 bytes, received {}", output.len()))
+            );
+        }
+    }
+
+    #[test]
+    fn extract_hmac_secret_returns_exact_output() {
+        let expected = [0x2a; 32];
+        let assertion = Assertion {
+            extensions: vec![Gext::HmacSecret(Some(expected))],
+            ..Default::default()
+        };
+
+        assert_eq!(extract_hmac_secret(&[assertion]).unwrap(), expected);
+    }
 
     #[test]
     fn portal_identity_derivation_is_stable_and_domain_separated() {

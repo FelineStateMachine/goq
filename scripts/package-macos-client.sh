@@ -17,8 +17,10 @@ Build and verify a distributable macOS DMG. This gate requires:
   - Tauri notarization credentials (App Store Connect API or Apple ID);
   - strict code-signing, hardened runtime, Gatekeeper, and stapling checks.
 
-The normal release is built without the demo-direct-node feature. Development
-or ad-hoc signatures are intentionally not accepted by this command.
+The normal release is built without optional Cargo features. Development
+features, including demo-direct-node and
+experimental-non-macos-pointer-capture, and ad-hoc signatures are
+intentionally not accepted by this command.
 EOF
 }
 

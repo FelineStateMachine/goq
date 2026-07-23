@@ -44,11 +44,29 @@ const fn should_apply_native_cursor_association(current: bool, requested: bool) 
     requested || current != requested
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(
+    not(target_os = "macos"),
+    feature = "experimental-non-macos-pointer-capture"
+))]
 fn set_native_cursor_grab(window: &tauri::WebviewWindow, grab: bool) -> Result<(), String> {
     window
         .set_cursor_grab(grab)
         .map_err(|error| format!("Could not set native cursor grab to {grab}: {error}"))
+}
+
+#[cfg(all(
+    not(target_os = "macos"),
+    not(feature = "experimental-non-macos-pointer-capture")
+))]
+fn set_native_cursor_grab(_window: &tauri::WebviewWindow, grab: bool) -> Result<(), String> {
+    if grab {
+        return Err(
+            "Relative pointer capture is unavailable on this Portal build; rebuild with the \
+             experimental-non-macos-pointer-capture feature for platform UAT"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

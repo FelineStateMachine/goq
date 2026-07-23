@@ -61,6 +61,9 @@ require_rust_test 'resolves_pinned_upstream_gamescope_pipewire_contract' \
 cargo fmt --all -- --check
 cargo test --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo check --locked -p portal --all-targets \
+  --features experimental-non-macos-pointer-capture
+echo 'experimental_non_macos_pointer_capture_compile=ok'
 if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
   control_test='encoder_control_coalesces_latest_state_and_acknowledges_only_configured_idr'
   gstreamer_test='in_process_gstreamer_x264_smoke'

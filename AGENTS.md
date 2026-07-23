@@ -102,6 +102,11 @@ Sigil host.
   the allowlisted runtime payload, carry complete checksums/provenance, and have
   a detached Minisign signature. Installation must preserve identity and host
   configuration and must not silently start, restart, or enable the service.
+- Product Sigil assets use the target-contract suffix
+  `linux-glibc2.17-x86_64`, pinned by
+  `release/sigil-target-contract.txt`. That name describes the binary ABI, not
+  validated host support; the public bootstrap remains Bazzite-only until
+  another environment passes its own packaging and hardware gates.
 - Portal is a compiled desktop download, never a shell install. The first
   public target is macOS arm64 and requires Developer ID signing, hardened
   runtime, notarization, stapling, and strict Gatekeeper verification. Its

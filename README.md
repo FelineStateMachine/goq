@@ -241,7 +241,7 @@ temporary testing:
 ```bash
 scripts/package-bazzite-release.sh \
   --release-tag v0.1.0 \
-  --output /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz
+  --output /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz
 
 # Temporary development package only:
 scripts/package-bazzite-release.sh \

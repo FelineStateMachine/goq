@@ -20,7 +20,7 @@ function connectedResult(overrides = {}) {
     text_available: false,
     gamepad_available: false,
     control_available: true,
-    media_transport: 'grouped-v3',
+    media_transport: 'iroh-moq',
     development_mode: false,
     ...overrides,
   };
@@ -64,8 +64,9 @@ function harness(results = [connectedResult()]) {
   return { state, commands, attempts, statuses, events };
 }
 
-test('pins the current transport allowlist including the known iroh-moq gap', () => {
+test('pins every Rust diagnostic transport name including preferred iroh-moq', () => {
   assert.deepEqual([...MEDIA_TRANSPORT_ALLOWLIST], [
+    'iroh-moq',
     'grouped-v3',
     'independent-v2',
     'reliable-v1',
@@ -74,7 +75,7 @@ test('pins the current transport allowlist including the known iroh-moq gap', ()
   for (const transport of MEDIA_TRANSPORT_ALLOWLIST) {
     assert.equal(normalizeMediaTransport(transport), transport);
   }
-  assert.equal(normalizeMediaTransport('iroh-moq'), 'unknown');
+  assert.equal(normalizeMediaTransport('iroh-moq'), 'iroh-moq');
   assert.equal(normalizeMediaTransport(null), 'unknown');
 });
 
@@ -161,7 +162,7 @@ test('successful connect normalizes capabilities and forces inconsistent control
     gamepad: false,
     control: false,
   });
-  assert.equal(current.state.mediaTransport, 'grouped-v3');
+  assert.equal(current.state.mediaTransport, 'iroh-moq');
   assert.deepEqual(current.statuses, [
     ['pending', 'connecting...'],
     ['ok', 'connected · view only'],

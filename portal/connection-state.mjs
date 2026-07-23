@@ -4,6 +4,7 @@ import {
 } from './connection-attempt.mjs';
 
 export const MEDIA_TRANSPORT_ALLOWLIST = Object.freeze([
+  'iroh-moq',
   'grouped-v3',
   'independent-v2',
   'reliable-v1',

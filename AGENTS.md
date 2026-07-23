@@ -202,6 +202,13 @@ Sigil host.
   controls, and restore and verify the ordinary authenticated
   `sigil-host.service` before calling the test complete.
 
+- Do not report a runtime-affecting change as hardware-tested unless Portal
+  actually established the UMPC session and exercised the affected live path.
+  When authentication or identity is itself under test, the development bypass
+  is not evidence for that behavior: complete the real LA_key PIN/tap
+  enrollment, disconnect, and ticket-free reconnect with the exact candidate
+  instead.
+
 - On Linux with NVIDIA, set `WEBKIT_DISABLE_DMABUF_RENDERER=1` for Portal.
 - Preserve `/Users/dami/Developer/sigil` untouched; it is the inherited source,
   not this working repository.

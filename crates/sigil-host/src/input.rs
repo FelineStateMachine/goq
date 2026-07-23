@@ -670,8 +670,8 @@ mod linux {
         ALL_MAPPED_KEYS, GAMEPAD_DEVICE_NAME, GAMEPAD_PRODUCT_ID, GamepadAxis, GamepadButton,
         InputDeviceClass, KEYBOARD_DEVICE_NAME, KEYBOARD_PRODUCT_ID, MappedKey,
         POINTER_DEVICE_NAME, POINTER_PRODUCT_ID, POSIX_ACL_REQUIRED_BYTES, PointerReportEvent,
-        UINPUT_VENDOR_ID, input_device_class, map_gamepad_state, map_key,
-        pointer_position_sync_report, validate_single_user_access_acl,
+        UINPUT_BUS_TYPE, UINPUT_DEVICE_VERSION, UINPUT_VENDOR_ID, input_device_class,
+        map_gamepad_state, map_key, pointer_position_sync_report, validate_single_user_access_acl,
     };
     use crate::config::UinputConfig;
 

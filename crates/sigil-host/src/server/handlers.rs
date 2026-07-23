@@ -1,3 +1,4 @@
+use super::session::InputLease;
 use super::*;
 
 pub(super) const MEDIA_CAPABILITIES: &[Capability] = &[Capability::VideoH264];
@@ -5,6 +6,49 @@ const AUDIO_CAPABILITIES: &[Capability] = &[Capability::AudioOpus];
 pub(super) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const INPUT_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const REJECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[must_use = "the guard must remain armed for the lifetime of the input session"]
+struct InputSessionGuard<F>
+where
+    F: FnOnce() -> Result<()>,
+{
+    _lease: InputLease,
+    reset: Option<F>,
+}
+
+impl<F> InputSessionGuard<F>
+where
+    F: FnOnce() -> Result<()>,
+{
+    fn new(lease: InputLease, reset: F) -> Self {
+        Self {
+            _lease: lease,
+            reset: Some(reset),
+        }
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.run()
+    }
+
+    fn run(&mut self) -> Result<()> {
+        let Some(reset) = self.reset.take() else {
+            return Ok(());
+        };
+        reset()
+    }
+}
+
+impl<F> Drop for InputSessionGuard<F>
+where
+    F: FnOnce() -> Result<()>,
+{
+    fn drop(&mut self) {
+        if let Err(error) = self.run() {
+            error!(%error, "failed to release held input transitions while dropping session");
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct MediaHandler {
@@ -225,9 +269,14 @@ async fn serve_input(
             return Err(error);
         }
     };
+    let session_id = lease.session_id;
+    let grants = lease.grants;
+    // Owning the lease guarantees cancellation or unwinding neutralizes the
+    // virtual devices before another input stream can be admitted.
+    let session_guard = InputSessionGuard::new(lease, || backend.reset_session());
     let supported =
         supported_input_capabilities(backend.capabilities(), pointer_positions.is_some());
-    let negotiated = negotiated_input_capabilities(&hello, &supported, lease.grants);
+    let negotiated = negotiated_input_capabilities(&hello, &supported, grants);
 
     let ack_enabled = negotiated.contains(&Capability::InputAck);
     let feedback_enabled = negotiated.contains(&Capability::PointerPositionFeedback);
@@ -237,10 +286,10 @@ async fn serve_input(
         .map(PointerPositionTracker::subscribe);
     write_host_hello(
         &mut send,
-        &HostHello::accepted(lease.session_id, negotiated.clone()),
+        &HostHello::accepted(session_id, negotiated.clone()),
     )
     .await?;
-    info!(%remote, session_id = lease.session_id, "input client accepted");
+    info!(%remote, session_id, "input client accepted");
 
     let session_result: Result<()> = async {
         let mut received_events = 0_u64;
@@ -263,8 +312,8 @@ async fn serve_input(
             .context("timed out writing initial pointer position")??;
         }
         loop {
-            if !sessions.is_active(remote, lease.session_id) {
-                debug!(%remote, session_id = lease.session_id, "media session ended; closing input");
+            if !sessions.is_active(remote, session_id) {
+                debug!(%remote, session_id, "media session ended; closing input");
                 break;
             }
             tokio::select! {
@@ -303,8 +352,8 @@ async fn serve_input(
                     let Some(event) = event? else {
                         break;
                     };
-                    if !sessions.is_active(remote, lease.session_id) {
-                        debug!(%remote, session_id = lease.session_id, "discarding input after media ended");
+                    if !sessions.is_active(remote, session_id) {
+                        debug!(%remote, session_id, "discarding input after media ended");
                         break;
                     }
                     match backend.apply(&event, &negotiated)? {
@@ -352,11 +401,15 @@ async fn serve_input(
         Ok(())
     }
     .await;
-    let reset_result = backend
-        .reset_session()
+    let reset_result = session_guard
+        .finish()
         .context("releasing held input transitions at session end");
+    if session_result.is_err()
+        && let Err(error) = &reset_result
+    {
+        error!(%error, "input session and held-transition release both failed");
+    }
     let result = session_result.and(reset_result);
-    drop(lease);
     info!(%remote, "input client released");
     result
 }
@@ -601,7 +654,116 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    #[test]
+    fn input_session_guard_resets_before_releasing_lease_on_drop() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let nonce = [1; 16];
+        let _media = sessions
+            .claim(remote, nonce, InvitationGrants::ALL)
+            .unwrap();
+        let input = sessions.claim_input(remote, nonce).unwrap();
+        let resets = Cell::new(0);
+        let reset_saw_lease_held = Cell::new(false);
+
+        {
+            let _guard = InputSessionGuard::new(input, || {
+                resets.set(resets.get() + 1);
+                reset_saw_lease_held.set(sessions.claim_input(remote, nonce).is_err());
+                Ok(())
+            });
+        }
+
+        assert_eq!(resets.get(), 1);
+        assert!(reset_saw_lease_held.get());
+        assert!(sessions.claim_input(remote, nonce).is_ok());
+    }
+
+    #[test]
+    fn input_session_guard_finish_propagates_reset_error_once() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let nonce = [2; 16];
+        let _media = sessions
+            .claim(remote, nonce, InvitationGrants::ALL)
+            .unwrap();
+        let input = sessions.claim_input(remote, nonce).unwrap();
+        let resets = Cell::new(0);
+
+        let error = InputSessionGuard::new(input, || {
+            resets.set(resets.get() + 1);
+            Err(anyhow::anyhow!("reset failed"))
+        })
+        .finish()
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "reset failed");
+        assert_eq!(resets.get(), 1);
+        assert!(sessions.claim_input(remote, nonce).is_ok());
+    }
+
+    #[test]
+    fn input_session_guard_resets_before_releasing_lease_during_unwind() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let nonce = [3; 16];
+        let _media = sessions
+            .claim(remote, nonce, InvitationGrants::ALL)
+            .unwrap();
+        let input = sessions.claim_input(remote, nonce).unwrap();
+        let reset_saw_lease_held = Cell::new(false);
+
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = InputSessionGuard::new(input, || {
+                reset_saw_lease_held.set(sessions.claim_input(remote, nonce).is_err());
+                Ok(())
+            });
+            panic!("simulate input task panic");
+        }));
+
+        assert!(panic_result.is_err());
+        assert!(reset_saw_lease_held.get());
+        assert!(sessions.claim_input(remote, nonce).is_ok());
+    }
+
+    #[tokio::test]
+    async fn input_session_guard_resets_before_releasing_lease_when_task_is_cancelled() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let nonce = [4; 16];
+        let _media = sessions
+            .claim(remote, nonce, InvitationGrants::ALL)
+            .unwrap();
+        let input = sessions.claim_input(remote, nonce).unwrap();
+        let reset_saw_lease_held = Arc::new(AtomicBool::new(false));
+        let task_sessions = Arc::clone(&sessions);
+        let task_reset_saw_lease_held = Arc::clone(&reset_saw_lease_held);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            let _guard = InputSessionGuard::new(input, move || {
+                task_reset_saw_lease_held.store(
+                    task_sessions.claim_input(remote, nonce).is_err(),
+                    Ordering::SeqCst,
+                );
+                Ok(())
+            });
+            armed_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        armed_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(reset_saw_lease_held.load(Ordering::SeqCst));
+        assert!(sessions.claim_input(remote, nonce).is_ok());
+    }
 
     #[test]
     fn capability_negotiation_is_an_exact_intersection() {

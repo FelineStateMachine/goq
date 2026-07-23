@@ -3,6 +3,8 @@ use std::fmt;
 use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(any(target_os = "linux", test))]
+use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
 use anyhow::Context;
@@ -282,13 +284,28 @@ impl InputBackend {
     pub fn reset_session(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(device) = &self.device {
-            device
-                .lock()
-                .map_err(|_| anyhow::anyhow!("uinput backend lock poisoned"))?
-                .release_all()?;
+            reset_through_poisoned_lock(device, linux::UinputDevice::release_all)?;
         }
         Ok(())
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn reset_through_poisoned_lock<T>(
+    device: &Mutex<T>,
+    reset: impl FnOnce(&mut T) -> Result<()>,
+) -> Result<()> {
+    let mut device = match device.lock() {
+        Ok(device) => device,
+        Err(poisoned) => {
+            // A panic while applying input poisons this mutex. Teardown must
+            // still recover the device solely to release held transitions;
+            // ordinary input continues to reject the poisoned lock.
+            tracing::warn!("recovering poisoned uinput lock for session reset");
+            poisoned.into_inner()
+        }
+    };
+    reset(&mut device)
 }
 
 fn ensure_event_was_negotiated(
@@ -1395,6 +1412,9 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Arc;
+
     use super::*;
 
     fn acl_entry(tag: u16, permissions: u16, id: u32) -> [u8; POSIX_ACL_ENTRY_BYTES] {
@@ -1499,6 +1519,32 @@ mod tests {
         assert_ne!(POINTER_PRODUCT_ID, KEYBOARD_PRODUCT_ID);
         assert_ne!(POINTER_PRODUCT_ID, GAMEPAD_PRODUCT_ID);
         assert_ne!(KEYBOARD_PRODUCT_ID, GAMEPAD_PRODUCT_ID);
+    }
+
+    #[test]
+    fn session_reset_recovers_a_lock_poisoned_while_applying_input() {
+        #[derive(Debug, Default)]
+        struct DeviceState {
+            released: bool,
+        }
+
+        let device = Arc::new(Mutex::new(DeviceState::default()));
+        let panic_device = Arc::clone(&device);
+        let panic_result = catch_unwind(AssertUnwindSafe(move || {
+            let _device = panic_device.lock().unwrap();
+            panic!("simulate panic while applying uinput");
+        }));
+        assert!(panic_result.is_err());
+        assert!(device.lock().is_err());
+
+        reset_through_poisoned_lock(device.as_ref(), |device| {
+            device.released = true;
+            Ok(())
+        })
+        .unwrap();
+
+        let device = device.lock().unwrap_err().into_inner();
+        assert!(device.released);
     }
 
     #[test]

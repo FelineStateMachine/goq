@@ -70,7 +70,19 @@ impl StartupCadenceSample {
 }
 
 fn startup_source_needs_restart(sample: StartupCadenceSample) -> bool {
-    !sample.is_usable()
+    // An open producer with no frames is ambiguous by design: damage-driven
+    // Gamescope capture may be healthy and simply have nothing to repaint.
+    // Restart only on a closed producer or observed encoded progress that
+    // never yielded a decodable GOP.
+    !sample.receiver_open || (sample.frame_progress() > 0 && !sample.decodable_gop_ready)
+}
+
+fn replacement_source_has_failed(sample: StartupCadenceSample) -> bool {
+    // After the one sequential retry, open output channels mean the capture
+    // task is still alive. A damage-driven Gamescope source may legitimately
+    // remain frameless until the next repaint, so do not turn the sampling
+    // deadline into a session-establishment deadline.
+    !sample.receiver_open
 }
 
 async fn sample_startup_cadence(
@@ -146,6 +158,11 @@ pub(super) async fn select_gamescope_startup_source(
         "sampled primary Gamescope capture startup"
     );
     if !startup_source_needs_restart(primary_sample) {
+        if !primary_sample.is_usable() {
+            warn!(
+                "primary Gamescope capture is live but awaiting a damage-driven decodable repaint"
+            );
+        }
         return Ok(primary);
     }
 
@@ -171,7 +188,7 @@ pub(super) async fn select_gamescope_startup_source(
         target_cadence = replacement_sample.meets_target_cadence(),
         "sampled sequential Gamescope capture startup replacement"
     );
-    if !replacement_sample.is_usable() {
+    if replacement_source_has_failed(replacement_sample) {
         let frames = replacement_sample.frame_progress();
         let fps = replacement_sample.fps();
         let receiver_open = replacement_sample.receiver_open;
@@ -181,6 +198,14 @@ pub(super) async fn select_gamescope_startup_source(
             "replacement Gamescope capture pipeline remained unhealthy: \
              frames={frames}, fps={fps:.2}, receiver_open={receiver_open}, \
              decodable_gop_ready={decodable_gop_ready}"
+        );
+    }
+    if !replacement_sample.is_usable() {
+        warn!(
+            frames = replacement_sample.frame_progress(),
+            fps = replacement_sample.fps(),
+            decodable_gop_ready = replacement_sample.decodable_gop_ready,
+            "sequential Gamescope capture is live but awaiting a damage-driven decodable repaint"
         );
     }
     Ok(replacement)
@@ -215,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_restart_requires_a_live_decodable_source_not_target_cadence() {
+    fn startup_restart_requires_closed_or_active_undecodable_source() {
         let slow = startup_sample(12.0, 6, true);
         let target = startup_sample(60.0, 8, true);
         assert!(!startup_source_needs_restart(slow));
@@ -223,7 +248,7 @@ mod tests {
         assert!(!startup_source_needs_restart(target));
         assert!(target.meets_target_cadence());
         assert!(startup_source_needs_restart(startup_sample(60.0, 8, false)));
-        assert!(startup_source_needs_restart(startup_sample(0.0, 0, true)));
+        assert!(!startup_source_needs_restart(startup_sample(0.0, 0, true)));
         let mut undecodable = startup_sample(60.0, 8, true);
         undecodable.decodable_gop_ready = false;
         assert!(startup_source_needs_restart(undecodable));
@@ -236,6 +261,30 @@ mod tests {
         assert!(!burst.has_representative_span());
         assert!(!burst.meets_target_cadence());
         assert!(!startup_source_needs_restart(burst));
+    }
+
+    #[test]
+    fn live_replacement_can_wait_for_damage_driven_repaint() {
+        let frameless = startup_sample(0.0, 0, true);
+        assert!(!startup_source_needs_restart(frameless));
+        assert!(!replacement_source_has_failed(frameless));
+
+        let closed = startup_sample(0.0, 0, false);
+        assert!(replacement_source_has_failed(closed));
+    }
+
+    #[tokio::test]
+    async fn startup_sampling_preserves_live_frameless_source() {
+        let (frame_sender, mut frame_receiver) = tokio::sync::watch::channel(None);
+        let (_gop_sender, gop_receiver) = tokio::sync::watch::channel(None);
+
+        let sample =
+            sample_startup_cadence(&mut frame_receiver, &gop_receiver, Duration::ZERO).await;
+
+        assert_eq!(sample.frame_progress(), 0);
+        assert!(sample.receiver_open);
+        assert!(!replacement_source_has_failed(sample));
+        assert!(!frame_sender.is_closed());
     }
 
     #[tokio::test]

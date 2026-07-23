@@ -1472,13 +1472,19 @@ set -o pipefail
 
 The Gamescope session must predate the first accepted SSH login.
 `--cold-boot` is read-only and makes the gate machine-checkable. It exits zero
-only when no DRM connector is connected, the SDDM Gaming Mode session and
-required PipeWire nodes are active, the Sigil service is enabled and ready,
-and Gamescope plus Sigil both predate the first accepted SSH login. Exit status
-`1` means observed evidence failed a gate. Exit status `3` means the boot
-journal is unavailable, starts more than five minutes after boot, or otherwise
-cannot establish the first SSH ordering; do not treat that as a pass. Run it
-immediately on the first SSH login so journal rotation cannot erase the proof.
+only when no DRM connector is connected, an active local gaming-user autologin
+session and the required PipeWire nodes are active, the Sigil service is
+enabled and ready, and Gamescope plus Sigil both predate the first accepted
+SSH login. The gaming
+session check is display-manager-independent: it requires an active, local
+logind session for the gaming user whose exact PAM service name ends in
+`-autologin` (for example, `sddm-autologin` or `gdm-autologin`). A manual
+desktop login, SSH session, or merely started user manager does not satisfy the
+gate. Exit status `1` means observed evidence failed a gate. Exit status `3`
+means the boot journal is unavailable, starts more than five minutes after
+boot, or otherwise cannot establish the first SSH ordering; do not treat that
+as a pass. Run it immediately on the first SSH login so journal rotation
+cannot erase the proof.
 
 If the stock session does not start or does not publish a node without a
 physical connector, stop at this gate. This is an expected discovery risk on

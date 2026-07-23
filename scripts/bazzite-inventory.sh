@@ -195,6 +195,8 @@ cold_boot_session_evidence() {
   local session_id
   local session_details
   local current_user_id
+  local service
+  local service_count
   local autologin_found=false
 
   current_user_id="$(id -u)"
@@ -215,7 +217,12 @@ cold_boot_session_evidence() {
     fi
     printf 'session_begin=%s\n%s\nsession_end=%s\n' \
       "$session_id" "$session_details" "$session_id"
-    if grep -qx 'Service=sddm-autologin' <<<"$session_details" &&
+    service_count="$(grep -c '^Service=' <<<"$session_details" || true)"
+    service=''
+    if [[ "$service_count" == 1 ]]; then
+      service="$(sed -n 's/^Service=//p' <<<"$session_details")"
+    fi
+    if [[ "$service" =~ ^[[:alnum:]_.@+-]+-autologin$ ]] &&
       grep -qx "User=$current_user_id" <<<"$session_details" &&
       grep -qx 'Remote=no' <<<"$session_details" &&
       grep -qx 'State=active' <<<"$session_details"; then
@@ -226,7 +233,7 @@ cold_boot_session_evidence() {
   if [[ "$autologin_found" == true ]]; then
     echo 'gaming_autologin_session=ok'
   else
-    cold_boot_failure no_active_local_sddm_autologin_session
+    cold_boot_failure no_active_local_gaming_autologin_session
   fi
 }
 

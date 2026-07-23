@@ -1220,18 +1220,21 @@ in the compositor's native pointer space without independent-axis stretching.
 Zero-sized, unrepresentable, off-root, or cross-screen geometry still fails
 closed.
 
-Gamescope builds that publish `GAMESCOPE_CURSOR_VISIBLE_FEEDBACK` provide exact
-cursor visibility. When that optional extension is absent or malformed, Sigil
-logs the fallback and shows the client cursor only for a bounded three seconds
-after authoritative pointer motion. Missing or unreachable Xwayland state
-during startup still disables the separately negotiated pointer feedback
-capability. After successful startup, losing Gamescope publishes pointer
-feedback as unavailable, then reconnects the bootstrap display with a bounded
-100 ms to 2 second backoff. A complete reconnect re-detects both optional
-Gamescope properties, validates one active-display sample, and only then
-publishes coordinates again. Relative uinput remains available without guessed
-cursor coordinates. The service `DISPLAY=:0` line is retained as an explicit
-fallback for configurations created before `xwayland_display` was added.
+Gamescope builds that publish `GAMESCOPE_CURSOR_VISIBLE_FEEDBACK` provide the
+compositor's visibility sample. Authoritative pointer motion deliberately keeps
+the client cursor visible for a bounded three seconds even if that sample is
+temporarily false, recovering Gamescope's virtual cursor after remote input.
+When the optional extension is absent or malformed, Sigil logs the fallback and
+uses that same bounded motion window without inventing longer-lived visibility.
+Missing or unreachable Xwayland state during startup still disables the
+separately negotiated pointer feedback capability. After successful startup,
+losing Gamescope publishes pointer feedback as unavailable, then reconnects the
+bootstrap display with a bounded 100 ms to 2 second backoff. A complete
+reconnect re-detects both optional Gamescope properties, validates one
+active-display sample, and only then publishes coordinates again. Relative
+uinput remains available without guessed cursor coordinates. The service
+`DISPLAY=:0` line is retained as an explicit fallback for configurations
+created before `xwayland_display` was added.
 
 Audio is optional and must resolve one exact PipeWire sink, never a microphone.
 The appliance owns a persistent 48 kHz stereo null sink so capture does not

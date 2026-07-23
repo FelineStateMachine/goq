@@ -20,3 +20,19 @@ test('mouse buttons use the same WebKit event family as motion and scrolling', (
   );
   assert.doesNotMatch(buttonHandlers, /pointer(?:down|up|cancel)|pointerType|PointerCapture/);
 });
+
+test('relative control consumes the synthetic local click before UI toggles see it', () => {
+  assert.match(
+    main,
+    /window\.addEventListener\('click', suppressLocalClickDuringRelativeControl, \{ capture: true \}\);/,
+  );
+
+  const clickGuard = main.slice(
+    main.indexOf('function suppressLocalClickDuringRelativeControl'),
+    main.indexOf("window.addEventListener('contextmenu'"),
+  );
+  assert.match(clickGuard, /controlRuntime\.active/);
+  assert.match(clickGuard, /connectionState\.inputCapabilities\.relativePointer/);
+  assert.match(clickGuard, /e\.preventDefault\(\)/);
+  assert.match(clickGuard, /e\.stopImmediatePropagation\(\)/);
+});

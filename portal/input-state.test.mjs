@@ -10,6 +10,7 @@ import {
   RelativePointerAccumulator,
   advanceRemotePointerPosition,
   browserPointerLockLossRequiresControlExit,
+  inputCapabilityLabel,
   mapCanvasPointToSurface,
   resolvePointerSurfaceSize,
   restoreRejectedPointerMotion,
@@ -18,6 +19,25 @@ import {
   validatePointerPositionFeedback,
   browserMouseButtonCode,
 } from './input-state.mjs';
+
+test('input capability labels group keyboard/mouse and rename gamepad for the UI', () => {
+  assert.equal(inputCapabilityLabel({
+    relativePointer: true,
+    absolutePointer: false,
+    keyboard: true,
+    text: false,
+    gamepad: true,
+  }), 'kbm + controller');
+  assert.equal(inputCapabilityLabel({
+    absolutePointer: true,
+    keyboard: true,
+  }), 'kbm');
+  assert.equal(inputCapabilityLabel({ gamepad: true }), 'controller');
+  assert.equal(inputCapabilityLabel({ relativePointer: true }), 'mouse');
+  assert.equal(inputCapabilityLabel({ keyboard: true }), 'keyboard');
+  assert.equal(inputCapabilityLabel({ text: true }), 'text');
+  assert.equal(inputCapabilityLabel({}), 'view only');
+});
 
 test('relative motion forwards finite safe deltas without surface scaling', () => {
   assert.deepEqual(

@@ -272,11 +272,11 @@ body.native-pointer-control * { cursor: none !important; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 40px;
-  min-height: 32px;
-  padding: 6px 10px;
-  font-family: system-ui, sans-serif;
-  font-size: 16px;
+  min-width: 80px;
+  min-height: 36px;
+  padding: 8px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
   line-height: 1;
   white-space: nowrap;
   touch-action: manipulation;

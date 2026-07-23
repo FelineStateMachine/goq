@@ -54,27 +54,27 @@ test('new audio sessions preserve seeded mute state and isolate mutable state', 
   assert.notEqual(muted.messageTracker, fresh.messageTracker);
 });
 
-test('audio button uses a speaker glyph with a mute action while playing', () => {
+test('audio button uses a text-on label with a mute action while playing', () => {
   assert.deepEqual(audioButtonPresentation({
     available: true,
     muted: false,
     state: 'playing',
     detail: 'bounded Opus playback',
   }), {
-    glyph: '🔊',
+    label: 'vol on',
     ariaLabel: 'Mute audio. Audio playing. bounded Opus playback',
     title: 'Audio playing: bounded Opus playback',
   });
 });
 
-test('audio button uses a muted glyph with an unmute action while muted', () => {
+test('audio button uses a text-off label with an unmute action while muted', () => {
   const presentation = audioButtonPresentation({
     available: true,
     muted: true,
     state: 'playing',
     detail: 'bounded Opus playback',
   });
-  assert.equal(presentation.glyph, '🔇');
+  assert.equal(presentation.label, 'vol off');
   assert.match(presentation.ariaLabel, /^Unmute audio\. Audio muted\./);
 });
 
@@ -84,13 +84,13 @@ test('audio button distinguishes priming from unavailable', () => {
     muted: false,
     state: 'priming',
     detail: 'Waiting for bounded Opus prebuffer',
-  }).glyph, 'audio ...');
+  }).label, 'vol ...');
   const unavailable = audioButtonPresentation({
     available: false,
     muted: false,
     state: 'unavailable',
     detail: 'not connected',
   });
-  assert.equal(unavailable.glyph, '🔇');
+  assert.equal(unavailable.label, 'vol off');
   assert.match(unavailable.ariaLabel, /^Audio unavailable\./);
 });

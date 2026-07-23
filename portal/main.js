@@ -5,6 +5,7 @@ import {
   validatePointerSurfaceDimensions,
   validatePointerPositionFeedback,
   browserMouseButtonCode,
+  inputCapabilityLabel,
 } from './input-state.mjs';
 import { createInputRuntime } from './input-runtime.mjs';
 import { createControlRuntime } from './control-runtime.mjs';
@@ -328,7 +329,7 @@ function updateAudioUI() {
       state: session.state,
       detail: session.stateDetail,
     });
-    toggle.textContent = presentation.glyph;
+    toggle.textContent = presentation.label;
     toggle.classList.toggle('active', session.available && !session.muted);
     toggle.classList.toggle('disabled', !session.available);
     toggle.setAttribute('aria-disabled', session.available ? 'false' : 'true');
@@ -791,14 +792,7 @@ async function toggleControl() {
 }
 
 function describeInputCapabilities() {
-  const accepted = [];
-  const capabilities = connectionState.inputCapabilities;
-  if (capabilities.relativePointer) accepted.push('relative pointer');
-  else if (capabilities.absolutePointer) accepted.push('pointer');
-  if (capabilities.keyboard) accepted.push('keyboard');
-  if (capabilities.text) accepted.push('text');
-  if (capabilities.gamepad) accepted.push('gamepad');
-  return accepted.length > 0 ? accepted.join(' + ') : 'view only';
+  return inputCapabilityLabel(connectionState.inputCapabilities);
 }
 
 function pointerInputAvailable() {
@@ -929,6 +923,18 @@ window.addEventListener('mouseup', (e) => {
   if (controlRuntime.active && connectionState.inputCapabilities.relativePointer) e.stopPropagation();
   releaseMouseButton(e);
 }, { capture: true });
+
+function suppressLocalClickDuringRelativeControl(e) {
+  if (!controlRuntime.active || !connectionState.inputCapabilities.relativePointer) return;
+  // mousedown/mouseup are forwarded to the host above, but WebKit synthesizes
+  // a separate click at the native cursor's frozen local position. Prevent
+  // that click from reaching the underlying Portal control that acquired the
+  // cursor, where it would immediately toggle controlling mode back off.
+  e.preventDefault();
+  e.stopImmediatePropagation();
+}
+
+window.addEventListener('click', suppressLocalClickDuringRelativeControl, { capture: true });
 
 window.addEventListener('contextmenu', (e) => {
   if (!controlRuntime.active || !pointerInputAvailable()) return;

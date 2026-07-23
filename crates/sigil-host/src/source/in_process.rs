@@ -337,6 +337,20 @@ impl EncoderControlTestHarness {
     pub(crate) fn requested_force_keyframe_revision(&self) -> Option<u64> {
         self._desired.borrow().force_keyframe_revision
     }
+
+    pub(crate) fn requested_bitrate(&self) -> Option<(u64, u32)> {
+        self._desired
+            .borrow()
+            .bitrate
+            .map(|bitrate| (bitrate.revision, bitrate.kbps))
+    }
+
+    pub(crate) fn requested_resolution(&self) -> Option<(u64, u16, u16)> {
+        self._desired
+            .borrow()
+            .resolution
+            .map(|resolution| (resolution.revision, resolution.width, resolution.height))
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]

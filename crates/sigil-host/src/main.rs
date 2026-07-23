@@ -459,14 +459,19 @@ fn appliance_command(command: ApplianceCommand) -> CliResult<()> {
     Ok(())
 }
 
-fn authorization_store_from_config(
+fn authorization_snapshot_from_config(
     path: &Path,
-) -> Result<(HostConfig, iroh::SecretKey, AuthorizationStore)> {
+) -> Result<(
+    HostConfig,
+    iroh::SecretKey,
+    authorization::AuthorizationSnapshot,
+)> {
     let config = HostConfig::load(path)?;
     config.ensure_runtime_directory()?;
     let secret = identity::load(&config.identity_path)?;
-    let store = AuthorizationStore::open(config.state_path.clone(), secret.public())?;
-    Ok((config, secret, store))
+    let inspection =
+        AuthorizationStore::inspect_existing(config.state_path.clone(), secret.public())?;
+    Ok((config, secret, inspection.snapshot))
 }
 
 fn invitation_command(command: InvitationCommand) -> Result<()> {
@@ -480,7 +485,7 @@ fn invitation_command(command: InvitationCommand) -> Result<()> {
             output,
             print_deep_link,
         } => {
-            let (_config, secret, store) = authorization_store_from_config(&config)?;
+            let (_config, secret, snapshot) = authorization_snapshot_from_config(&config)?;
             let mut grants = InvitationGrants::VIEW;
             if pointer_keyboard {
                 grants = grants.union(InvitationGrants::POINTER_KEYBOARD);
@@ -491,7 +496,15 @@ fn invitation_command(command: InvitationCommand) -> Result<()> {
             let mut nonce = [0_u8; 32];
             getrandom::fill(&mut nonce).context("generating invitation nonce")?;
             let now = unix_timestamp_now()?;
-            let claims = store.issue_claims(peer, grants, expires_in_seconds, now, nonce)?;
+            let claims = AuthorizationStore::issue_claims_from_snapshot(
+                secret.public(),
+                snapshot,
+                peer,
+                grants,
+                expires_in_seconds,
+                now,
+                nonce,
+            )?;
             let expires_at = claims.expires_at_unix;
             let invitation = SignedInvitation::issue(claims, &secret.to_bytes())?;
             let token = invitation.encode();
@@ -512,8 +525,7 @@ fn invitation_command(command: InvitationCommand) -> Result<()> {
 fn enrollment_command(command: EnrollmentCommand) -> Result<()> {
     match command {
         EnrollmentCommand::Show { config } => {
-            let (_config, _secret, store) = authorization_store_from_config(&config)?;
-            let snapshot = store.snapshot()?;
+            let (_config, _secret, snapshot) = authorization_snapshot_from_config(&config)?;
             println!("enrollment_epoch={}", snapshot.epoch);
             match (snapshot.peer, snapshot.grants) {
                 (Some(peer), Some(grants)) => {

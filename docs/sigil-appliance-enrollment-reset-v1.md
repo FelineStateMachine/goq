@@ -22,6 +22,23 @@ daemon for that state still blocks the operation. The command never stops or
 starts systemd itself. This keeps service policy in the Decky backend and
 prevents a reset from leaving a live remote session attached.
 
+Authorization writers have an explicit second level in that hierarchy:
+`daemon-v1.lock` (and the global lifecycle lock when configured) is acquired
+before `<state_path>/authorization-v1.lock`. The daemon holds the authorization
+writer lease for its complete lifetime and serves handshakes from its validated
+in-memory state. An offline reset temporarily becomes the sole writer only
+after it owns the lifecycle scope. Writer-lease acquisition uses nonblocking
+`flock` with a fixed 250 ms bound, so an abandoned or hung management process
+cannot stall daemon startup or recovery indefinitely; terminating a crashed
+owner releases the kernel lease and a retry loads the last complete atomic
+state document. Live handshake contention fails closed immediately and may be
+retried by Portal.
+
+Status, `sigil enrollment show`, and invitation creation remain atomic
+read-only operations and do not take the writer lease. The authorization-v1
+document, replay ledger, enrollment epoch, file names, permissions, and CLI
+schemas are unchanged, so no state migration is required.
+
 The expected fingerprint is the redacted value returned by
 `sigil appliance status`. It is an accidental-target confirmation interlock,
 not a new authentication factor. Existing same-user file ownership and mode

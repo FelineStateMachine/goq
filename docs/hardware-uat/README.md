@@ -1,5 +1,11 @@
 # Bazzite hardware acceptance
 
+The cross-host claim contract is
+[`MATRIX.md`](MATRIX.md). A successful run on one machine establishes only
+named reference-host evidence; it does not prove a hardware class or transfer
+to another commit. Both required matrix rows must pass the same exact candidate
+before unqualified hardware-proof language is allowed.
+
 The repository's hardware acceptance is a two-stage, commit-pinned gate:
 
 1. `.github/workflows/sigil-hardware-uat.yml` builds and inspects an unsigned

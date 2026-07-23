@@ -133,7 +133,9 @@ jobs:
           release_json="$(gh release view "$RELEASE_TAG" --json isDraft,tagName,assets)"
           test "$(jq -r '.isDraft' <<<"$release_json")" = true
           test "$(jq -r '.tagName' <<<"$release_json")" = "$RELEASE_TAG"
-          sigil_asset="sigil-$RELEASE_TAG-bazzite-x86_64.tar.gz"
+          target_contract="$(<release/sigil-target-contract.txt)"
+          test "$target_contract" = linux-glibc2.17-x86_64
+          sigil_asset="sigil-$RELEASE_TAG-$target_contract.tar.gz"
           expected="$(printf '%s\n' "$sigil_asset" "$sigil_asset.sha256" | sort)"
           actual="$(jq -r '.assets[].name' <<<"$release_json" | sort)"
           test "$actual" = "$expected" || {
@@ -163,7 +165,9 @@ jobs:
           test "$(jq -r '.isDraft' <<<"$release_json")" = true
           test "$(jq -r '.tagName' <<<"$release_json")" = "$RELEASE_TAG"
           version="${RELEASE_TAG#v}"
-          sigil_asset="sigil-$RELEASE_TAG-bazzite-x86_64.tar.gz"
+          target_contract="$(<release/sigil-target-contract.txt)"
+          test "$target_contract" = linux-glibc2.17-x86_64
+          sigil_asset="sigil-$RELEASE_TAG-$target_contract.tar.gz"
           expected="$(printf '%s\n' \
             "$sigil_asset" \
             "$sigil_asset.sha256" \

@@ -299,7 +299,9 @@ test('Portal delegates queue ownership while retaining DOM input wiring', () => 
   );
   assert.match(main, /window\.addEventListener\('mousedown', handleMouseDown/);
   assert.match(main, /inputRuntime\.trackMouseButton\(btn\)/);
-  assert.match(main, /inputRuntime\.trackKey\(keyId, k\)/);
+  assert.match(main, /keyboardInputForEvent\(e, connectionState\.inputCapabilities\)/);
+  assert.match(main, /inputRuntime\.trackKey\(keyId, input\.key\)/);
+  assert.doesNotMatch(main, /const printableText =/);
   assert.doesNotMatch(main, /const reliableInputQueue =/);
   assert.doesNotMatch(main, /function sendInput\(/);
   assert.doesNotMatch(main, /new HeldInputState\(/);

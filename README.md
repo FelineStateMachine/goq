@@ -83,6 +83,12 @@ Steam and games.
   are frozen independently from display branding.
 - Controller-first client navigation includes a D-pad PIN pad, negotiated
   latest-state gamepad routing, and a one-second Back+Start escape chord.
+- Portal's proven relative-pointer capture is macOS-only. Default non-macOS
+  builds negotiate absolute pointer, keyboard/text, and gamepad without
+  advertising relative capture; the Tao + browser Pointer Lock path requires
+  the explicitly experimental `experimental-non-macos-pointer-capture` build
+  feature and the platform UAT in
+  [`docs/portal-platform-support.md`](docs/portal-platform-support.md).
 - The Bazzite host has an allowlisted deterministic runtime package with
   checksum-bound release IDs, serialized install/upgrade, tamper-checked
   rollback, and package-owned user assets that follow the active release.
@@ -243,7 +249,7 @@ temporary testing:
 ```bash
 scripts/package-bazzite-release.sh \
   --release-tag v0.1.0 \
-  --output /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz
+  --output /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz
 
 # Temporary development package only:
 scripts/package-bazzite-release.sh \

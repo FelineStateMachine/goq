@@ -61,7 +61,10 @@ test('awaits the probe before publishing the exact raw delivery mode', async () 
   }
   const pending = detectAndPublishVideoDeliveryMode({
     VideoDecoder: DelayedDecoder,
-    invokeCommand: async (...args) => { calls.push(args); },
+    invokeCommand: async (...args) => {
+      calls.push(args);
+      return true;
+    },
   });
 
   await Promise.resolve();
@@ -72,6 +75,35 @@ test('awaits the probe before publishing the exact raw delivery mode', async () 
     'probe',
     ['set_webcodecs_available', { available: true }],
   ]);
+});
+
+test('keeps the real probe but obeys native forced-JPEG publication', async () => {
+  const calls = [];
+  const warnings = [];
+  class SupportedDecoder {
+    static async isConfigSupported(config) {
+      calls.push(['probe', config]);
+      return { supported: true, config };
+    }
+  }
+
+  assert.equal(await detectAndPublishVideoDeliveryMode({
+    VideoDecoder: SupportedDecoder,
+    invokeCommand: async (...args) => {
+      calls.push(args);
+      return false;
+    },
+    logger: { warn: (...args) => warnings.push(args), error() {} },
+  }), false);
+  assert.deepEqual(calls, [
+    ['probe', {
+      codec: 'avc1.64001f',
+      optimizeForLatency: true,
+    }],
+    ['set_webcodecs_available', { available: true }],
+  ]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0][0], /JPEG compatibility mode forced/);
 });
 
 test('keeps frontend on JPEG when capability publication fails', async () => {

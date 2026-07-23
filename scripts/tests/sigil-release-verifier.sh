@@ -38,7 +38,7 @@ root = pathlib.Path(sys.argv[1])
 tag = sys.argv[2]
 commit = sys.argv[3]
 variant = sys.argv[4]
-asset = f"sigil-{tag}-bazzite-x86_64.tar.gz"
+asset = f"sigil-{tag}-linux-glibc2.17-x86_64.tar.gz"
 archive_path = root / asset
 
 manifest = {
@@ -154,9 +154,17 @@ assert_rejected() {
 
 valid_dir="$temp_root/valid"
 make_fixture "$valid_dir"
-archive="$valid_dir/sigil-$release_tag-bazzite-x86_64.tar.gz"
+archive="$valid_dir/sigil-$release_tag-linux-glibc2.17-x86_64.tar.gz"
 "$verifier" --tag "$release_tag" --archive "$archive" \
   --source-commit "$source_commit" --candidate | grep -Fq 'sigil_release_verification=ok'
+
+legacy_contract="bazzite""-x86_64"
+legacy_archive="$valid_dir/sigil-$release_tag-$legacy_contract.tar.gz"
+cp "$archive" "$legacy_archive"
+cp "$archive.sha256" "$legacy_archive.sha256"
+assert_rejected legacy-distro-name \
+  "archive must be named sigil-$release_tag-linux-glibc2.17-x86_64.tar.gz" \
+  "$verifier" --tag "$release_tag" --archive "$legacy_archive" --candidate
 
 printf 'not a signature\n' >"$archive.minisig"
 key_file="$temp_root/test.pub"
@@ -176,7 +184,7 @@ assert_rejected wrong-commit 'commit does not match' \
 
 bad_checksum_dir="$temp_root/bad-checksum"
 make_fixture "$bad_checksum_dir"
-bad_archive="$bad_checksum_dir/sigil-$release_tag-bazzite-x86_64.tar.gz"
+bad_archive="$bad_checksum_dir/sigil-$release_tag-linux-glibc2.17-x86_64.tar.gz"
 printf '%064d  %s\n' 0 "$(basename -- "$bad_archive")" >"$bad_archive.sha256"
 assert_rejected bad-checksum 'checksum declaration does not exactly match' \
   "$verifier" --tag "$release_tag" --archive "$bad_archive" --candidate
@@ -184,7 +192,7 @@ assert_rejected bad-checksum 'checksum declaration does not exactly match' \
 for variant in symlink duplicate unexpected default-features demo-auth-bypass; do
   fixture_dir="$temp_root/$variant"
   make_fixture "$fixture_dir" "$variant"
-  fixture_archive="$fixture_dir/sigil-$release_tag-bazzite-x86_64.tar.gz"
+  fixture_archive="$fixture_dir/sigil-$release_tag-linux-glibc2.17-x86_64.tar.gz"
   case "$variant" in
     symlink) expected='unsafe type' ;;
     duplicate) expected='duplicate members' ;;

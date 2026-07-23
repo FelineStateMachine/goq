@@ -29,6 +29,7 @@ for path in \
   scripts/70-sigil-remote-input.rules \
   scripts/72-sigil-uinput.rules \
   scripts/99-sigil-uinput.rules \
+  release/sigil-target-contract.txt \
   docs/sigil-host-activation.md \
   crates/sigil-host/Cargo.toml \
   Cargo.lock rust-toolchain.toml LICENSE
@@ -67,7 +68,7 @@ git -C "$fixture_repo" commit -qm 'fixture release'
 git -C "$fixture_repo" tag v0.1.0
 source_commit="$(git -C "$fixture_repo" rev-parse HEAD)"
 
-archive="$temp_root/output/sigil-v0.1.0-bazzite-x86_64.tar.gz"
+archive="$temp_root/output/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz"
 PATH="$temp_root/bin:$PATH" "$fixture_repo/scripts/package-bazzite-release.sh" \
   --release-tag v0.1.0 --output "$archive" >"$temp_root/product.log"
 grep -Fq 'publisher_signature=pending-offline' "$temp_root/product.log"
@@ -118,7 +119,7 @@ assert_rejected() {
   local tag="$3"
   local output_dir="$temp_root/$name"
   install -d -m 0700 "$output_dir"
-  local output="$output_dir/sigil-$tag-bazzite-x86_64.tar.gz"
+  local output="$output_dir/sigil-$tag-linux-glibc2.17-x86_64.tar.gz"
   local log="$output_dir/rejected.log"
   if PATH="$temp_root/bin:$PATH" "$fixture_repo/scripts/package-bazzite-release.sh" \
     --release-tag "$tag" --output "$output" >"$log" 2>&1

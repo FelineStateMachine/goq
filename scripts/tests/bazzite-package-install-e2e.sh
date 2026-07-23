@@ -33,7 +33,7 @@ make_payload() {
   local root="$1"
   local tag="$2"
   local commit="$3"
-  local asset_name="sigil-$tag-bazzite-x86_64.tar.gz"
+  local asset_name="sigil-$tag-linux-glibc2.17-x86_64.tar.gz"
   local release="$root/release"
   local true_binary
   true_binary="$(readlink -f /usr/bin/true 2>/dev/null || readlink -f /bin/true)"

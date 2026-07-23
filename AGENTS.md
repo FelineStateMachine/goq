@@ -75,6 +75,10 @@ Sigil host.
   coverage. Hardware acceptance that remains incomplete is listed below.
 - Portal's window scales to the incoming stream while preserving aspect ratio;
   larger client screens do not stretch the host image.
+- Portal's proven relative-pointer capture path is macOS-only. Non-macOS
+  builds must mask relative-pointer negotiation unless explicitly built with
+  `experimental-non-macos-pointer-capture`; that feature is for platform UAT
+  only and must not enter an ordinary or published build.
 
 ## Security boundary
 
@@ -105,6 +109,11 @@ Sigil host.
   the allowlisted runtime payload, carry complete checksums/provenance, and have
   a detached Minisign signature. Installation must preserve identity and host
   configuration and must not silently start, restart, or enable the service.
+- Product Sigil assets use the target-contract suffix
+  `linux-glibc2.17-x86_64`, pinned by
+  `release/sigil-target-contract.txt`. That name describes the binary ABI, not
+  validated host support; the public bootstrap remains Bazzite-only until
+  another environment passes its own packaging and hardware gates.
 - Portal is a compiled desktop download, never a shell install. The first
   public target is macOS arm64 and requires Developer ID signing, hardened
   runtime, notarization, stapling, and strict Gatekeeper verification. Its
@@ -128,6 +137,9 @@ Sigil host.
   measured end to end. Do not select codecs by compression ratio alone.
 - Preserve native pointer coordinates independently from encoded resolution or
   client window size.
+- Map a differently shaped focused Xwayland root through a centered aspect-fit
+  region in the native pointer surface; never stretch pointer axes
+  independently.
 - Session teardown must release all held input transitions and emit a neutral
   gamepad state even after an error or disconnect.
 
@@ -214,6 +226,10 @@ Sigil host.
   credential material.
 
 - On Linux with NVIDIA, set `WEBKIT_DISABLE_DMABUF_RENDERER=1` for Portal.
+- Treat `experimental-non-macos-pointer-capture` as an explicit non-release
+  build mode. Complete the per-platform checklist in
+  `docs/portal-platform-support.md`, including a real Portal -> UMPC session,
+  before changing a platform's support status or its default feature policy.
 - Preserve `/Users/dami/Developer/sigil` untouched; it is the inherited source,
   not this working repository.
 - Preserve unrelated worktree changes. Never sweep generated credentials,

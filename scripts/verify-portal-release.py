@@ -22,6 +22,10 @@ BUNDLE_IDENTIFIER = "sh.goq.portal"
 PLATFORM = "macos"
 ARCHITECTURE = "arm64"
 VERIFICATION = "developer-id+hardened-runtime+notarized+stapled+gatekeeper"
+NON_RELEASE_FEATURES = (
+    "demo-direct-node",
+    "experimental-non-macos-pointer-capture",
+)
 TAG_PATTERN = re.compile(
     r"^v(?P<version>(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\."
     r"(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?)$"
@@ -128,12 +132,11 @@ def validate_source(
 
     portal_manifest = read_toml(repo_dir / "src-tauri" / "Cargo.toml")
     features = portal_manifest.get("features", {})
-    require("demo-direct-node" in features, "Portal demo feature declaration is missing")
     default_features = features.get("default", [])
-    require(
-        isinstance(default_features, list) and "demo-direct-node" not in default_features,
-        "demo-direct-node must not be enabled by default",
-    )
+    require(isinstance(default_features, list), "Portal default features must be a list")
+    for feature in NON_RELEASE_FEATURES:
+        require(feature in features, f"Portal {feature} feature declaration is missing")
+        require(feature not in default_features, f"{feature} must not be enabled by default")
     return {
         "release_tag": release_tag,
         "version": version,

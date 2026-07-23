@@ -335,3 +335,30 @@ test('adaptive feedback preserves bounded queue fallbacks and pressure signals',
     resyncActive: true,
   });
 });
+
+test('adaptive feedback projects the bounded JPEG decode-plus-latest queue and overwrite counter', () => {
+  const { runtime, events } = subject();
+  runtime.prepareConnection();
+  const session = runtime.openFrameSession();
+  activate(runtime, session, 6);
+  events.length = 0;
+
+  assert.equal(runtime.publishAdaptiveFeedback(videoSnapshot({
+    presenterQueueDepth: 2,
+    presenterQueueCapacity: 2,
+    presentationDroppedFrames: 3,
+  })), true);
+  assert.equal(events[0].snapshot.presenterQueueDepth, 2);
+  assert.equal(events[0].snapshot.presenterQueueCapacity, 2);
+  assert.equal(events[0].snapshot.presenterDroppedTotal, 3);
+
+  events.length = 0;
+  assert.equal(runtime.publishAdaptiveFeedback(videoSnapshot({
+    presenterQueueDepth: 0,
+    presenterQueueCapacity: 2,
+    presentationDroppedFrames: 3,
+  })), true);
+  assert.equal(events[0].snapshot.presenterQueueDepth, 0);
+  assert.equal(events[0].snapshot.presenterQueueCapacity, 2);
+  assert.equal(events[0].snapshot.presenterDroppedTotal, 3);
+});

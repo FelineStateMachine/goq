@@ -12,6 +12,7 @@ use tauri::ipc::Channel;
 use crate::commands::state::AppState;
 use crate::media::network_diagnostics::{NetworkSessionDiagnostics, lock_network_diagnostics};
 use crate::media::transport::{NegotiatedV1Stream, negotiate_v1};
+use crate::platform_capabilities::relative_pointer_capture_enabled;
 
 const INPUT_ALPN: &[u8] = sigil_protocol::LEGACY_INPUT_ALPN_V0;
 pub(crate) const CLIENT_INPUT_QUEUE_CAPACITY: usize = 256;
@@ -154,39 +155,48 @@ async fn open_negotiated_input_stream(
     Ok((connection, send, recv, negotiation))
 }
 
-fn input_capability_offers(grants: InvitationGrants) -> Vec<Vec<Capability>> {
-    let base = [
-        vec![
-            Capability::RelativePointer,
-            Capability::PointerPositionFeedback,
-            Capability::PointerVisibilityFeedback,
-            Capability::AbsolutePointer,
-            Capability::Keyboard,
-            Capability::Text,
-            Capability::Gamepad,
-        ],
-        vec![
-            Capability::RelativePointer,
-            Capability::PointerPositionFeedback,
-            Capability::AbsolutePointer,
-            Capability::Keyboard,
-            Capability::Text,
-            Capability::Gamepad,
-        ],
-        vec![
-            Capability::RelativePointer,
-            Capability::AbsolutePointer,
-            Capability::Keyboard,
-            Capability::Text,
-            Capability::Gamepad,
-        ],
-        vec![
-            Capability::AbsolutePointer,
-            Capability::Keyboard,
-            Capability::Text,
-            Capability::Gamepad,
-        ],
-    ];
+fn input_capability_offers_for(
+    grants: InvitationGrants,
+    relative_pointer_capture: bool,
+) -> Vec<Vec<Capability>> {
+    // Keep the relative compatibility ladder ordered from newest to oldest.
+    // When local relative capture is unavailable, deliberately collapse it to
+    // only the inherited absolute-pointer offer.
+    let mut base = Vec::with_capacity(if relative_pointer_capture { 4 } else { 1 });
+    if relative_pointer_capture {
+        base.extend([
+            vec![
+                Capability::RelativePointer,
+                Capability::PointerPositionFeedback,
+                Capability::PointerVisibilityFeedback,
+                Capability::AbsolutePointer,
+                Capability::Keyboard,
+                Capability::Text,
+                Capability::Gamepad,
+            ],
+            vec![
+                Capability::RelativePointer,
+                Capability::PointerPositionFeedback,
+                Capability::AbsolutePointer,
+                Capability::Keyboard,
+                Capability::Text,
+                Capability::Gamepad,
+            ],
+            vec![
+                Capability::RelativePointer,
+                Capability::AbsolutePointer,
+                Capability::Keyboard,
+                Capability::Text,
+                Capability::Gamepad,
+            ],
+        ]);
+    }
+    base.push(vec![
+        Capability::AbsolutePointer,
+        Capability::Keyboard,
+        Capability::Text,
+        Capability::Gamepad,
+    ]);
     let has_input_grant = grants.contains(InvitationGrants::POINTER_KEYBOARD)
         || grants.contains(InvitationGrants::GAMEPAD);
     let mut offers = Vec::with_capacity(base.len() * 2);
@@ -214,6 +224,27 @@ fn input_capability_offers(grants: InvitationGrants) -> Vec<Vec<Capability>> {
     }
     offers.dedup();
     offers
+}
+
+fn input_capability_offers(grants: InvitationGrants) -> Vec<Vec<Capability>> {
+    input_capability_offers_for(grants, relative_pointer_capture_enabled())
+}
+
+fn mask_unavailable_relative_pointer_capabilities(
+    mut capabilities: Vec<Capability>,
+    relative_pointer_capture: bool,
+) -> Vec<Capability> {
+    if !relative_pointer_capture {
+        capabilities.retain(|capability| {
+            !matches!(
+                capability,
+                Capability::RelativePointer
+                    | Capability::PointerPositionFeedback
+                    | Capability::PointerVisibilityFeedback
+            )
+        });
+    }
+    capabilities
 }
 
 fn input_event_allowed(capabilities: &[Capability], event: &InputEvent) -> bool {
@@ -335,6 +366,12 @@ pub(crate) async fn open_input_session(
             ],
         )
     };
+    // A malformed or future host must not be able to re-enable a local input
+    // path that this Portal build deliberately withheld from its offers.
+    let capabilities = mask_unavailable_relative_pointer_capabilities(
+        capabilities,
+        relative_pointer_capture_enabled(),
+    );
     let availability = InputAvailability::from_capabilities(&capabilities);
     Ok(InputSession {
         connection,
@@ -794,7 +831,7 @@ mod tests {
 
     #[test]
     fn input_capability_fallbacks_remove_only_one_protocol_extension_at_a_time() {
-        let offers = input_capability_offers(InvitationGrants::ALL);
+        let offers = input_capability_offers_for(InvitationGrants::ALL, true);
         assert_eq!(offers.len(), 8);
         let visibility = &offers[0];
         let position = &offers[1];
@@ -828,6 +865,92 @@ mod tests {
                 Capability::Gamepad,
                 Capability::InputAck,
             ]
+        );
+    }
+
+    #[test]
+    fn disabled_relative_capture_preserves_only_non_relative_input_offers() {
+        let offers = input_capability_offers_for(InvitationGrants::ALL, false);
+        assert_eq!(
+            offers,
+            [
+                vec![
+                    Capability::AbsolutePointer,
+                    Capability::Keyboard,
+                    Capability::Text,
+                    Capability::Gamepad,
+                    Capability::InputAck,
+                ],
+                vec![
+                    Capability::AbsolutePointer,
+                    Capability::Keyboard,
+                    Capability::Text,
+                    Capability::Gamepad,
+                ],
+            ]
+        );
+        assert!(offers.iter().flatten().all(|capability| !matches!(
+            capability,
+            Capability::RelativePointer
+                | Capability::PointerPositionFeedback
+                | Capability::PointerVisibilityFeedback
+        )));
+    }
+
+    #[test]
+    fn compiled_pointer_policy_controls_the_actual_negotiation_offers() {
+        let offers = input_capability_offers(InvitationGrants::ALL);
+        let offers_relative_pointer = offers
+            .iter()
+            .flatten()
+            .any(|capability| *capability == Capability::RelativePointer);
+        assert_eq!(offers_relative_pointer, relative_pointer_capture_enabled());
+        assert!(
+            offers
+                .iter()
+                .all(|offer| offer.contains(&Capability::AbsolutePointer))
+        );
+    }
+
+    #[test]
+    fn negotiated_capability_mask_fails_closed_without_losing_other_input() {
+        let accepted = vec![
+            Capability::RelativePointer,
+            Capability::PointerPositionFeedback,
+            Capability::PointerVisibilityFeedback,
+            Capability::AbsolutePointer,
+            Capability::Keyboard,
+            Capability::Text,
+            Capability::Gamepad,
+            Capability::InputAck,
+        ];
+        let masked = mask_unavailable_relative_pointer_capabilities(accepted.clone(), false);
+        assert_eq!(
+            masked,
+            [
+                Capability::AbsolutePointer,
+                Capability::Keyboard,
+                Capability::Text,
+                Capability::Gamepad,
+                Capability::InputAck,
+            ]
+        );
+        assert_eq!(
+            mask_unavailable_relative_pointer_capabilities(accepted.clone(), true),
+            accepted
+        );
+        assert_eq!(
+            InputAvailability::from_capabilities(&masked),
+            InputAvailability {
+                relative_pointer: false,
+                pointer_position_feedback: false,
+                absolute_pointer: true,
+                keyboard: true,
+                text: true,
+                gamepad: true,
+                input_ack: true,
+                control: true,
+            }
         );
     }
 

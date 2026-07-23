@@ -10,6 +10,8 @@ if [[ -f "$HOME/.cargo/env" ]]; then
   source "$HOME/.cargo/env"
 fi
 
+./scripts/run-linux-cross-build-gate.sh
+
 for command_name in cargo rustc node git ffmpeg shellcheck; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     printf 'required command is missing: %s\n' "$command_name" >&2
@@ -24,6 +26,24 @@ case "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" in
     exit 1
     ;;
 esac
+
+case "${GOQ_REQUIRE_LINUX_CROSS_BUILD:-0}" in
+  0|1) ;;
+  *)
+    printf 'GOQ_REQUIRE_LINUX_CROSS_BUILD must be 0 or 1\n' >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${GOQ_REQUIRE_LINUX_CROSS_BUILD:-0}" == 1 ]]; then
+  for cross_command in cargo-zigbuild zig; do
+    if ! command -v "$cross_command" >/dev/null 2>&1; then
+      printf 'required Linux cross-build command is missing: %s\n' \
+        "$cross_command" >&2
+      exit 1
+    fi
+  done
+fi
 
 require_rust_test() {
   local test_name="$1"
@@ -61,6 +81,9 @@ require_rust_test 'resolves_pinned_upstream_gamescope_pipewire_contract' \
 cargo fmt --all -- --check
 cargo test --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo check --locked -p portal --all-targets \
+  --features experimental-non-macos-pointer-capture
+echo 'experimental_non_macos_pointer_capture_compile=ok'
 if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
   control_test='encoder_control_coalesces_latest_state_and_acknowledges_only_configured_idr'
   gstreamer_test='in_process_gstreamer_x264_smoke'
@@ -72,22 +95,6 @@ if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
     "$gstreamer_test" -- --ignored --nocapture
   echo 'in_process_gstreamer_gate=ok'
 fi
-if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
-  if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
-    # Zig intentionally omits the host's default system-library paths for an
-    # explicit target. Preserve pkg-config's system -L entries so the dynamic
-    # GStreamer/GLib development libraries remain linkable without an rpath.
-    PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 \
-      cargo zigbuild --locked -p sigil-host --bins \
-        --target x86_64-unknown-linux-gnu.2.17 --features in-process-gstreamer
-  else
-    cargo zigbuild --locked -p sigil-host --bins \
-      --target x86_64-unknown-linux-gnu.2.17
-  fi
-  echo 'linux_cross_build=ok'
-else
-  echo 'linux_cross_build=skipped (cargo-zigbuild and zig are both required)'
-fi
 while IFS= read -r frontend_source; do
   node --check "$frontend_source"
 done < <(find portal -maxdepth 1 -type f \( -name '*.js' -o -name '*.mjs' \) -print | sort)
@@ -95,9 +102,7 @@ node --test portal/*.test.mjs
 
 cargo build --locked -p sigil-host --bin sigil
 find scripts -type f -name '*.sh' -exec shellcheck {} +
-while IFS= read -r script_test; do
-  "$script_test"
-done < <(find scripts/tests -maxdepth 1 -type f -name '*.sh' -perm -u+x -print | sort)
+./scripts/run-shell-tests.sh scripts/tests
 
 host_dependencies="$(cargo tree --locked -p sigil-host --edges normal)"
 if grep -Eiq '(^|[[:space:]├└│─])(tauri|wry|webkit)([[:space:]-]|$)' <<<"$host_dependencies"; then
@@ -124,6 +129,22 @@ cargo test --locked -p portal --release \
 
 cargo test --locked -p portal --release \
   commands::state::tests::ordinary_release_excludes_direct_node_bypass \
+  -- --exact
+
+cargo test --locked -p portal --release \
+  commands::state::tests::rejects_force_jpeg_when_debug_mode_is_disabled \
+  -- --exact
+
+cargo test --locked -p portal --release \
+  commands::state::tests::ordinary_release_excludes_force_jpeg_override \
+  -- --exact
+
+cargo test --locked -p portal --release \
+  commands::state::tests::app_state_accepts_force_jpeg_only_in_debug_builds \
+  -- --exact
+
+cargo test --locked -p portal --release --features demo-direct-node \
+  commands::state::tests::app_state_accepts_force_jpeg_only_in_debug_builds \
   -- --exact
 
 cargo test --locked -p portal --release --features demo-direct-node \

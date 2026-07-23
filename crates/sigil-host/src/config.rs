@@ -134,8 +134,10 @@ pub struct GamescopePipewireConfig {
     /// Optional additional exact PipeWire property matches, for example a stable GPU identity.
     #[serde(default)]
     pub match_properties: BTreeMap<String, String>,
-    /// Bootstrap Gamescope Xwayland display used to discover the compositor's
-    /// current mouse-focus display. Absence disables cursor feedback.
+    /// Bootstrap Gamescope Xwayland display. When Gamescope exposes its
+    /// mouse-focus property Sigil follows the active Xwayland; otherwise
+    /// pointer feedback remains bounded to this configured display. Absence
+    /// disables cursor feedback.
     #[serde(default)]
     pub xwayland_display: Option<String>,
     /// Absolute paths avoid PATH-dependent executable selection in the daemon.

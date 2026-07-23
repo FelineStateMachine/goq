@@ -136,6 +136,8 @@ test('configured H.264 keyframes commit format only after decode enqueue', () =>
   assert.equal(stats.droppedFrames, 0);
   assert.equal(stats.recovering, false);
   assert.equal(stats.decoderQueueCapacity, MAX_DECODE_QUEUE_SIZE);
+  assert.equal(stats.presenterQueueDepth, 0);
+  assert.equal(stats.presenterQueueCapacity, 2);
 });
 
 test('unsupported codecs are dropped before decoder construction', () => {
@@ -222,12 +224,16 @@ test('JPEG fallback keeps its asynchronous base64 draw behavior', () => {
   assert.equal(subject.images[0].src, 'blob:test-frame-1');
   assert.deepEqual(subject.draws, []);
   assert.deepEqual(subject.revokedUrls, []);
+  assert.equal(subject.pipeline.snapshot().presenterQueueDepth, 1);
+  assert.equal(subject.pipeline.snapshot().presenterQueueCapacity, 1);
 
   subject.advance();
   subject.images[0].onload();
   assert.equal(subject.draws.length, 1);
   assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
   assert.equal(subject.pipeline.snapshot().presentedFrames, 1);
+  assert.equal(subject.pipeline.snapshot().presenterQueueDepth, 0);
+  assert.equal(subject.pipeline.snapshot().presenterQueueCapacity, 1);
 });
 
 test('JPEG fallback presents only the newest frame when loads complete out of order', () => {
@@ -246,7 +252,10 @@ test('JPEG fallback presents only the newest frame when loads complete out of or
   subject.pipeline.processFramePayload(payload);
   const newestLoad = subject.images[1].onload;
   assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
-  assert.equal(subject.pipeline.snapshot().presentationDroppedFrames, 1);
+  const afterOverwrite = subject.pipeline.snapshot();
+  assert.equal(afterOverwrite.presentationDroppedFrames, 1);
+  assert.equal(afterOverwrite.presenterQueueDepth, 1);
+  assert.equal(afterOverwrite.presenterQueueCapacity, 1);
 
   subject.advance(5);
   newestLoad();
@@ -256,6 +265,8 @@ test('JPEG fallback presents only the newest frame when loads complete out of or
   assert.equal(afterNewest.presentPercentiles.count, 1);
   assert.equal(afterNewest.presentPercentiles.p50, 5);
   assert.equal(afterNewest.presentationDroppedFrames, 1);
+  assert.equal(afterNewest.presenterQueueDepth, 0);
+  assert.equal(afterNewest.presenterQueueCapacity, 1);
 
   subject.advance(100);
   staleLoad();
@@ -294,6 +305,9 @@ test('JPEG fallback error callbacks affect only the current pending frame', () =
   const afterFailure = subject.pipeline.snapshot();
   assert.equal(afterFailure.droppedFrames, 1);
   assert.equal(afterFailure.presentedFrames, 0);
+  assert.equal(afterFailure.presentationDroppedFrames, 1);
+  assert.equal(afterFailure.presenterQueueDepth, 0);
+  assert.equal(afterFailure.presenterQueueCapacity, 1);
   assert.deepEqual(subject.draws, []);
   assert.deepEqual(subject.revokedUrls, [
     'blob:test-frame-1',
@@ -322,6 +336,8 @@ test('JPEG fallback callbacks cannot survive a session reset', () => {
   assert.equal(stats.presentedFrames, 0);
   assert.equal(stats.droppedFrames, 0);
   assert.equal(stats.presentPercentiles.count, 0);
+  assert.equal(stats.presenterQueueDepth, 0);
+  assert.equal(stats.presenterQueueCapacity, 1);
   assert.deepEqual(subject.draws, []);
   assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
 });

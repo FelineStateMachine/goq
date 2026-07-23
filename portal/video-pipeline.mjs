@@ -23,6 +23,7 @@ import {
 export const MAX_DECODE_QUEUE_SIZE = 2;
 const MAX_DECODE_TIMINGS = 8;
 const PRESENTER_QUEUE_CAPACITY = 2;
+const JPEG_PRESENTER_QUEUE_CAPACITY = 1;
 
 export function createVideoPipelineSession({
   hasWebCodecs,
@@ -484,8 +485,12 @@ export function createVideoPipelineSession({
       avSkewPercentiles: avSkew.summary(at),
       decoderQueueDepth: videoDecoder?.decodeQueueSize ?? 0,
       decoderQueueCapacity: MAX_DECODE_QUEUE_SIZE,
-      presenterQueueDepth: framePresenter.depth,
-      presenterQueueCapacity: PRESENTER_QUEUE_CAPACITY,
+      presenterQueueDepth: hasWebCodecs
+        ? framePresenter.depth
+        : Number(pendingJpegFrame !== null),
+      presenterQueueCapacity: hasWebCodecs
+        ? PRESENTER_QUEUE_CAPACITY
+        : JPEG_PRESENTER_QUEUE_CAPACITY,
       recovering: decoderRecovery.recovering,
     };
   }

@@ -80,6 +80,8 @@ test('rejects malformed identity, version, codec, flags, and reserved fields', (
     (bytes) => { bytes[0] = 0; },
     (bytes) => { bytes[4] = 2; },
     (bytes) => { bytes[5] = 0; },
+    (bytes) => { bytes[5] = 2; },
+    (bytes) => { bytes[5] = 3; },
     (bytes) => { bytes[6] = 0x80; },
     (bytes) => { bytes[6] = 0b100; },
     (bytes) => { bytes[7] = 1; },

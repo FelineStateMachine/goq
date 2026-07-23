@@ -55,3 +55,10 @@ test('a discontinuity starts a new configured epoch even at the same dimensions'
   assert.equal(boundary.reconfigure, true);
   assert.equal(boundary.epoch, 2);
 });
+
+test('only the negotiated H.264 codec is accepted', () => {
+  const guard = new VideoFormatTransitionGuard();
+  assert.throws(() => guard.plan(frame({ codec: 'h265' })), /invalid video codec/);
+  assert.throws(() => guard.plan(frame({ codec: 'av1' })), /invalid video codec/);
+  assert.equal(guard.format, null);
+});

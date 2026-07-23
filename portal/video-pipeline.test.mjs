@@ -28,6 +28,8 @@ function harness({ hasWebCodecs = true } = {}) {
   const draws = [];
   const revokedUrls = [];
   const images = [];
+  const imageStarts = [];
+  const abortedImages = [];
   let nextObjectUrl = 0;
   const canvas = { width: 0, height: 0 };
   const context = {
@@ -69,9 +71,22 @@ function harness({ hasWebCodecs = true } = {}) {
     createObjectUrl: () => `blob:test-frame-${++nextObjectUrl}`,
     revokeObjectUrl: (url) => revokedUrls.push(url),
     createImage: () => {
-      const image = { onload: null, onerror: null, src: null };
+      let src = null;
+      const image = {
+        onload: null,
+        onerror: null,
+        get src() { return src; },
+        set src(value) {
+          src = value;
+          imageStarts.push({ image: this, value });
+        },
+      };
       images.push(image);
       return image;
+    },
+    abortImage: (image) => {
+      abortedImages.push(image);
+      image.src = null;
     },
     requestFrame: () => 1,
     cancelFrame: () => {},
@@ -90,6 +105,8 @@ function harness({ hasWebCodecs = true } = {}) {
     draws,
     revokedUrls,
     images,
+    imageStarts,
+    abortedImages,
     advance(milliseconds = 1) { clock += milliseconds; },
   };
 }
@@ -225,7 +242,7 @@ test('JPEG fallback keeps its asynchronous base64 draw behavior', () => {
   assert.deepEqual(subject.draws, []);
   assert.deepEqual(subject.revokedUrls, []);
   assert.equal(subject.pipeline.snapshot().presenterQueueDepth, 1);
-  assert.equal(subject.pipeline.snapshot().presenterQueueCapacity, 1);
+  assert.equal(subject.pipeline.snapshot().presenterQueueCapacity, 2);
 
   subject.advance();
   subject.images[0].onload();
@@ -233,10 +250,10 @@ test('JPEG fallback keeps its asynchronous base64 draw behavior', () => {
   assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
   assert.equal(subject.pipeline.snapshot().presentedFrames, 1);
   assert.equal(subject.pipeline.snapshot().presenterQueueDepth, 0);
-  assert.equal(subject.pipeline.snapshot().presenterQueueCapacity, 1);
+  assert.equal(subject.pipeline.snapshot().presenterQueueCapacity, 2);
 });
 
-test('JPEG fallback presents only the newest frame when loads complete out of order', () => {
+test('JPEG fallback suppresses an active stale decode before starting the newest frame', () => {
   const subject = harness({ hasWebCodecs: false });
   const payload = {
     width: 640,
@@ -250,33 +267,34 @@ test('JPEG fallback presents only the newest frame when loads complete out of or
 
   subject.advance(10);
   subject.pipeline.processFramePayload(payload);
-  const newestLoad = subject.images[1].onload;
-  assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
+  assert.equal(subject.images.length, 1);
+  assert.deepEqual(subject.revokedUrls, []);
   const afterOverwrite = subject.pipeline.snapshot();
   assert.equal(afterOverwrite.presentationDroppedFrames, 1);
-  assert.equal(afterOverwrite.presenterQueueDepth, 1);
-  assert.equal(afterOverwrite.presenterQueueCapacity, 1);
+  assert.equal(afterOverwrite.presenterQueueDepth, 2);
+  assert.equal(afterOverwrite.presenterQueueCapacity, 2);
+
+  subject.advance(5);
+  staleLoad();
+  assert.deepEqual(subject.draws, []);
+  assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
+  assert.equal(subject.images.length, 2);
+  assert.equal(subject.images[1].src, 'blob:test-frame-2');
+  const newestLoad = subject.images[1].onload;
+  assert.equal(subject.pipeline.snapshot().presenterQueueDepth, 1);
 
   subject.advance(5);
   newestLoad();
+  staleError(new Error('stale JPEG failure'));
   const afterNewest = subject.pipeline.snapshot();
   assert.deepEqual(subject.draws.map(([image]) => image), [subject.images[1]]);
   assert.equal(afterNewest.presentedFrames, 1);
   assert.equal(afterNewest.presentPercentiles.count, 1);
-  assert.equal(afterNewest.presentPercentiles.p50, 5);
+  assert.equal(afterNewest.presentPercentiles.p50, 10);
   assert.equal(afterNewest.presentationDroppedFrames, 1);
+  assert.equal(afterNewest.droppedFrames, 0);
   assert.equal(afterNewest.presenterQueueDepth, 0);
-  assert.equal(afterNewest.presenterQueueCapacity, 1);
-
-  subject.advance(100);
-  staleLoad();
-  staleError(new Error('stale JPEG failure'));
-  const afterStaleCallbacks = subject.pipeline.snapshot();
-  assert.deepEqual(subject.draws.map(([image]) => image), [subject.images[1]]);
-  assert.equal(afterStaleCallbacks.presentedFrames, 1);
-  assert.equal(afterStaleCallbacks.presentPercentiles.count, 1);
-  assert.equal(afterStaleCallbacks.presentPercentiles.p50, 5);
-  assert.equal(afterStaleCallbacks.droppedFrames, 0);
+  assert.equal(afterNewest.presenterQueueCapacity, 2);
   assert.deepEqual(subject.revokedUrls, [
     'blob:test-frame-1',
     'blob:test-frame-2',
@@ -295,10 +313,11 @@ test('JPEG fallback error callbacks affect only the current pending frame', () =
   const staleError = subject.images[0].onerror;
 
   subject.pipeline.processFramePayload(payload);
-  const failedLoad = subject.images[1].onload;
-  const currentError = subject.images[1].onerror;
   staleError(new Error('stale JPEG failure'));
   assert.equal(subject.pipeline.snapshot().droppedFrames, 0);
+  assert.equal(subject.images.length, 2);
+  const failedLoad = subject.images[1].onload;
+  const currentError = subject.images[1].onerror;
 
   currentError(new Error('current JPEG failure'));
   failedLoad();
@@ -307,7 +326,7 @@ test('JPEG fallback error callbacks affect only the current pending frame', () =
   assert.equal(afterFailure.presentedFrames, 0);
   assert.equal(afterFailure.presentationDroppedFrames, 1);
   assert.equal(afterFailure.presenterQueueDepth, 0);
-  assert.equal(afterFailure.presenterQueueCapacity, 1);
+  assert.equal(afterFailure.presenterQueueCapacity, 2);
   assert.deepEqual(subject.draws, []);
   assert.deepEqual(subject.revokedUrls, [
     'blob:test-frame-1',
@@ -337,9 +356,64 @@ test('JPEG fallback callbacks cannot survive a session reset', () => {
   assert.equal(stats.droppedFrames, 0);
   assert.equal(stats.presentPercentiles.count, 0);
   assert.equal(stats.presenterQueueDepth, 0);
-  assert.equal(stats.presenterQueueCapacity, 1);
+  assert.equal(stats.presenterQueueCapacity, 2);
   assert.deepEqual(subject.draws, []);
   assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
+  assert.deepEqual(subject.abortedImages, [subject.images[0]]);
+});
+
+test('JPEG fallback bounds delayed decoding to one active and one coalesced latest payload', () => {
+  const subject = harness({ hasWebCodecs: false });
+  const payload = {
+    width: 640,
+    height: 400,
+    data: 'AQID',
+    keyframe: true,
+  };
+  subject.pipeline.processFramePayload(payload);
+  const oldestLoad = subject.images[0].onload;
+
+  for (let frame = 2; frame <= 10; frame++) {
+    subject.advance();
+    subject.pipeline.processFramePayload(payload);
+  }
+
+  assert.equal(subject.images.length, 1);
+  assert.deepEqual(subject.imageStarts, [{
+    image: subject.images[0],
+    value: 'blob:test-frame-1',
+  }]);
+  assert.deepEqual(subject.revokedUrls, []);
+  let stats = subject.pipeline.snapshot();
+  assert.equal(stats.presentationDroppedFrames, 9);
+  assert.equal(stats.presenterQueueDepth, 2);
+  assert.equal(stats.presenterQueueCapacity, 2);
+
+  subject.advance();
+  oldestLoad();
+  assert.equal(subject.images.length, 2);
+  assert.deepEqual(subject.imageStarts, [
+    { image: subject.images[0], value: 'blob:test-frame-1' },
+    { image: subject.images[1], value: 'blob:test-frame-2' },
+  ]);
+  assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
+  stats = subject.pipeline.snapshot();
+  assert.equal(stats.presenterQueueDepth, 1);
+  assert.equal(stats.presenterQueueCapacity, 2);
+
+  subject.advance();
+  subject.images[1].onload();
+  stats = subject.pipeline.snapshot();
+  assert.deepEqual(subject.draws.map(([image]) => image), [subject.images[1]]);
+  assert.equal(stats.presentedFrames, 1);
+  assert.equal(stats.presentPercentiles.p50, 2);
+  assert.equal(stats.presentationDroppedFrames, 9);
+  assert.equal(stats.presenterQueueDepth, 0);
+  assert.equal(stats.presenterQueueCapacity, 2);
+  assert.deepEqual(subject.revokedUrls, [
+    'blob:test-frame-1',
+    'blob:test-frame-2',
+  ]);
 });
 
 test('reset closes decoding state but preserves the last dimensions and codec quirk', () => {

@@ -336,7 +336,7 @@ test('adaptive feedback preserves bounded queue fallbacks and pressure signals',
   });
 });
 
-test('adaptive feedback projects the JPEG one-slot queue and overwrite counter', () => {
+test('adaptive feedback projects the bounded JPEG decode-plus-latest queue and overwrite counter', () => {
   const { runtime, events } = subject();
   runtime.prepareConnection();
   const session = runtime.openFrameSession();
@@ -344,21 +344,21 @@ test('adaptive feedback projects the JPEG one-slot queue and overwrite counter',
   events.length = 0;
 
   assert.equal(runtime.publishAdaptiveFeedback(videoSnapshot({
-    presenterQueueDepth: 1,
-    presenterQueueCapacity: 1,
+    presenterQueueDepth: 2,
+    presenterQueueCapacity: 2,
     presentationDroppedFrames: 3,
   })), true);
-  assert.equal(events[0].snapshot.presenterQueueDepth, 1);
-  assert.equal(events[0].snapshot.presenterQueueCapacity, 1);
+  assert.equal(events[0].snapshot.presenterQueueDepth, 2);
+  assert.equal(events[0].snapshot.presenterQueueCapacity, 2);
   assert.equal(events[0].snapshot.presenterDroppedTotal, 3);
 
   events.length = 0;
   assert.equal(runtime.publishAdaptiveFeedback(videoSnapshot({
     presenterQueueDepth: 0,
-    presenterQueueCapacity: 1,
+    presenterQueueCapacity: 2,
     presentationDroppedFrames: 3,
   })), true);
   assert.equal(events[0].snapshot.presenterQueueDepth, 0);
-  assert.equal(events[0].snapshot.presenterQueueCapacity, 1);
+  assert.equal(events[0].snapshot.presenterQueueCapacity, 2);
   assert.equal(events[0].snapshot.presenterDroppedTotal, 3);
 });

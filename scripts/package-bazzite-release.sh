@@ -133,6 +133,9 @@ fi
 [[ -f "$script_dir/sigil-host.service" ]] || die "systemd user unit is missing"
 [[ -f "$script_dir/50-sigil-spark-audio.conf" ]] || die "PipeWire audio drop-in is missing"
 [[ -f "$script_dir/70-sigil-remote-input.rules" ]] || die "udev rule is missing"
+[[ -f "$script_dir/72-sigil-uinput.rules" ]] || die "early uinput rule is missing"
+[[ -f "$script_dir/99-sigil-uinput.rules" ]] || die "final uinput rule is missing"
+[[ -f "$repo_dir/docs/sigil-host-activation.md" ]] || die "host activation guide is missing"
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v python3 >/dev/null 2>&1 || die "python3 is required for deterministic archives"
 command -v tar >/dev/null 2>&1 || die "tar is required"
@@ -214,7 +217,9 @@ fi
 
 payload="$temp_root/payload"
 release_tree="$payload/release"
-install -d -m 0700 "$payload" "$release_tree" "$release_tree/assets" "$release_tree/tools"
+install -d -m 0700 \
+  "$payload" "$release_tree" "$release_tree/assets" "$release_tree/docs" \
+  "$release_tree/tools"
 install -m 0755 "$host_binary" "$release_tree/sigil"
 # Retain one byte-identical compatibility executable for existing automation.
 install -m 0755 "$host_binary" "$release_tree/sigil-host"
@@ -226,6 +231,12 @@ install -m 0600 "$script_dir/50-sigil-spark-audio.conf" \
   "$release_tree/assets/50-sigil-spark-audio.conf"
 install -m 0644 "$script_dir/70-sigil-remote-input.rules" \
   "$release_tree/assets/70-sigil-remote-input.rules"
+install -m 0644 "$script_dir/72-sigil-uinput.rules" \
+  "$release_tree/assets/72-sigil-uinput.rules"
+install -m 0644 "$script_dir/99-sigil-uinput.rules" \
+  "$release_tree/assets/99-sigil-uinput.rules"
+install -m 0644 "$repo_dir/docs/sigil-host-activation.md" \
+  "$release_tree/docs/sigil-host-activation.md"
 install -m 0644 "$repo_dir/LICENSE" "$release_tree/LICENSE"
 install -m 0755 "$script_dir/install-bazzite-package.sh" "$payload/install-bazzite-package.sh"
 
@@ -298,7 +309,10 @@ for relative in \
   sigil-probe \
   assets/50-sigil-spark-audio.conf \
   assets/70-sigil-remote-input.rules \
+  assets/72-sigil-uinput.rules \
+  assets/99-sigil-uinput.rules \
   assets/sigil-host.service \
+  docs/sigil-host-activation.md \
   tools/rollback-bazzite-release.sh \
   LICENSE \
   release-manifest.json

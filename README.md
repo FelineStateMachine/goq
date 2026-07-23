@@ -183,9 +183,12 @@ Portal, then use **client -> reset enrollment** and confirm the displayed host.
 The reset is intentionally explicit and controller reachable; importing a new
 invitation never silently replaces a working enrollment.
 
-Provision a dedicated AMD host with the
-[fresh Bazzite host runbook](docs/fresh-bazzite-host.md). The runbook also
-defines the temporary `slate` stand-in used for protocol and daemon extraction.
+Activate an installed dedicated AMD host with the portable, package-owned
+[Sigil host activation guide](docs/sigil-host-activation.md). It uses the
+current gaming user, dynamically discovered hardware, and installed package
+assets without assuming a maintainer hostname or checkout path. The
+[fresh Bazzite host runbook](docs/fresh-bazzite-host.md) remains the engineering
+and hardware-acceptance log, including the temporary `slate` stand-in.
 The backward-compatible [appliance status v1 contract](docs/sigil-appliance-status-v1.md)
 and explicit [v2 contract](docs/sigil-appliance-status-v2.md) define the local,
 redacted interface intended for the Decky management surface.
@@ -217,7 +220,7 @@ scripts/stage-bazzite-release.sh \
 The stager atomically updates the user-owned `current` symlink only after both
 binaries, their dynamic libraries, and bounded startup commands validate. Host
 identity, hardware-specific configuration, and service activation remain
-separate gates in the Bazzite runbook.
+separate gates in the package-owned activation guide.
 
 The thin binary stager is only for unmanaged development layouts. It refuses
 activation when package-managed service, audio, rollback, or udev links follow
@@ -255,13 +258,13 @@ The GitHub workflow and package builder never receive the Minisign secret.
 
 The package contains the primary `sigil` host executable, its byte-identical
 `sigil-host` compatibility copy, the `sigil-probe` diagnostic, installer and
-rollback tools, service/audio/udev assets, license, checksums, and build
-provenance. It cannot contain the source tree, `.env` files, identities, host
-configuration, or test evidence. Its release ID is the SHA-256 of the complete
-installed-file checksum manifest. Identical inputs produce a byte-identical
-archive. The manifest marks product binaries as built from clean `HEAD`;
-caller-supplied development binaries are explicitly marked as having
-unverified provenance.
+rollback tools, service/audio/udev assets, the portable activation guide,
+license, checksums, and build provenance. It cannot contain the source tree,
+`.env` files, identities, host configuration, or test evidence. Its release ID
+is the SHA-256 of the complete installed-file checksum manifest. Identical
+inputs produce a byte-identical archive. The manifest marks product binaries
+as built from clean `HEAD`; caller-supplied development binaries are explicitly
+marked as having unverified provenance.
 
 During the legacy rollback window, `sigil-host.service` deliberately starts
 the byte-identical `sigil-host` compatibility filename. Interactive and

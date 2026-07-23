@@ -39,7 +39,8 @@ make_payload() {
   true_binary="$(readlink -f /usr/bin/true 2>/dev/null || readlink -f /bin/true)"
   [[ -x "$true_binary" ]]
 
-  install -d -m 0700 "$root" "$release/assets" "$release/tools"
+  install -d -m 0700 \
+    "$root" "$release/assets" "$release/docs" "$release/tools"
   install -m 0755 "$true_binary" "$release/sigil"
   install -m 0755 "$true_binary" "$release/sigil-host"
   install -m 0755 "$true_binary" "$release/sigil-probe"
@@ -47,10 +48,19 @@ make_payload() {
   printf '[Service]\nExecStart=/fixture serve\n' >"$release/assets/sigil-host.service"
   printf 'audio fixture\n' >"$release/assets/50-sigil-spark-audio.conf"
   printf 'udev fixture\n' >"$release/assets/70-sigil-remote-input.rules"
+  printf 'early uinput fixture\n' >"$release/assets/72-sigil-uinput.rules"
+  printf 'final uinput fixture\n' >"$release/assets/99-sigil-uinput.rules"
+  printf '# Activation fixture %s\n' "$tag" \
+    >"$release/docs/sigil-host-activation.md"
   printf 'MIT\n' >"$release/LICENSE"
   chmod 0600 "$release/assets/50-sigil-spark-audio.conf"
-  chmod 0644 "$release/assets/70-sigil-remote-input.rules" \
-    "$release/assets/sigil-host.service" "$release/LICENSE"
+  chmod 0644 \
+    "$release/assets/70-sigil-remote-input.rules" \
+    "$release/assets/72-sigil-uinput.rules" \
+    "$release/assets/99-sigil-uinput.rules" \
+    "$release/assets/sigil-host.service" \
+    "$release/docs/sigil-host-activation.md" \
+    "$release/LICENSE"
 
   python3 - "$release/release-manifest.json" "$tag" "$commit" "$asset_name" <<'PY'
 import json
@@ -88,7 +98,10 @@ PY
     sigil sigil-host sigil-probe \
     assets/50-sigil-spark-audio.conf \
     assets/70-sigil-remote-input.rules \
+    assets/72-sigil-uinput.rules \
+    assets/99-sigil-uinput.rules \
     assets/sigil-host.service \
+    docs/sigil-host-activation.md \
     tools/rollback-bazzite-release.sh \
     LICENSE release-manifest.json
   do
@@ -147,6 +160,14 @@ run_installer "$payload_a" >"$temp_root/install-a.log"
 install_root="$test_home/.local/libexec/sigil-spark"
 [[ "$(basename -- "$(readlink -f "$install_root/current")")" == "$release_a" ]]
 [[ ! -e "$install_root/previous" && ! -L "$install_root/previous" ]]
+grep -Fqx '# Activation fixture v0.1.0' \
+  "$install_root/current/docs/sigil-host-activation.md"
+grep -Fq "activation_guide=$install_root/current/docs/sigil-host-activation.md" \
+  "$temp_root/install-a.log"
+if grep -Fq 'fresh-bazzite-host.md' "$temp_root/install-a.log"; then
+  printf 'FAIL: package installer delegated activation to the lab runbook\n' >&2
+  exit 1
+fi
 
 run_installer "$payload_a" >"$temp_root/repeat-a.log"
 [[ "$(basename -- "$(readlink -f "$install_root/current")")" == "$release_a" ]]
@@ -164,6 +185,8 @@ config_sha="$(sha256sum "$config" | awk '{print $1}')"
 run_installer "$payload_b" >"$temp_root/install-b.log"
 [[ "$(basename -- "$(readlink -f "$install_root/current")")" == "$release_b" ]]
 [[ "$(basename -- "$(readlink -f "$install_root/previous")")" == "$release_a" ]]
+grep -Fqx '# Activation fixture v0.1.1' \
+  "$install_root/current/docs/sigil-host-activation.md"
 [[ "$(sha256sum "$identity" | awk '{print $1}')" == "$identity_sha" ]]
 [[ "$(sha256sum "$config" | awk '{print $1}')" == "$config_sha" ]]
 

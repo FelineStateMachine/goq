@@ -27,6 +27,9 @@ for path in \
   scripts/sigil-host.service \
   scripts/50-sigil-spark-audio.conf \
   scripts/70-sigil-remote-input.rules \
+  scripts/72-sigil-uinput.rules \
+  scripts/99-sigil-uinput.rules \
+  docs/sigil-host-activation.md \
   crates/sigil-host/Cargo.toml \
   Cargo.lock rust-toolchain.toml LICENSE
 do

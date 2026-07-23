@@ -66,7 +66,10 @@ if ! diff -u \
     release/SHA256SUMS \
     release/assets/50-sigil-spark-audio.conf \
     release/assets/70-sigil-remote-input.rules \
+    release/assets/72-sigil-uinput.rules \
+    release/assets/99-sigil-uinput.rules \
     release/assets/sigil-host.service \
+    release/docs/sigil-host-activation.md \
     release/release-manifest.json \
     release/sigil \
     release/sigil-host \
@@ -82,7 +85,10 @@ if ! diff -u \
     LICENSE \
     assets/50-sigil-spark-audio.conf \
     assets/70-sigil-remote-input.rules \
+    assets/72-sigil-uinput.rules \
+    assets/99-sigil-uinput.rules \
     assets/sigil-host.service \
+    docs/sigil-host-activation.md \
     release-manifest.json \
     sigil \
     sigil-host \
@@ -465,4 +471,5 @@ printf 'pipewire_restart=not-attempted\n'
 printf 'service_activation=not-attempted\n'
 printf 'system_asset=%s\n' "$asset_dir/70-sigil-remote-input.rules"
 printf '%s\n' \
-  'next: complete the explicit identity, hardware config, uinput-group/udev, PipeWire restart, and service-enable gates from docs/fresh-bazzite-host.md'
+  "activation_guide=$install_root/current/docs/sigil-host-activation.md" \
+  "next: follow $install_root/current/docs/sigil-host-activation.md as the dedicated gaming user"

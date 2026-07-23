@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde::Serialize;
-use sigil_protocol::{MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS};
+use sigil_protocol::{FrameFlags, MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS};
 use tauri::{AppHandle, Emitter};
 
 use crate::commands::state::AppState;
@@ -52,9 +52,12 @@ pub(crate) const CLIENT_FRAME_CHANNEL_CAPACITY: usize = 4;
 const FRAME_CHANNEL_MAGIC: [u8; 4] = *b"SGFR";
 const FRAME_CHANNEL_VERSION: u8 = 1;
 const FRAME_CHANNEL_HEADER_LEN: usize = 40;
-const FRAME_CHANNEL_FLAG_KEYFRAME: u8 = 1 << 0;
-const FRAME_CHANNEL_FLAG_DISCONTINUITY: u8 = 1 << 1;
-const FRAME_CHANNEL_FLAG_CODEC_CONFIG: u8 = 1 << 2;
+// The channel flag byte uses the exact sigil-protocol wire bit assignments;
+// deriving them here keeps the two layers incapable of drifting apart.
+// portal/frame-envelope.mjs mirrors the same values.
+const FRAME_CHANNEL_FLAG_KEYFRAME: u8 = FrameFlags::KEYFRAME.bits();
+const FRAME_CHANNEL_FLAG_CODEC_CONFIG: u8 = FrameFlags::CODEC_CONFIG.bits();
+const FRAME_CHANNEL_FLAG_DISCONTINUITY: u8 = FrameFlags::DISCONTINUITY.bits();
 const FRAME_CHANNEL_OPTIONAL_U64_NONE: u64 = u64::MAX;
 const FRAME_CHANNEL_OPTIONAL_I64_NONE: i64 = i64::MIN;
 
@@ -311,6 +314,27 @@ mod tests {
         assert_eq!(&envelope[24..32], &123_456_u64.to_be_bytes());
         assert_eq!(&envelope[32..40], &98_765_i64.to_be_bytes());
         assert_eq!(&envelope[40..], payload);
+    }
+
+    #[test]
+    fn channel_flag_bits_match_protocol_wire_assignments() {
+        let envelope = encode_frame_envelope(
+            FrameEnvelopeMetadata {
+                width: 1,
+                height: 1,
+                codec: "h264",
+                keyframe: false,
+                discontinuity: true,
+                codec_config: false,
+                sequence: None,
+                capture_timestamp_micros: None,
+                pts_micros: None,
+            },
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(envelope[6], FrameFlags::DISCONTINUITY.bits());
+        assert_eq!(envelope[6], 0b100);
     }
 
     #[test]

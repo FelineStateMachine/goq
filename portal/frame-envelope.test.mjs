@@ -64,6 +64,18 @@ test('parses an exact v1 frame envelope without copying its payload', () => {
   assert.equal(frame.data[0], 9);
 });
 
+test('flag bit positions match the sigil-protocol wire assignments', () => {
+  const discontinuityOnly = parseFrameEnvelope(frameEnvelope({ flags: 0b100 }));
+  assert.equal(discontinuityOnly.keyframe, false);
+  assert.equal(discontinuityOnly.codecConfig, false);
+  assert.equal(discontinuityOnly.discontinuity, true);
+
+  const keyframeConfig = parseFrameEnvelope(frameEnvelope({ flags: 0b011 }));
+  assert.equal(keyframeConfig.keyframe, true);
+  assert.equal(keyframeConfig.codecConfig, true);
+  assert.equal(keyframeConfig.discontinuity, false);
+});
+
 test('maps optional integer sentinels to null', () => {
   const frame = parseFrameEnvelope(frameEnvelope({
     sequence: 0xffffffffffffffffn,
@@ -83,7 +95,7 @@ test('rejects malformed identity, version, codec, flags, and reserved fields', (
     (bytes) => { bytes[5] = 2; },
     (bytes) => { bytes[5] = 3; },
     (bytes) => { bytes[6] = 0x80; },
-    (bytes) => { bytes[6] = 0b100; },
+    (bytes) => { bytes[6] = 0b010; },
     (bytes) => { bytes[7] = 1; },
   ];
   for (const mutate of mutations) {

@@ -816,16 +816,6 @@ impl ShadowBitrateController {
             trusted_host_pressure,
         )
     }
-
-    #[cfg(test)]
-    fn commit_observation_from(&mut self, candidate: &Self) {
-        self.next_decision_id = candidate.next_decision_id;
-        self.last_report_id = candidate.last_report_id;
-        self.last_report_received_at = candidate.last_report_received_at;
-        self.previous_telemetry = candidate.previous_telemetry;
-        self.baseline_rtt_micros = candidate.baseline_rtt_micros;
-        self.last_sequence = candidate.last_sequence;
-    }
 }
 
 fn add_feedback_signal(
@@ -928,8 +918,14 @@ impl AdaptiveCommitCoordinator {
         self.pending
     }
 
-    fn submit(&mut self, plan: AdaptiveCommitPlan) -> Option<AdaptiveCommitAcknowledgement> {
+    fn submit(&mut self, mut plan: AdaptiveCommitPlan) -> Option<AdaptiveCommitAcknowledgement> {
         if self.pending {
+            if let Some(queued) = self.queued {
+                // The latest decision replaces older diagnostics, but a
+                // recovery barrier requested by any coalesced desired update
+                // must survive until that desired state is actuated.
+                plan.force_keyframe |= queued.force_keyframe;
+            }
             self.queued = Some(plan);
             return None;
         }
@@ -2357,36 +2353,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_adaptive_application_commits_observation_but_not_target() {
-        let mut committed =
-            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
-        controller_decide(&mut committed, &clean_feedback(1), 0);
-        let old_target = committed.target_kbps;
-        let old_decision_id = committed.next_decision_id;
-        let mut severe = clean_feedback(2);
-        severe.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
-
-        let mut candidate = committed.clone();
-        let decision = controller_decide(&mut candidate, &severe, 1);
-        assert_eq!(decision.state, AdaptiveBitrateStateV1::Decrease);
-        assert!(candidate.target_kbps < old_target);
-        committed.commit_observation_from(&candidate);
-
-        assert_eq!(committed.target_kbps, old_target);
-        assert_eq!(committed.last_report_id, Some(2));
-        assert_eq!(committed.next_decision_id, old_decision_id + 1);
-        assert!(
-            committed
-                .decide(
-                    &clean_feedback(3),
-                    MediaV3TelemetrySnapshot::default(),
-                    Instant::now() + Duration::from_secs(2)
-                )
-                .is_ok()
-        );
-    }
-
-    #[test]
     fn adaptive_recovery_idr_is_only_requested_for_a_bitrate_change_during_resync() {
         let mut report = clean_feedback(1);
         let mut decision = AdaptiveBitrateDecisionV1 {
@@ -2506,6 +2472,81 @@ mod tests {
                 .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE),
             "a clamped aggregate must be stale rather than disguised as one fresh report"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_adaptive_plan_keeps_latest_ids_and_recovery_barrier() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let media = sessions
+            .claim(remote, [3; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let harness = crate::source::EncoderControlTestHarness::new();
+        sessions
+            .install_encoder_control(remote, media.session_id, Some(harness.control.clone()))
+            .unwrap();
+        let mut coordinator = AdaptiveCommitCoordinator::new(
+            Arc::clone(&sessions),
+            remote,
+            media.session_id,
+            true,
+            12_000,
+            Some(native_dimensions()),
+        );
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        let mut resolution_controller = None;
+        let observed_at = Instant::now();
+
+        let seed = evaluate_commit_plan(
+            &mut controller,
+            &mut resolution_controller,
+            &clean_feedback(1),
+            observed_at,
+        );
+        assert!(coordinator.submit(seed).is_some());
+
+        let mut first_pressure = clean_feedback(2);
+        first_pressure.decoder_dropped_delta = 1;
+        let first = evaluate_commit_plan(
+            &mut controller,
+            &mut resolution_controller,
+            &first_pressure,
+            observed_at + Duration::from_secs(1),
+        );
+        assert!(!first.force_keyframe);
+        assert!(coordinator.submit(first).is_none());
+
+        let mut recovery_pressure = clean_feedback(3);
+        recovery_pressure.decoder_dropped_delta = 1;
+        recovery_pressure.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+        let recovery = evaluate_commit_plan(
+            &mut controller,
+            &mut resolution_controller,
+            &recovery_pressure,
+            observed_at + Duration::from_secs(2),
+        );
+        assert!(recovery.force_keyframe);
+        assert!(coordinator.submit(recovery).is_none());
+
+        let latest = evaluate_commit_plan(
+            &mut controller,
+            &mut resolution_controller,
+            &clean_feedback(4),
+            observed_at + Duration::from_secs(3),
+        );
+        assert!(!latest.force_keyframe);
+        assert!(coordinator.submit(latest).is_none());
+        let retained = coordinator.queued.expect("latest plan must be retained");
+        assert_eq!(retained.decision.decision_id, latest.decision.decision_id);
+        assert_eq!(retained.decision.report_id, latest.decision.report_id);
+        assert!(
+            retained.force_keyframe,
+            "a coalesced recovery barrier must survive a newer hold decision"
+        );
+
+        coordinator.abort_and_drain().await;
+        drop(media);
     }
 
     #[tokio::test(start_paused = true)]

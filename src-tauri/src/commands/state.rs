@@ -282,12 +282,21 @@ pub const fn development_direct_node_available() -> bool {
     cfg!(any(debug_assertions, feature = "demo-direct-node"))
 }
 
+pub const fn development_force_jpeg_available() -> bool {
+    cfg!(debug_assertions)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaunchOptions {
     pub dev_connect_node_id: Option<iroh::PublicKey>,
+    pub dev_force_jpeg: bool,
 }
 
-pub fn parse_launch_options<I, S>(args: I, allow_dev_connect: bool) -> Result<LaunchOptions, String>
+pub fn parse_launch_options<I, S>(
+    args: I,
+    allow_dev_connect: bool,
+    allow_force_jpeg: bool,
+) -> Result<LaunchOptions, String>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
@@ -309,6 +318,19 @@ where
         let arg = arg
             .into_string()
             .map_err(|_| "Portal command-line arguments must be valid UTF-8".to_string())?;
+        if arg == "--dev-force-jpeg" {
+            if !allow_force_jpeg {
+                return Err(
+                    "--dev-force-jpeg requires a debug build; ordinary release builds use the normal WebCodecs capability probe"
+                        .to_string(),
+                );
+            }
+            if options.dev_force_jpeg {
+                return Err("--dev-force-jpeg may be specified only once".to_string());
+            }
+            options.dev_force_jpeg = true;
+            continue;
+        }
         let node_id = if arg == "--dev-connect" {
             Some(
                 args.next()
@@ -362,6 +384,7 @@ pub struct AppState {
     pub client_connection_active: Arc<AtomicBool>,
     pub webcodecs: AtomicBool,
     pub dev_connect_node_id: Option<iroh::PublicKey>,
+    pub dev_force_jpeg: bool,
 }
 
 pub type MediaControlRequestSender =
@@ -463,7 +486,12 @@ impl AppState {
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
-        parse_launch_options(args, development_direct_node_available()).map(Self::new)
+        parse_launch_options(
+            args,
+            development_direct_node_available(),
+            development_force_jpeg_available(),
+        )
+        .map(Self::new)
     }
 
     fn new(options: LaunchOptions) -> Self {
@@ -484,6 +512,7 @@ impl AppState {
             client_connection_active: Arc::new(AtomicBool::new(false)),
             webcodecs: AtomicBool::new(false),
             dev_connect_node_id: options.dev_connect_node_id,
+            dev_force_jpeg: options.dev_force_jpeg,
         }
     }
 }
@@ -495,6 +524,8 @@ pub struct DevelopmentConnectionMode {
     pub enabled: bool,
     pub host_node_id: Option<String>,
     pub warning: &'static str,
+    pub force_jpeg: bool,
+    pub jpeg_warning: &'static str,
 }
 
 #[tauri::command]
@@ -503,6 +534,8 @@ pub fn development_connection_mode(state: tauri::State<'_, AppState>) -> Develop
         enabled: state.dev_connect_node_id.is_some(),
         host_node_id: state.dev_connect_node_id.map(|node_id| node_id.to_string()),
         warning: "Development direct-node routing skips passkey identity lookup; it is not client authorization.",
+        force_jpeg: state.dev_force_jpeg,
+        jpeg_warning: "Development JPEG compatibility mode is forced; WebCodecs remains probed but is not selected.",
     }
 }
 
@@ -587,9 +620,15 @@ pub fn set_client_cursor_grab(window: tauri::WebviewWindow, grab: bool) -> Resul
         .map(|()| !cfg!(target_os = "macos"))
 }
 
+const fn effective_webcodecs_available(available: bool, force_jpeg: bool) -> bool {
+    available && !force_jpeg
+}
+
 #[tauri::command]
-pub fn set_webcodecs_available(state: tauri::State<'_, AppState>, available: bool) {
-    state.webcodecs.store(available, Ordering::SeqCst);
+pub fn set_webcodecs_available(state: tauri::State<'_, AppState>, available: bool) -> bool {
+    let effective = effective_webcodecs_available(available, state.dev_force_jpeg);
+    state.webcodecs.store(effective, Ordering::SeqCst);
+    effective
 }
 
 #[tauri::command]
@@ -711,14 +750,41 @@ mod tests {
     #[test]
     fn parses_debug_direct_node_flag() {
         let node_id = test_node_id();
-        let options = parse_launch_options(["portal", "--dev-connect", &node_id], true).unwrap();
+        let options =
+            parse_launch_options(["portal", "--dev-connect", &node_id], true, true).unwrap();
 
         assert_eq!(options.dev_connect_node_id.unwrap().to_string(), node_id);
     }
 
     #[test]
+    fn parses_debug_force_jpeg_flag() {
+        let options = parse_launch_options(["portal", "--dev-force-jpeg"], true, true).unwrap();
+
+        assert!(options.dev_force_jpeg);
+    }
+
+    #[test]
+    fn parses_combined_debug_hardware_proof_flags() {
+        let node_id = test_node_id();
+        let options = parse_launch_options(
+            [
+                "portal",
+                "--dev-connect",
+                node_id.as_str(),
+                "--dev-force-jpeg",
+            ],
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(options.dev_connect_node_id.unwrap().to_string(), node_id);
+        assert!(options.dev_force_jpeg);
+    }
+
+    #[test]
     fn rejects_legacy_daemon_mode() {
-        let error = parse_launch_options(["portal", "--daemon"], true).unwrap_err();
+        let error = parse_launch_options(["portal", "--daemon"], true, true).unwrap_err();
         assert!(error.contains("separate sigil executable"));
     }
 
@@ -726,7 +792,7 @@ mod tests {
     fn parses_equals_form() {
         let node_id = test_node_id();
         let flag = format!("--dev-connect={node_id}");
-        let options = parse_launch_options(["portal", &flag], true).unwrap();
+        let options = parse_launch_options(["portal", &flag], true, true).unwrap();
 
         assert_eq!(options.dev_connect_node_id.unwrap().to_string(), node_id);
     }
@@ -734,9 +800,17 @@ mod tests {
     #[test]
     fn rejects_direct_node_when_debug_mode_is_disabled() {
         let node_id = test_node_id();
-        let error = parse_launch_options(["portal", "--dev-connect", &node_id], false).unwrap_err();
+        let error =
+            parse_launch_options(["portal", "--dev-connect", &node_id], false, true).unwrap_err();
 
         assert!(error.contains("debug build or the explicit demo-direct-node feature"));
+    }
+
+    #[test]
+    fn rejects_force_jpeg_when_debug_mode_is_disabled() {
+        let error = parse_launch_options(["portal", "--dev-force-jpeg"], true, false).unwrap_err();
+
+        assert!(error.contains("requires a debug build"));
     }
 
     #[test]
@@ -755,6 +829,28 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_release_excludes_force_jpeg_override() {
+        if cfg!(not(debug_assertions)) {
+            assert!(!development_force_jpeg_available());
+        }
+    }
+
+    #[test]
+    fn app_state_accepts_force_jpeg_only_in_debug_builds() {
+        let result = AppState::from_args(["portal", "--dev-force-jpeg"]);
+
+        assert_eq!(result.is_ok(), development_force_jpeg_available());
+    }
+
+    #[test]
+    fn forced_jpeg_publication_keeps_native_and_frontend_mode_aligned() {
+        assert!(effective_webcodecs_available(true, false));
+        assert!(!effective_webcodecs_available(true, true));
+        assert!(!effective_webcodecs_available(false, false));
+        assert!(!effective_webcodecs_available(false, true));
+    }
+
+    #[test]
     fn app_state_starts_without_owned_transport_connections() {
         let state = AppState::default();
 
@@ -768,12 +864,12 @@ mod tests {
     #[test]
     fn rejects_missing_invalid_and_duplicate_node_ids() {
         assert!(
-            parse_launch_options(["portal", "--dev-connect"], true)
+            parse_launch_options(["portal", "--dev-connect"], true, true)
                 .unwrap_err()
                 .contains("requires an iroh node ID")
         );
         assert!(
-            parse_launch_options(["portal", "--dev-connect", "not-a-node-id"], true)
+            parse_launch_options(["portal", "--dev-connect", "not-a-node-id"], true, true)
                 .unwrap_err()
                 .contains("Invalid iroh node ID")
         );
@@ -788,6 +884,16 @@ mod tests {
                     "--dev-connect",
                     &node_id,
                 ],
+                true,
+                true,
+            )
+            .unwrap_err()
+            .contains("only once")
+        );
+        assert!(
+            parse_launch_options(
+                ["portal", "--dev-force-jpeg", "--dev-force-jpeg"],
+                true,
                 true,
             )
             .unwrap_err()

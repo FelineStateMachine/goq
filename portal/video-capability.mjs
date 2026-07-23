@@ -38,8 +38,14 @@ export async function detectAndPublishVideoDeliveryMode({
 
   const available = await probeH264WebCodecsSupport({ VideoDecoder, logger });
   try {
-    await invokeCommand('set_webcodecs_available', { available });
-    return available;
+    const effectiveAvailable = await invokeCommand('set_webcodecs_available', { available });
+    if (typeof effectiveAvailable !== 'boolean') {
+      throw new TypeError('native video delivery publication returned an invalid mode');
+    }
+    if (available && !effectiveAvailable) {
+      logger.warn('development JPEG compatibility mode forced; WebCodecs probe passed but is not selected');
+    }
+    return effectiveAvailable;
   } catch (error) {
     logger.error('could not publish WebCodecs capability; using JPEG fallback:', error);
     return false;

@@ -261,6 +261,12 @@ async function cancelInvitation() {
 async function checkDevelopmentConnectionMode() {
   const mode = await invoke('development_connection_mode');
   connectionState.setDevelopmentMode(mode.enabled);
+  if (mode.force_jpeg) {
+    const jpegBadge = document.getElementById('dev-jpeg-badge');
+    jpegBadge.classList.remove('hidden');
+    jpegBadge.title = mode.jpeg_warning;
+    console.warn('[development JPEG compatibility mode]', mode.jpeg_warning);
+  }
   if (!mode.enabled) return;
 
   const badge = document.getElementById('dev-connect-badge');

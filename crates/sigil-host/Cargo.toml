@@ -11,6 +11,8 @@ default-run = "sigil"
 
 [features]
 default = []
+# Explicitly insecure configured-host authorization mode for bounded tests.
+# Never infer this capability from the optimization or debug-assertion profile.
 demo-auth-bypass = []
 in-process-gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 

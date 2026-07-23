@@ -1062,7 +1062,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
 }
 
 const fn development_auth_bypass_available() -> bool {
-    cfg!(any(debug_assertions, feature = "demo-auth-bypass"))
+    cfg!(feature = "demo-auth-bypass")
 }
 
 fn validate_development_auth_bypass(
@@ -1071,7 +1071,7 @@ fn validate_development_auth_bypass(
 ) -> Result<()> {
     ensure!(
         !requested || development_auth_bypass_available(),
-        "--dev-allow-unauthorized requires a debug build or the explicit demo-auth-bypass feature; ordinary release builds always require enrollment"
+        "--dev-allow-unauthorized requires the explicit demo-auth-bypass feature; ordinary builds always require enrollment"
     );
     if requested {
         ensure!(
@@ -1271,7 +1271,7 @@ mod tests {
 
     #[test]
     fn ordinary_release_excludes_configured_host_auth_bypass() {
-        if cfg!(not(debug_assertions)) && cfg!(not(feature = "demo-auth-bypass")) {
+        if cfg!(not(feature = "demo-auth-bypass")) {
             assert!(!development_auth_bypass_available());
             assert!(validate_development_auth_bypass(true, Some(60)).is_err());
         }

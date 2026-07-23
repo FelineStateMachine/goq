@@ -424,6 +424,12 @@ class Controller:
         previous_instance: Any = None,
     ) -> dict[str, Any]:
         deadline = asyncio.get_running_loop().time() + READY_TIMEOUT_SECONDS
+        # Remember why the last poll fell short so a timeout reports the root
+        # cause instead of swallowing it: a status call that itself failed
+        # (last_error) or a status that came back but never proved ready
+        # (last_gap).
+        last_error: ControllerError | None = None
+        last_gap: str | None = None
         while asyncio.get_running_loop().time() < deadline:
             try:
                 status = await self._status()
@@ -445,10 +451,46 @@ class Controller:
                     and instance_ok
                 ):
                     return status
-            except ControllerError:
-                pass
+                last_error = None
+                last_gap = self._describe_readiness_gap(
+                    status, runtime, expected_revision, previous_instance
+                )
+            except ControllerError as error:
+                last_error = error
+                last_gap = None
             await asyncio.sleep(POLL_SECONDS)
-        raise ControllerError("service_ready_timeout")
+        detail = last_error.code if last_error is not None else last_gap
+        raise ControllerError("service_ready_timeout", detail) from last_error
+
+    @staticmethod
+    def _describe_readiness_gap(
+        status: dict[str, Any],
+        runtime: dict[str, Any],
+        expected_revision: Any,
+        previous_instance: Any,
+    ) -> str:
+        """Name the first unmet readiness condition, for timeout diagnostics."""
+        overall = status.get("overall")
+        if overall not in {"ready", "active"}:
+            return f"overall={overall!r}"
+        if runtime.get("state") != "fresh":
+            return f"runtime.state={runtime.get('state')!r}"
+        if runtime.get("daemon") != "ready":
+            return f"runtime.daemon={runtime.get('daemon')!r}"
+        instance = runtime.get("instance_id")
+        if not isinstance(instance, str):
+            return "runtime.instance_id missing"
+        if (
+            expected_revision is not None
+            and runtime.get("loaded_config_revision") != expected_revision
+        ):
+            return (
+                f"loaded_config_revision={runtime.get('loaded_config_revision')!r} "
+                f"!= expected {expected_revision!r}"
+            )
+        if isinstance(previous_instance, str) and instance == previous_instance:
+            return "runtime.instance_id unchanged from previous"
+        return "readiness conditions not met"
 
     @staticmethod
     def _revision(value: Any) -> str:

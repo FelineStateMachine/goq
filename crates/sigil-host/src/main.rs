@@ -1243,6 +1243,36 @@ mod tests {
     }
 
     #[test]
+    fn encoder_preflight_requires_an_exact_pair_and_rate_control() {
+        let valid = [
+            "sigil",
+            "capture",
+            "encoder-preflight",
+            "--vaapi-encoder",
+            "varenderD129h264enc",
+            "--vaapi-render-node",
+            "/dev/dri/renderD129",
+            "--rate-control",
+            "cbr",
+            "--rate-control",
+            "cqp",
+        ];
+        assert!(Cli::try_parse_from(valid).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "capture",
+                "encoder-preflight",
+                "--vaapi-encoder",
+                "vah264enc",
+                "--vaapi-render-node",
+                "/dev/dri/renderD128",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn direct_serve_requires_identity_and_source() {
         assert!(Cli::try_parse_from(["sigil", "serve"]).is_err());
         assert!(

@@ -1132,10 +1132,11 @@ this dedicated group single-purpose. Do not add
 `PrivateDevices=true` to the user unit because that would deliberately hide the
 validated device.
 
-Set `vaapi_encoder` to one factory whose inspected read-only `device-path`
-exactly equals `render_node`. This is deliberate: GstVA selects a DRM device by
-factory and exposes `device-path` as read-only, so Sigil verifies the factory's
-reported device before starting capture. Set `rate_control = "cbr"` only when
+Set `vaapi_encoder` to one factory whose programmatically queried read-only
+`device-path` exactly equals `render_node`. This is deliberate: GstVA selects a
+DRM device by factory and exposes `device-path` as read-only, so Sigil verifies
+the live element's reported device before starting capture. Set
+`rate_control = "cbr"` only when
 that factory advertises CBR; otherwise select a low-power factory that
 advertises CQP and use `rate_control = "cqp"`. Do not silently substitute a
 different factory, render node, or software encoder.
@@ -1592,7 +1593,8 @@ unchanged, and the host log must contain one `Gamescope Xwayland pointer
 feedback reconnected` event per restart. The packaged hardware UAT performs
 this sequence after its fixed-mode session checks. That runner independently
 enumerates accessible DRM render nodes and matches the exact GstVA H.264
-factory by its inspected `device-path` and required CBR/CQP properties; it
+factory by its programmatically queried `device-path` and required CBR/CQP
+properties; it
 never assumes a kernel driver, `renderD128`, or the generic `vah264enc` factory.
 If the panel's resolved native
 mode is the same 1280x800 mode as the fixed performance leg, the native-config

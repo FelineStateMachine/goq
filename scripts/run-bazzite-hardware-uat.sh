@@ -3,6 +3,7 @@
 set -euo pipefail
 
 GST_INSPECT_MAX_BYTES=1048576
+ENCODER_PREFLIGHT_MAX_BYTES=1048576
 
 run_bounded_gst_inspect() {
   local timeout_path="$1"
@@ -21,54 +22,26 @@ run_bounded_gst_inspect() {
   [[ "$output_size" =~ ^[0-9]+$ && "$output_size" -le "$GST_INSPECT_MAX_BYTES" ]]
 }
 
-gst_property_block_contains() {
-  local property="$1"
-  local needle="$2"
+run_bounded_encoder_preflight() {
+  local timeout_path="$1"
+  local sigil_path="$2"
+  local output_path="$3"
+  local factory="$4"
+  local render_node="$5"
+  local output_size
 
-  awk -v property="$property" -v needle="$needle" '
-    $0 ~ ("^  " property "[[:space:]]+:") {
-      inside = 1
-    }
-    inside && index($0, needle) {
-      found = 1
-    }
-    inside && $0 !~ ("^  " property "[[:space:]]+:") \
-      && $0 ~ /^  [^[:space:]].*[[:space:]]+:/ {
-      exit
-    }
-    END { exit !found }
-  '
-}
-
-gst_property_block_is_writable() {
-  local property="$1"
-
-  awk -v property="$property" '
-    $0 ~ ("^  " property "[[:space:]]+:") {
-      inside = 1
-    }
-    inside && index(tolower($0), "writable") {
-      found = 1
-    }
-    inside && $0 !~ ("^  " property "[[:space:]]+:") \
-      && $0 ~ /^  [^[:space:]].*[[:space:]]+:/ {
-      exit
-    }
-    END { exit !found }
-  '
-}
-
-gstva_factory_supports_uat() {
-  local inspection="$1"
-  local property
-
-  gst_property_block_contains rate-control cbr <<<"$inspection" || return 1
-  gst_property_block_contains rate-control cqp <<<"$inspection" || return 1
-  for property in \
-    aud b-frames key-int-max rate-control ref-frames target-usage bitrate qpi qpp
-  do
-    gst_property_block_is_writable "$property" <<<"$inspection" || return 1
-  done
+  if ! "$timeout_path" --signal=TERM --kill-after=2s 5s \
+    "$sigil_path" capture encoder-preflight \
+      --vaapi-encoder "$factory" \
+      --vaapi-render-node "$render_node" \
+      --rate-control cbr --rate-control cqp 2>&1 \
+    | head -c "$((ENCODER_PREFLIGHT_MAX_BYTES + 1))" >"$output_path"
+  then
+    return 1
+  fi
+  output_size="$(wc -c <"$output_path" | tr -d '[:space:]')"
+  [[ "$output_size" =~ ^[0-9]+$ \
+    && "$output_size" -le "$ENCODER_PREFLIGHT_MAX_BYTES" ]]
 }
 
 classify_native_uat_mode() {
@@ -86,17 +59,17 @@ classify_native_uat_mode() {
 }
 
 select_gstva_h264_encoder() {
-  local gst_inspect_path="$1"
-  local device_root="${2:-/dev/dri}"
-  local require_character="${3:-true}"
-  local override_node="${4:-}"
-  local override_factory="${5:-}"
-  local timeout_path="${6:?timeout command is required}"
-  local output_root="${7:?bounded inspection output directory is required}"
+  local sigil_path="$1"
+  local gst_inspect_path="$2"
+  local device_root="${3:-/dev/dri}"
+  local require_character="${4:-true}"
+  local override_node="${5:-}"
+  local override_factory="${6:-}"
+  local timeout_path="${7:?timeout command is required}"
+  local output_root="${8:?bounded inspection output directory is required}"
   local factory
   local factories
-  local factory_output
-  local inspection
+  local probe_output
   local candidate
   local pair
   local candidate_count=0
@@ -127,16 +100,12 @@ select_gstva_h264_encoder() {
 
     while IFS= read -r factory; do
       [[ -n "$factory" ]] || continue
-      factory_output="$output_root/gst-inspect.$factory"
-      if ! LC_ALL=C run_bounded_gst_inspect \
-        "$timeout_path" "$gst_inspect_path" "$factory_output" "$factory";
+      probe_output="$output_root/encoder-preflight.$(basename "$candidate").$factory"
+      if ! LC_ALL=C run_bounded_encoder_preflight \
+        "$timeout_path" "$sigil_path" "$probe_output" "$factory" "$candidate";
       then
         continue
       fi
-      inspection="$(<"$factory_output")"
-      gst_property_block_contains device-path "Default: \"$candidate\"" \
-        <<<"$inspection" || continue
-      gstva_factory_supports_uat "$inspection" || continue
       pair="$candidate $factory"
       if [[ -n "$va_candidates" ]]; then
         va_candidates="$va_candidates
@@ -422,7 +391,7 @@ ffmpeg="$(command -v ffmpeg)"
 [[ -S "$XDG_RUNTIME_DIR/pipewire-0" ]]
 selection_status=0
 select_gstva_h264_encoder \
-  "$gst_inspect" /dev/dri true \
+  "$sigil" "$gst_inspect" /dev/dri true \
   "$render_node_override" "$va_encoder_override" \
   "$timeout_command" "$private" || selection_status=$?
 if [[ "$selection_status" -ne 0 ]]; then

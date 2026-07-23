@@ -60,37 +60,44 @@ cat >"$bin/gst-inspect-1.0" <<'EOF'
 set -euo pipefail
 
 fixture="${SIGIL_TEST_FACTORY_FIXTURE:?}"
-if [[ "${SIGIL_TEST_GST_MODE:-}" == oversize-factory && $# -gt 0 ]]; then
-  awk 'BEGIN { for (i = 0; i < 1048578; i++) printf "x" }'
-  exit 0
-fi
 if [[ $# -eq 0 ]]; then
   awk -F '\t' '{ printf "va:  %s: fixture encoder\n", $1 }' "$fixture"
   exit 0
 fi
-
-record="$(awk -F '\t' -v factory="$1" '$1 == factory { print; exit }' "$fixture")"
-[[ -n "$record" ]] || exit 1
-IFS=$'\t' read -r factory device modes completeness <<<"$record"
-printf '%s\n' \
-  '  device-path         : DRM render device' \
-  '                        flags: readable' \
-  "                        String. Default: \"$device\"" \
-  '  rate-control        : Rate control mode' \
-  '                        flags: readable, writable'
-case ",$modes," in
-  *,cqp,*) printf '%s\n' '                           (1): cqp' ;;
-esac
-case ",$modes," in
-  *,cbr,*) printf '%s\n' '                           (2): cbr' ;;
-esac
-for property in aud b-frames key-int-max ref-frames target-usage bitrate qpi qpp; do
-  [[ "$completeness" == "missing-$property" ]] && continue
-  printf '  %-20s: fixture property\n' "$property"
-  printf '%s\n' '                        flags: readable, writable'
-done
+exit 1
 EOF
 chmod 0755 "$bin/gst-inspect-1.0"
+cat >"$bin/sigil" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+fixture="${SIGIL_TEST_FACTORY_FIXTURE:?}"
+[[ "$1" == capture && "$2" == encoder-preflight ]]
+shift 2
+factory=''
+device=''
+required_modes=''
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --vaapi-encoder) factory="$2"; shift 2 ;;
+    --vaapi-render-node) device="$2"; shift 2 ;;
+    --rate-control) required_modes="${required_modes:+$required_modes,}$2"; shift 2 ;;
+    *) exit 64 ;;
+  esac
+done
+if [[ "${SIGIL_TEST_GST_MODE:-}" == oversize-factory ]]; then
+  awk 'BEGIN { for (i = 0; i < 1048578; i++) printf "x" }'
+  exit 0
+fi
+[[ "$required_modes" == cbr,cqp ]]
+awk -F '\t' -v factory="$factory" -v device="$device" '
+  $1 == factory && $2 == device && $4 == "complete" \
+    && ("," $3 ",") ~ /,cbr,/ && ("," $3 ",") ~ /,cqp,/ { found = 1 }
+  END { exit !found }
+' "$fixture"
+printf '%s\n' encoder_preflight=ok
+EOF
+chmod 0755 "$bin/sigil"
 cat >"$bin/timeout" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -109,7 +116,7 @@ export SIGIL_TEST_FACTORY_FIXTURE="$factory_fixture"
 
 select_fixture() {
   select_gstva_h264_encoder \
-    "$bin/gst-inspect-1.0" "$device_root" false \
+    "$bin/sigil" "$bin/gst-inspect-1.0" "$device_root" false \
     "${1:-}" "${2:-}" "$bin/timeout" "$fixture"
 }
 
@@ -221,7 +228,7 @@ fi
 rm -f -- "$device_root/renderD130"
 install -m 0600 /dev/null "$device_root/renderD130"
 if select_gstva_h264_encoder \
-  "$bin/gst-inspect-1.0" "$device_root" true '' '' \
+  "$bin/sigil" "$bin/gst-inspect-1.0" "$device_root" true '' '' \
   "$bin/timeout" "$fixture"
 then
   fail 'a regular file was accepted as a production DRM character device'

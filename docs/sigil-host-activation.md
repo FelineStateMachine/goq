@@ -95,7 +95,8 @@ to the host identity represented by this file.
 
 ## 3. Select the exact VA-API render node and GstVA H.264 factory
 
-Sigil binds the encoder factory to its inspected read-only `device-path`; a
+Sigil binds the encoder factory to its programmatically queried read-only
+`device-path`; a
 factory name alone is not enough on a multi-GPU machine. The following chooses
 automatically only when there is one usable capability-backed node/factory
 pair, independent of its kernel driver. Set
@@ -132,6 +133,26 @@ bounded_gst_inspect() {
   rm -f -- "$output_path"
 }
 
+bounded_encoder_preflight() {
+  local node="$1"
+  local factory="$2"
+  local output_path
+  local output_size
+  output_path="$(mktemp "$inspection_dir/encoder-preflight.XXXXXX")"
+  if ! "$timeout_path" --signal=TERM --kill-after=2s 5s \
+    "$sigil" capture encoder-preflight \
+      --vaapi-encoder "$factory" --vaapi-render-node "$node" \
+      --rate-control cbr --rate-control cqp 2>&1 \
+    | head -c "$((inspect_max_bytes + 1))" >"$output_path"
+  then
+    rm -f -- "$output_path"
+    return 1
+  fi
+  output_size="$(wc -c <"$output_path" | tr -d '[:space:]')"
+  rm -f -- "$output_path"
+  test "$output_size" -le "$inspect_max_bytes"
+}
+
 mapfile -t render_nodes < <(
   for node in /dev/dri/renderD*; do
     test -c "$node" && test -r "$node" && test -w "$node" && printf '%s\n' "$node"
@@ -148,9 +169,7 @@ mapfile -t va_factories < <(
 eligible_pairs=()
 for node in "${render_nodes[@]}"; do
   for factory in "${va_factories[@]}"; do
-    inspection="$(bounded_gst_inspect "$factory")" || continue
-    grep -Fq "Default: \"$node\"" <<<"$inspection" || continue
-    grep -Eq '\([0-9]+\): cbr([[:space:]]|$)' <<<"$inspection" || continue
+    bounded_encoder_preflight "$node" "$factory" || continue
     eligible_pairs+=("$node $factory")
   done
 done

@@ -59,13 +59,14 @@ explicitly and rerun:
 ```
 
 The two override options are inseparable, and the requested pair must pass the
-same device, factory binding, property, CBR, and CQP checks as automatic
+same device, factory binding, programmatic property, CBR, and CQP checks as automatic
 selection. The runner rejects reused output directories and concurrent hardware
 runs.
 Before generating its isolated configs, it enumerates accessible DRM render
-nodes and matches each one to the exact dynamically registered GstVA H.264
-factory whose read-only `device-path` names that node. No kernel-driver name is
-required. The chosen factory must advertise both CBR (for
+nodes and uses Sigil's GObject probe to match each one to the exact dynamically
+registered GstVA H.264 factory whose read-only `device-path` names that node.
+No kernel-driver name or `gst-inspect` property formatting is required. The
+chosen factory must advertise both CBR (for
 the in-process fixed/native legs) and CQP (for the external compatibility leg).
 The gate therefore does not assume either `/dev/dri/renderD128` or the generic
 `vah264enc` factory. The selected pair is recorded in `summary.env`.

@@ -4,7 +4,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::framing::{read_json, write_json};
 use crate::{MAX_INPUT_MESSAGE_LEN, ProtocolError, Result};
 
-const MAX_KEY_LEN: usize = 64;
+const MAX_KEY_IDENTIFIER_UTF8_BYTES: usize = 64;
 const MAX_TEXT_LEN: usize = 1_024;
 
 /// Symmetric per-message relative pointer range. Large accumulated movement
@@ -102,6 +102,8 @@ pub enum InputEvent {
     MouseUp { b: u8 },
     #[serde(rename = "ms")]
     MouseScroll { dx: i32, dy: i32 },
+    /// Bounded physical key identifier. New clients send the supported
+    /// `KeyboardEvent.code` subset; legacy logical key names remain decodable.
     #[serde(rename = "kd")]
     KeyDown { k: String },
     #[serde(rename = "ku")]
@@ -204,7 +206,7 @@ impl InputEvent {
                 })
             }
             Self::KeyDown { k } | Self::KeyUp { k } | Self::KeyClick { k }
-                if k.is_empty() || k.len() > MAX_KEY_LEN =>
+                if k.is_empty() || k.len() > MAX_KEY_IDENTIFIER_UTF8_BYTES =>
             {
                 Err(ProtocolError::InvalidMessage {
                     message_type: "input event",
@@ -319,6 +321,22 @@ mod tests {
 
         assert_eq!(read_input_event(&mut receiver).await.unwrap(), Some(event));
         assert_eq!(read_input_event(&mut receiver).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn physical_keyboard_down_up_and_click_tokens_round_trip() {
+        for event in [
+            InputEvent::KeyDown { k: "F1".into() },
+            InputEvent::KeyUp {
+                k: "PrintScreen".into(),
+            },
+            InputEvent::KeyClick { k: "KeyQ".into() },
+        ] {
+            let (mut sender, mut receiver) = duplex(256);
+            write_input_event(&mut sender, &event).await.unwrap();
+            sender.shutdown().await.unwrap();
+            assert_eq!(read_input_event(&mut receiver).await.unwrap(), Some(event));
+        }
     }
 
     #[tokio::test]
@@ -477,6 +495,20 @@ mod tests {
         );
         assert!(InputEvent::MouseDown { b: 9 }.validate().is_err());
         assert!(InputEvent::KeyUp { k: String::new() }.validate().is_err());
+        assert!(
+            InputEvent::KeyDown {
+                k: "é".repeat(MAX_KEY_IDENTIFIER_UTF8_BYTES / 2)
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            InputEvent::KeyUp {
+                k: "é".repeat((MAX_KEY_IDENTIFIER_UTF8_BYTES / 2) + 1)
+            }
+            .validate()
+            .is_err()
+        );
         assert!(
             InputEvent::Text {
                 s: "x".repeat(MAX_TEXT_LEN + 1)

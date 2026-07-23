@@ -18,6 +18,7 @@ use crate::config::{GamescopeEncoderBackend, GamescopePipewireConfig, HostConfig
 
 mod annexb;
 mod external;
+mod gstreamer_properties;
 mod in_process;
 mod preflight;
 
@@ -27,6 +28,7 @@ use external::{
     forward_annex_b_stream, spawn_gamescope_pipewire_with_target,
     spawn_gamescope_pipewire_with_target_and_shutdown,
 };
+pub(crate) use gstreamer_properties::probe_encoder_properties;
 #[cfg(test)]
 pub(crate) use in_process::EncoderControlTestHarness;
 #[cfg(all(target_os = "linux", feature = "in-process-gstreamer"))]

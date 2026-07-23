@@ -93,11 +93,12 @@ chmod 0600 "$identity"
 Never copy this seed to a client or rotate it during an upgrade. Portal pairs
 to the host identity represented by this file.
 
-## 3. Select the exact AMD render node and GstVA H.264 factory
+## 3. Select the exact VA-API render node and GstVA H.264 factory
 
 Sigil binds the encoder factory to its inspected read-only `device-path`; a
 factory name alone is not enough on a multi-GPU machine. The following chooses
-automatically only when there is one usable AMD node/factory pair. Set
+automatically only when there is one usable capability-backed node/factory
+pair, independent of its kernel driver. Set
 `RENDER_NODE` and `VA_ENCODER` explicitly before running it when the printed
 inventory is intentionally ambiguous.
 
@@ -131,23 +132,12 @@ bounded_gst_inspect() {
   rm -f -- "$output_path"
 }
 
-mapfile -t amd_nodes < <(
-  for sysfs_node in /sys/class/drm/renderD*; do
-    test -e "$sysfs_node/device/driver" || continue
-    test "$(basename "$(readlink -f "$sysfs_node/device/driver")")" = amdgpu \
-      || continue
-    node="/dev/dri/$(basename "$sysfs_node")"
+mapfile -t render_nodes < <(
+  for node in /dev/dri/renderD*; do
     test -c "$node" && test -r "$node" && test -w "$node" && printf '%s\n' "$node"
   done
 )
-printf 'AMD render node: %s\n' "${amd_nodes[@]}"
-if test -n "${RENDER_NODE:-}"; then
-  render_node="$RENDER_NODE"
-else
-  test "${#amd_nodes[@]}" -eq 1
-  render_node="${amd_nodes[0]}"
-fi
-printf '%s\n' "${amd_nodes[@]}" | grep -Fx "$render_node"
+printf 'accessible render node: %s\n' "${render_nodes[@]}"
 
 registry="$(bounded_gst_inspect)"
 mapfile -t va_factories < <(
@@ -155,21 +145,25 @@ mapfile -t va_factories < <(
     sub(/:$/, "", $2); print $2
   }' <<<"$registry" | sort -u
 )
-matching_factories=()
-for factory in "${va_factories[@]}"; do
-  inspection="$(bounded_gst_inspect "$factory")" || continue
-  grep -Fq "Default: \"$render_node\"" <<<"$inspection" || continue
-  grep -Eq '\([0-9]+\): cbr([[:space:]]|$)' <<<"$inspection" || continue
-  matching_factories+=("$factory")
+eligible_pairs=()
+for node in "${render_nodes[@]}"; do
+  for factory in "${va_factories[@]}"; do
+    inspection="$(bounded_gst_inspect "$factory")" || continue
+    grep -Fq "Default: \"$node\"" <<<"$inspection" || continue
+    grep -Eq '\([0-9]+\): cbr([[:space:]]|$)' <<<"$inspection" || continue
+    eligible_pairs+=("$node $factory")
+  done
 done
-printf 'matching CBR GstVA factory: %s\n' "${matching_factories[@]}"
-if test -n "${VA_ENCODER:-}"; then
-  va_encoder="$VA_ENCODER"
+printf 'eligible CBR GstVA pair: %s\n' "${eligible_pairs[@]}"
+if test -n "${RENDER_NODE:-}" || test -n "${VA_ENCODER:-}"; then
+  test -n "${RENDER_NODE:-}" && test -n "${VA_ENCODER:-}"
+  selected_pair="$RENDER_NODE $VA_ENCODER"
+  printf '%s\n' "${eligible_pairs[@]}" | grep -Fx "$selected_pair"
 else
-  test "${#matching_factories[@]}" -eq 1
-  va_encoder="${matching_factories[0]}"
+  test "${#eligible_pairs[@]}" -eq 1
+  selected_pair="${eligible_pairs[0]}"
 fi
-printf '%s\n' "${matching_factories[@]}" | grep -Fx "$va_encoder"
+read -r render_node va_encoder <<<"$selected_pair"
 
 printf 'export SIGIL_RENDER_NODE=%q\n' "$render_node"
 printf 'export SIGIL_VA_ENCODER=%q\n' "$va_encoder"

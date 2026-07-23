@@ -15,6 +15,42 @@ optional() {
   fi
 }
 
+probe_h264_vaapi_render_node() {
+  local ffmpeg_path="$1"
+  local candidate="$2"
+
+  "$ffmpeg_path" -hide_banner -loglevel error \
+    -vaapi_device "$candidate" \
+    -f lavfi -i color=size=128x128:rate=1 \
+    -vf 'format=nv12,hwupload' \
+    -c:v h264_vaapi -frames:v 1 -f null -
+}
+
+select_h264_vaapi_render_node() {
+  local device_root="${1:-/dev/dri}"
+  local require_character="${2:-true}"
+  local ffmpeg_path
+  local candidate
+
+  render_node=''
+  ffmpeg_path="$(command -v ffmpeg)" || return 1
+  for candidate in "$device_root"/renderD*; do
+    [[ "$(basename "$candidate")" =~ ^renderD[0-9]+$ ]] || continue
+    [[ -e "$candidate" && ! -L "$candidate" && -r "$candidate" && -w "$candidate" ]] \
+      || continue
+    if [[ "$require_character" == true && ! -c "$candidate" ]]; then
+      continue
+    fi
+    if probe_h264_vaapi_render_node "$ffmpeg_path" "$candidate" \
+      >/dev/null 2>&1
+    then
+      render_node="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 gstreamer_inventory() {
   if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
     echo 'gstreamer_inventory=unavailable'
@@ -422,10 +458,8 @@ for sysfs_node in /sys/class/drm/renderD*; do
   device="$(basename "$(readlink -f "$sysfs_node/device")")"
   printf 'render_node=/dev/dri/%s driver=%s device=%s\n' \
     "$(basename "$sysfs_node")" "$driver" "$device"
-  if [[ -z "$render_node" && "$driver" == amdgpu ]]; then
-    render_node="/dev/dri/$(basename "$sysfs_node")"
-  fi
 done
+select_h264_vaapi_render_node /dev/dri true || true
 optional lspci lspci -nnk
 optional vulkaninfo vulkaninfo --summary
 
@@ -482,7 +516,7 @@ fi
 if [[ "$mode" == smoke ]]; then
   section h264_smoke
   if [[ -z "$render_node" ]]; then
-    echo "AMD render node is required for --smoke" >&2
+    echo "an accessible VA-API H.264 encode-capable render node is required for --smoke" >&2
     exit 1
   fi
   ffmpeg -hide_banner -loglevel warning \

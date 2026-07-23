@@ -85,22 +85,18 @@ classify_native_uat_mode() {
   fi
 }
 
-select_amd_gstva_h264_encoder() {
+select_gstva_h264_encoder() {
   local gst_inspect_path="$1"
-  local sysfs_root="${2:-/sys/class/drm}"
-  local device_root="${3:-/dev/dri}"
-  local require_character="${4:-true}"
-  local override_node="${5:-}"
-  local override_factory="${6:-}"
-  local timeout_path="${7:?timeout command is required}"
-  local output_root="${8:?bounded inspection output directory is required}"
+  local device_root="${2:-/dev/dri}"
+  local require_character="${3:-true}"
+  local override_node="${4:-}"
+  local override_factory="${5:-}"
+  local timeout_path="${6:?timeout command is required}"
+  local output_root="${7:?bounded inspection output directory is required}"
   local factory
   local factories
   local factory_output
   local inspection
-  local node_name
-  local sysfs_node
-  local driver
   local candidate
   local pair
   local candidate_count=0
@@ -121,13 +117,8 @@ select_amd_gstva_h264_encoder() {
     }
   ' "$output_root/gst-inspect.registry" | sort -u)" || return 1
 
-  for sysfs_node in "$sysfs_root"/renderD*; do
-    [[ -e "$sysfs_node/device/driver" ]] || continue
-    node_name="$(basename "$sysfs_node")"
-    [[ "$node_name" =~ ^renderD[0-9]+$ ]] || continue
-    driver="$(basename "$(readlink -f "$sysfs_node/device/driver")")" || continue
-    [[ "$driver" == amdgpu ]] || continue
-    candidate="$device_root/$node_name"
+  for candidate in "$device_root"/renderD*; do
+    [[ "$(basename "$candidate")" =~ ^renderD[0-9]+$ ]] || continue
     [[ -e "$candidate" && ! -L "$candidate" && -r "$candidate" && -w "$candidate" ]] \
       || continue
     if [[ "$require_character" == true && ! -c "$candidate" ]]; then
@@ -430,17 +421,17 @@ timeout_command="$(command -v timeout)"
 ffmpeg="$(command -v ffmpeg)"
 [[ -S "$XDG_RUNTIME_DIR/pipewire-0" ]]
 selection_status=0
-select_amd_gstva_h264_encoder \
-  "$gst_inspect" /sys/class/drm /dev/dri true \
+select_gstva_h264_encoder \
+  "$gst_inspect" /dev/dri true \
   "$render_node_override" "$va_encoder_override" \
   "$timeout_command" "$private" || selection_status=$?
 if [[ "$selection_status" -ne 0 ]]; then
   if [[ -n "$render_node_override" ]]; then
     echo "the requested render-node and VA-encoder pair is not eligible for this UAT" >&2
   elif [[ "$selection_status" -eq 2 ]]; then
-    echo "multiple AMD GstVA H.264 encoder pairs are eligible; select one exact pair with --render-node and --va-encoder" >&2
+    echo "multiple GstVA H.264 encoder pairs are eligible; select one exact pair with --render-node and --va-encoder" >&2
   else
-    echo "no accessible AMD render node has a GstVA H.264 factory satisfying the CBR and CQP UAT contract" >&2
+    echo "no accessible render node has a GstVA H.264 factory satisfying the CBR and CQP UAT contract" >&2
   fi
   if [[ -n "$va_candidates" ]]; then
     while IFS= read -r pair; do

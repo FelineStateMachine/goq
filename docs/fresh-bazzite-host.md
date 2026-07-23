@@ -1,4 +1,4 @@
-# Fresh Bazzite AMD host engineering setup
+# Fresh Bazzite host engineering setup
 
 This document is the maintainer lab log and hardware-acceptance source. It
 intentionally contains historical machine names, checkout paths, evidence, and
@@ -6,8 +6,10 @@ development workflows. A user activating an installed package should follow
 the portable [Sigil host activation guide](sigil-host-activation.md) shipped in
 that package instead.
 
-This runbook takes a dedicated AMD x86_64 machine from a fresh Bazzite install
-to a remotely managed Sigil host. It also defines how `slate` is used as
+This runbook takes a dedicated x86_64 machine with VA-API H.264 encoding from a
+fresh Bazzite install to a remotely managed Sigil host. The proven reference
+machine uses AMD graphics, but host admission is based on encoder capability,
+not a kernel-driver name. It also defines how `slate` is used as
 the temporary Linux stand-in while Steps 0–2 are being built.
 
 The dedicated Bazzite machine is the only target for Gamescope, PipeWire,
@@ -20,7 +22,7 @@ changes on `slate`.
 | --- | --- | --- |
 | Development Mac | Portal client and primary source tree | Client development, tests, evidence collection |
 | `tank@slate` | Temporary Linux stand-in | Protocol tests, pure Rust host, synthetic H.264, iroh transport, reconnect tests |
-| Dedicated Bazzite AMD host | Final appliance | Everything above plus Gamescope, PipeWire, hardware H.264, audio, and `uinput` |
+| Dedicated Bazzite host | Final appliance | Everything above plus Gamescope, PipeWire, hardware H.264, audio, and `uinput` |
 
 Steps 0–2 do not require Gamescope. They use a synthetic encoded source so the
 host boundary can be proven independently. The cutover to Gamescope starts at
@@ -47,7 +49,7 @@ portal --dev-connect <host-node-id>
 The Gamescope source uses GStreamer's `pipewiresrc` and GstVA H.264 encoder,
 because stock upstream FFmpeg does not expose a PipeWire video input device.
 It resolves exactly one live node from configured PipeWire properties and
-fails closed if the node, encoder factory, AMD render node, or required
+fails closed if the node, encoder factory, render-node binding, or required
 low-latency encoder properties do not match. This implementation still needs
 the attached-display and headless appliance gates below before it is proven on
 the target Bazzite image.
@@ -348,9 +350,10 @@ Run this while a display is still attached:
 ./scripts/bazzite-inventory.sh --smoke | tee "$HOME/bazzite-smoke.txt"
 ```
 
-The script selects the first render node whose sysfs driver is `amdgpu`; it
-does not assume `renderD128`. The equivalent individual checks are shown below
-for recovery and review:
+The script selects the first accessible render node that completes a real
+one-frame VA-API H.264 encode; it does not assume a driver name or
+`renderD128`. The equivalent individual checks are shown below for recovery
+and review:
 
 ```bash
 hostnamectl
@@ -367,10 +370,14 @@ ls -l /dev/dri
 id
 vulkaninfo --summary
 render_node="$({
-  for node in /sys/class/drm/renderD*; do
-    test -e "$node/device/driver" || continue
-    test "$(basename "$(readlink -f "$node/device/driver")")" = amdgpu || continue
-    printf '/dev/dri/%s\n' "$(basename "$node")"
+  for node in /dev/dri/renderD*; do
+    test -c "$node" && test -r "$node" && test -w "$node" || continue
+    ffmpeg -hide_banner -loglevel error \
+      -vaapi_device "$node" \
+      -f lavfi -i color=size=128x128:rate=1 \
+      -vf 'format=nv12,hwupload' \
+      -c:v h264_vaapi -frames:v 1 -f null - >/dev/null 2>&1 || continue
+    printf '%s\n' "$node"
   done
 } | head -n 1)"
 test -n "$render_node"
@@ -391,9 +398,8 @@ ffmpeg -hide_banner -loglevel warning \
 
 Required observations:
 
-- The AMD GPU uses the `amdgpu` kernel driver.
 - The gaming user can open a `/dev/dri/renderD*` render node.
-- Vulkan selects the intended AMD GPU.
+- Vulkan selects the intended gaming GPU.
 - VA-API exposes H.264 encoding and completes the 600-frame smoke encode.
 - FFmpeg exposes `libx264` for the bounded synthetic Steps 0–2 source.
 - PipeWire and Gamescope are installed.
@@ -1016,7 +1022,7 @@ journalctl --user -b --no-pager | grep -Ei 'gamescope|pipewire.*node'
 Gamescope should publish a PipeWire stream with both `node.name=gamescope` and
 `media.class=Video/Source`. Select by those properties, not by numeric node ID,
 because node IDs change across boots. Inventory the exact executable paths,
-AMD render node, and dynamically registered GstVA H.264 factories:
+render-node candidates, and dynamically registered GstVA H.264 factories:
 
 ```bash
 pw_dump_path="$(readlink -f "$(command -v pw-dump)")"
@@ -1035,10 +1041,9 @@ for node in /sys/class/drm/renderD*; do
     "$(basename "$(readlink -f "$node/device/driver")")" \
     "$(basename "$(readlink -f "$node/device")")"
 done
-render_node="<exact AMD render node chosen from the inventory>"
+render_node="<exact encode-capable render node chosen from the inventory>"
 test -n "$render_node"
 test -r "$render_node" && test -w "$render_node"
-test "$(basename "$(readlink -f "/sys/class/drm/$(basename "$render_node")/device/driver")")" = amdgpu
 
 gst-inspect-1.0 | awk '
   $2 ~ /^va(renderD[0-9]+)?h264(lp)?enc:$/ {
@@ -1348,9 +1353,9 @@ of `/proc/<pid>/exe` and the Gamescope cgroup.
 `config check` performs a live, bounded preflight. It requires exactly one
 matching PipeWire node, checks every configured executable and required
 GStreamer element, opens the configured render node read/write, proves its
-kernel driver is `amdgpu`, verifies that the selected encoder reports the same
-device plus all low-latency properties used by the pipeline, and—when audio is
-configured—prints the exact resolved sink target:
+exact GstVA factory is bound to that node, and verifies all low-latency
+properties used by the pipeline. When audio is configured, it also prints the
+exact resolved sink target:
 
 ```bash
 "$HOME/.local/libexec/sigil-spark/current/sigil" config check \
@@ -1586,9 +1591,10 @@ the redeemed invitation. Both runs must pass, the Sigil PID must remain
 unchanged, and the host log must contain one `Gamescope Xwayland pointer
 feedback reconnected` event per restart. The packaged hardware UAT performs
 this sequence after its fixed-mode session checks. That runner independently
-enumerates `amdgpu` render nodes and matches the exact GstVA H.264 factory by
-its inspected `device-path`; it never assumes `renderD128` is the AMD device or
-that the matching factory is named `vah264enc`. If the panel's resolved native
+enumerates accessible DRM render nodes and matches the exact GstVA H.264
+factory by its inspected `device-path` and required CBR/CQP properties; it
+never assumes a kernel driver, `renderD128`, or the generic `vah264enc` factory.
+If the panel's resolved native
 mode is the same 1280x800 mode as the fixed performance leg, the native-config
 leg still runs and records that the two pixel sizes are identical instead of
 rejecting the host.

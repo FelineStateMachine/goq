@@ -444,7 +444,13 @@ pub(crate) async fn run_video_delivery(request: VideoDeliveryRequest) {
                 }
 
                 let is_keyframe = header[12] == 1;
-                let codec = byte_to_codec(header[13]).to_string();
+                let codec = match byte_to_codec(header[13]) {
+                    Ok(codec) => codec.to_string(),
+                    Err(error) => {
+                        emit_frame_error(&app, media_generation, error);
+                        break;
+                    }
+                };
 
                 let mut frame_buf = vec![0u8; frame_len];
                 match tokio::time::timeout(

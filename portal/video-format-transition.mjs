@@ -1,5 +1,5 @@
 function validFormat({ codec, width, height }) {
-  if (!['h264', 'h265', 'av1'].includes(codec)) throw new TypeError('invalid video codec');
+  if (codec !== 'h264') throw new TypeError('invalid video codec');
   if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0) {
     throw new TypeError('invalid video dimensions');
   }

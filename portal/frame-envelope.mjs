@@ -12,7 +12,7 @@ const CODEC_CONFIG_FLAG = 1 << 2;
 const OPTIONAL_U64_NONE = 0xffffffffffffffffn;
 const OPTIONAL_I64_NONE = -0x8000000000000000n;
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
-const CODECS = Object.freeze({ 1: 'h264', 2: 'h265', 3: 'av1' });
+const CODECS = Object.freeze({ 1: 'h264' });
 
 function exactOptionalUnsigned(value, field) {
   if (value === OPTIONAL_U64_NONE) return null;

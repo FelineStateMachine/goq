@@ -4,12 +4,6 @@ import {
   buildAvcDescription,
   avcCodecStr,
   h264NalType,
-  buildHvcDescription,
-  hevcCodecStr,
-  hevcNalType,
-  parseAv1Obus,
-  av1CodecStr,
-  buildAv1Description,
 } from './codecs.js';
 import { exactMediaTimestampMicros } from './av-sync.mjs';
 import {
@@ -349,90 +343,31 @@ export function createVideoPipelineSession({
         ? mediaPtsMicros
         : now() * 1000;
 
-      if (codec === 'av1') {
-        // ── AV1 path ──
-        const obus = parseAv1Obus(raw);
-        if (keyframe) {
-          const seqHeader = obus.find(o => o.type === 12);
-          if (seqHeader && formatPlan.reconfigure) {
-            initWebCodecsDecoder(width, height, buildAv1Description(seqHeader.data), av1CodecStr(seqHeader.data));
-          }
-        }
-        if (!decoderConfigured || !videoDecoder) { droppedFrames++; return; }
-        const frameObus = obus.filter(o => o.type !== 2 && o.type !== 12);
-        if (frameObus.length > 0) {
-          let totalLen = 0;
-          for (const o of frameObus) totalLen += o.data.length;
-          const chunkData = new Uint8Array(totalLen);
-          let off = 0;
-          for (const o of frameObus) { chunkData.set(o.data, off); off += o.data.length; }
-          const chunk = createEncodedChunk({
-            type: keyframe ? 'key' : 'delta',
-            timestamp: chunkTimestamp,
-            data: chunkData,
-          });
-          const enqueued = enqueueVideoChunk(chunk, receivedAt, 'av1', mediaPtsMicros);
-          commitVideoFrame(formatPlan, keyframe, enqueued);
-        }
-
-      } else if (codec === 'h265') {
-        // ── H.265 path ──
-        const nals = parseAnnexBNals(raw);
-        if (keyframe) {
-          let vps = null, sps = null, pps = null;
-          for (const nal of nals) {
-            const type = hevcNalType(nal);
-            if (type === 32) vps = nal;
-            else if (type === 33) sps = nal;
-            else if (type === 34) pps = nal;
-          }
-          if (vps && sps && pps && formatPlan.reconfigure) {
-            initWebCodecsDecoder(width, height, buildHvcDescription(vps, sps, pps), hevcCodecStr(sps));
-          }
-        }
-        if (!decoderConfigured || !videoDecoder) { droppedFrames++; return; }
-        const sliceNals = nals.filter(nal => {
-          const type = hevcNalType(nal);
-          return type !== 32 && type !== 33 && type !== 34 && type !== 35;
-        });
-        if (sliceNals.length > 0) {
-          const chunk = createEncodedChunk({
-            type: keyframe ? 'key' : 'delta',
-            timestamp: chunkTimestamp,
-            data: nalsToLengthPrefixed(sliceNals),
-          });
-          const enqueued = enqueueVideoChunk(chunk, receivedAt, 'hevc', mediaPtsMicros);
-          commitVideoFrame(formatPlan, keyframe, enqueued);
-        }
-
-      } else {
-        // ── H.264 path (default) ──
-        const nals = parseAnnexBNals(raw);
-        if (keyframe) {
-          let sps = null, pps = null;
-          for (const nal of nals) {
-            const type = h264NalType(nal);
-            if (type === 7) sps = nal;
-            else if (type === 8) pps = nal;
-          }
-          if (sps && pps && formatPlan.reconfigure) {
-            initWebCodecsDecoder(width, height, buildAvcDescription(sps, pps), avcCodecStr(sps));
-          }
-        }
-        if (!decoderConfigured || !videoDecoder) { droppedFrames++; return; }
-        const sliceNals = nals.filter(nal => {
+      const nals = parseAnnexBNals(raw);
+      if (keyframe) {
+        let sps = null, pps = null;
+        for (const nal of nals) {
           const type = h264NalType(nal);
-          return type !== 7 && type !== 8 && type !== 9;
-        });
-        if (sliceNals.length > 0) {
-          const chunk = createEncodedChunk({
-            type: keyframe ? 'key' : 'delta',
-            timestamp: chunkTimestamp,
-            data: nalsToLengthPrefixed(sliceNals),
-          });
-          const enqueued = enqueueVideoChunk(chunk, receivedAt, 'h264', mediaPtsMicros);
-          commitVideoFrame(formatPlan, keyframe, enqueued);
+          if (type === 7) sps = nal;
+          else if (type === 8) pps = nal;
         }
+        if (sps && pps && formatPlan.reconfigure) {
+          initWebCodecsDecoder(width, height, buildAvcDescription(sps, pps), avcCodecStr(sps));
+        }
+      }
+      if (!decoderConfigured || !videoDecoder) { droppedFrames++; return; }
+      const sliceNals = nals.filter(nal => {
+        const type = h264NalType(nal);
+        return type !== 7 && type !== 8 && type !== 9;
+      });
+      if (sliceNals.length > 0) {
+        const chunk = createEncodedChunk({
+          type: keyframe ? 'key' : 'delta',
+          timestamp: chunkTimestamp,
+          data: nalsToLengthPrefixed(sliceNals),
+        });
+        const enqueued = enqueueVideoChunk(chunk, receivedAt, 'h264', mediaPtsMicros);
+        commitVideoFrame(formatPlan, keyframe, enqueued);
       }
     } else {
       // JPEG fallback (openh264 decode → JPEG encode in Rust)

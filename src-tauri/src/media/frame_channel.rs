@@ -6,12 +6,12 @@ use tauri::{AppHandle, Emitter};
 
 use crate::commands::state::AppState;
 
-pub(crate) fn byte_to_codec(value: u8) -> &'static str {
+pub(crate) fn byte_to_codec(value: u8) -> Result<&'static str, String> {
     match value {
-        1 => "h264",
-        2 => "h265",
-        3 => "av1",
-        _ => "h264",
+        1 => Ok("h264"),
+        unsupported => Err(format!(
+            "Unsupported legacy media codec: {unsupported}; Portal supports H.264 only"
+        )),
     }
 }
 
@@ -145,8 +145,6 @@ pub(crate) fn encode_frame_envelope(
     })?;
     let codec = match metadata.codec {
         "h264" => 1,
-        "h265" => 2,
-        "av1" => 3,
         other => return Err(format!("Unsupported frame channel codec: {other}")),
     };
     let mut flags = 0_u8;
@@ -321,7 +319,7 @@ mod tests {
             FrameEnvelopeMetadata {
                 width: 1,
                 height: 1,
-                codec: "av1",
+                codec: "h264",
                 keyframe: false,
                 discontinuity: false,
                 codec_config: false,
@@ -332,7 +330,7 @@ mod tests {
             &[1],
         )
         .unwrap();
-        assert_eq!(envelope[5], 3);
+        assert_eq!(envelope[5], 1);
         assert_eq!(&envelope[16..24], &u64::MAX.to_be_bytes());
         assert_eq!(&envelope[24..32], &u64::MAX.to_be_bytes());
         assert_eq!(&envelope[32..40], &i64::MIN.to_be_bytes());
@@ -351,6 +349,8 @@ mod tests {
             capture_timestamp_micros: None,
             pts_micros: None,
         };
+        assert!(encode_frame_envelope(metadata("h265"), &[1]).is_err());
+        assert!(encode_frame_envelope(metadata("av1"), &[1]).is_err());
         assert!(encode_frame_envelope(metadata("vp9"), &[1]).is_err());
         assert!(encode_frame_envelope(metadata("h264"), &[]).is_err());
         assert!(
@@ -393,6 +393,15 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_codec_bytes_fail_closed_to_h264_only() {
+        assert_eq!(byte_to_codec(1).unwrap(), "h264");
+        for unsupported in [0, 2, 3, u8::MAX] {
+            let error = byte_to_codec(unsupported).unwrap_err();
+            assert!(error.contains("H.264 only"));
+        }
     }
 
     #[test]

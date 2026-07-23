@@ -145,6 +145,11 @@ sigil_unit_before_first_ssh=ok
 sigil_ready_before_first_ssh=ok
 ```
 
+`gaming_autologin_session=ok` means logind reported an active, local session
+for the gaming user whose exact PAM service name ends in `-autologin`, such as
+`sddm-autologin` or `gdm-autologin`; an SSH or manual desktop login does not
+qualify.
+
 This proves Gamescope and Sigil became ready before first SSH, not merely that
 they were running after an operator repaired the boot.
 

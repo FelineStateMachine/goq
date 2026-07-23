@@ -33,41 +33,112 @@ assert_not_contains() {
 }
 
 session_user_id="$(id -u)"
+session_fixture_user="$session_user_id"
+session_fixture_remote=no
+session_fixture_state=active
+session_fixture_services='Service=sddm-autologin'
 loginctl() {
   if [[ "$1" == list-sessions ]]; then
     printf '2 %s test seat0 tty1\n' "$session_user_id"
   else
     printf '%s\n' \
       'Id=2' \
-      "User=$session_user_id" \
-      'Remote=no' \
-      'Service=sddm-autologin' \
+      "User=$session_fixture_user" \
+      "Remote=$session_fixture_remote"
+    [[ -z "$session_fixture_services" ]] || \
+      printf '%s\n' "$session_fixture_services"
+    printf '%s\n' \
       'Type=wayland' \
       'Class=user' \
-      'State=active'
+      "State=$session_fixture_state"
   fi
 }
-session_output="$(cold_boot_session_evidence)"
-assert_contains "$session_output" 'gaming_autologin_session=ok'
-assert_not_contains "$session_output" 'cold_boot_failure='
+
+assert_session_fixture() {
+  local label="$1"
+  local expected="$2"
+  local output
+
+  output="$(cold_boot_session_evidence)"
+  if [[ "$expected" == pass ]]; then
+    assert_contains "$output" 'gaming_autologin_session=ok'
+    assert_not_contains "$output" 'cold_boot_failure='
+  else
+    assert_contains "$output" \
+      'cold_boot_failure=no_active_local_gaming_autologin_session'
+    assert_not_contains "$output" 'gaming_autologin_session=ok'
+  fi
+  printf 'session_fixture=%s result=%s\n' "$label" "$expected"
+}
+
+assert_session_fixture sddm pass
+session_fixture_services='Service=gdm-autologin'
+assert_session_fixture gdm pass
+session_fixture_user=65534
+assert_session_fixture wrong-user fail
+session_fixture_user="$session_user_id"
+session_fixture_remote=yes
+assert_session_fixture remote fail
+session_fixture_remote=no
+session_fixture_state=closing
+assert_session_fixture inactive fail
+session_fixture_state=active
+session_fixture_services='Service=gdm-password'
+assert_session_fixture manual-gdm fail
+session_fixture_services=''
+assert_session_fixture missing-service fail
+session_fixture_services='Service='
+assert_session_fixture empty-service fail
+session_fixture_services='Service=sddm-autologin-extra'
+assert_session_fixture near-miss-service fail
+session_fixture_services='Service=-autologin'
+assert_session_fixture empty-service-prefix fail
+session_fixture_services=$'Service=sddm-autologin\nService=gdm-autologin'
+assert_session_fixture duplicate-service fail
+session_fixture_services='Service=sddm-autologin'
+session_fixture_user=$'65534\nUser='"$session_user_id"
+assert_session_fixture duplicate-user fail
+session_fixture_user="$session_user_id"
+session_fixture_remote=$'yes\nRemote=no'
+assert_session_fixture duplicate-remote fail
+session_fixture_remote=no
+session_fixture_state=$'closing\nState=active'
+assert_session_fixture duplicate-state fail
+session_fixture_state=active
 
 loginctl() {
   if [[ "$1" == list-sessions ]]; then
-    printf '2 65534 somebody seat0 tty1\n'
-  else
     printf '%s\n' \
-      'Id=2' \
-      'User=65534' \
-      'Remote=no' \
-      'Service=sddm-autologin' \
-      'Type=wayland' \
-      'Class=user' \
-      'State=active'
+      "2 $session_user_id test - pts/0" \
+      "3 $session_user_id test - -" \
+      "4 $session_user_id test seat0 tty1"
+    return
   fi
+
+  case "$2" in
+    2)
+      printf '%s\n' \
+        'Id=2' "User=$session_user_id" 'Remote=yes' 'Service=sshd' \
+        'Type=tty' 'Class=user' 'State=active'
+      ;;
+    3)
+      printf '%s\n' \
+        'Id=3' "User=$session_user_id" 'Remote=no' 'Service=systemd-user' \
+        'Type=unspecified' 'Class=manager' 'State=active'
+      ;;
+    4)
+      printf '%s\n' \
+        'Id=4' "User=$session_user_id" 'Remote=no' 'Service=gdm-autologin' \
+        'Type=wayland' 'Class=user' 'State=active'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
-wrong_user_session_output="$(cold_boot_session_evidence)"
-assert_contains "$wrong_user_session_output" \
-  'cold_boot_failure=no_active_local_sddm_autologin_session'
+multiple_session_output="$(cold_boot_session_evidence)"
+assert_contains "$multiple_session_output" 'gaming_autologin_session=ok'
+assert_not_contains "$multiple_session_output" 'cold_boot_failure='
 
 pass_journal='[0.500000] host systemd[1]: Reached target Basic System
 [1.000000] host gamescope-session-plus[100]: starting Gamescope

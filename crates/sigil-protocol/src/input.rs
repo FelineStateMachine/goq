@@ -495,6 +495,8 @@ mod tests {
         );
         assert!(InputEvent::MouseDown { b: 9 }.validate().is_err());
         assert!(InputEvent::KeyUp { k: String::new() }.validate().is_err());
+        // This exercises the UTF-8 byte bound only; protocol validation does
+        // not imply that arbitrary Unicode is an operational keyboard input.
         assert!(
             InputEvent::KeyDown {
                 k: "é".repeat(MAX_KEY_IDENTIFIER_UTF8_BYTES / 2)

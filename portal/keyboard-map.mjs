@@ -98,8 +98,9 @@ export function mapKey(event) {
 }
 
 // Resolve each keydown to exactly one protocol class. Physical keyboard input
-// wins whenever it is available; text is a fallback for virtual keyboards or
-// unsupported physical codes and is never emitted alongside a key transition.
+// wins whenever it is available. Text is considered only if the host separately
+// advertises an operational Text capability, and is never emitted alongside a
+// key transition.
 export function keyboardInputForEvent(event, capabilities = {}) {
   if (capabilities.keyboard === true) {
     const key = mapKey(event);

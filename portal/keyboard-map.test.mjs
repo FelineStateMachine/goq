@@ -32,7 +32,7 @@ test('forwards the bounded physical code contract including extended keys', () =
   }
 });
 
-test('physical codes preserve non-ASCII and alternate-layout key positions', () => {
+test('physical codes preserve client key positions across keyboard layouts', () => {
   assert.equal(mapKey({ code: 'KeyE', key: 'é' }), 'KeyE');
   assert.equal(mapKey({ code: 'Digit2', key: 'é' }), 'Digit2');
   assert.equal(mapKey({ code: 'KeyQ', key: 'a' }), 'KeyQ');
@@ -71,12 +71,18 @@ test('rejects unsupported physical and logical keys without guessing', () => {
   }
 });
 
-test('chooses one physical key transition before any text fallback', () => {
-  const both = { keyboard: true, text: true };
+test('production keyboard capability forwards a physical code without Text', () => {
   assert.deepEqual(
-    keyboardInputForEvent({ code: 'KeyE', key: 'é' }, both),
+    keyboardInputForEvent(
+      { code: 'KeyE', key: 'é' },
+      { keyboard: true, text: false },
+    ),
     { type: 'key', key: 'KeyE' },
   );
+});
+
+test('hypothetical operational Text capability remains exclusive with keyboard', () => {
+  const both = { keyboard: true, text: true };
   assert.deepEqual(
     keyboardInputForEvent({ code: 'F5', key: 'F5' }, both),
     { type: 'key', key: 'F5' },
@@ -87,7 +93,7 @@ test('chooses one physical key transition before any text fallback', () => {
   );
 });
 
-test('text-only fallback accepts one Unicode scalar and rejects modified or composing input', () => {
+test('hypothetical Text-only capability accepts one scalar and rejects unsafe input', () => {
   const textOnly = { keyboard: false, text: true };
   assert.deepEqual(
     keyboardInputForEvent({ code: '', key: 'é' }, textOnly),

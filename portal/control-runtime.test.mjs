@@ -159,6 +159,29 @@ test('explicit native false bypasses browser lock and controller activation stay
   assert.equal(harness.runtime.activationGateActive, false);
 });
 
+test('absolute-pointer control never enters the gated relative-capture path', async () => {
+  let nativeGrabCalls = 0;
+  let pointerLockRequests = 0;
+  const harness = newHarness({
+    invokeCursorGrab: async () => {
+      nativeGrabCalls += 1;
+      return true;
+    },
+    pointerRequest: () => {
+      pointerLockRequests += 1;
+    },
+  });
+  harness.capabilities.relativePointer = false;
+  harness.capabilities.absolutePointer = true;
+
+  await harness.runtime.toggle();
+
+  assert.equal(harness.runtime.active, true);
+  assert.equal(nativeGrabCalls, 0);
+  assert.equal(pointerLockRequests, 0);
+  assert.equal(harness.calls.publish, 1);
+});
+
 test('ordinary toggle exit queues neutral and releases held input without resetting controller escape', async () => {
   const harness = newHarness({ invokeCursorGrab: async () => false });
   await harness.runtime.toggle();

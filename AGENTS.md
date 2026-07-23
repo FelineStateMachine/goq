@@ -75,6 +75,10 @@ Sigil host.
   coverage. Hardware acceptance that remains incomplete is listed below.
 - Portal's window scales to the incoming stream while preserving aspect ratio;
   larger client screens do not stretch the host image.
+- Portal's proven relative-pointer capture path is macOS-only. Non-macOS
+  builds must mask relative-pointer negotiation unless explicitly built with
+  `experimental-non-macos-pointer-capture`; that feature is for platform UAT
+  only and must not enter an ordinary or published build.
 
 ## Security boundary
 
@@ -200,6 +204,10 @@ Sigil host.
   `sigil-host.service` before calling the test complete.
 
 - On Linux with NVIDIA, set `WEBKIT_DISABLE_DMABUF_RENDERER=1` for Portal.
+- Treat `experimental-non-macos-pointer-capture` as an explicit non-release
+  build mode. Complete the per-platform checklist in
+  `docs/portal-platform-support.md`, including a real Portal -> UMPC session,
+  before changing a platform's support status or its default feature policy.
 - Preserve `/Users/dami/Developer/sigil` untouched; it is the inherited source,
   not this working repository.
 - Preserve unrelated worktree changes. Never sweep generated credentials,

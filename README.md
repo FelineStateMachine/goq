@@ -81,6 +81,12 @@ Steam and games.
   while release builds reject it.
 - Controller-first client navigation includes a D-pad PIN pad, negotiated
   latest-state gamepad routing, and a one-second Back+Start escape chord.
+- Portal's proven relative-pointer capture is macOS-only. Default non-macOS
+  builds negotiate absolute pointer, keyboard/text, and gamepad without
+  advertising relative capture; the Tao + browser Pointer Lock path requires
+  the explicitly experimental `experimental-non-macos-pointer-capture` build
+  feature and the platform UAT in
+  [`docs/portal-platform-support.md`](docs/portal-platform-support.md).
 - The Bazzite host has an allowlisted deterministic runtime package with
   checksum-bound release IDs, serialized install/upgrade, tamper-checked
   rollback, and package-owned user assets that follow the active release.

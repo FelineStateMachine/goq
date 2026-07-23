@@ -53,7 +53,8 @@ class PortalReleaseVerifierTests(unittest.TestCase):
             path.write_text(f'[package]\nname = "{name}"\nversion = "{version}"\n', encoding="utf-8")
         (repo / "src-tauri" / "Cargo.toml").write_text(
             f'[package]\nname = "portal"\nversion = "{version}"\n'
-            '[features]\ndemo-direct-node = []\n',
+            '[features]\ndemo-direct-node = []\n'
+            'experimental-non-macos-pointer-capture = []\n',
             encoding="utf-8",
         )
         (repo / "src-tauri" / "tauri.conf.json").write_text(
@@ -92,6 +93,19 @@ class PortalReleaseVerifierTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(VERIFIER.VerificationError, "enabled by default"):
+                VERIFIER.validate_source(repo, "v0.1.0", FakeGit())
+            (repo / "src-tauri" / "Cargo.toml").write_text(
+                '[package]\nname = "portal"\nversion = "0.1.0"\n'
+                '[features]\n'
+                'default = ["experimental-non-macos-pointer-capture"]\n'
+                'demo-direct-node = []\n'
+                'experimental-non-macos-pointer-capture = []\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                VERIFIER.VerificationError,
+                "experimental-non-macos-pointer-capture must not be enabled by default",
+            ):
                 VERIFIER.validate_source(repo, "v0.1.0", FakeGit())
 
     def write_assets(self, assets: pathlib.Path) -> None:

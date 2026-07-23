@@ -94,7 +94,9 @@ jobs:
         id: candidate
         run: |
           source_commit="$(git rev-parse HEAD)"
-          asset_name="sigil-$RELEASE_TAG-bazzite-x86_64.tar.gz"
+          target_contract="$(<release/sigil-target-contract.txt)"
+          test "$target_contract" = linux-glibc2.17-x86_64
+          asset_name="sigil-$RELEASE_TAG-$target_contract.tar.gz"
           output_dir="$RUNNER_TEMP/sigil-release"
           install -d -m 0700 "$output_dir"
           archive="$output_dir/$asset_name"
@@ -174,7 +176,9 @@ jobs:
           release_json="$(gh release view "$RELEASE_TAG" --json isDraft,tagName,assets)"
           test "$(jq -r '.isDraft' <<<"$release_json")" = true
           test "$(jq -r '.tagName' <<<"$release_json")" = "$RELEASE_TAG"
-          asset_name="sigil-$RELEASE_TAG-bazzite-x86_64.tar.gz"
+          target_contract="$(<release/sigil-target-contract.txt)"
+          test "$target_contract" = linux-glibc2.17-x86_64
+          asset_name="sigil-$RELEASE_TAG-$target_contract.tar.gz"
           version="${RELEASE_TAG#v}"
           expected="$(printf '%s\n' \
             "$asset_name" \
@@ -233,6 +237,6 @@ jobs:
           gh release edit "$RELEASE_TAG" \
             --draft=false \
             --prerelease \
-            --notes "Verified public alpha for $RELEASE_TAG: signed Bazzite Sigil host package plus Developer ID signed, notarized, stapled macOS arm64 Portal. Hardware UAT remains tracked separately."
+            --notes "Verified public alpha for $RELEASE_TAG: signed Linux glibc 2.17 x86_64 Sigil host package, validated on the supported Bazzite appliance, plus Developer ID signed, notarized, stapled macOS arm64 Portal. Hardware UAT remains tracked separately."
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = false
           test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease')" = true

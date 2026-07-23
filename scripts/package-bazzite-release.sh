@@ -12,6 +12,8 @@ allow_unsigned=false
 release_tag=""
 linux_target="x86_64-unknown-linux-gnu.2.17"
 linux_output_target="x86_64-unknown-linux-gnu"
+asset_target_contract_file="$repo_dir/release/sigil-target-contract.txt"
+asset_target_contract=""
 
 usage() {
   cat <<'EOF'
@@ -19,7 +21,9 @@ Usage: scripts/package-bazzite-release.sh --output /absolute/path/package.tar.gz
 
 Create an allowlisted, deterministic Bazzite host runtime package. Product mode
 exports the clean source HEAD and builds both generic Linux release binaries in
-an isolated Cargo target directory. The package includes atomic install,
+an isolated Cargo target directory. Its public asset name describes that
+Linux/glibc/architecture contract rather than the validated host distribution.
+The package includes atomic install,
 upgrade/rollback support, the systemd user unit, PipeWire sink, staged udev
 rule, complete checksums, and build provenance. It never includes the source
 tree, host identity, hardware configuration, environment files, or evidence.
@@ -95,6 +99,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$output_path" ]] || die "--output is required"
+[[ -f "$asset_target_contract_file" && ! -L "$asset_target_contract_file" ]] \
+  || die "Sigil asset target contract is missing or unsafe"
+[[ "$(wc -l <"$asset_target_contract_file" | tr -d ' ')" == 1 ]] \
+  || die "Sigil asset target contract must contain exactly one line"
+asset_target_contract="$(<"$asset_target_contract_file")"
+[[ "$asset_target_contract" == linux-glibc2.17-x86_64 ]] \
+  || die "Sigil asset target contract does not match the approved Linux build target"
 case "$output_path" in
   /*.tar.gz) ;;
   *) die "--output must be an absolute .tar.gz path" ;;
@@ -123,7 +134,7 @@ if $allow_dirty || $allow_unsigned || $caller_supplied_binaries; then
 else
   [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] \
     || die "product mode requires --release-tag vVERSION"
-  expected_asset="sigil-$release_tag-bazzite-x86_64.tar.gz"
+  expected_asset="sigil-$release_tag-$asset_target_contract.tar.gz"
   [[ "$(basename -- "$output_path")" == "$expected_asset" ]] \
     || die "product output must be named $expected_asset"
 fi

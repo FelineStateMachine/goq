@@ -26,7 +26,8 @@ SPEC.loader.exec_module(VERIFIER)
 PUBLISHER_KEY = base64.b64encode(b"Ed" + b"A" * 8 + b"B" * 32).decode("ascii")
 OTHER_PUBLISHER_KEY = base64.b64encode(b"Ed" + b"C" * 8 + b"D" * 32).decode("ascii")
 RELEASE_TAG = "v1.2.3-alpha.1"
-ASSET_NAME = f"sigil-{RELEASE_TAG}-bazzite-x86_64.tar.gz"
+ASSET_TARGET_CONTRACT = "linux-glibc2.17-x86_64"
+ASSET_NAME = f"sigil-{RELEASE_TAG}-{ASSET_TARGET_CONTRACT}.tar.gz"
 ASSET_BASE = (
     "https://github.com/FelineStateMachine/goq/releases/download/"
     f"{RELEASE_TAG}/{ASSET_NAME}"
@@ -178,12 +179,16 @@ class SigilBootstrapContractTests(unittest.TestCase):
 
     def test_verifier_provisioning_is_bound_to_reviewed_exact_pins(self) -> None:
         pins = VERIFIER.parse_bootstrap_pins(self.bootstrap_source)
+        self.assertEqual(pins["asset_target_contract"], ASSET_TARGET_CONTRACT)
         self.assertEqual(pins["minisign_version"], MINISIGN_VERSION)
         self.assertEqual(pins["minisign_url"], MINISIGN_URL)
         self.assertEqual(pins["minisign_sha256"], MINISIGN_SHA256)
 
         public_key = "unconfigured\n"
         replacements = {
+            f'readonly asset_target_contract="{ASSET_TARGET_CONTRACT}"': (
+                'readonly asset_target_contract="' + "bazzite" + '-x86_64"'
+            ),
             'readonly minisign_version="0.12"': 'readonly minisign_version="0.13"',
             f'readonly minisign_url="{MINISIGN_URL}"': (
                 'readonly minisign_url="https://example.invalid/minisign.tar.gz"'

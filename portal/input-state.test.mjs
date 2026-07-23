@@ -230,6 +230,21 @@ test('ordinary releases retain the original forwarded key value', () => {
   assert.equal(state.takeKeyRelease('Digit1'), null);
 });
 
+test('extended physical keys suppress repeats and retain exact neutralization tokens', () => {
+  const state = new HeldInputState();
+  assert.equal(state.trackKey('F12', 'F12'), 'tracked');
+  assert.equal(state.trackKey('F12', 'F12'), 'repeat');
+  assert.equal(state.trackKey('IntlBackslash', 'IntlBackslash'), 'tracked');
+  assert.equal(state.trackKey('AltRight', 'AltRight'), 'tracked');
+  assert.deepEqual(state.releaseEvents(), [
+    { t: 'ku', k: 'F12' },
+    { t: 'ku', k: 'IntlBackslash' },
+    { t: 'ku', k: 'AltRight' },
+  ]);
+  assert.deepEqual(state.takeKeyRelease('F12'), { t: 'ku', k: 'F12' });
+  assert.equal(state.takeKeyRelease('F12'), null);
+});
+
 test('relative motion coalesces small displacement into one bounded event', () => {
   const motion = new RelativePointerAccumulator();
   assert.equal(motion.add(2.4, -3.6), true);

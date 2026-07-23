@@ -13,6 +13,7 @@ import sys
 
 REPOSITORY = "FelineStateMachine/goq"
 UNCONFIGURED = "unconfigured"
+ASSET_TARGET_CONTRACT = "linux-glibc2.17-x86_64"
 MINISIGN_VERSION = "0.12"
 MINISIGN_URL = (
     "https://github.com/jedisct1/minisign/releases/download/0.12/"
@@ -56,6 +57,7 @@ def parse_bootstrap_pins(source: str) -> dict[str, str]:
         "repository",
         "publisher_key",
         "release_tag",
+        "asset_target_contract",
         "minisign_version",
         "minisign_url",
         "minisign_sha256",
@@ -66,6 +68,10 @@ def parse_bootstrap_pins(source: str) -> dict[str, str]:
     require(
         pins["repository"] == REPOSITORY,
         "bootstrap repository pin is not the Goq release repository",
+    )
+    require(
+        pins["asset_target_contract"] == ASSET_TARGET_CONTRACT,
+        "bootstrap asset target contract is not the reviewed build ABI",
     )
     require(
         pins["minisign_version"] == MINISIGN_VERSION,

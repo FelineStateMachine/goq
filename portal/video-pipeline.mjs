@@ -23,6 +23,7 @@ import {
 export const MAX_DECODE_QUEUE_SIZE = 2;
 const MAX_DECODE_TIMINGS = 8;
 const PRESENTER_QUEUE_CAPACITY = 2;
+const JPEG_PRESENTER_QUEUE_CAPACITY = 2;
 
 export function createVideoPipelineSession({
   hasWebCodecs,
@@ -40,6 +41,7 @@ export function createVideoPipelineSession({
   createObjectUrl = (blob) => URL.createObjectURL(blob),
   revokeObjectUrl = (url) => URL.revokeObjectURL(url),
   createImage = () => new Image(),
+  abortImage = (image) => image.removeAttribute('src'),
   requestFrame = (callback) => requestAnimationFrame(callback),
   cancelFrame = (handle) => cancelAnimationFrame(handle),
   setTimer = (callback, delayMs) => setTimeout(callback, delayMs),
@@ -58,6 +60,9 @@ export function createVideoPipelineSession({
   let presentedFrames = 0;
   let presentationDroppedFrames = 0;
   let lastVideoDrawCompletedAtMs = null;
+  let jpegFrameSequence = 0;
+  let activeJpegDecode = null;
+  let queuedJpegFrame = null;
 
   const frontendDeliveryRate = new RollingRateWindow();
   const decoderInputRate = new RollingRateWindow();
@@ -113,8 +118,107 @@ export function createVideoPipelineSession({
     resetAudioSync(...args);
   }
 
+  function releaseActiveJpegDecode(frame, { abort = false } = {}) {
+    if (!frame || frame.released) return;
+    frame.released = true;
+    frame.image.onload = null;
+    frame.image.onerror = null;
+    if (abort) {
+      try {
+        abortImage(frame.image);
+      } catch (error) {
+        console.warn('could not abort stale JPEG decode:', error);
+      }
+    }
+    revokeObjectUrl(frame.url);
+  }
+
+  function startQueuedJpegDecode() {
+    if (activeJpegDecode || !queuedJpegFrame) return;
+    const pending = queuedJpegFrame;
+    queuedJpegFrame = null;
+
+    let url = null;
+    let image;
+    try {
+      url = createObjectUrl(pending.blob);
+      image = createImage();
+    } catch (error) {
+      if (url !== null) revokeObjectUrl(url);
+      droppedFrames++;
+      console.warn('could not start JPEG decode:', error);
+      startQueuedJpegDecode();
+      return;
+    }
+
+    const frame = {
+      ...pending,
+      image,
+      url,
+      released: false,
+      superseded: false,
+    };
+    activeJpegDecode = frame;
+    image.onload = () => {
+      if (activeJpegDecode !== frame) return;
+      activeJpegDecode = null;
+      try {
+        if (!frame.superseded && queuedJpegFrame === null) {
+          const drawStartedAt = now();
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          const presentedAt = now();
+          presentedFrames++;
+          presentationRate.record(presentedAt);
+          presentationCadence.record(presentedAt);
+          drawLatency.record(presentedAt - drawStartedAt, presentedAt);
+          clientPresentationLatency.record(
+            presentedAt - frame.receivedAt,
+            presentedAt,
+          );
+        }
+      } finally {
+        releaseActiveJpegDecode(frame);
+        startQueuedJpegDecode();
+      }
+    };
+    image.onerror = () => {
+      if (activeJpegDecode !== frame) return;
+      activeJpegDecode = null;
+      if (!frame.superseded && queuedJpegFrame === null) droppedFrames++;
+      releaseActiveJpegDecode(frame);
+      startQueuedJpegDecode();
+    };
+    try {
+      image.src = url;
+    } catch (error) {
+      if (activeJpegDecode === frame) activeJpegDecode = null;
+      droppedFrames++;
+      releaseActiveJpegDecode(frame, { abort: true });
+      console.warn('could not assign JPEG decode source:', error);
+      startQueuedJpegDecode();
+    }
+  }
+
+  function enqueueJpegFrame(frame) {
+    if (!activeJpegDecode) {
+      queuedJpegFrame = frame;
+      startQueuedJpegDecode();
+      return;
+    }
+    if (!activeJpegDecode.superseded) {
+      activeJpegDecode.superseded = true;
+      presentationDroppedFrames++;
+    }
+    if (queuedJpegFrame) presentationDroppedFrames++;
+    queuedJpegFrame = frame;
+  }
+
   function teardown() {
     resetAvSync();
+    queuedJpegFrame = null;
+    const active = activeJpegDecode;
+    activeJpegDecode = null;
+    releaseActiveJpegDecode(active, { abort: true });
     framePresenter.clear();
     decodeTimings.clear();
     if (videoDecoder) {
@@ -384,22 +488,16 @@ export function createVideoPipelineSession({
           epoch: activeVideoFormatEpoch,
         });
       }
+      // Keep exactly one browser decode active and one coalesced latest payload.
+      // Receipt order is authoritative: once a newer payload is queued, the
+      // active decode may finish to release its resources but can never draw.
       const bytes = decodeBase64(data);
       const blob = createBlob([bytes], { type: 'image/jpeg' });
-      const url = createObjectUrl(blob);
-      const image = createImage();
-      image.onload = () => {
-        const drawStartedAt = now();
-        context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        revokeObjectUrl(url);
-        const presentedAt = now();
-        presentedFrames++;
-        presentationRate.record(presentedAt);
-        presentationCadence.record(presentedAt);
-        drawLatency.record(presentedAt - drawStartedAt, presentedAt);
-        clientPresentationLatency.record(presentedAt - receivedAt, presentedAt);
-      };
-      image.src = url;
+      enqueueJpegFrame({
+        sequence: ++jpegFrameSequence,
+        blob,
+        receivedAt,
+      });
     }
   }
 
@@ -429,8 +527,12 @@ export function createVideoPipelineSession({
       avSkewPercentiles: avSkew.summary(at),
       decoderQueueDepth: videoDecoder?.decodeQueueSize ?? 0,
       decoderQueueCapacity: MAX_DECODE_QUEUE_SIZE,
-      presenterQueueDepth: framePresenter.depth,
-      presenterQueueCapacity: PRESENTER_QUEUE_CAPACITY,
+      presenterQueueDepth: hasWebCodecs
+        ? framePresenter.depth
+        : Number(activeJpegDecode !== null) + Number(queuedJpegFrame !== null),
+      presenterQueueCapacity: hasWebCodecs
+        ? PRESENTER_QUEUE_CAPACITY
+        : JPEG_PRESENTER_QUEUE_CAPACITY,
       recovering: decoderRecovery.recovering,
     };
   }

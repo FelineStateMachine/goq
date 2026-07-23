@@ -96,6 +96,9 @@ Sigil host.
   escalation must fail closed.
 - The authorization state and replay ledger are security-sensitive host state;
   preserve their owner-only permissions and atomic update rules.
+- `docs/compatibility-identifiers.md` freezes Portal's FIDO/Iroh derivation,
+  Sigil's local runtime child, and its Linux virtual-input identity tuple.
+  Never rename one in place or add a silent alternate acceptance path.
 
 ## Release and installation boundary
 
@@ -202,7 +205,11 @@ Sigil host.
   decoding, A/V, input, or session behavior requires a real Portal -> UMPC
   Gamescope connection from the exact candidate commit. A successful config
   check, capture probe, headless probe, or loopback is supporting evidence, not
-  a substitute for that end-to-end session. Fresh exact-commit builds are not
+  a substitute for that end-to-end session. Starting a bypass-enabled daemon
+  and observing that it listens is also not an end-to-end test: Portal must
+  connect to that exact daemon, the host must admit the session, live media
+  diagnostics must advance, and the affected interaction or recovery path must
+  be exercised from Portal. Fresh exact-commit builds are not
   expected to be enrolled. This also applies when authentication or identity
   code changed: do not skip the connection because ordinary authentication
   blocks it. For development hardware testing, build Sigil with

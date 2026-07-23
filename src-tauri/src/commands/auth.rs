@@ -1,4 +1,3 @@
-use super::state::{RPID, SALT_MESSAGE};
 use anyhow::Context as _;
 use ctap_hid_fido2::fidokey::{
     GetAssertionArgsBuilder, MakeCredentialArgsBuilder, get_assertion::Extension as Gext,
@@ -11,27 +10,33 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
+// These values are enrollment compatibility identifiers, not display
+// branding. Changing any of them in place would derive a different Portal
+// identity or create a second resident credential for existing users. See
+// docs/compatibility-identifiers.md before introducing a versioned successor.
+const FIDO_RP_ID: &str = "sigil";
+const FIDO_HMAC_SALT_MESSAGE: &str = "sigil-iroh-identity-v1";
+const FIDO_RESIDENT_USER_ID: &[u8] = b"sigil-user";
+const FIDO_RESIDENT_USER_NAME: &str = "sigil";
+const FIDO_RESIDENT_USER_DISPLAY_NAME: &str = "Sigil";
 const PORTAL_CLIENT_IDENTITY_DOMAIN: &[u8] = b"goq/portal-client-identity/v1\0";
 
 // ─── FIDO2 HMAC-Secret Derivation ────────────────────────────────────────────
+
+fn fido_hmac_salt() -> [u8; 32] {
+    Sha256::digest(FIDO_HMAC_SALT_MESSAGE.as_bytes()).into()
+}
 
 pub fn derive_secret_from_key(pin: &str) -> anyhow::Result<[u8; 32]> {
     let cfg = Cfg::init();
     let device = FidoKeyHidFactory::create(&cfg)
         .context("Security key not found. Make sure it is plugged in.")?;
 
-    let salt: [u8; 32] = {
-        let mut hasher = Sha256::new();
-        hasher.update(SALT_MESSAGE.as_bytes());
-        let result = hasher.finalize();
-        let mut s = [0u8; 32];
-        s.copy_from_slice(&result);
-        s
-    };
+    let salt = fido_hmac_salt();
 
     // Try resident key first
     let challenge = verifier::create_challenge();
-    let get_args = GetAssertionArgsBuilder::new(RPID, &challenge)
+    let get_args = GetAssertionArgsBuilder::new(FIDO_RP_ID, &challenge)
         .pin(pin)
         .extensions(&[Gext::HmacSecret(Some(salt))])
         .build();
@@ -41,11 +46,14 @@ pub fn derive_secret_from_key(pin: &str) -> anyhow::Result<[u8; 32]> {
     }
 
     // No resident key — create one
-    let user_entity =
-        PublicKeyCredentialUserEntity::new(Some(b"sigil-user"), Some("sigil"), Some("Sigil"));
+    let user_entity = PublicKeyCredentialUserEntity::new(
+        Some(FIDO_RESIDENT_USER_ID),
+        Some(FIDO_RESIDENT_USER_NAME),
+        Some(FIDO_RESIDENT_USER_DISPLAY_NAME),
+    );
 
     let challenge = verifier::create_challenge();
-    let make_args = MakeCredentialArgsBuilder::new(RPID, &challenge)
+    let make_args = MakeCredentialArgsBuilder::new(FIDO_RP_ID, &challenge)
         .pin(pin)
         .user_entity(&user_entity)
         .resident_key()
@@ -56,14 +64,14 @@ pub fn derive_secret_from_key(pin: &str) -> anyhow::Result<[u8; 32]> {
         .make_credential_with_args(&make_args)
         .context("make_credential failed")?;
 
-    let verify_result = verifier::verify_attestation(RPID, &challenge, &attestation);
+    let verify_result = verifier::verify_attestation(FIDO_RP_ID, &challenge, &attestation);
     if !verify_result.is_success {
         anyhow::bail!("Attestation verification failed");
     }
     let credential_id = verify_result.credential_id;
 
     let challenge2 = verifier::create_challenge();
-    let get_args = GetAssertionArgsBuilder::new(RPID, &challenge2)
+    let get_args = GetAssertionArgsBuilder::new(FIDO_RP_ID, &challenge2)
         .pin(pin)
         .credential_id(&credential_id)
         .extensions(&[Gext::HmacSecret(Some(salt))])
@@ -315,11 +323,41 @@ mod tests {
     }
 
     #[test]
-    fn portal_identity_derivation_is_stable_and_domain_separated() {
+    fn portal_identity_compatibility_identifiers_are_golden() {
+        assert_eq!(FIDO_RP_ID, "sigil");
+        assert_eq!(FIDO_HMAC_SALT_MESSAGE, "sigil-iroh-identity-v1");
+        assert_eq!(FIDO_RESIDENT_USER_ID, b"sigil-user");
+        assert_eq!(FIDO_RESIDENT_USER_NAME, "sigil");
+        assert_eq!(FIDO_RESIDENT_USER_DISPLAY_NAME, "Sigil");
+        assert_eq!(
+            fido_hmac_salt(),
+            [
+                0x14, 0x7e, 0xc5, 0x1f, 0xc9, 0x5a, 0x4a, 0xdd, 0x3b, 0x73, 0xf9, 0xf3, 0x66, 0xb1,
+                0x57, 0xfb, 0x5d, 0xec, 0x70, 0x6a, 0x12, 0x17, 0x31, 0x51, 0x06, 0x27, 0x28, 0xdb,
+                0xad, 0x15, 0x84, 0xaa,
+            ]
+        );
+        assert_eq!(
+            PORTAL_CLIENT_IDENTITY_DOMAIN,
+            b"goq/portal-client-identity/v1\0"
+        );
+
         let root = [0x2a; 32];
         let first = portal_client_secret_from_hmac(root);
         let second = portal_client_secret_from_hmac(root);
         assert_eq!(first.to_bytes(), second.to_bytes());
+        assert_eq!(
+            first.to_bytes(),
+            [
+                0x78, 0xcc, 0xce, 0x6e, 0x04, 0x07, 0x0f, 0xff, 0x0a, 0xc5, 0xf7, 0x4c, 0xde, 0x6d,
+                0x94, 0x8e, 0xa4, 0x80, 0x42, 0xa6, 0x6f, 0x45, 0xa8, 0xc5, 0x8a, 0x96, 0xeb, 0x45,
+                0x9c, 0xa1, 0x0d, 0xd9,
+            ]
+        );
+        assert_eq!(
+            first.public().to_string(),
+            "0383aa3774fe624d7a3bc9189c64770e077c43db7315dde1df19085538adc136"
+        );
         assert_ne!(first.to_bytes(), root);
         assert_ne!(
             first.to_bytes(),

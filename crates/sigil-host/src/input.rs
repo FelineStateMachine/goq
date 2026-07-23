@@ -117,7 +117,14 @@ fn validate_single_user_access_acl(
 }
 
 #[cfg(any(target_os = "linux", test))]
+// This Linux input identity tuple is an external ABI consumed by Gamescope,
+// udev/libinput rules, and hardware evidence. Preserve it exactly; see
+// docs/compatibility-identifiers.md.
+const UINPUT_BUS_TYPE: u16 = 0x06; // Linux BUS_VIRTUAL
+#[cfg(any(target_os = "linux", test))]
 const UINPUT_VENDOR_ID: u16 = 0x5347;
+#[cfg(any(target_os = "linux", test))]
+const UINPUT_DEVICE_VERSION: u16 = 1;
 #[cfg(any(target_os = "linux", test))]
 const POINTER_PRODUCT_ID: u16 = 1;
 #[cfg(any(target_os = "linux", test))]
@@ -781,8 +788,8 @@ mod linux {
         ALL_MAPPED_KEYS, GAMEPAD_DEVICE_NAME, GAMEPAD_PRODUCT_ID, GamepadAxis, GamepadButton,
         InputDeviceClass, KEYBOARD_DEVICE_NAME, KEYBOARD_PRODUCT_ID, MappedKey,
         POINTER_DEVICE_NAME, POINTER_PRODUCT_ID, POSIX_ACL_REQUIRED_BYTES, PointerReportEvent,
-        UINPUT_VENDOR_ID, input_device_class, map_gamepad_state, map_key,
-        pointer_position_sync_report, validate_single_user_access_acl,
+        UINPUT_BUS_TYPE, UINPUT_DEVICE_VERSION, UINPUT_VENDOR_ID, input_device_class,
+        map_gamepad_state, map_key, pointer_position_sync_report, validate_single_user_access_acl,
     };
     use crate::config::UinputConfig;
 
@@ -873,10 +880,10 @@ mod linux {
             handle
                 .create(
                     &InputId {
-                        bustype: input_linux::sys::BUS_VIRTUAL,
+                        bustype: UINPUT_BUS_TYPE,
                         vendor: UINPUT_VENDOR_ID,
                         product: POINTER_PRODUCT_ID,
-                        version: 1,
+                        version: UINPUT_DEVICE_VERSION,
                     },
                     POINTER_DEVICE_NAME,
                     0,
@@ -1047,10 +1054,10 @@ mod linux {
             handle
                 .create(
                     &InputId {
-                        bustype: input_linux::sys::BUS_VIRTUAL,
+                        bustype: UINPUT_BUS_TYPE,
                         vendor: UINPUT_VENDOR_ID,
                         product: KEYBOARD_PRODUCT_ID,
-                        version: 1,
+                        version: UINPUT_DEVICE_VERSION,
                     },
                     KEYBOARD_DEVICE_NAME,
                     0,
@@ -1204,10 +1211,10 @@ mod linux {
             handle
                 .create(
                     &InputId {
-                        bustype: input_linux::sys::BUS_VIRTUAL,
+                        bustype: UINPUT_BUS_TYPE,
                         vendor: UINPUT_VENDOR_ID,
                         product: GAMEPAD_PRODUCT_ID,
-                        version: 1,
+                        version: UINPUT_DEVICE_VERSION,
                     },
                     GAMEPAD_DEVICE_NAME,
                     0,
@@ -1648,7 +1655,11 @@ mod tests {
 
     #[test]
     fn virtual_input_topology_has_stable_distinct_identities() {
+        assert_eq!(UINPUT_BUS_TYPE, 0x06);
+        #[cfg(target_os = "linux")]
+        assert_eq!(UINPUT_BUS_TYPE, input_linux::sys::BUS_VIRTUAL);
         assert_eq!(UINPUT_VENDOR_ID, 0x5347);
+        assert_eq!(UINPUT_DEVICE_VERSION, 1);
         assert_eq!(POINTER_DEVICE_NAME, b"Sigil Spark Virtual Pointer");
         assert_eq!(KEYBOARD_DEVICE_NAME, b"Sigil Spark Virtual Keyboard");
         assert_eq!(GAMEPAD_DEVICE_NAME, b"Sigil Spark Virtual Gamepad");

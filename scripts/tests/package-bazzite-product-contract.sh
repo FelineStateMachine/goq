@@ -72,6 +72,14 @@ archive="$temp_root/output/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz"
 PATH="$temp_root/bin:$PATH" "$fixture_repo/scripts/package-bazzite-release.sh" \
   --release-tag v0.1.0 --output "$archive" >"$temp_root/product.log"
 grep -Fq 'publisher_signature=pending-offline' "$temp_root/product.log"
+packaged_input_rules="$temp_root/output/70-sigil-remote-input.rules"
+tar -xOzf "$archive" payload/release/assets/70-sigil-remote-input.rules \
+  >"$packaged_input_rules"
+cmp -s "$repo_dir/scripts/70-sigil-remote-input.rules" "$packaged_input_rules" \
+  || {
+    printf 'packaged virtual-input rules differ from the frozen source ABI\n' >&2
+    exit 1
+  }
 "$repo_dir/scripts/verify-sigil-release.sh" \
   --tag v0.1.0 --archive "$archive" --source-commit "$source_commit" --candidate \
   | grep -Fq 'sigil_release_verification=ok'

@@ -176,8 +176,6 @@ fn reapply_hidden_cursor_rect(
 }
 
 pub const FRAME_ALPN: &[u8] = sigil_protocol::LEGACY_FRAME_ALPN_V0;
-pub const RPID: &str = "sigil";
-pub const SALT_MESSAGE: &str = "sigil-iroh-identity-v1";
 pub const AUDIO_DELIVERY_CAPACITY: usize = 3;
 
 #[derive(Debug, Default)]

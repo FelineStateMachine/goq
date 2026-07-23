@@ -18,6 +18,9 @@ use crate::server::SessionRegistry;
 const LIFECYCLE_LOCK_FILE: &str = "daemon-v1.lock";
 const GLOBAL_LIFECYCLE_LOCK_FILE: &str = "daemon-global-v1.lock";
 const RUNTIME_STATUS_FILE: &str = "daemon-status-v1.json";
+// Frozen local-management ABI consumed by Sigil commands and the Decky
+// plugin. A successor needs an explicit migration; never rename this in place.
+const RUNTIME_DIRECTORY_COMPONENT: &str = "sigil-spark";
 const RUNTIME_STATUS_VERSION: u16 = 2;
 const MAX_RUNTIME_STATUS_BYTES: u64 = 16 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -467,7 +470,7 @@ fn configured_runtime_directory() -> Result<Option<PathBuf>> {
     ensure!(root.is_absolute(), "XDG_RUNTIME_DIR must be absolute");
     secure_state::validate_private_directory(&root)
         .context("validating XDG_RUNTIME_DIR for Sigil appliance status")?;
-    Ok(Some(root.join("sigil-spark")))
+    Ok(Some(root.join(RUNTIME_DIRECTORY_COMPONENT)))
 }
 
 pub(crate) fn resolve_management_runtime_directory(
@@ -485,7 +488,7 @@ pub(crate) fn resolve_management_runtime_directory(
                 "--runtime-dir must have mode 0700"
             );
         }
-        return Ok(root.join("sigil-spark"));
+        return Ok(root.join(RUNTIME_DIRECTORY_COMPONENT));
     }
     configured_runtime_directory()?
         .context("configured Sigil service requires a valid XDG_RUNTIME_DIR")
@@ -1021,10 +1024,11 @@ mod tests {
     fn explicit_management_runtime_root_is_strict_and_appends_one_child() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
+        assert_eq!(RUNTIME_DIRECTORY_COMPONENT, "sigil-spark");
         let root = private_directory();
         assert_eq!(
             resolve_management_runtime_directory(Some(root.path())).unwrap(),
-            root.path().join("sigil-spark")
+            root.path().join(RUNTIME_DIRECTORY_COMPONENT)
         );
         assert!(resolve_management_runtime_directory(Some(Path::new("relative"))).is_err());
 

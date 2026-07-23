@@ -91,6 +91,9 @@ Sigil host.
   escalation must fail closed.
 - The authorization state and replay ledger are security-sensitive host state;
   preserve their owner-only permissions and atomic update rules.
+- `docs/compatibility-identifiers.md` freezes Portal's FIDO/Iroh derivation,
+  Sigil's local runtime child, and its Linux virtual-input identity tuple.
+  Never rename one in place or add a silent alternate acceptance path.
 
 ## Release and installation boundary
 

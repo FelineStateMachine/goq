@@ -78,7 +78,9 @@ Steam and games.
   short-lived Sigil invitation enrolls that peer once with exact view,
   pointer/keyboard, and gamepad grants; ordinary reconnects remain
   **PIN -> tap -> play**. Debug builds retain a visibly labeled routing bypass,
-  while release builds reject it.
+  while release builds reject it. The
+  [identity and appliance compatibility identifiers](docs/compatibility-identifiers.md)
+  are frozen independently from display branding.
 - Controller-first client navigation includes a D-pad PIN pad, negotiated
   latest-state gamepad routing, and a one-second Back+Start escape chord.
 - The Bazzite host has an allowlisted deterministic runtime package with

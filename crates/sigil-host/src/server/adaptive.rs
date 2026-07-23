@@ -1621,6 +1621,25 @@ mod tests {
             .unwrap()
     }
 
+    fn evaluate_commit_plan(
+        controller: &mut ShadowBitrateController,
+        resolution_controller: &mut Option<MotionResolutionPolicy>,
+        report: &MediaFeedbackReportV1,
+        observed_at: Instant,
+    ) -> AdaptiveCommitPlan {
+        let telemetry = MediaV3TelemetrySnapshot::default();
+        let evaluation = controller.evaluate(report, telemetry, observed_at).unwrap();
+        let resolution_decision = resolution_controller
+            .as_mut()
+            .map(|policy| policy.observe_window(report, &evaluation, observed_at));
+        AdaptiveCommitPlan {
+            decision: evaluation.decision,
+            telemetry,
+            resolution_decision,
+            force_keyframe: adaptive_recovery_keyframe_required(report, &evaluation.decision),
+        }
+    }
+
     fn native_dimensions() -> VideoDimensions {
         VideoDimensions {
             width: 1_280,
@@ -2487,5 +2506,218 @@ mod tests {
                 .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE),
             "a clamped aggregate must be stale rather than disguised as one fresh report"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_adaptive_commit_does_not_pause_feedback_evaluation() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let media = sessions
+            .claim(remote, [4; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let harness = crate::source::EncoderControlTestHarness::new();
+        sessions
+            .install_encoder_control(remote, media.session_id, Some(harness.control.clone()))
+            .unwrap();
+        let mut coordinator = AdaptiveCommitCoordinator::new(
+            Arc::clone(&sessions),
+            remote,
+            media.session_id,
+            true,
+            12_000,
+            Some(native_dimensions()),
+        );
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        let mut resolution_controller = None;
+        let observed_at = Instant::now();
+
+        let seed = evaluate_commit_plan(
+            &mut controller,
+            &mut resolution_controller,
+            &clean_feedback(1),
+            observed_at,
+        );
+        assert_eq!(
+            coordinator.submit(seed).unwrap().plan.decision.decision_id,
+            1
+        );
+
+        let mut severe = clean_feedback(2);
+        severe.decoder_dropped_delta = 1;
+        let first = evaluate_commit_plan(
+            &mut controller,
+            &mut resolution_controller,
+            &severe,
+            observed_at + Duration::from_secs(1),
+        );
+        assert_eq!(first.decision.state, AdaptiveBitrateStateV1::Decrease);
+        assert!(coordinator.submit(first).is_none());
+        assert!(coordinator.has_pending());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let evaluation_tick = tokio::time::Instant::now();
+        let mut newer_severe = clean_feedback(3);
+        newer_severe.decoder_dropped_delta = 1;
+        let queued = evaluate_commit_plan(
+            &mut controller,
+            &mut resolution_controller,
+            &newer_severe,
+            observed_at + Duration::from_secs(2),
+        );
+        assert_eq!(queued.decision.decision_id, 3);
+        assert_eq!(queued.decision.state, AdaptiveBitrateStateV1::Decrease);
+        assert!(coordinator.submit(queued).is_none());
+        assert_eq!(tokio::time::Instant::now(), evaluation_tick);
+        assert_eq!(coordinator.acknowledgements.len(), 1);
+        assert_eq!(
+            coordinator.queued.unwrap().decision.decision_id,
+            queued.decision.decision_id
+        );
+
+        // Revision one is acknowledged only after another feedback window was
+        // evaluated. The decision retains that exact readback result.
+        harness.status.send_modify(|status| {
+            status.applied_bitrate_revision = Some(1);
+            status.applied_bitrate_kbps = Some(first.decision.target_kbps);
+        });
+        let commit_result = coordinator.acknowledgements.join_next().await;
+        let completed = coordinator.complete(commit_result).unwrap();
+        assert_eq!(completed.plan.decision.decision_id, 2);
+        assert!(completed.plan.decision.applied);
+        assert_eq!(
+            completed.applied_bitrate_kbps,
+            Some(first.decision.target_kbps)
+        );
+
+        assert!(coordinator.start_queued().is_none());
+        assert!(coordinator.has_pending());
+        assert_eq!(coordinator.acknowledgements.len(), 1);
+
+        let session_id = media.session_id;
+        drop(media);
+        assert!(!sessions.is_active(remote, session_id));
+        let session_end_result = coordinator.acknowledgements.join_next().await;
+        let session_end = coordinator.complete(session_end_result).unwrap();
+        assert!(session_end.generation_ended);
+        coordinator.abort_and_drain().await;
+        assert!(!coordinator.has_pending());
+        assert!(coordinator.queued.is_none());
+        assert!(coordinator.acknowledgements.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timing_out_commits_keep_uniform_hysteresis_and_bounded_work() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let media = sessions
+            .claim(remote, [5; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let harness = crate::source::EncoderControlTestHarness::new();
+        sessions
+            .install_encoder_control(remote, media.session_id, Some(harness.control.clone()))
+            .unwrap();
+        let mut coordinator = AdaptiveCommitCoordinator::new(
+            Arc::clone(&sessions),
+            remote,
+            media.session_id,
+            true,
+            12_000,
+            Some(native_dimensions()),
+        );
+        let mut controller =
+            ShadowBitrateController::new(12_000, MediaV3TelemetrySnapshot::default());
+        let mut resolution_controller =
+            Some(MotionResolutionPolicy::new(native_dimensions()).unwrap());
+        let observed_at = Instant::now();
+        let virtual_started_at = tokio::time::Instant::now();
+        let mut evaluation_ticks = Vec::new();
+        let mut decision_ids = Vec::new();
+        let mut states = Vec::new();
+        let mut completed = Vec::new();
+
+        for report_id in 1..=9 {
+            evaluation_ticks.push(tokio::time::Instant::now());
+            let mut report = clean_feedback(report_id);
+            if report_id > 1 {
+                report.frontend_queue_depth = 2;
+            }
+            let plan = evaluate_commit_plan(
+                &mut controller,
+                &mut resolution_controller,
+                &report,
+                observed_at + Duration::from_secs(report_id - 1),
+            );
+            decision_ids.push(plan.decision.decision_id);
+            states.push(plan.decision.state);
+            if let Some(immediate) = coordinator.submit(plan) {
+                completed.push(immediate);
+            }
+            assert!(
+                coordinator.acknowledgements.len() <= 1,
+                "the coordinator must own at most one commit task"
+            );
+            assert!(
+                coordinator.queued.iter().count() <= 1,
+                "the coordinator must retain only the latest plan"
+            );
+
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            if let Some(result) = coordinator.acknowledgements.try_join_next() {
+                completed.push(coordinator.complete(Some(result)).unwrap());
+                if let Some(immediate) = coordinator.start_queued() {
+                    completed.push(immediate);
+                }
+            }
+        }
+
+        assert_eq!(
+            decision_ids,
+            (1..=9).collect::<Vec<_>>(),
+            "coalescing must not pause or reuse decision IDs"
+        );
+        assert_eq!(
+            states,
+            [
+                AdaptiveBitrateStateV1::Hold,
+                AdaptiveBitrateStateV1::Hold,
+                AdaptiveBitrateStateV1::Decrease,
+                AdaptiveBitrateStateV1::Hold,
+                AdaptiveBitrateStateV1::Decrease,
+                AdaptiveBitrateStateV1::Hold,
+                AdaptiveBitrateStateV1::Decrease,
+                AdaptiveBitrateStateV1::Hold,
+                AdaptiveBitrateStateV1::Decrease,
+            ],
+            "moderate-pressure hysteresis must advance once per feedback window"
+        );
+        for (index, tick) in evaluation_ticks.into_iter().enumerate() {
+            assert_eq!(
+                tick.duration_since(virtual_started_at),
+                Duration::from_secs(index as u64),
+                "feedback evaluation cadence must remain uniform during commit timeouts"
+            );
+        }
+        assert!(
+            completed.iter().any(|acknowledgement| {
+                acknowledgement.plan.decision.decision_id == 3
+                    && !acknowledgement.plan.decision.applied
+                    && acknowledgement.resolution_applied == Some(false)
+            }),
+            "the first bitrate and resolution timeout must retain exact negative acknowledgement"
+        );
+        assert!(coordinator.has_pending());
+        assert_eq!(coordinator.acknowledgements.len(), 1);
+        assert!(coordinator.queued.is_some());
+
+        coordinator.abort_and_drain().await;
+        assert!(!coordinator.has_pending());
+        assert!(coordinator.queued.is_none());
+        assert!(coordinator.acknowledgements.is_empty());
+
+        let session_id = media.session_id;
+        drop(media);
+        assert!(!sessions.is_active(remote, session_id));
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS, PROTOCOL_VERSION, ProtocolError,
     Result,
@@ -203,7 +205,10 @@ impl MediaFrameHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaFrame {
     pub header: MediaFrameHeader,
-    pub payload: Vec<u8>,
+    /// The compressed access unit. Held behind an `Arc` so the host can fan the
+    /// same encoded frame out to every connected client without copying the
+    /// payload per connection.
+    pub payload: Arc<[u8]>,
 }
 
 /// Encode one complete application media frame for an object transport such
@@ -256,12 +261,13 @@ pub fn decode_media_frame_object(object: &[u8]) -> Result<MediaFrame> {
             reason: "object length does not match declared payload",
         });
     }
-    MediaFrame::new(header, object[MEDIA_HEADER_LEN..].to_vec())
+    MediaFrame::new(header, &object[MEDIA_HEADER_LEN..])
 }
 
 impl MediaFrame {
-    pub fn new(header: MediaFrameHeader, payload: Vec<u8>) -> Result<Self> {
+    pub fn new(header: MediaFrameHeader, payload: impl Into<Arc<[u8]>>) -> Result<Self> {
         header.validate()?;
+        let payload = payload.into();
         if payload.len() != header.payload_len as usize {
             return Err(ProtocolError::InvalidMessage {
                 message_type: "media frame",

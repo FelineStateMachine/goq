@@ -570,7 +570,7 @@ pub(super) fn media_frame_for_encoded(
         frame.presentation_timestamp_micros,
         flags,
     )?;
-    MediaFrame::new(header, frame.data.as_ref().to_vec()).map_err(Into::into)
+    MediaFrame::new(header, frame.data.clone()).map_err(Into::into)
 }
 
 #[cfg(test)]

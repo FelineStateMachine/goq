@@ -260,15 +260,6 @@ impl MotionResolutionPolicy {
         }
     }
 
-    fn commit_observation_from(&mut self, candidate: &Self) {
-        self.motion_active = candidate.motion_active;
-        self.still_since = candidate.still_since;
-        self.pressure_active = candidate.pressure_active;
-        self.moderate_windows = candidate.moderate_windows;
-        self.clean_windows = candidate.clean_windows;
-        self.last_motion_sequence = candidate.last_motion_sequence;
-    }
-
     fn downshift(
         &mut self,
         observed_at: Instant,
@@ -826,6 +817,7 @@ impl ShadowBitrateController {
         )
     }
 
+    #[cfg(test)]
     fn commit_observation_from(&mut self, candidate: &Self) {
         self.next_decision_id = candidate.next_decision_id;
         self.last_report_id = candidate.last_report_id;
@@ -858,6 +850,213 @@ fn queue_ratio_at_least(depth: u8, capacity: u8, numerator: u16, denominator: u1
     capacity > 0
         && u16::from(depth).saturating_mul(denominator)
             >= u16::from(capacity).saturating_mul(numerator)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AdaptiveCommitPlan {
+    decision: AdaptiveBitrateDecisionV1,
+    telemetry: MediaV3TelemetrySnapshot,
+    resolution_decision: Option<MotionResolutionDecision>,
+    force_keyframe: bool,
+}
+
+#[derive(Debug)]
+struct AdaptiveCommitAcknowledgement {
+    plan: AdaptiveCommitPlan,
+    generation_ended: bool,
+    recovery_acknowledged: Option<bool>,
+    resolution_applied: Option<bool>,
+    applied_bitrate_kbps: Option<u32>,
+    applied_resolution: Option<VideoDimensions>,
+}
+
+impl AdaptiveCommitAcknowledgement {
+    fn immediate(plan: AdaptiveCommitPlan) -> Self {
+        Self {
+            plan,
+            generation_ended: false,
+            recovery_acknowledged: None,
+            resolution_applied: None,
+            applied_bitrate_kbps: None,
+            applied_resolution: None,
+        }
+    }
+}
+
+/// Bounded adaptive-control actuator.
+///
+/// Feedback evaluation remains synchronous and deterministic, while this
+/// coordinator owns the slower encoder acknowledgements. At most one commit
+/// task and one latest coalesced plan exist. A queued plan carries the latest
+/// desired bitrate and resolution even when its feedback decision is a hold,
+/// so a slow or failed predecessor cannot strand an uncommitted target.
+struct AdaptiveCommitCoordinator {
+    sessions: Arc<SessionRegistry>,
+    remote: EndpointId,
+    session_id: u64,
+    actuation_enabled: bool,
+    committed_bitrate_kbps: u32,
+    committed_resolution: Option<VideoDimensions>,
+    pending: bool,
+    queued: Option<AdaptiveCommitPlan>,
+    acknowledgements: tokio::task::JoinSet<AdaptiveCommitAcknowledgement>,
+}
+
+impl AdaptiveCommitCoordinator {
+    fn new(
+        sessions: Arc<SessionRegistry>,
+        remote: EndpointId,
+        session_id: u64,
+        actuation_enabled: bool,
+        committed_bitrate_kbps: u32,
+        committed_resolution: Option<VideoDimensions>,
+    ) -> Self {
+        Self {
+            sessions,
+            remote,
+            session_id,
+            actuation_enabled,
+            committed_bitrate_kbps,
+            committed_resolution,
+            pending: false,
+            queued: None,
+            acknowledgements: tokio::task::JoinSet::new(),
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending
+    }
+
+    fn submit(&mut self, plan: AdaptiveCommitPlan) -> Option<AdaptiveCommitAcknowledgement> {
+        if self.pending {
+            self.queued = Some(plan);
+            return None;
+        }
+        self.start(plan)
+    }
+
+    fn start_queued(&mut self) -> Option<AdaptiveCommitAcknowledgement> {
+        let plan = self.queued.take()?;
+        self.start(plan)
+    }
+
+    fn start(&mut self, plan: AdaptiveCommitPlan) -> Option<AdaptiveCommitAcknowledgement> {
+        if !self.actuation_enabled {
+            return Some(AdaptiveCommitAcknowledgement::immediate(plan));
+        }
+
+        let desired_resolution = plan.resolution_decision.map(|change| change.target);
+        let changes_resolution =
+            desired_resolution.is_some() && desired_resolution != self.committed_resolution;
+        let bitrate_proposal = if plan.decision.target_kbps != self.committed_bitrate_kbps {
+            match self.sessions.propose_adaptive_encoder_update(
+                self.remote,
+                self.session_id,
+                plan.decision.target_kbps,
+                plan.force_keyframe && !changes_resolution,
+            ) {
+                Ok(Some(proposal)) => Some(proposal),
+                Ok(None) => {
+                    warn!(
+                        remote = %self.remote,
+                        session_id = self.session_id,
+                        "active adaptive session lost encoder control; retaining committed bitrate"
+                    );
+                    None
+                }
+                Err(error) => {
+                    warn!(
+                        remote = %self.remote,
+                        session_id = self.session_id,
+                        %error,
+                        "adaptive encoder proposal failed; retaining committed bitrate"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let resolution_proposal = if changes_resolution {
+            let target = desired_resolution.expect("resolution target was checked as present");
+            match self
+                .sessions
+                .propose_resolution_update(self.remote, self.session_id, target)
+            {
+                Ok(Some(proposal)) => Some(proposal),
+                Ok(None) => {
+                    warn!(
+                        remote = %self.remote,
+                        session_id = self.session_id,
+                        "active adaptive session lost encoder control; retaining committed resolution"
+                    );
+                    None
+                }
+                Err(error) => {
+                    warn!(
+                        remote = %self.remote,
+                        session_id = self.session_id,
+                        %error,
+                        "adaptive resolution proposal failed; retaining committed resolution"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if bitrate_proposal.is_none() && resolution_proposal.is_none() {
+            return Some(AdaptiveCommitAcknowledgement::immediate(plan));
+        }
+
+        self.pending = true;
+        let sessions = Arc::clone(&self.sessions);
+        let remote = self.remote;
+        let session_id = self.session_id;
+        self.acknowledgements.spawn(async move {
+            run_adaptive_commit(
+                sessions,
+                remote,
+                session_id,
+                plan,
+                bitrate_proposal,
+                resolution_proposal,
+            )
+            .await
+        });
+        None
+    }
+
+    fn complete(
+        &mut self,
+        result: Option<std::result::Result<AdaptiveCommitAcknowledgement, tokio::task::JoinError>>,
+    ) -> Result<AdaptiveCommitAcknowledgement> {
+        ensure!(
+            self.pending,
+            "adaptive commit completed without pending work"
+        );
+        self.pending = false;
+        let acknowledgement = result
+            .context("adaptive commit task ended without a result")?
+            .context("adaptive commit task failed")?;
+        if let Some(applied) = acknowledgement.applied_bitrate_kbps {
+            self.committed_bitrate_kbps = applied;
+        }
+        if let Some(applied) = acknowledgement.applied_resolution {
+            self.committed_resolution = Some(applied);
+        }
+        Ok(acknowledgement)
+    }
+
+    async fn abort_and_drain(&mut self) {
+        self.pending = false;
+        self.queued = None;
+        self.acknowledgements.abort_all();
+        while self.acknowledgements.join_next().await.is_some() {}
+    }
 }
 
 pub(super) async fn serve_media_feedback(
@@ -938,9 +1137,37 @@ pub(super) async fn serve_media_feedback(
     } else {
         None
     };
+    let initial_resolution = resolution_controller
+        .as_ref()
+        .map(MotionResolutionPolicy::target);
+    let mut commit_coordinator = AdaptiveCommitCoordinator::new(
+        Arc::clone(sessions),
+        remote,
+        lease.session_id,
+        encoder_actuation_available,
+        ceiling_kbps,
+        initial_resolution,
+    );
     let mut feedback_cursor = FeedbackIngressCursor::default();
+    let mut ready_acknowledgement: Option<AdaptiveCommitAcknowledgement> = None;
 
     let result: Result<()> = loop {
+        if let Some(acknowledgement) = ready_acknowledgement.take() {
+            if acknowledgement.generation_ended {
+                break Ok(());
+            }
+            write_adaptive_acknowledgement(
+                &mut send,
+                remote,
+                lease.session_id,
+                encoder_actuation_available,
+                &acknowledgement,
+            )
+            .await?;
+            ready_acknowledgement = commit_coordinator.start_queued();
+            continue;
+        }
+
         let session_changed = sessions.session_changed.notified();
         tokio::pin!(session_changed);
         session_changed.as_mut().enable();
@@ -963,6 +1190,12 @@ pub(super) async fn serve_media_feedback(
                     }
                 }
             }
+            commit_result = commit_coordinator.acknowledgements.join_next(),
+                if commit_coordinator.has_pending() =>
+            {
+                let acknowledgement = commit_coordinator.complete(commit_result)?;
+                ready_acknowledgement = Some(acknowledgement);
+            }
             changed = feedback_receiver.changed(), if receiver_open => {
                 if changed.is_err() {
                     receiver_open = false;
@@ -983,198 +1216,25 @@ pub(super) async fn serve_media_feedback(
                 let observed_at = Instant::now();
                 let mut candidate = controller.clone();
                 let evaluation = candidate.evaluate(&report, telemetry, observed_at)?;
-                let mut decision = evaluation.decision;
+                let decision = evaluation.decision;
                 let mut resolution_candidate = resolution_controller.clone();
                 let resolution_decision = resolution_candidate
                     .as_mut()
                     .map(|policy| policy.observe_window(&report, &evaluation, observed_at));
-                let changes_bitrate = decision.state != AdaptiveBitrateStateV1::Hold;
-                let changes_resolution = resolution_decision.is_some_and(|change| change.changed);
-                let can_actuate_bitrate = changes_bitrate && encoder_actuation_available;
-                let can_actuate_resolution = changes_resolution && encoder_actuation_available;
-                let mut recovery_acknowledged = None;
-                let bitrate_proposal = if can_actuate_bitrate {
-                    let force_keyframe =
-                        adaptive_recovery_keyframe_required(&report, &decision)
-                            && !changes_resolution;
-                    match sessions.propose_adaptive_encoder_update(
-                        remote,
-                        lease.session_id,
-                        decision.target_kbps,
+                let force_keyframe =
+                    adaptive_recovery_keyframe_required(&report, &decision);
+                // Evaluation state advances at feedback cadence. The actuator
+                // independently retains the exact committed target and retries
+                // the latest desired state after a slow or failed predecessor.
+                controller = candidate;
+                resolution_controller = resolution_candidate;
+                ready_acknowledgement =
+                    commit_coordinator.submit(AdaptiveCommitPlan {
+                        decision,
+                        telemetry,
+                        resolution_decision,
                         force_keyframe,
-                    ) {
-                        Ok(Some(proposal)) => Some(proposal),
-                        Ok(None) => {
-                            warn!(
-                                %remote,
-                                session_id = lease.session_id,
-                                "active adaptive session lost encoder control; retaining committed bitrate"
-                            );
-                            None
-                        }
-                        Err(error) => {
-                            warn!(
-                                %remote,
-                                session_id = lease.session_id,
-                                %error,
-                                "adaptive encoder proposal failed; retaining committed bitrate"
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let resolution_proposal = if can_actuate_resolution {
-                    let target = resolution_decision
-                        .expect("resolution change is required for actuation")
-                        .target;
-                    match sessions.propose_resolution_update(remote, lease.session_id, target) {
-                        Ok(Some(proposal)) => Some(proposal),
-                        Ok(None) => {
-                            warn!(
-                                %remote,
-                                session_id = lease.session_id,
-                                "active adaptive session lost encoder control; retaining committed resolution"
-                            );
-                            None
-                        }
-                        Err(error) => {
-                            warn!(
-                                %remote,
-                                session_id = lease.session_id,
-                                %error,
-                                "adaptive resolution proposal failed; retaining committed resolution"
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(proposal) = bitrate_proposal {
-                        match commit_adaptive_encoder_proposal(
-                            sessions,
-                            remote,
-                            lease.session_id,
-                            &proposal,
-                        )
-                        .await
-                        {
-                            AdaptiveEncoderCommit::GenerationEnded => break Ok(()),
-                            AdaptiveEncoderCommit::NotApplied(error) => {
-                                warn!(
-                                    %remote,
-                                    session_id = lease.session_id,
-                                    %error,
-                                    "adaptive encoder application failed; retaining committed bitrate"
-                                );
-                            }
-                            AdaptiveEncoderCommit::Applied => {
-                                decision.applied = true;
-                                controller = candidate.clone();
-                                if proposal.force_keyframe_revision.is_some() {
-                                    match await_adaptive_recovery_keyframe(
-                                        sessions,
-                                        remote,
-                                        lease.session_id,
-                                        &proposal,
-                                    )
-                                    .await
-                                    {
-                                        None => break Ok(()),
-                                        Some(Ok(())) => recovery_acknowledged = Some(true),
-                                        Some(Err(error)) => {
-                                            recovery_acknowledged = Some(false);
-                                            warn!(
-                                                %remote,
-                                                session_id = lease.session_id,
-                                                %error,
-                                                "adaptive bitrate applied but forced-IDR recovery was not acknowledged"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                }
-                if can_actuate_bitrate {
-                    if !decision.applied {
-                        controller.commit_observation_from(&candidate);
-                    }
-                } else {
-                    // External gst-launch and sources without EncoderControl
-                    // remain intentionally shadow-only. Hold decisions do not
-                    // need encoder actuation.
-                    controller = candidate;
-                }
-
-                let mut resolution_applied = None;
-                if let Some(proposal) = resolution_proposal {
-                    match commit_resolution_encoder_proposal(
-                        sessions,
-                        remote,
-                        lease.session_id,
-                        &proposal,
-                    )
-                    .await
-                    {
-                        AdaptiveEncoderCommit::GenerationEnded => break Ok(()),
-                        AdaptiveEncoderCommit::NotApplied(error) => {
-                            resolution_applied = Some(false);
-                            warn!(
-                                %remote,
-                                session_id = lease.session_id,
-                                target_width = proposal.target.width,
-                                target_height = proposal.target.height,
-                                %error,
-                                "adaptive resolution application failed; retaining committed resolution"
-                            );
-                        }
-                        AdaptiveEncoderCommit::Applied => {
-                            resolution_applied = Some(true);
-                            resolution_controller = resolution_candidate.clone();
-                        }
-                    }
-                }
-                if can_actuate_resolution && resolution_applied != Some(true) {
-                    if let (Some(committed), Some(candidate)) =
-                        (resolution_controller.as_mut(), resolution_candidate.as_ref())
-                    {
-                        committed.commit_observation_from(candidate);
-                    }
-                } else if !changes_resolution {
-                    resolution_controller = resolution_candidate;
-                }
-                tokio::time::timeout(
-                    FEEDBACK_WRITE_TIMEOUT,
-                    write_adaptive_bitrate_decision_v1(&mut send, &decision),
-                )
-                .await
-                .context("timed out writing adaptive bitrate decision")??;
-                debug!(
-                    %remote,
-                    session_id = lease.session_id,
-                    report_id = decision.report_id,
-                    decision_id = decision.decision_id,
-                    target_kbps = decision.target_kbps,
-                    ?decision.state,
-                    reasons = decision.reasons.bits(),
-                    applied = decision.applied,
-                    ?recovery_acknowledged,
-                    resolution_width = resolution_decision.map(|change| change.target.width),
-                    resolution_height = resolution_decision.map(|change| change.target.height),
-                    resolution_trigger = ?resolution_decision.map(|change| change.trigger),
-                    ?resolution_applied,
-                    path_rtt_micros = telemetry.selected_path_rtt_micros,
-                    path_lost_packets = telemetry.selected_path_lost_packets,
-                    path_congestion_events = telemetry.selected_path_congestion_events,
-                    scheduler_cancellations = telemetry.scheduler_cancellations,
-                    send_failures = telemetry.send_failures,
-                    mode = if encoder_actuation_available { "active" } else { "shadow" },
-                    "adaptive bitrate decision"
-                );
+                    });
             }
             _ = &mut session_changed => {
                 if !sessions.is_active(remote, lease.session_id) {
@@ -1186,7 +1246,11 @@ pub(super) async fn serve_media_feedback(
                 break Ok(());
             }
         }
-        if reader_finished && !receiver_open {
+        if reader_finished
+            && !receiver_open
+            && !commit_coordinator.has_pending()
+            && commit_coordinator.queued.is_none()
+        {
             break Ok(());
         }
     };
@@ -1195,10 +1259,128 @@ pub(super) async fn serve_media_feedback(
         reader_task.abort();
         let _ = reader_task.await;
     }
+    commit_coordinator.abort_and_drain().await;
     let _ = send.finish();
     drop(lease);
     info!(%remote, "media feedback client released");
     result
+}
+
+async fn write_adaptive_acknowledgement(
+    send: &mut SendStream,
+    remote: EndpointId,
+    session_id: u64,
+    encoder_actuation_available: bool,
+    acknowledgement: &AdaptiveCommitAcknowledgement,
+) -> Result<()> {
+    let decision = acknowledgement.plan.decision;
+    let telemetry = acknowledgement.plan.telemetry;
+    let resolution_decision = acknowledgement.plan.resolution_decision;
+    tokio::time::timeout(
+        FEEDBACK_WRITE_TIMEOUT,
+        write_adaptive_bitrate_decision_v1(send, &decision),
+    )
+    .await
+    .context("timed out writing adaptive bitrate decision")??;
+    debug!(
+        %remote,
+        session_id,
+        report_id = decision.report_id,
+        decision_id = decision.decision_id,
+        target_kbps = decision.target_kbps,
+        ?decision.state,
+        reasons = decision.reasons.bits(),
+        applied = decision.applied,
+        recovery_acknowledged = ?acknowledgement.recovery_acknowledged,
+        resolution_width = resolution_decision.map(|change| change.target.width),
+        resolution_height = resolution_decision.map(|change| change.target.height),
+        resolution_trigger = ?resolution_decision.map(|change| change.trigger),
+        resolution_applied = ?acknowledgement.resolution_applied,
+        path_rtt_micros = telemetry.selected_path_rtt_micros,
+        path_lost_packets = telemetry.selected_path_lost_packets,
+        path_congestion_events = telemetry.selected_path_congestion_events,
+        scheduler_cancellations = telemetry.scheduler_cancellations,
+        send_failures = telemetry.send_failures,
+        mode = if encoder_actuation_available { "active" } else { "shadow" },
+        "adaptive bitrate decision"
+    );
+    Ok(())
+}
+
+async fn run_adaptive_commit(
+    sessions: Arc<SessionRegistry>,
+    remote: EndpointId,
+    session_id: u64,
+    plan: AdaptiveCommitPlan,
+    bitrate_proposal: Option<AdaptiveEncoderProposal>,
+    resolution_proposal: Option<ResolutionEncoderProposal>,
+) -> AdaptiveCommitAcknowledgement {
+    let mut acknowledgement = AdaptiveCommitAcknowledgement::immediate(plan);
+    if let Some(proposal) = bitrate_proposal {
+        match commit_adaptive_encoder_proposal(&sessions, remote, session_id, &proposal).await {
+            AdaptiveEncoderCommit::GenerationEnded => {
+                acknowledgement.generation_ended = true;
+                return acknowledgement;
+            }
+            AdaptiveEncoderCommit::NotApplied(error) => {
+                warn!(
+                    %remote,
+                    session_id,
+                    %error,
+                    "adaptive encoder application failed; retaining committed bitrate"
+                );
+            }
+            AdaptiveEncoderCommit::Applied => {
+                acknowledgement.plan.decision.applied = true;
+                acknowledgement.applied_bitrate_kbps = Some(proposal.target_kbps);
+                if proposal.force_keyframe_revision.is_some() {
+                    match await_adaptive_recovery_keyframe(&sessions, remote, session_id, &proposal)
+                        .await
+                    {
+                        None => {
+                            acknowledgement.generation_ended = true;
+                            return acknowledgement;
+                        }
+                        Some(Ok(())) => acknowledgement.recovery_acknowledged = Some(true),
+                        Some(Err(error)) => {
+                            acknowledgement.recovery_acknowledged = Some(false);
+                            warn!(
+                                %remote,
+                                session_id,
+                                %error,
+                                "adaptive bitrate applied but forced-IDR recovery was not acknowledged"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(proposal) = resolution_proposal {
+        match commit_resolution_encoder_proposal(&sessions, remote, session_id, &proposal).await {
+            AdaptiveEncoderCommit::GenerationEnded => {
+                acknowledgement.generation_ended = true;
+                return acknowledgement;
+            }
+            AdaptiveEncoderCommit::NotApplied(error) => {
+                acknowledgement.resolution_applied = Some(false);
+                warn!(
+                    %remote,
+                    session_id,
+                    target_width = proposal.target.width,
+                    target_height = proposal.target.height,
+                    %error,
+                    "adaptive resolution application failed; retaining committed resolution"
+                );
+            }
+            AdaptiveEncoderCommit::Applied => {
+                acknowledgement.resolution_applied = Some(true);
+                acknowledgement.applied_resolution = Some(proposal.target);
+            }
+        }
+    }
+    acknowledgement
 }
 
 async fn forward_media_feedback_reports<R>(

@@ -181,6 +181,12 @@ pub struct UinputConfig {
     pub expected_owner_uid: u32,
     pub expected_group_gid: u32,
     pub expected_mode: u32,
+    /// Optional single named-user POSIX ACL entry expected for the daemon UID.
+    ///
+    /// Omission preserves the default group-only scheme and rejects every
+    /// extended access ACL.
+    #[serde(default)]
+    pub expected_acl_user_uid: Option<u32>,
 }
 
 impl UinputConfig {
@@ -206,6 +212,16 @@ impl UinputConfig {
             self.expected_mode & 0o007 == 0,
             "uinput.expected_mode must not grant access to other users"
         );
+        if let Some(acl_uid) = self.expected_acl_user_uid {
+            ensure!(
+                acl_uid != self.expected_owner_uid,
+                "uinput.expected_acl_user_uid must differ from expected_owner_uid"
+            );
+            ensure!(
+                self.expected_mode & 0o060 == 0o060,
+                "uinput.expected_mode must grant ACL mask read/write access when expected_acl_user_uid is set"
+            );
+        }
         Ok(())
     }
 }
@@ -981,6 +997,28 @@ expected_mode = 0o660
         )
         .unwrap();
         config.validate().unwrap();
+        assert_eq!(config.uinput.as_ref().unwrap().expected_acl_user_uid, None);
+
+        let acl_config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+input_mode = "uinput"
+
+[uinput]
+device_path = "/dev/uinput"
+expected_owner_uid = 0
+expected_group_gid = 986
+expected_mode = 0o660
+expected_acl_user_uid = 1000
+"#,
+        )
+        .unwrap();
+        acl_config.validate().unwrap();
+        assert_eq!(
+            acl_config.uinput.as_ref().unwrap().expected_acl_user_uid,
+            Some(1000)
+        );
     }
 
     #[test]
@@ -1007,6 +1045,45 @@ expected_mode = 0o666
         config.uinput.as_mut().unwrap().expected_mode = 0o660;
         config.input_mode = InputMode::Disabled;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_uinput_acl_principal_fails_closed() {
+        let mut config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+input_mode = "uinput"
+
+[uinput]
+device_path = "/dev/uinput"
+expected_owner_uid = 0
+expected_group_gid = 986
+expected_mode = 0o660
+expected_acl_user_uid = 1000
+"#,
+        )
+        .unwrap();
+
+        config.uinput.as_mut().unwrap().expected_acl_user_uid = Some(0);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must differ from expected_owner_uid")
+        );
+
+        let uinput = config.uinput.as_mut().unwrap();
+        uinput.expected_acl_user_uid = Some(1000);
+        uinput.expected_mode = 0o640;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("ACL mask read/write")
+        );
     }
 
     #[cfg(unix)]

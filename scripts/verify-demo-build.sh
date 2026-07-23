@@ -25,6 +25,24 @@ case "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" in
     ;;
 esac
 
+case "${GOQ_REQUIRE_LINUX_CROSS_BUILD:-0}" in
+  0|1) ;;
+  *)
+    printf 'GOQ_REQUIRE_LINUX_CROSS_BUILD must be 0 or 1\n' >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${GOQ_REQUIRE_LINUX_CROSS_BUILD:-0}" == 1 ]]; then
+  for cross_command in cargo-zigbuild zig; do
+    if ! command -v "$cross_command" >/dev/null 2>&1; then
+      printf 'required Linux cross-build command is missing: %s\n' \
+        "$cross_command" >&2
+      exit 1
+    fi
+  done
+fi
+
 require_rust_test() {
   local test_name="$1"
   shift

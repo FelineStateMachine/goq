@@ -44,6 +44,12 @@ fi
 
 grep -Fq 'refusing to replace existing host configuration' "$guide" \
   || fail 'the activation guide can overwrite an existing host configuration'
+grep -Fq 'set -o noclobber' "$guide" \
+  || fail 'the activation guide does not create host.toml exclusively'
+grep -Fq -- '--kill-after=2s 5s' "$guide" \
+  || fail 'the activation guide does not time-bound GStreamer inspection'
+grep -Fq 'inspect_max_bytes=1048576' "$guide" \
+  || fail 'the activation guide does not size-bound GStreamer inspection'
 grep -Fq 'current/assets/72-sigil-uinput.rules' "$guide" \
   || fail 'the activation guide does not use its packaged early uinput rule'
 grep -Fq 'current/assets/99-sigil-uinput.rules' "$guide" \

@@ -25,7 +25,10 @@ early_uinput_rule="$current/assets/72-sigil-uinput.rules"
 final_uinput_rule="$current/assets/99-sigil-uinput.rules"
 test -x "$current/sigil"
 for rule in "$remote_input_rule" "$early_uinput_rule" "$final_uinput_rule"; do
-  test -f "$rule" && test ! -L "$rule"
+  if test ! -f "$rule" || test -L "$rule"; then
+    echo "unsafe or missing package rule: $rule" >&2
+    exit 1
+  fi
 done
 
 getent group sigil-uinput >/dev/null || sudo groupadd --system sigil-uinput
@@ -76,10 +79,13 @@ sigil="$HOME/.local/libexec/sigil-spark/current/sigil"
 identity="$HOME/.local/share/sigil-spark/identity/host.key"
 install -d -m 0700 "$(dirname "$identity")" \
   "$HOME/.config/sigil-spark" "$HOME/.local/state/sigil-spark"
-if ! test -e "$identity"; then
+if test ! -e "$identity" && test ! -L "$identity"; then
   "$sigil" identity init --output "$identity"
 fi
-test -f "$identity" && test ! -L "$identity"
+if test ! -f "$identity" || test -L "$identity"; then
+  echo "unsafe host identity: $identity" >&2
+  exit 1
+fi
 chmod 0600 "$identity"
 "$sigil" identity show --identity "$identity"
 ```
@@ -97,6 +103,33 @@ inventory is intentionally ambiguous.
 
 ```bash
 set -euo pipefail
+
+gst_inspect_path="$(command -v gst-inspect-1.0)"
+timeout_path="$(command -v timeout)"
+inspect_max_bytes=1048576
+inspection_dir="$(mktemp -d "${TMPDIR:-/tmp}/sigil-activation-inspect.XXXXXX")"
+chmod 0700 "$inspection_dir"
+trap 'rm -rf -- "$inspection_dir"' EXIT INT TERM HUP
+
+bounded_gst_inspect() {
+  local output_path
+  local output_size
+  output_path="$(mktemp "$inspection_dir/gst-inspect.XXXXXX")"
+  if ! "$timeout_path" --signal=TERM --kill-after=2s 5s \
+    "$gst_inspect_path" "$@" 2>/dev/null \
+    | head -c "$((inspect_max_bytes + 1))" >"$output_path"
+  then
+    rm -f -- "$output_path"
+    return 1
+  fi
+  output_size="$(wc -c <"$output_path" | tr -d '[:space:]')"
+  if test "$output_size" -gt "$inspect_max_bytes"; then
+    rm -f -- "$output_path"
+    return 1
+  fi
+  cat "$output_path"
+  rm -f -- "$output_path"
+}
 
 mapfile -t amd_nodes < <(
   for sysfs_node in /sys/class/drm/renderD*; do
@@ -116,14 +149,15 @@ else
 fi
 printf '%s\n' "${amd_nodes[@]}" | grep -Fx "$render_node"
 
+registry="$(bounded_gst_inspect)"
 mapfile -t va_factories < <(
-  gst-inspect-1.0 | awk '$2 ~ /^va(renderD[0-9]+)?h264(lp)?enc:$/ {
+  awk '$2 ~ /^va(renderD[0-9]+)?h264(lp)?enc:$/ {
     sub(/:$/, "", $2); print $2
-  }' | sort -u
+  }' <<<"$registry" | sort -u
 )
 matching_factories=()
 for factory in "${va_factories[@]}"; do
-  inspection="$(gst-inspect-1.0 "$factory")" || continue
+  inspection="$(bounded_gst_inspect "$factory")" || continue
   grep -Fq "Default: \"$render_node\"" <<<"$inspection" || continue
   grep -Eq '\([0-9]+\): cbr([[:space:]]|$)' <<<"$inspection" || continue
   matching_factories+=("$factory")
@@ -139,6 +173,9 @@ printf '%s\n' "${matching_factories[@]}" | grep -Fx "$va_encoder"
 
 printf 'export SIGIL_RENDER_NODE=%q\n' "$render_node"
 printf 'export SIGIL_VA_ENCODER=%q\n' "$va_encoder"
+
+rm -rf -- "$inspection_dir"
+trap - EXIT INT TERM HUP
 ```
 
 Keep the two printed export commands for the next step. If automatic selection
@@ -195,11 +232,17 @@ gst_inspect_path="$(command -v gst-inspect-1.0)"
 test -n "$uinput_gid"
 
 umask 077
-if test -e "$config" || test -L "$config"; then
+set +e
+set -o noclobber
+exec 3>"$config"
+create_status=$?
+set +o noclobber
+set -e
+if test "$create_status" -ne 0; then
   echo "refusing to replace existing host configuration: $config" >&2
   exit 1
 fi
-cat >"$config" <<EOF
+cat >&3 <<EOF
 identity_path = "$HOME/.local/share/sigil-spark/identity/host.key"
 state_path = "$HOME/.local/state/sigil-spark/runtime"
 source = "gamescope-pipewire"
@@ -232,7 +275,8 @@ node_name = "sigil_spark"
 media_class = "Audio/Sink"
 bitrate_bps = 96000
 EOF
-chmod 0600 "$config"
+exec 3>&-
+test "$(stat -Lc '%a:%U' "$config")" = "600:$(id -un)"
 
 "$sigil" config check --config "$config"
 "$sigil" capture probe \

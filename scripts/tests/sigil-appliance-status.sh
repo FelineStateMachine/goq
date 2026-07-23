@@ -154,7 +154,6 @@ PY
 XDG_RUNTIME_DIR="$runtime_directory" \
   "$sigil" serve \
     --config "$config_path" \
-    --max-runtime-seconds 4 \
     >"$host_log" 2>&1 &
 host_pid=$!
 
@@ -308,7 +307,16 @@ fi
 grep -Fq 'another Sigil daemon or capture probe already owns this lifecycle scope' \
   "$temp_root/live-reset.log"
 
-wait "$host_pid"
+if ! kill -TERM "$host_pid" 2>/dev/null; then
+  printf 'Sigil exited before the appliance status proof requested shutdown\n' >&2
+  sed -n '1,160p' "$host_log" >&2
+  exit 1
+fi
+if ! wait "$host_pid"; then
+  printf 'Sigil did not shut down cleanly during the appliance status proof\n' >&2
+  sed -n '1,160p' "$host_log" >&2
+  exit 1
+fi
 host_pid=''
 if XDG_RUNTIME_DIR="$runtime_directory" \
   "$sigil" capture probe \

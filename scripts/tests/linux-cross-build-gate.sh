@@ -36,6 +36,7 @@ success_log="$temp_root/success.log"
 GOQ_CARGO_ARGS_LOG="$temp_root/cargo-args.log" \
   GOQ_CARGO_ENV_LOG="$temp_root/cargo-env.log" \
   GOQ_REQUIRE_LINUX_CROSS_BUILD=1 \
+  GOQ_VERIFY_IN_PROCESS_GSTREAMER=0 \
   PATH="$success_bin" \
   "$gate" >"$success_log"
 grep -Fxq 'linux_cross_build=ok' "$success_log"
@@ -62,6 +63,7 @@ make_command "$missing_bin" cargo-zigbuild 'exit 0'
 
 missing_log="$temp_root/missing.log"
 if GOQ_REQUIRE_LINUX_CROSS_BUILD=1 \
+  GOQ_VERIFY_IN_PROCESS_GSTREAMER=0 \
   PATH="$missing_bin" \
   "$gate" >"$temp_root/missing.stdout" 2>"$missing_log"; then
   echo 'required cross-build gate accepted a missing point-of-use tool' >&2
@@ -83,6 +85,7 @@ optional_bin="$temp_root/optional-bin"
 make_command "$optional_bin" cargo 'exit 92'
 optional_log="$temp_root/optional.log"
 GOQ_REQUIRE_LINUX_CROSS_BUILD=0 \
+  GOQ_VERIFY_IN_PROCESS_GSTREAMER=0 \
   PATH="$optional_bin" \
   "$gate" >"$optional_log"
 grep -Fxq \

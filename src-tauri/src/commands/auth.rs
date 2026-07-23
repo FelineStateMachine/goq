@@ -77,14 +77,24 @@ pub fn derive_secret_from_key(pin: &str) -> anyhow::Result<[u8; 32]> {
 }
 
 pub fn extract_hmac_secret(assertions: &[Assertion]) -> anyhow::Result<[u8; 32]> {
-    for ext in &assertions[0].extensions {
-        if let Gext::HmacSecret(Some(output)) = ext {
-            let mut secret = [0u8; 32];
-            secret.copy_from_slice(&output[..]);
-            return Ok(secret);
+    let assertion = assertions.first().context(
+        "Security key returned no assertions. Reconnect the key and try the PIN and tap again.",
+    )?;
+
+    for ext in &assertion.extensions {
+        match ext {
+            Gext::HmacSecret(Some(output)) => return Ok(*output),
+            Gext::HmacSecret2(Some(_)) => {
+                anyhow::bail!(
+                    "Security key returned a two-output hmac-secret response (64 bytes); Portal requires exactly one 32-byte output. Reconnect the key or use a compatible FIDO2 key."
+                )
+            }
+            _ => {}
         }
     }
-    anyhow::bail!("No hmac-secret in assertion response")
+    anyhow::bail!(
+        "Security key assertion did not contain hmac-secret output. Use a compatible FIDO2 key and try again."
+    )
 }
 
 pub fn derive_iroh_secret_from_key(pin: &str) -> anyhow::Result<SecretKey> {
@@ -244,6 +254,65 @@ pub async fn key_derive_identity(pin: String) -> KeyIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_hmac_secret_rejects_empty_assertion_list() {
+        let error = extract_hmac_secret(&[]).expect_err("empty assertions must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Security key returned no assertions. Reconnect the key and try the PIN and tap again."
+        );
+    }
+
+    #[test]
+    fn extract_hmac_secret_rejects_two_output_response() {
+        let assertion = Assertion {
+            extensions: vec![Gext::HmacSecret2(Some(([0x2a; 32], [0x2b; 32])))],
+            ..Default::default()
+        };
+
+        let error =
+            extract_hmac_secret(&[assertion]).expect_err("two-output response must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Security key returned a two-output hmac-secret response (64 bytes); Portal requires exactly one 32-byte output. Reconnect the key or use a compatible FIDO2 key."
+        );
+    }
+
+    #[test]
+    fn extract_hmac_secret_rejects_extension_without_output() {
+        let assertion = Assertion {
+            extensions: vec![Gext::HmacSecret(None)],
+            ..Default::default()
+        };
+
+        let error = extract_hmac_secret(&[assertion]).expect_err("absent output must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Security key assertion did not contain hmac-secret output. Use a compatible FIDO2 key and try again."
+        );
+    }
+
+    #[test]
+    fn extract_hmac_secret_rejects_assertion_without_extension() {
+        let error = extract_hmac_secret(&[Assertion::default()])
+            .expect_err("missing extension must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Security key assertion did not contain hmac-secret output. Use a compatible FIDO2 key and try again."
+        );
+    }
+
+    #[test]
+    fn extract_hmac_secret_returns_exact_output() {
+        let expected = [0x2a; 32];
+        let assertion = Assertion {
+            extensions: vec![Gext::HmacSecret(Some(expected))],
+            ..Default::default()
+        };
+
+        assert_eq!(extract_hmac_secret(&[assertion]).unwrap(), expected);
+    }
 
     #[test]
     fn portal_identity_derivation_is_stable_and_domain_separated() {

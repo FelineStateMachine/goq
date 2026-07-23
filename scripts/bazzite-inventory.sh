@@ -115,6 +115,19 @@ summary_value() {
   sed -n "s/^${key}=//p" | head -n 1
 }
 
+exact_property_value() {
+  local document="$1"
+  local property="$2"
+  local count
+  local value
+
+  count="$(grep -c "^${property}=" <<<"$document" || true)"
+  [[ "$count" == 1 ]] || return 1
+  value="$(sed -n "s/^${property}=//p" <<<"$document")"
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
 monotonic_before() {
   local earlier="$1"
   local later="$2"
@@ -196,7 +209,9 @@ cold_boot_session_evidence() {
   local session_details
   local current_user_id
   local service
-  local service_count
+  local session_user
+  local remote
+  local state
   local autologin_found=false
 
   current_user_id="$(id -u)"
@@ -217,15 +232,14 @@ cold_boot_session_evidence() {
     fi
     printf 'session_begin=%s\n%s\nsession_end=%s\n' \
       "$session_id" "$session_details" "$session_id"
-    service_count="$(grep -c '^Service=' <<<"$session_details" || true)"
-    service=''
-    if [[ "$service_count" == 1 ]]; then
-      service="$(sed -n 's/^Service=//p' <<<"$session_details")"
-    fi
+    service="$(exact_property_value "$session_details" Service)" || continue
+    session_user="$(exact_property_value "$session_details" User)" || continue
+    remote="$(exact_property_value "$session_details" Remote)" || continue
+    state="$(exact_property_value "$session_details" State)" || continue
     if [[ "$service" =~ ^[[:alnum:]_.@+-]+-autologin$ ]] &&
-      grep -qx "User=$current_user_id" <<<"$session_details" &&
-      grep -qx 'Remote=no' <<<"$session_details" &&
-      grep -qx 'State=active' <<<"$session_details"; then
+      [[ "$session_user" == "$current_user_id" ]] &&
+      [[ "$remote" == no ]] &&
+      [[ "$state" == active ]]; then
       autologin_found=true
     fi
   done <<<"$sessions"

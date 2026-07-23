@@ -95,6 +95,16 @@ session_fixture_services='Service=-autologin'
 assert_session_fixture empty-service-prefix fail
 session_fixture_services=$'Service=sddm-autologin\nService=gdm-autologin'
 assert_session_fixture duplicate-service fail
+session_fixture_services='Service=sddm-autologin'
+session_fixture_user=$'65534\nUser='"$session_user_id"
+assert_session_fixture duplicate-user fail
+session_fixture_user="$session_user_id"
+session_fixture_remote=$'yes\nRemote=no'
+assert_session_fixture duplicate-remote fail
+session_fixture_remote=no
+session_fixture_state=$'closing\nState=active'
+assert_session_fixture duplicate-state fail
+session_fixture_state=active
 
 loginctl() {
   if [[ "$1" == list-sessions ]]; then

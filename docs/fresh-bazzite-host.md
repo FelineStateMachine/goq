@@ -496,7 +496,7 @@ dirty tree, `.env` file, identity, or evidence directory. On the Mac, create a
 bundle for the intentional checkpoint:
 
 ```bash
-cd /Users/dami/Developer/sigil-spark
+cd ~/Developer/sigil-spark
 test -z "$(git status --porcelain)" || {
   echo "Commit or intentionally discard all changes before a proof build." >&2
   exit 1
@@ -607,7 +607,7 @@ version, or the output does not use the stable public asset name. The builder
 never receives the offline Minisign secret:
 
 ```bash
-cd /Users/dami/Developer/sigil-spark
+cd ~/Developer/sigil-spark
 source ~/.cargo/env
 scripts/package-bazzite-release.sh \
   --release-tag v0.1.0 \
@@ -817,7 +817,7 @@ or leave an unattended background process on `slate`.
 From the Mac:
 
 ```bash
-cd /Users/dami/Developer/sigil-spark
+cd ~/Developer/sigil-spark
 test -z "$(git status --porcelain)"
 sigil_rev="$(git rev-parse HEAD)"
 sigil_short="$(git rev-parse --short=12 HEAD)"
@@ -887,7 +887,7 @@ stand-in test.
 On the Mac, connect with the node ID printed by `slate`:
 
 ```bash
-cd /Users/dami/Developer/sigil-spark
+cd ~/Developer/sigil-spark
 source "$HOME/.cargo/env"
 cargo run -p portal -- --dev-connect <slate-node-id>
 ```

@@ -233,8 +233,8 @@ Sigil host.
   build mode. Complete the per-platform checklist in
   `docs/portal-platform-support.md`, including a real Portal -> UMPC session,
   before changing a platform's support status or its default feature policy.
-- Preserve `/Users/dami/Developer/sigil` untouched; it is the inherited source,
-  not this working repository.
+- Preserve the inherited `sigil` checkout that sits beside this repository on
+  the development machine untouched; it is not this working repository.
 - Preserve unrelated worktree changes. Never sweep generated credentials,
   evidence, local Claude/Codex configuration, `.env` files, or test-host state
   into commits.

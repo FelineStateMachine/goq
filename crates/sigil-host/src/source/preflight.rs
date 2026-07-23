@@ -26,7 +26,7 @@ pub(super) async fn preflight_gamescope_static(config: &HostConfig) -> Result<()
     if pipewire.encoder_backend == GamescopeEncoderBackend::ExternalGstLaunch {
         validate_executable("gst_launch_path", &pipewire.gst_launch_path)?;
     }
-    validate_amd_render_node(&pipewire.vaapi_render_node)?;
+    validate_render_node(&pipewire.vaapi_render_node)?;
 
     let terminal_sink = match pipewire.encoder_backend {
         GamescopeEncoderBackend::ExternalGstLaunch => "fdsink",
@@ -187,7 +187,7 @@ pub(crate) async fn preflight_gstreamer_element(
     Ok(())
 }
 
-fn validate_amd_render_node(path: &std::path::Path) -> Result<()> {
+fn validate_render_node(path: &std::path::Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspecting VAAPI render node {}", path.display()))?;
     #[cfg(unix)]
@@ -206,23 +206,6 @@ fn validate_amd_render_node(path: &std::path::Path) -> Result<()> {
                 path.display()
             )
         })?;
-    #[cfg(target_os = "linux")]
-    {
-        let name = path
-            .file_name()
-            .context("VAAPI render node has no file name")?;
-        let driver = fs::canonicalize(
-            std::path::Path::new("/sys/class/drm")
-                .join(name)
-                .join("device/driver"),
-        )
-        .with_context(|| format!("resolving kernel driver for {}", path.display()))?;
-        ensure!(
-            driver.file_name().and_then(|name| name.to_str()) == Some("amdgpu"),
-            "VAAPI render node {} is not backed by amdgpu",
-            path.display()
-        );
-    }
     Ok(())
 }
 

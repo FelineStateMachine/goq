@@ -108,24 +108,21 @@ chmod 0755 "$bin/timeout"
 export SIGIL_TEST_FACTORY_FIXTURE="$factory_fixture"
 
 select_fixture() {
-  select_amd_gstva_h264_encoder \
-    "$bin/gst-inspect-1.0" "$sysfs_root" "$device_root" false \
+  select_gstva_h264_encoder \
+    "$bin/gst-inspect-1.0" "$device_root" false \
     "${1:-}" "${2:-}" "$bin/timeout" "$fixture"
 }
 
 reset_render_nodes
 add_render_node renderD128 i915
-add_render_node renderD129 amdgpu
 printf '%s\t%s\t%s\t%s\n' \
   vah264enc "$device_root/renderD128" cqp,cbr complete \
-  varenderD129h264lpenc "$device_root/renderD129" cqp complete \
-  varenderD129h264enc "$device_root/renderD129" cqp,cbr complete \
   >"$factory_fixture"
-select_fixture || fail 'a matching non-primary AMD encoder was not selected'
-[[ "$render_node" == "$device_root/renderD129" ]] || \
-  fail 'the Intel renderD128 node was selected instead of the AMD node'
-[[ "$va_encoder" == varenderD129h264enc ]] || \
-  fail 'the exact CBR+CQP per-device factory was not selected'
+select_fixture || fail 'an Intel GstVA H.264 encoder was rejected by driver name'
+[[ "$render_node" == "$device_root/renderD128" ]] || \
+  fail 'the capability-backed Intel render node was not selected'
+[[ "$va_encoder" == vah264enc ]] || \
+  fail 'the factory bound to the Intel render node was not selected'
 
 reset_render_nodes
 add_render_node renderD130 amdgpu
@@ -137,7 +134,7 @@ select_fixture || fail 'a generic factory backed by renderD130 was not selected'
   fail 'selection retained a renderD128 or per-device factory assumption'
 
 reset_render_nodes
-add_render_node renderD128 amdgpu
+add_render_node renderD128 i915
 add_render_node renderD129 amdgpu
 printf '%s\t%s\t%s\t%s\n' \
   vah264enc "$device_root/renderD128" cqp,cbr complete \
@@ -145,7 +142,8 @@ printf '%s\t%s\t%s\t%s\n' \
   >"$factory_fixture"
 selection_status=0
 select_fixture || selection_status=$?
-[[ "$selection_status" -eq 2 ]] || fail 'two viable AMD pairs were not ambiguous'
+[[ "$selection_status" -eq 2 ]] || \
+  fail 'two viable cross-driver pairs were not ambiguous'
 [[ -z "$render_node" && -z "$va_encoder" ]] || \
   fail 'ambiguous discovery retained a silent first selection'
 grep -Fxq "$device_root/renderD128 vah264enc" <<<"$va_candidates" || \
@@ -168,7 +166,7 @@ printf '%s\t%s\t%s\t%s\n' \
   vah264enc "$device_root/renderD129" cqp,cbr complete \
   >"$factory_fixture"
 if select_fixture; then
-  fail 'a factory whose device-path mismatched the AMD node was accepted'
+  fail 'a factory whose device-path mismatched the render node was accepted'
 fi
 
 for modes in cqp cbr; do
@@ -222,8 +220,8 @@ if select_fixture; then
 fi
 rm -f -- "$device_root/renderD130"
 install -m 0600 /dev/null "$device_root/renderD130"
-if select_amd_gstva_h264_encoder \
-  "$bin/gst-inspect-1.0" "$sysfs_root" "$device_root" true '' '' \
+if select_gstva_h264_encoder \
+  "$bin/gst-inspect-1.0" "$device_root" true '' '' \
   "$bin/timeout" "$fixture"
 then
   fail 'a regular file was accepted as a production DRM character device'

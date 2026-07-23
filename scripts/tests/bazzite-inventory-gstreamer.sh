@@ -60,6 +60,19 @@ fi
 printf '1.26.11\n'
 EOF
 chmod 0755 "$temp_root/bin/pkg-config"
+cat >"$temp_root/bin/ffmpeg" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == -vaapi_device && $# -ge 2 ]]; then
+    [[ "$2" == "${SIGIL_TEST_VAAPI_NODE:?}" ]]
+    exit
+  fi
+  shift
+done
+exit 1
+EOF
+chmod 0755 "$temp_root/bin/ffmpeg"
 
 PATH="$temp_root/bin:$PATH"
 export PATH
@@ -73,6 +86,17 @@ grep -qxF 'gstreamer_va_h264_factory=vah264enc' <<<"$present_output" || \
 missing_output="$(SIGIL_TEST_APPSINK=missing gstreamer_inventory)"
 grep -qxF 'gstreamer_element=appsink status=missing' <<<"$missing_output" || \
   fail 'appsink absence was not recorded'
+
+install -d -m 0700 "$temp_root/dev/dri"
+install -m 0600 /dev/null "$temp_root/dev/dri/renderD128"
+install -m 0600 /dev/null "$temp_root/dev/dri/renderD129"
+SIGIL_TEST_VAAPI_NODE="$temp_root/dev/dri/renderD129"
+export SIGIL_TEST_VAAPI_NODE
+render_node=''
+select_h264_vaapi_render_node "$temp_root/dev/dri" false || \
+  fail 'a capability-backed non-AMD render node was not selected'
+[[ "$render_node" == "$SIGIL_TEST_VAAPI_NODE" ]] || \
+  fail 'render-node selection used enumeration order instead of the encode probe'
 
 development_output="$(SIGIL_TEST_MISSING_MODULE=gstreamer-video-1.0 \
   gstreamer_development_inventory)"

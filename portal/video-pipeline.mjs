@@ -58,6 +58,8 @@ export function createVideoPipelineSession({
   let presentedFrames = 0;
   let presentationDroppedFrames = 0;
   let lastVideoDrawCompletedAtMs = null;
+  let jpegFrameSequence = 0;
+  let pendingJpegFrame = null;
 
   const frontendDeliveryRate = new RollingRateWindow();
   const decoderInputRate = new RollingRateWindow();
@@ -113,8 +115,29 @@ export function createVideoPipelineSession({
     resetAudioSync(...args);
   }
 
+  function releaseJpegFrame(frame) {
+    if (!frame || frame.released) return;
+    frame.released = true;
+    frame.image.onload = null;
+    frame.image.onerror = null;
+    revokeObjectUrl(frame.url);
+  }
+
+  function discardPendingJpegFrame({ overwritten = false } = {}) {
+    const frame = pendingJpegFrame;
+    if (!frame) return;
+    pendingJpegFrame = null;
+    if (overwritten) presentationDroppedFrames++;
+    releaseJpegFrame(frame);
+  }
+
+  function isCurrentJpegFrame(frame) {
+    return pendingJpegFrame === frame && frame.sequence === jpegFrameSequence;
+  }
+
   function teardown() {
     resetAvSync();
+    discardPendingJpegFrame();
     framePresenter.clear();
     decodeTimings.clear();
     if (videoDecoder) {
@@ -384,20 +407,52 @@ export function createVideoPipelineSession({
           epoch: activeVideoFormatEpoch,
         });
       }
+      // Receipt order is authoritative. Invalidate the older async decode
+      // before starting this one so a late load can never repaint the past.
+      discardPendingJpegFrame({ overwritten: true });
+      const sequence = ++jpegFrameSequence;
       const bytes = decodeBase64(data);
       const blob = createBlob([bytes], { type: 'image/jpeg' });
       const url = createObjectUrl(blob);
-      const image = createImage();
-      image.onload = () => {
-        const drawStartedAt = now();
-        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      let image;
+      try {
+        image = createImage();
+      } catch (error) {
         revokeObjectUrl(url);
-        const presentedAt = now();
-        presentedFrames++;
-        presentationRate.record(presentedAt);
-        presentationCadence.record(presentedAt);
-        drawLatency.record(presentedAt - drawStartedAt, presentedAt);
-        clientPresentationLatency.record(presentedAt - receivedAt, presentedAt);
+        throw error;
+      }
+      const jpegFrame = {
+        sequence,
+        image,
+        url,
+        receivedAt,
+        released: false,
+      };
+      pendingJpegFrame = jpegFrame;
+      image.onload = () => {
+        if (!isCurrentJpegFrame(jpegFrame)) return;
+        pendingJpegFrame = null;
+        const drawStartedAt = now();
+        try {
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          const presentedAt = now();
+          presentedFrames++;
+          presentationRate.record(presentedAt);
+          presentationCadence.record(presentedAt);
+          drawLatency.record(presentedAt - drawStartedAt, presentedAt);
+          clientPresentationLatency.record(
+            presentedAt - jpegFrame.receivedAt,
+            presentedAt,
+          );
+        } finally {
+          releaseJpegFrame(jpegFrame);
+        }
+      };
+      image.onerror = () => {
+        if (!isCurrentJpegFrame(jpegFrame)) return;
+        pendingJpegFrame = null;
+        droppedFrames++;
+        releaseJpegFrame(jpegFrame);
       };
       image.src = url;
     }

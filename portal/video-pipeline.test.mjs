@@ -28,6 +28,7 @@ function harness({ hasWebCodecs = true } = {}) {
   const draws = [];
   const revokedUrls = [];
   const images = [];
+  let nextObjectUrl = 0;
   const canvas = { width: 0, height: 0 };
   const context = {
     drawImage: (...args) => draws.push(args),
@@ -65,10 +66,10 @@ function harness({ hasWebCodecs = true } = {}) {
     },
     decodeBase64: () => new Uint8Array([1, 2, 3]),
     createBlob: (parts, options) => ({ parts, options }),
-    createObjectUrl: () => 'blob:test-frame',
+    createObjectUrl: () => `blob:test-frame-${++nextObjectUrl}`,
     revokeObjectUrl: (url) => revokedUrls.push(url),
     createImage: () => {
-      const image = { onload: null, src: null };
+      const image = { onload: null, onerror: null, src: null };
       images.push(image);
       return image;
     },
@@ -218,15 +219,111 @@ test('JPEG fallback keeps its asynchronous base64 draw behavior', () => {
   assert.deepEqual(subject.formats, [subject.pipeline.format]);
   assert.equal(subject.canvas.width, 640);
   assert.equal(subject.canvas.height, 400);
-  assert.equal(subject.images[0].src, 'blob:test-frame');
+  assert.equal(subject.images[0].src, 'blob:test-frame-1');
   assert.deepEqual(subject.draws, []);
   assert.deepEqual(subject.revokedUrls, []);
 
   subject.advance();
   subject.images[0].onload();
   assert.equal(subject.draws.length, 1);
-  assert.deepEqual(subject.revokedUrls, ['blob:test-frame']);
+  assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
   assert.equal(subject.pipeline.snapshot().presentedFrames, 1);
+});
+
+test('JPEG fallback presents only the newest frame when loads complete out of order', () => {
+  const subject = harness({ hasWebCodecs: false });
+  const payload = {
+    width: 640,
+    height: 400,
+    data: 'AQID',
+    keyframe: true,
+  };
+  subject.pipeline.processFramePayload(payload);
+  const staleLoad = subject.images[0].onload;
+  const staleError = subject.images[0].onerror;
+
+  subject.advance(10);
+  subject.pipeline.processFramePayload(payload);
+  const newestLoad = subject.images[1].onload;
+  assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
+  assert.equal(subject.pipeline.snapshot().presentationDroppedFrames, 1);
+
+  subject.advance(5);
+  newestLoad();
+  const afterNewest = subject.pipeline.snapshot();
+  assert.deepEqual(subject.draws.map(([image]) => image), [subject.images[1]]);
+  assert.equal(afterNewest.presentedFrames, 1);
+  assert.equal(afterNewest.presentPercentiles.count, 1);
+  assert.equal(afterNewest.presentPercentiles.p50, 5);
+  assert.equal(afterNewest.presentationDroppedFrames, 1);
+
+  subject.advance(100);
+  staleLoad();
+  staleError(new Error('stale JPEG failure'));
+  const afterStaleCallbacks = subject.pipeline.snapshot();
+  assert.deepEqual(subject.draws.map(([image]) => image), [subject.images[1]]);
+  assert.equal(afterStaleCallbacks.presentedFrames, 1);
+  assert.equal(afterStaleCallbacks.presentPercentiles.count, 1);
+  assert.equal(afterStaleCallbacks.presentPercentiles.p50, 5);
+  assert.equal(afterStaleCallbacks.droppedFrames, 0);
+  assert.deepEqual(subject.revokedUrls, [
+    'blob:test-frame-1',
+    'blob:test-frame-2',
+  ]);
+});
+
+test('JPEG fallback error callbacks affect only the current pending frame', () => {
+  const subject = harness({ hasWebCodecs: false });
+  const payload = {
+    width: 640,
+    height: 400,
+    data: 'AQID',
+    keyframe: true,
+  };
+  subject.pipeline.processFramePayload(payload);
+  const staleError = subject.images[0].onerror;
+
+  subject.pipeline.processFramePayload(payload);
+  const failedLoad = subject.images[1].onload;
+  const currentError = subject.images[1].onerror;
+  staleError(new Error('stale JPEG failure'));
+  assert.equal(subject.pipeline.snapshot().droppedFrames, 0);
+
+  currentError(new Error('current JPEG failure'));
+  failedLoad();
+  const afterFailure = subject.pipeline.snapshot();
+  assert.equal(afterFailure.droppedFrames, 1);
+  assert.equal(afterFailure.presentedFrames, 0);
+  assert.deepEqual(subject.draws, []);
+  assert.deepEqual(subject.revokedUrls, [
+    'blob:test-frame-1',
+    'blob:test-frame-2',
+  ]);
+});
+
+test('JPEG fallback callbacks cannot survive a session reset', () => {
+  const subject = harness({ hasWebCodecs: false });
+  subject.pipeline.processFramePayload({
+    width: 640,
+    height: 400,
+    data: 'AQID',
+    keyframe: true,
+  });
+  const staleLoad = subject.images[0].onload;
+  const staleError = subject.images[0].onerror;
+
+  subject.pipeline.reset();
+  subject.advance();
+  staleLoad();
+  staleError(new Error('reset JPEG failure'));
+
+  const stats = subject.pipeline.snapshot();
+  assert.equal(stats.receivedFrames, 0);
+  assert.equal(stats.presentedFrames, 0);
+  assert.equal(stats.droppedFrames, 0);
+  assert.equal(stats.presentPercentiles.count, 0);
+  assert.deepEqual(subject.draws, []);
+  assert.deepEqual(subject.revokedUrls, ['blob:test-frame-1']);
 });
 
 test('reset closes decoding state but preserves the last dimensions and codec quirk', () => {

@@ -185,8 +185,10 @@ Sigil host.
   decoding, A/V, input, or session behavior requires a real Portal -> UMPC
   Gamescope connection from the exact candidate commit. A successful config
   check, capture probe, headless probe, or loopback is supporting evidence, not
-  a substitute for that end-to-end session. For development hardware testing,
-  build Sigil with `demo-auth-bypass`, run it with
+  a substitute for that end-to-end session. Fresh exact-commit builds are not
+  expected to be enrolled: do not skip the connection because ordinary
+  authentication blocks it. For development hardware testing, build Sigil with
+  `demo-auth-bypass`, run it with
   `--dev-allow-unauthorized` and a bounded `--max-runtime-seconds`, and connect
   a debug Portal with `--dev-connect`. Verify the affected live diagnostics
   and interaction path, then stop the bypass process, undo temporary Gamescope

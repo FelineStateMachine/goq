@@ -51,6 +51,12 @@ enum PointerReportEvent {
 }
 
 #[cfg(any(target_os = "linux", test))]
+/// Emulate an absolute position on the relative-only appliance pointer.
+///
+/// This is correct only when Gamescope clamps the first report at the surface
+/// origin and applies neither acceleration nor scaling to either report. The
+/// hardware UAT verifies both the synchronized position and one subsequent
+/// relative delta through the Xwayland pointer tracker.
 fn pointer_position_sync_report(x: i32, y: i32) -> [PointerReportEvent; 6] {
     [
         PointerReportEvent::RelativeX(sigil_protocol::RELATIVE_POINTER_DELTA_MIN),

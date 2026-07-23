@@ -15,15 +15,15 @@ use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
 use sigil_protocol::{
     AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1,
     CONTROL_ALPN_V1, Capability, ClientHello, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN,
-    GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, INVITATION_CLOCK_SKEW_SECS, InputEvent,
-    InvitationGrants, KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN, MAX_MEDIA_GROUP_BYTES_V3,
-    MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1,
-    MediaCodec, MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame,
-    MediaObjectV3, PointerSurfaceDimensions, ProtocolError, SignedInvitation,
-    decode_media_frame_object, media_moq_broadcast_name, read_adaptive_bitrate_decision_v1,
-    read_host_hello, read_input_ack, read_media_frame, read_media_object, read_media_object_v3,
-    write_client_hello, write_input_event, write_media_control_request_v3,
-    write_media_feedback_report_v1,
+    GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, INVITATION_CLOCK_SKEW_SECS, InputAck,
+    InputEvent, InvitationGrants, KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN,
+    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3,
+    MEDIA_FEEDBACK_ALPN_V1, MediaCodec, MediaControlRequestV3, MediaFeedbackFlags,
+    MediaFeedbackReportV1, MediaFrame, MediaObjectV3, PointerPosition, PointerSurfaceDimensions,
+    ProtocolError, SignedInvitation, decode_media_frame_object, media_moq_broadcast_name,
+    read_adaptive_bitrate_decision_v1, read_host_hello, read_input_ack, read_media_frame,
+    read_media_object, read_media_object_v3, write_client_hello, write_input_event,
+    write_media_control_request_v3, write_media_feedback_report_v1,
 };
 
 #[cfg(unix)]
@@ -1634,6 +1634,8 @@ async fn main() -> Result<()> {
     read_expected_input_ack(&mut input_recv, args.timeout_seconds, 1).await?;
     let input_ack_micros = input_started.elapsed().as_micros();
     let mut expected_ack = 1_u64;
+    let mut pointer_sync_position = None;
+    let mut pointer_motion_position = None;
 
     if args.pointer_smoke {
         ensure!(
@@ -1642,18 +1644,53 @@ async fn main() -> Result<()> {
                 .contains(&Capability::RelativePointer),
             "host did not accept the required relative pointer capability"
         );
+        let pointer_dimensions = media_negotiation.pointer_surface_dimensions.context(
+            "host did not advertise pointer surface dimensions required by --pointer-smoke",
+        )?;
         let [position_sync, relative_motion, click] =
-            pointer_smoke_events(media_negotiation.pointer_surface_dimensions)?;
+            pointer_smoke_events(Some(pointer_dimensions))?;
+        let [expected_sync_position, expected_motion_position] =
+            pointer_smoke_expected_positions(pointer_dimensions)?;
         write_input_event(&mut input_send, &position_sync)
             .await
             .context("writing pointer position synchronization")?;
         expected_ack += 1;
-        read_expected_input_ack(&mut input_recv, args.timeout_seconds, expected_ack).await?;
+        let sync_ack =
+            read_expected_input_ack(&mut input_recv, args.timeout_seconds, expected_ack).await?;
+        if args.pointer_feedback_smoke {
+            pointer_sync_position = Some(
+                confirm_pointer_position(
+                    &mut input_send,
+                    &mut input_recv,
+                    &mut expected_ack,
+                    sync_ack,
+                    expected_sync_position,
+                    Duration::from_secs(args.timeout_seconds.min(5)),
+                )
+                .await
+                .context("verifying compositor position after pointer synchronization")?,
+            );
+        }
         write_input_event(&mut input_send, &relative_motion)
             .await
             .context("writing relative pointer smoke motion")?;
         expected_ack += 1;
-        read_expected_input_ack(&mut input_recv, args.timeout_seconds, expected_ack).await?;
+        let motion_ack =
+            read_expected_input_ack(&mut input_recv, args.timeout_seconds, expected_ack).await?;
+        if args.pointer_feedback_smoke {
+            pointer_motion_position = Some(
+                confirm_pointer_position(
+                    &mut input_send,
+                    &mut input_recv,
+                    &mut expected_ack,
+                    motion_ack,
+                    expected_motion_position,
+                    Duration::from_secs(args.timeout_seconds.min(5)),
+                )
+                .await
+                .context("verifying compositor position after relative pointer motion")?,
+            );
+        }
         write_input_event(&mut input_send, &click)
             .await
             .context("writing pointer smoke click")?;
@@ -2490,6 +2527,14 @@ async fn main() -> Result<()> {
             "not-requested"
         }
     );
+    match pointer_sync_position {
+        Some(position) => println!("pointer_sync_position={},{}", position.x, position.y),
+        None => println!("pointer_sync_position=not-requested"),
+    }
+    match pointer_motion_position {
+        Some(position) => println!("pointer_motion_position={},{}", position.x, position.y),
+        None => println!("pointer_motion_position=not-requested"),
+    }
     println!(
         "gamepad_smoke={}",
         if args.gamepad_smoke {
@@ -2564,14 +2609,35 @@ fn pointer_smoke_events(
 ) -> Result<[InputEvent; 3]> {
     let dimensions = pointer_surface_dimensions
         .context("host did not advertise pointer surface dimensions required by --pointer-smoke")?;
+    let [sync_position, _motion_position] = pointer_smoke_expected_positions(dimensions)?;
     Ok([
         InputEvent::MousePositionSync {
-            x: i32::from(dimensions.width / 2),
-            y: i32::from(dimensions.height / 2),
+            x: sync_position.x,
+            y: sync_position.y,
         },
         InputEvent::MouseMoveRelative { dx: 32, dy: 16 },
         InputEvent::MouseClick { b: 1 },
     ])
+}
+
+fn pointer_smoke_expected_positions(
+    dimensions: PointerSurfaceDimensions,
+) -> Result<[PointerPosition; 2]> {
+    let sync_position = PointerPosition::new(
+        i32::from(dimensions.width / 2),
+        i32::from(dimensions.height / 2),
+    )?;
+    let motion_position = PointerPosition::new(
+        sync_position
+            .x
+            .checked_add(32)
+            .context("pointer smoke X position overflowed")?,
+        sync_position
+            .y
+            .checked_add(16)
+            .context("pointer smoke Y position overflowed")?,
+    )?;
+    Ok([sync_position, motion_position])
 }
 
 fn sequence_gap(previous: u64, current: u64) -> Result<u64> {
@@ -2799,28 +2865,96 @@ async fn read_expected_input_ack<R>(
     recv: &mut R,
     timeout_seconds: u64,
     expected_sequence: u64,
-) -> Result<sigil_protocol::InputAck>
+) -> Result<InputAck>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let input_ack = tokio::time::timeout(Duration::from_secs(timeout_seconds.min(5)), async {
-        loop {
-            let input_ack = read_input_ack(recv)
-                .await?
-                .context("host closed before input acknowledgment")?;
-            ensure!(
-                input_ack.sequence <= expected_sequence,
-                "unexpected input acknowledgment sequence {}; expected at most {expected_sequence}",
-                input_ack.sequence
-            );
-            if input_ack.sequence == expected_sequence {
-                break Ok(input_ack);
-            }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds.min(5));
+    read_expected_input_ack_before(recv, deadline, expected_sequence).await
+}
+
+async fn read_expected_input_ack_before<R>(
+    recv: &mut R,
+    deadline: tokio::time::Instant,
+    expected_sequence: u64,
+) -> Result<InputAck>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        let input_ack = tokio::time::timeout_at(deadline, read_input_ack(recv))
+            .await
+            .context("timed out waiting for input acknowledgment")??
+            .context("host closed before input acknowledgment")?;
+        ensure!(
+            input_ack.sequence <= expected_sequence,
+            "unexpected input acknowledgment sequence {}; expected at most {expected_sequence}",
+            input_ack.sequence
+        );
+        if input_ack.sequence == expected_sequence {
+            return Ok(input_ack);
         }
-    })
-    .await
-    .context("timed out waiting for input acknowledgment")??;
-    Ok(input_ack)
+    }
+}
+
+async fn confirm_pointer_position<S, R>(
+    send: &mut S,
+    recv: &mut R,
+    expected_sequence: &mut u64,
+    mut input_ack: InputAck,
+    expected_position: PointerPosition,
+    timeout: Duration,
+) -> Result<PointerPosition>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    ensure!(
+        !timeout.is_zero(),
+        "pointer feedback confirmation timeout must be nonzero"
+    );
+    let deadline = tokio::time::Instant::now() + timeout.min(Duration::from_secs(5));
+    loop {
+        if input_ack.pointer_position == Some(expected_position) {
+            return Ok(expected_position);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!(
+                "compositor pointer position did not converge to {},{}; last observed position was {:?}",
+                expected_position.x,
+                expected_position.y,
+                input_ack.pointer_position
+            );
+        }
+        tokio::time::sleep_until(std::cmp::min(now + Duration::from_millis(16), deadline)).await;
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "compositor pointer position did not converge to {},{}; last observed position was {:?}",
+                expected_position.x,
+                expected_position.y,
+                input_ack.pointer_position
+            );
+        }
+        write_input_event(send, &InputEvent::Probe)
+            .await
+            .context("writing pointer feedback convergence probe")?;
+        *expected_sequence = expected_sequence
+            .checked_add(1)
+            .context("input acknowledgment sequence overflowed")?;
+        input_ack = match read_expected_input_ack_before(recv, deadline, *expected_sequence).await {
+            Ok(input_ack) => input_ack,
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                bail!(
+                    "compositor pointer position did not converge to {},{}; last observed position was {:?}: {error:#}",
+                    expected_position.x,
+                    expected_position.y,
+                    input_ack.pointer_position
+                );
+            }
+            Err(error) => return Err(error),
+        };
+    }
 }
 
 #[cfg(test)]
@@ -2867,6 +3001,79 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("expected at most 1"));
+    }
+
+    #[tokio::test]
+    async fn pointer_confirmation_polls_until_the_tracker_reports_the_exact_position() {
+        let target = PointerPosition::new(1_280, 800).unwrap();
+        let initial_ack = InputAck {
+            sequence: 2,
+            pointer_position: Some(PointerPosition::new(10, 20).unwrap()),
+            pointer_visible: Some(false),
+        };
+        let (client, server) = tokio::io::duplex(512);
+        let (mut client_recv, mut client_send) = tokio::io::split(client);
+        let (mut server_recv, mut server_send) = tokio::io::split(server);
+        let server_task = tokio::spawn(async move {
+            let event = sigil_protocol::read_input_event(&mut server_recv)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event, InputEvent::Probe);
+            sigil_protocol::write_input_ack(
+                &mut server_send,
+                &InputAck {
+                    sequence: 3,
+                    pointer_position: Some(target),
+                    pointer_visible: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let mut expected_sequence = 2;
+
+        let observed = confirm_pointer_position(
+            &mut client_send,
+            &mut client_recv,
+            &mut expected_sequence,
+            initial_ack,
+            target,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(observed, target);
+        assert_eq!(expected_sequence, 3);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pointer_confirmation_fails_when_the_tracker_never_converges() {
+        let target = PointerPosition::new(1_280, 800).unwrap();
+        let initial_ack = InputAck {
+            sequence: 2,
+            pointer_position: Some(PointerPosition::new(10, 20).unwrap()),
+            pointer_visible: Some(false),
+        };
+        let (client, server_guard) = tokio::io::duplex(512);
+        let (mut client_recv, mut client_send) = tokio::io::split(client);
+        let mut expected_sequence = 2;
+
+        let error = confirm_pointer_position(
+            &mut client_send,
+            &mut client_recv,
+            &mut expected_sequence,
+            initial_ack,
+            target,
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("did not converge to 1280,800"));
+        drop(server_guard);
     }
 
     #[test]
@@ -2920,6 +3127,13 @@ mod tests {
                 InputEvent::MousePositionSync { x: 1_280, y: 800 },
                 InputEvent::MouseMoveRelative { dx: 32, dy: 16 },
                 InputEvent::MouseClick { b: 1 },
+            ]
+        );
+        assert_eq!(
+            pointer_smoke_expected_positions(dimensions).unwrap(),
+            [
+                PointerPosition::new(1_280, 800).unwrap(),
+                PointerPosition::new(1_312, 816).unwrap(),
             ]
         );
     }

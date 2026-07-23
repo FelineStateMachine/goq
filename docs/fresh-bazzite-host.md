@@ -1572,11 +1572,20 @@ target/debug/sigil-probe \
 
 The probe must report `pointer_smoke=ok` and `pointer_feedback_smoke=ok`.
 The feedback check requires an immediately available compositor position and
-visibility sample; an input acknowledgment with unavailable coordinates fails
-the proof. The pointer smoke uses the native pointer-surface
-dimensions negotiated in the media `HostHello`, not the potentially downscaled
-encoded dimensions. On a 2560x1600 Gamescope surface, before the ordinary
-motion, evtest must show the synchronization sequence:
+visibility sample, then polls bounded input acknowledgments until the existing
+Xwayland tracker reports the exact post-sync and post-motion coordinates. An
+unavailable position, a timeout, or any coordinate drift fails the proof. This
+asserts the appliance invariant that Gamescope clamps the first relative jump
+at the surface origin and applies neither acceleration nor scaling to the
+virtual pointer. A generic libinput desktop profile is not assumed to satisfy
+that invariant.
+
+The pointer smoke uses the native pointer-surface dimensions negotiated in the
+media `HostHello`, not the potentially downscaled encoded dimensions. On a
+2560x1600 Gamescope surface, it must report
+`pointer_sync_position=1280,800` and
+`pointer_motion_position=1312,816`. Before the ordinary motion, evtest must
+show the synchronization sequence:
 `REL_X=-32767`/`REL_Y=-32767`, a `SYN_REPORT`, then
 `REL_X=1280`/`REL_Y=800` and another `SYN_REPORT`. It must then show
 `REL_X=32`, `REL_Y=16`, and a complete `BTN_LEFT` press/release, while libinput

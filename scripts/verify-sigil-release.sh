@@ -5,10 +5,12 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage: scripts/verify-sigil-release.sh \
-  --tag vVERSION --archive /absolute/path/sigil-vVERSION-bazzite-x86_64.tar.gz \
+  --tag vVERSION --archive /absolute/path/sigil-vVERSION-linux-glibc2.17-x86_64.tar.gz \
   [--source-commit HEX] [--candidate | --public-key-file PATH]
 
-Verify the exact Sigil Bazzite release asset contract without extracting it.
+Verify the exact Sigil Linux/glibc/x86_64 release asset contract without
+extracting it. This target identity does not broaden the separately validated
+host-distribution support boundary.
 Candidate mode verifies a clean, unsigned product candidate before it crosses
 the offline signing boundary. Published mode additionally requires and verifies
 ARCHIVE.minisig with the reviewed Minisign public key file.
@@ -19,6 +21,17 @@ die() {
   printf 'release verification failed: %s\n' "$*" >&2
   exit 1
 }
+
+script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_dir="$(CDPATH='' cd -- "$script_dir/.." && pwd -P)"
+asset_target_contract_file="$repo_dir/release/sigil-target-contract.txt"
+[[ -f "$asset_target_contract_file" && ! -L "$asset_target_contract_file" ]] \
+  || die "Sigil asset target contract is missing or unsafe"
+[[ "$(wc -l <"$asset_target_contract_file" | tr -d ' ')" == 1 ]] \
+  || die "Sigil asset target contract must contain exactly one line"
+asset_target_contract="$(<"$asset_target_contract_file")"
+[[ "$asset_target_contract" == linux-glibc2.17-x86_64 ]] \
+  || die "Sigil asset target contract does not match the approved Linux build target"
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -75,7 +88,7 @@ done
 [[ "$archive_path" == /* ]] || die "--archive must be absolute"
 [[ -f "$archive_path" && ! -L "$archive_path" ]] || die "archive is missing or unsafe"
 
-asset_name="sigil-$release_tag-bazzite-x86_64.tar.gz"
+asset_name="sigil-$release_tag-$asset_target_contract.tar.gz"
 [[ "$(basename -- "$archive_path")" == "$asset_name" ]] \
   || die "archive must be named $asset_name"
 checksum_path="$archive_path.sha256"

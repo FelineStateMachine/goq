@@ -9,12 +9,18 @@ Neither path may fall back to an unsigned development build.
 The first public release is a draft or prerelease until capability-ticket
 onboarding and the release-candidate hardware pass are complete.
 
-Sigil publishes exactly these x86_64 Bazzite assets for a tag such as
+Sigil publishes exactly these Linux glibc 2.17 x86_64 assets for a tag such as
 `v0.3.0-alpha.1`:
 
-- `sigil-v0.3.0-alpha.1-bazzite-x86_64.tar.gz`
-- `sigil-v0.3.0-alpha.1-bazzite-x86_64.tar.gz.sha256`
-- `sigil-v0.3.0-alpha.1-bazzite-x86_64.tar.gz.minisig`
+- `sigil-v0.3.0-alpha.1-linux-glibc2.17-x86_64.tar.gz`
+- `sigil-v0.3.0-alpha.1-linux-glibc2.17-x86_64.tar.gz.sha256`
+- `sigil-v0.3.0-alpha.1-linux-glibc2.17-x86_64.tar.gz.minisig`
+
+The Sigil asset suffix names the binary target contract, not a support claim.
+The public bootstrap and package-owned activation path remain restricted to the
+Bazzite appliance until SteamOS or another host environment passes its own
+packaging, capability, cold-boot, and hardware acceptance gates. The canonical
+suffix is pinned in `release/sigil-target-contract.txt`.
 
 Portal preserves the package builder's versioned macOS contract:
 
@@ -77,8 +83,8 @@ environment builds clean tagged source, runs the complete repository gate,
 creates exactly these unsigned draft assets, and retains the same bytes as a
 short-lived Actions artifact:
 
-- `sigil-$tag-bazzite-x86_64.tar.gz`
-- `sigil-$tag-bazzite-x86_64.tar.gz.sha256`
+- `sigil-$tag-linux-glibc2.17-x86_64.tar.gz`
+- `sigil-$tag-linux-glibc2.17-x86_64.tar.gz.sha256`
 
 Move those bytes to the offline publisher machine. After independently
 confirming the tag commit and reviewed public key, sign without exporting the
@@ -87,7 +93,7 @@ secret key or its passphrase:
 ```bash
 scripts/sign-bazzite-release.sh \
   --tag "$tag" \
-  --archive "/absolute/offline/path/sigil-$tag-bazzite-x86_64.tar.gz" \
+  --archive "/absolute/offline/path/sigil-$tag-linux-glibc2.17-x86_64.tar.gz" \
   --source-commit "$tag_commit" \
   --minisign-key /absolute/offline/path/sigil-release.key \
   --public-key-file /absolute/offline/path/sigil-minisign.pub
@@ -117,6 +123,11 @@ tag equal to Sigil's Cargo version, and the stable public asset name. The two
 development flags are an inseparable escape hatch and cannot claim a release
 tag. `scripts/verify-sigil-release.sh` is the common candidate, offline, and
 promotion verifier.
+
+No public goq release exists under the former distro-named suffix. Unpublished
+drafts or locally staged candidates using `bazzite-x86_64` must be discarded
+and rebuilt; release verification intentionally provides no compatibility
+alias that could make two names identify the same public bytes.
 
 ## Public Bazzite acceptance record
 

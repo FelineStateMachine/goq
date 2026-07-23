@@ -69,8 +69,22 @@ assert_rejected inline-secret-key \
 assert_rejected missing-release-tag \
   'product mode requires --release-tag vVERSION'
 assert_rejected wrong-product-name \
-  'product output must be named sigil-v0.1.0-bazzite-x86_64.tar.gz' \
+  'product output must be named sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz' \
   --release-tag v0.1.0
+legacy_contract="bazzite""-x86_64"
+legacy_output="$temp_root/sigil-v0.1.0-$legacy_contract.tar.gz"
+legacy_log="$temp_root/legacy-product-name.log"
+if "$package_script" --output "$legacy_output" --release-tag v0.1.0 \
+  >"$legacy_log" 2>&1
+then
+  printf 'FAIL: distro-named product output unexpectedly succeeded\n' >&2
+  exit 1
+fi
+grep -Fq \
+  'product output must be named sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz' \
+  "$legacy_log"
+[[ ! -e "$legacy_output" && ! -e "$legacy_output.sha256" \
+  && ! -e "$legacy_output.minisig" ]]
 
 development_output="$temp_root/development-supplied.tar.gz"
 development_log="$temp_root/development-supplied.log"

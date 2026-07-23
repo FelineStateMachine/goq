@@ -26,6 +26,7 @@ die() {
 
 script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 payload_dir="$script_dir"
+readonly asset_target_contract="linux-glibc2.17-x86_64"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -250,13 +251,14 @@ validate_release_tree() {
     cd "$path"
     sha256sum -c SHA256SUMS
   )
-  python3 - "$path/release-manifest.json" <<'PY'
+  python3 - "$path/release-manifest.json" "$asset_target_contract" <<'PY'
 import json
 import pathlib
 import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
+asset_target_contract = sys.argv[2]
 try:
     manifest = json.loads(path.read_text())
 except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -289,7 +291,7 @@ if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
 if not isinstance(asset_name, str) or re.fullmatch(r"[A-Za-z0-9._-]+[.]tar[.]gz", asset_name) is None:
     raise SystemExit("package install failed: release manifest asset name is invalid")
 if release_kind == "product-candidate":
-    if release_tag != f"v{version}" or asset_name != f"sigil-{release_tag}-bazzite-x86_64.tar.gz":
+    if release_tag != f"v{version}" or asset_name != f"sigil-{release_tag}-{asset_target_contract}.tar.gz":
         raise SystemExit("package install failed: product release identity is inconsistent")
     if manifest.get("git_dirty") is not False:
         raise SystemExit("package install failed: product release claims dirty source")

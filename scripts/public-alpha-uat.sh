@@ -8,6 +8,7 @@ MAX_SOURCE_BYTES=$((1024 * 1024))
 DEFAULT_MAX_AGE_SECONDS=$((7 * 24 * 60 * 60))
 FUTURE_SKEW_SECONDS=300
 GITHUB_REPOSITORY='FelineStateMachine/goq'
+SIGIL_ASSET_TARGET_CONTRACT='linux-glibc2.17-x86_64'
 required_kinds=(cold-boot controller mouse soak network-direct network-relay reconnect second-client)
 all_kinds=("${required_kinds[@]}" loopback-preflight)
 script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -647,6 +648,7 @@ reject_sensitive_source() {
 validate_manifest() {
   local directory="$1"
   local manifest="$directory/manifest.tsv"
+  local sigil_archive_name
   local key
   local record_kind
   local record_field
@@ -671,7 +673,9 @@ validate_manifest() {
   require_equal "$(manifest_get "$manifest" format)" "$FORMAT" format
   require_commit "$(manifest_get "$manifest" git_commit)" manifest
   require_release_tag "$(manifest_get "$manifest" release_tag)"
-  [[ "$(manifest_get "$manifest" sigil_archive_name)" =~ ^sigil-v[0-9A-Za-z.-]+-bazzite-x86_64\.tar\.gz$ ]] \
+  sigil_archive_name="$(manifest_get "$manifest" sigil_archive_name)"
+  [[ "$sigil_archive_name" =~ ^sigil-v[0-9A-Za-z.-]+-[0-9A-Za-z._-]+[.]tar[.]gz$ \
+    && "$sigil_archive_name" == sigil-v*-"$SIGIL_ASSET_TARGET_CONTRACT".tar.gz ]] \
     || die "invalid manifest Sigil archive name"
   [[ "$(manifest_get "$manifest" portal_dmg_name)" =~ ^Portal-[0-9A-Za-z.-]+-arm64\.dmg$ ]] \
     || die "invalid manifest Portal DMG name"

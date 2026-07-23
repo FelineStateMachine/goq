@@ -611,12 +611,12 @@ cd /Users/dami/Developer/sigil-spark
 source ~/.cargo/env
 scripts/package-bazzite-release.sh \
   --release-tag v0.1.0 \
-  --output /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz
+  --output /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz
 
 # Verify the candidate before it crosses the offline signing boundary.
 scripts/verify-sigil-release.sh \
   --tag v0.1.0 \
-  --archive /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz \
+  --archive /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz \
   --source-commit "$(git rev-parse HEAD)" \
   --candidate
 
@@ -624,19 +624,19 @@ scripts/verify-sigil-release.sh \
 # reviewed public key before extraction. See docs/public-release-delivery.md.
 scripts/verify-sigil-release.sh \
   --tag v0.1.0 \
-  --archive /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz \
+  --archive /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz \
   --source-commit "$(git rev-parse HEAD)" \
   --public-key-file /absolute/path/to/sigil-minisign.pub
-shasum -a 256 -c /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz.sha256
-scp /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz tank@umpc:/tmp/
+shasum -a 256 -c /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz.sha256
+scp /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz tank@umpc:/tmp/
 
 ssh tank@umpc '
   set -eu
   incoming="$HOME/.local/share/sigil-spark/incoming"
   install -d -m 0700 "$incoming"
   run_dir="$(mktemp -d "$incoming/package.XXXXXX")"
-  tar -tzf /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz
-  tar -xzf /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz -C "$run_dir"
+  tar -tzf /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz
+  tar -xzf /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz -C "$run_dir"
   cd "$run_dir/payload"
   sha256sum -c PACKAGE-SHA256SUMS
   bash -n stage-this-release.sh

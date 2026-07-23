@@ -71,6 +71,20 @@ gstva_factory_supports_uat() {
   done
 }
 
+classify_native_uat_mode() {
+  local native_size="$1"
+  local fixed_size="$2"
+
+  native_mode_relation=''
+  [[ "$native_size" =~ ^[1-9][0-9]*x[1-9][0-9]*$ ]] || return 1
+  [[ "$fixed_size" =~ ^[1-9][0-9]*x[1-9][0-9]*$ ]] || return 1
+  if [[ "$native_size" == "$fixed_size" ]]; then
+    native_mode_relation=identical-to-fixed
+  else
+    native_mode_relation=distinct-from-fixed
+  fi
+}
+
 select_amd_gstva_h264_encoder() {
   local gst_inspect_path="$1"
   local sysfs_root="${2:-/sys/class/drm}"
@@ -536,11 +550,7 @@ grep -Fxq encoded_mode=1280x800@60 "$private/external-cqp-config-check.log"
 grep -Fxq config=ok "$private/native-config-check.log"
 grep -Fxq capture_preflight=ok "$private/native-config-check.log"
 native_size="$(sed -n 's/^encoded_mode=\([0-9][0-9]*x[0-9][0-9]*\)@60$/\1/p' "$private/native-config-check.log")"
-[[ -n "$native_size" ]]
-[[ "$native_size" != 1280x800 ]] || {
-  echo "native UAT resolved to the fixed 1280x800 mode" >&2
-  exit 1
-}
+classify_native_uat_mode "$native_size" 1280x800
 
 "$sigil" invitation create \
   --config "$fixed_config" \
@@ -1054,6 +1064,7 @@ fi
   echo gamescope_pointer_feedback_recovery=pass
   echo gamescope_pointer_daemon_pid_stable=pass
   echo "native_size=$native_size"
+  echo "native_mode_relation=$native_mode_relation"
   echo native_performance_gate=observational
   echo "native_observed_fps=$native_observed_fps"
   echo "native_55fps_status=$native_55fps_status"

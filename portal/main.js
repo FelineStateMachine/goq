@@ -40,7 +40,7 @@ import {
   normalizeInvitationSummary,
   shortPeerFingerprint,
 } from './enrollment.mjs';
-import { mapKey } from './keyboard-map.mjs';
+import { keyboardInputForEvent } from './keyboard-map.mjs';
 
 let enrollmentReady = false;
 let pendingInvitationSummary = null;
@@ -983,25 +983,21 @@ window.addEventListener('keydown', (e) => {
     controlRuntime.exit();
     return;
   }
-  const printableText = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
-  if (printableText && connectionState.inputCapabilities.text) {
-    e.preventDefault();
-    inputRuntime.send({ t: 'tx', s: e.key });
+  const input = keyboardInputForEvent(e, connectionState.inputCapabilities);
+  if (input === null) return;
+  e.preventDefault();
+  if (input.type === 'text') {
+    inputRuntime.send({ t: 'tx', s: input.text });
     return;
   }
-  if (!connectionState.inputCapabilities.keyboard) return;
-  const k = mapKey(e);
-  if (k) {
-    e.preventDefault();
-    const keyId = e.code || e.key;
-    const tracking = inputRuntime.trackKey(keyId, k);
-    if (tracking === 'repeat') return;
-    if (tracking === 'full') {
-      console.error('held key limit reached; refusing additional key transition');
-      return;
-    }
-    if (!inputRuntime.send({ t: 'kd', k })) inputRuntime.takeKeyRelease(keyId);
+  const keyId = e.code || e.key;
+  const tracking = inputRuntime.trackKey(keyId, input.key);
+  if (tracking === 'repeat') return;
+  if (tracking === 'full') {
+    console.error('held key limit reached; refusing additional key transition');
+    return;
   }
+  if (!inputRuntime.send({ t: 'kd', k: input.key })) inputRuntime.takeKeyRelease(keyId);
 });
 
 window.addEventListener('keyup', (e) => {

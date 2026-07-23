@@ -1318,11 +1318,15 @@ separate `gamepad` input capability and rejects gamepad snapshots unless that
 capability was negotiated.
 
 It releases every held keyboard/mouse transition and sends a fully neutral
-gamepad snapshot when an input session ends. The client currently sends a Text
-event in addition to physical printable-key events; the host explicitly treats
-Text as a content-free no-op, acknowledges it when ACKs were negotiated, and
-does not advertise Text support. No key, text, or gamepad payload is logged.
-The Linux button/axis assignments follow the kernel's
+gamepad snapshot when an input session ends. Portal sends a bounded subset of
+W3C `KeyboardEvent.code` physical-position tokens for keyboard input. This
+keeps game and Steam bindings independent of the client's active keyboard
+layout. The current uinput backend advertises keyboard input but does not
+advertise Text; Unicode text and IME composition are therefore unsupported.
+For protocol compatibility, any legacy Text event received by Sigil remains a
+content-free no-op and is acknowledged when ACKs were negotiated. No key,
+text, or gamepad payload is logged. The Linux button/axis assignments follow
+the kernel's
 [gamepad protocol](https://docs.kernel.org/input/gamepad.html) and Xbox `xpad`
 layout.
 

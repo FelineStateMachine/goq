@@ -13,13 +13,14 @@ render-node and encoder selection remain capability-based.
 
 | Row ID | Required class | Status | Evidence report |
 | --- | --- | --- | --- |
-| native-1280x800-handheld | Gamescope handheld with a native 1280x800 panel and integrated GPU | pending | pending |
-| physically-headless-desktop-dgpu | Physically headless Gamescope desktop with a discrete GPU | pending | pending |
+| native-1280x800-handheld | Upstream SteamOS Gamescope handheld with a native 1280x800 panel and integrated GPU | pending | pending |
+| physically-headless-desktop-dgpu | Physically headless Gamescope desktop with a discrete GPU on SteamOS or a SteamOS-inspired distribution | pending | pending |
 
-The two rows collectively must exercise upstream SteamOS and/or a
-SteamOS-inspired distribution such as Bazzite or CachyOS. A distribution,
-display manager, render-node number, encoder factory name, driver name, or GPU
-vendor is not part of the product contract.
+The handheld row prevents Bazzite-specific Gamescope behavior from standing in
+for upstream SteamOS. The desktop row may use SteamOS or a SteamOS-inspired
+distribution such as Bazzite or CachyOS. A display manager, render-node number,
+encoder factory name, driver name, or GPU vendor is not part of the product
+contract.
 
 The committed GPD Pocket 4/Bazzite run at
 [`7920c5d21434`](7920c5d21434/REPORT.md) is reference-host evidence only. Its

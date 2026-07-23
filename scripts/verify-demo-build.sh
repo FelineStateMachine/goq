@@ -10,6 +10,8 @@ if [[ -f "$HOME/.cargo/env" ]]; then
   source "$HOME/.cargo/env"
 fi
 
+./scripts/run-linux-cross-build-gate.sh
+
 for command_name in cargo rustc node git ffmpeg shellcheck; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     printf 'required command is missing: %s\n' "$command_name" >&2
@@ -24,6 +26,24 @@ case "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" in
     exit 1
     ;;
 esac
+
+case "${GOQ_REQUIRE_LINUX_CROSS_BUILD:-0}" in
+  0|1) ;;
+  *)
+    printf 'GOQ_REQUIRE_LINUX_CROSS_BUILD must be 0 or 1\n' >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${GOQ_REQUIRE_LINUX_CROSS_BUILD:-0}" == 1 ]]; then
+  for cross_command in cargo-zigbuild zig; do
+    if ! command -v "$cross_command" >/dev/null 2>&1; then
+      printf 'required Linux cross-build command is missing: %s\n' \
+        "$cross_command" >&2
+      exit 1
+    fi
+  done
+fi
 
 require_rust_test() {
   local test_name="$1"
@@ -74,22 +94,6 @@ if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
   cargo test --locked -p sigil-host --features in-process-gstreamer \
     "$gstreamer_test" -- --ignored --nocapture
   echo 'in_process_gstreamer_gate=ok'
-fi
-if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
-  if [[ "${GOQ_VERIFY_IN_PROCESS_GSTREAMER:-0}" == 1 ]]; then
-    # Zig intentionally omits the host's default system-library paths for an
-    # explicit target. Preserve pkg-config's system -L entries so the dynamic
-    # GStreamer/GLib development libraries remain linkable without an rpath.
-    PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 \
-      cargo zigbuild --locked -p sigil-host --bins \
-        --target x86_64-unknown-linux-gnu.2.17 --features in-process-gstreamer
-  else
-    cargo zigbuild --locked -p sigil-host --bins \
-      --target x86_64-unknown-linux-gnu.2.17
-  fi
-  echo 'linux_cross_build=ok'
-else
-  echo 'linux_cross_build=skipped (cargo-zigbuild and zig are both required)'
 fi
 while IFS= read -r frontend_source; do
   node --check "$frontend_source"

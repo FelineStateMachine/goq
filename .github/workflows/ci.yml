@@ -82,9 +82,44 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
             pkg-config \
+            python3-venv \
             shellcheck
+
+      - name: Restore pinned cargo-zigbuild
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.0
+
+      - name: Install pinned cross-build tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig-venv"
+          printf '%s\n' \
+            'ziglang==0.16.0 --hash=sha256:9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b' \
+            | "$RUNNER_TEMP/zig-venv/bin/pip" install \
+                --disable-pip-version-check \
+                --only-binary=:all: \
+                --require-hashes \
+                --requirement /dev/stdin
+          install -d "$RUNNER_TEMP/ci-bin"
+          # Expand runner paths when the generated wrapper executes.
+          # shellcheck disable=SC2016
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'exec "$RUNNER_TEMP/zig-venv/bin/python" -m ziglang "$@"' \
+            >"$RUNNER_TEMP/ci-bin/zig"
+          chmod 0755 "$RUNNER_TEMP/ci-bin/zig"
+          echo "$RUNNER_TEMP/ci-bin" >>"$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/ci-bin:$PATH"
+          if ! cargo-zigbuild --version 2>/dev/null \
+            | grep -Fxq 'cargo-zigbuild 0.23.0'; then
+            cargo install cargo-zigbuild --locked --version 0.23.0
+          fi
+          test "$(zig version)" = 0.16.0
+          test "$(cargo-zigbuild --version)" = 'cargo-zigbuild 0.23.0'
 
       - name: Run complete demo gate
         env:
           GOQ_VERIFY_IN_PROCESS_GSTREAMER: "1"
+          GOQ_REQUIRE_LINUX_CROSS_BUILD: "1"
         run: ./scripts/verify-demo-build.sh

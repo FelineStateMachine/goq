@@ -269,7 +269,8 @@ expected = {
     "compatibility_executable": "sigil-host",
     "target": "x86_64-unknown-linux-gnu.2.17",
     "profile": "release",
-    "features": ["default", "in-process-gstreamer"],
+    "features": ["in-process-gstreamer"],
+    "demo_auth_bypass": False,
     "demo_direct_node": False,
 }
 for key, value in expected.items():

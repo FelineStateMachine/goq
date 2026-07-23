@@ -46,7 +46,9 @@ printf '%s\n' \
   'test "${1:-}" = zigbuild' \
   'test "${PKG_CONFIG_ALLOW_CROSS:-}" = 1' \
   'test "${PKG_CONFIG_ALLOW_SYSTEM_LIBS:-}" = 1' \
+  'case " $* " in *" --no-default-features "*) ;; *) exit 63 ;; esac' \
   'case " $* " in *" --features in-process-gstreamer "*) ;; *) exit 64 ;; esac' \
+  'case " $* " in *"demo-auth-bypass"*) exit 65 ;; esac' \
   'output="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"' \
   'install -d -m 0700 "$output"' \
   'printf "#!/usr/bin/env bash\\nexit 0\\n" >"$output/sigil"' \

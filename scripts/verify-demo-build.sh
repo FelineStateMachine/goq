@@ -130,5 +130,13 @@ cargo test --locked -p portal --release --features demo-direct-node \
   commands::state::tests::app_state_accepts_direct_node_only_in_debug_builds \
   -- --exact
 
+cargo test --locked -p sigil-host --release \
+  tests::ordinary_release_excludes_configured_host_auth_bypass \
+  -- --exact
+
+cargo test --locked -p sigil-host --release --features demo-auth-bypass \
+  tests::configured_host_auth_bypass_is_explicitly_build_contained \
+  -- --exact
+
 git diff --check
 echo 'demo_build_preflight=ok'

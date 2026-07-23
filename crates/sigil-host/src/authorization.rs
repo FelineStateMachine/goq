@@ -32,6 +32,9 @@ pub enum AuthorizationPolicy {
     /// Explicit direct `sigil serve --identity ... --source test-pattern`
     /// proof mode. Configured hosts never select this branch.
     TestPatternProof,
+    /// Explicitly insecure configured-host mode for development hardware tests.
+    /// Ordinary release builds cannot select this branch.
+    DevelopmentBypass,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -600,10 +603,10 @@ impl AuthorizationPolicy {
     ) -> Result<InvitationGrants> {
         match self {
             Self::Required(store) => store.authorize_or_redeem(remote, invitation_token, now),
-            Self::TestPatternProof => {
+            Self::TestPatternProof | Self::DevelopmentBypass => {
                 ensure!(
                     invitation_token.is_none(),
-                    "proof mode does not accept invitations"
+                    "unrestricted development modes do not accept invitations"
                 );
                 Ok(InvitationGrants::ALL)
             }
@@ -866,6 +869,24 @@ mod tests {
         let snapshot = reopened.snapshot().unwrap();
         assert_eq!(snapshot.epoch, 2);
         assert!(snapshot.peer.is_none());
+    }
+
+    #[test]
+    fn development_bypass_grants_all_without_touching_persistent_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let remote = SecretKey::from_bytes(&[29; 32]).public();
+        let policy = AuthorizationPolicy::DevelopmentBypass;
+
+        assert_eq!(
+            policy.authorize_or_redeem(remote, None, 1_000).unwrap(),
+            InvitationGrants::ALL
+        );
+        assert!(
+            policy
+                .authorize_or_redeem(remote, Some("not-an-invitation"), 1_000)
+                .is_err()
+        );
+        assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
     }
 
     #[test]

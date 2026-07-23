@@ -49,7 +49,8 @@ manifest = {
     "version": tag[1:],
     "target": "x86_64-unknown-linux-gnu.2.17",
     "profile": "release",
-    "features": ["default", "in-process-gstreamer"],
+    "features": ["in-process-gstreamer"],
+    "demo_auth_bypass": False,
     "demo_direct_node": False,
     "git_commit": commit,
     "git_dirty": False,
@@ -64,6 +65,8 @@ manifest = {
 }
 if variant == "default-features":
     manifest["features"] = ["default"]
+if variant == "demo-auth-bypass":
+    manifest["demo_auth_bypass"] = True
 binary = b"fixture executable\n"
 release = {
     "sigil": binary,
@@ -178,7 +181,7 @@ printf '%064d  %s\n' 0 "$(basename -- "$bad_archive")" >"$bad_archive.sha256"
 assert_rejected bad-checksum 'checksum declaration does not exactly match' \
   "$verifier" --tag "$release_tag" --archive "$bad_archive" --candidate
 
-for variant in symlink duplicate unexpected default-features; do
+for variant in symlink duplicate unexpected default-features demo-auth-bypass; do
   fixture_dir="$temp_root/$variant"
   make_fixture "$fixture_dir" "$variant"
   fixture_archive="$fixture_dir/sigil-$release_tag-bazzite-x86_64.tar.gz"
@@ -187,6 +190,7 @@ for variant in symlink duplicate unexpected default-features; do
     duplicate) expected='duplicate members' ;;
     unexpected) expected='do not match the package allowlist' ;;
     default-features) expected='field features does not match the product contract' ;;
+    demo-auth-bypass) expected='field demo_auth_bypass does not match the product contract' ;;
   esac
   assert_rejected "$variant" "$expected" \
     "$verifier" --tag "$release_tag" --archive "$fixture_archive" --candidate

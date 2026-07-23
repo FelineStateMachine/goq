@@ -611,12 +611,12 @@ cd /Users/dami/Developer/sigil-spark
 source ~/.cargo/env
 scripts/package-bazzite-release.sh \
   --release-tag v0.1.0 \
-  --output /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz
+  --output /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz
 
 # Verify the candidate before it crosses the offline signing boundary.
 scripts/verify-sigil-release.sh \
   --tag v0.1.0 \
-  --archive /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz \
+  --archive /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz \
   --source-commit "$(git rev-parse HEAD)" \
   --candidate
 
@@ -624,19 +624,19 @@ scripts/verify-sigil-release.sh \
 # reviewed public key before extraction. See docs/public-release-delivery.md.
 scripts/verify-sigil-release.sh \
   --tag v0.1.0 \
-  --archive /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz \
+  --archive /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz \
   --source-commit "$(git rev-parse HEAD)" \
   --public-key-file /absolute/path/to/sigil-minisign.pub
-shasum -a 256 -c /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz.sha256
-scp /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz tank@umpc:/tmp/
+shasum -a 256 -c /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz.sha256
+scp /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz tank@umpc:/tmp/
 
 ssh tank@umpc '
   set -eu
   incoming="$HOME/.local/share/sigil-spark/incoming"
   install -d -m 0700 "$incoming"
   run_dir="$(mktemp -d "$incoming/package.XXXXXX")"
-  tar -tzf /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz
-  tar -xzf /tmp/sigil-v0.1.0-bazzite-x86_64.tar.gz -C "$run_dir"
+  tar -tzf /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz
+  tar -xzf /tmp/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz -C "$run_dir"
   cd "$run_dir/payload"
   sha256sum -c PACKAGE-SHA256SUMS
   bash -n stage-this-release.sh
@@ -1205,21 +1205,36 @@ acknowledged only after exact property readback. CQP remains on the external
 compatibility backend until its in-process force-keyframe path is implemented
 and proven separately.
 
-The configured `:0` is a bootstrap connection, not a fixed input target.
-Gamescope may move mouse focus between its `:0` and `:1` Xwayland servers.
-Sigil reads `GAMESCOPE_MOUSE_FOCUS_DISPLAY` from the bootstrap root, reconnects
-to the active local display, and samples `QueryPointer` at no more than 60 Hz.
-It also reads `GAMESCOPE_CURSOR_VISIBLE_FEEDBACK` from that active root so the
-client overlay disappears when Gamescope hides its cursor. Missing, malformed,
-or unreachable Xwayland state during startup disables the separately
-negotiated pointer feedback capability. After successful startup, losing
-Gamescope publishes pointer feedback as unavailable, then reconnects the
+The configured `:0` is the bootstrap connection. Gamescope builds that publish
+`GAMESCOPE_MOUSE_FOCUS_DISPLAY` may move mouse focus between their `:0` and
+`:1` Xwayland servers; Sigil follows that property and reconnects to the active
+local display. Upstream SteamOS and older Gamescope builds need not ship this
+extension. Sigil detects that absence without creating the atom, logs the
+degraded discovery mode, and safely samples only the explicitly configured
+display instead of disabling pointer feedback.
+
+Sigil samples `QueryPointer` at no more than 60 Hz. If the active Xwayland root
+has a different aspect ratio than the native captured surface, Sigil maps it
+into a centered aspect-fit region (letterbox or pillarbox) so coordinates stay
+in the compositor's native pointer space without independent-axis stretching.
+Zero-sized, unrepresentable, off-root, or cross-screen geometry still fails
+closed.
+
+Gamescope builds that publish `GAMESCOPE_CURSOR_VISIBLE_FEEDBACK` provide the
+compositor's visibility sample. Authoritative pointer motion deliberately keeps
+the client cursor visible for a bounded three seconds even if that sample is
+temporarily false, recovering Gamescope's virtual cursor after remote input.
+When the optional extension is absent or malformed, Sigil logs the fallback and
+uses that same bounded motion window without inventing longer-lived visibility.
+Missing or unreachable Xwayland state during startup still disables the
+separately negotiated pointer feedback capability. After successful startup,
+losing Gamescope publishes pointer feedback as unavailable, then reconnects the
 bootstrap display with a bounded 100 ms to 2 second backoff. A complete
-reconnect re-interns both Gamescope atoms, discovers the replacement native
-surface, and validates one active-display sample before publishing coordinates
-again. Relative uinput remains available without guessed cursor coordinates.
-The service `DISPLAY=:0` line is retained as an explicit fallback for
-configurations created before `xwayland_display` was added.
+reconnect re-detects both optional Gamescope properties, validates one
+active-display sample, and only then publishes coordinates again. Relative
+uinput remains available without guessed cursor coordinates. The service
+`DISPLAY=:0` line is retained as an explicit fallback for configurations
+created before `xwayland_display` was added.
 
 Audio is optional and must resolve one exact PipeWire sink, never a microphone.
 The appliance owns a persistent 48 kHz stereo null sink so capture does not
@@ -1318,11 +1333,15 @@ separate `gamepad` input capability and rejects gamepad snapshots unless that
 capability was negotiated.
 
 It releases every held keyboard/mouse transition and sends a fully neutral
-gamepad snapshot when an input session ends. The client currently sends a Text
-event in addition to physical printable-key events; the host explicitly treats
-Text as a content-free no-op, acknowledges it when ACKs were negotiated, and
-does not advertise Text support. No key, text, or gamepad payload is logged.
-The Linux button/axis assignments follow the kernel's
+gamepad snapshot when an input session ends. Portal sends a bounded subset of
+W3C `KeyboardEvent.code` physical-position tokens for keyboard input. This
+keeps game and Steam bindings independent of the client's active keyboard
+layout. The current uinput backend advertises keyboard input but does not
+advertise Text; Unicode text and IME composition are therefore unsupported.
+For protocol compatibility, any legacy Text event received by Sigil remains a
+content-free no-op and is acknowledged when ACKs were negotiated. No key,
+text, or gamepad payload is logged. The Linux button/axis assignments follow
+the kernel's
 [gamepad protocol](https://docs.kernel.org/input/gamepad.html) and Xbox `xpad`
 layout.
 

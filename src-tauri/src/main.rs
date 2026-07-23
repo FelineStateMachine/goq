@@ -3,6 +3,7 @@
 
 mod commands;
 mod media;
+mod platform_capabilities;
 
 use commands::AppState;
 

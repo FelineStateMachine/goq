@@ -9,6 +9,13 @@ and release gates.
 Portal is always a compiled DMG download. There is no shell installer and no
 fallback to an ad-hoc, demo, or development build.
 
+The release build uses no optional Cargo features. In particular,
+`demo-direct-node` and `experimental-non-macos-pointer-capture` are forbidden
+from the default feature set and from the packaging command. The latter exists
+only to compile the unverified Tao + browser Pointer Lock path during
+non-macOS platform UAT; see
+[Portal platform support](portal-platform-support.md).
+
 ## One-time GitHub and Apple setup
 
 Protect the GitHub environment named `main` with required reviewers and limit

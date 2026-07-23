@@ -24,7 +24,7 @@ uat_dir="$PWD-private/goq-uat-rc1"
 ./scripts/public-alpha-uat.sh init \
   --evidence-dir "$uat_dir" \
   --release-tag v0.1.0-rc.1 \
-  --sigil-archive /absolute/path/sigil-v0.1.0-rc.1-bazzite-x86_64.tar.gz \
+  --sigil-archive /absolute/path/sigil-v0.1.0-rc.1-linux-glibc2.17-x86_64.tar.gz \
   --sigil-bin /absolute/path/to/sigil \
   --portal-assets /absolute/path/to/portal-v0.1.0-rc.1-assets
 ```
@@ -311,7 +311,7 @@ Stored hashes alone are not sufficient:
 ```bash
 ./scripts/public-alpha-uat.sh verify \
   --evidence-dir "$uat_dir" \
-  --sigil-archive /absolute/path/sigil-v0.1.0-rc.1-bazzite-x86_64.tar.gz \
+  --sigil-archive /absolute/path/sigil-v0.1.0-rc.1-linux-glibc2.17-x86_64.tar.gz \
   --sigil-bin /absolute/path/to/sigil \
   --portal-assets /absolute/path/to/portal-v0.1.0-rc.1-assets
 ```

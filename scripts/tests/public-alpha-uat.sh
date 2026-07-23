@@ -84,7 +84,7 @@ printf '%s\n' \
   '  esac' \
   'done' \
   '[[ "$tag" == v1.2.3 ]]' \
-  '[[ "$(basename -- "$archive")" == sigil-v1.2.3-bazzite-x86_64.tar.gz ]]' \
+  '[[ "$(basename -- "$archive")" == sigil-v1.2.3-linux-glibc2.17-x86_64.tar.gz ]]' \
   '[[ "$commit" =~ ^[0-9a-f]{40}$ ]]' \
   '[[ -s "$archive.sha256" && "$(<"$archive.minisig")" == fixture-signature ]]' \
   'grep -q fixture "$key"' \
@@ -133,7 +133,7 @@ archive_dir="$temporary_root/sigil-assets"
 payload_root="$temporary_root/payload-root"
 mkdir -p "$archive_dir" "$payload_root/payload/release"
 cp "$sigil_bin" "$payload_root/payload/release/sigil"
-sigil_archive="$archive_dir/sigil-v1.2.3-bazzite-x86_64.tar.gz"
+sigil_archive="$archive_dir/sigil-v1.2.3-linux-glibc2.17-x86_64.tar.gz"
 tar -czf "$sigil_archive" -C "$payload_root" payload
 printf '%s\n' 'fixture checksum' > "$sigil_archive.sha256"
 printf '%s\n' 'fixture-signature' > "$sigil_archive.minisig"
@@ -401,7 +401,7 @@ rm "$fixture_repo/untracked-release-residue"
 
 arbitrary_dir="$temporary_root/arbitrary-sigil"
 mkdir "$arbitrary_dir"
-arbitrary_archive="$arbitrary_dir/sigil-v1.2.3-bazzite-x86_64.tar.gz"
+arbitrary_archive="$arbitrary_dir/sigil-v1.2.3-linux-glibc2.17-x86_64.tar.gz"
 printf '%s\n' 'arbitrary text archive' > "$arbitrary_archive"
 printf '%s\n' 'fixture checksum' > "$arbitrary_archive.sha256"
 printf '%s\n' 'fixture-signature' > "$arbitrary_archive.minisig"

@@ -40,7 +40,7 @@ import {
   normalizeInvitationSummary,
   shortPeerFingerprint,
 } from './enrollment.mjs';
-import { mapKey } from './keyboard-map.mjs';
+import { keyboardInputForEvent } from './keyboard-map.mjs';
 
 let enrollmentReady = false;
 let pendingInvitationSummary = null;
@@ -261,6 +261,12 @@ async function cancelInvitation() {
 async function checkDevelopmentConnectionMode() {
   const mode = await invoke('development_connection_mode');
   connectionState.setDevelopmentMode(mode.enabled);
+  if (mode.force_jpeg) {
+    const jpegBadge = document.getElementById('dev-jpeg-badge');
+    jpegBadge.classList.remove('hidden');
+    jpegBadge.title = mode.jpeg_warning;
+    console.warn('[development JPEG compatibility mode]', mode.jpeg_warning);
+  }
   if (!mode.enabled) return;
 
   const badge = document.getElementById('dev-connect-badge');
@@ -977,25 +983,21 @@ window.addEventListener('keydown', (e) => {
     controlRuntime.exit();
     return;
   }
-  const printableText = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
-  if (printableText && connectionState.inputCapabilities.text) {
-    e.preventDefault();
-    inputRuntime.send({ t: 'tx', s: e.key });
+  const input = keyboardInputForEvent(e, connectionState.inputCapabilities);
+  if (input === null) return;
+  e.preventDefault();
+  if (input.type === 'text') {
+    inputRuntime.send({ t: 'tx', s: input.text });
     return;
   }
-  if (!connectionState.inputCapabilities.keyboard) return;
-  const k = mapKey(e);
-  if (k) {
-    e.preventDefault();
-    const keyId = e.code || e.key;
-    const tracking = inputRuntime.trackKey(keyId, k);
-    if (tracking === 'repeat') return;
-    if (tracking === 'full') {
-      console.error('held key limit reached; refusing additional key transition');
-      return;
-    }
-    if (!inputRuntime.send({ t: 'kd', k })) inputRuntime.takeKeyRelease(keyId);
+  const keyId = e.code || e.key;
+  const tracking = inputRuntime.trackKey(keyId, input.key);
+  if (tracking === 'repeat') return;
+  if (tracking === 'full') {
+    console.error('held key limit reached; refusing additional key transition');
+    return;
   }
+  if (!inputRuntime.send({ t: 'kd', k: input.key })) inputRuntime.takeKeyRelease(keyId);
 });
 
 window.addEventListener('keyup', (e) => {

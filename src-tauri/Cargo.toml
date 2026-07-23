@@ -11,6 +11,9 @@ rust-version = "1.91"
 # Produces an optimized, explicitly insecure demo build while keeping ordinary
 # release builds fail-closed around --dev-connect.
 demo-direct-node = []
+# Compiles the unverified Tao + WebKit Pointer Lock relative-capture path on
+# non-macOS clients. This is a development/UAT switch, not a release feature.
+experimental-non-macos-pointer-capture = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

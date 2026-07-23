@@ -7,7 +7,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/sign-bazzite-release.sh \
   --tag vVERSION \
-  --archive /absolute/path/sigil-vVERSION-bazzite-x86_64.tar.gz \
+  --archive /absolute/path/sigil-vVERSION-linux-glibc2.17-x86_64.tar.gz \
   --minisign-key /absolute/offline/path/to/release.key \
   --public-key-file /absolute/path/to/sigil-minisign.pub \
   [--source-commit HEX]

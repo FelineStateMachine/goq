@@ -1123,10 +1123,13 @@ event nodes and assigns the same single-purpose group. Without it, correct
 `BTN_LEFT` and `REL_X/Y` events can appear in `evtest` while Gamescope silently
 ignores an inaccessible hot-plugged device.
 The daemon independently opens the configured path three times with
-`O_NOFOLLOW`, verifies that character-device identity, exact owner/group/mode,
-and absence of an extended access ACL on every descriptor, then creates
-separate pointer, keyboard, and gamepad devices before it binds Iroh. Any change
-fails closed. Access to
+`O_NOFOLLOW`, verifies that character-device identity and exact
+owner/group/mode, and—under this default Bazzite configuration—requires the
+absence of an extended access ACL on every descriptor. The portable activation
+guide documents the separate, explicit `expected_acl_user_uid` contract for a
+distribution that intentionally owns a one-user seat ACL; it is not enabled by
+the shipped rules. Sigil then creates separate pointer, keyboard, and gamepad
+devices before it binds Iroh. Any change fails closed. Access to
 uinput is equivalent to local keyboard, pointer, and gamepad control, so keep
 this dedicated group single-purpose. Do not add
 `PrivateDevices=true` to the user unit because that would deliberately hide the

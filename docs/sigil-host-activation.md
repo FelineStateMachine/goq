@@ -69,6 +69,35 @@ Do not add this account to the broad `input` group and do not run Sigil as
 root. Access to uinput is equivalent to local controller, keyboard, and pointer
 control.
 
+The shipped Bazzite/SteamOS-like setup above is the default **group-only**
+scheme. Sigil expects the configured owner, group, and mode and rejects every
+extended access ACL. Its preflight error names that scheme explicitly.
+
+On a distribution that deliberately provisions `/dev/uinput` with a
+seat-managed POSIX ACL instead, opt in to exactly one named-user entry:
+
+```toml
+[uinput]
+device_path = "/dev/uinput"
+expected_owner_uid = 0
+expected_group_gid = 986
+expected_mode = 0o660
+expected_acl_user_uid = 1000
+```
+
+Use the machine-local numeric UID of the non-root account that runs Sigil.
+Sigil requires it to equal the daemon's effective UID. The access ACL must have
+exactly the canonical `user::rw-`, `user:<uid>:rw-`, `group::rw-`, `mask::rw-`,
+and `other::---` entries matching the configured mode; extra users, named
+groups, different permissions, or a missing ACL fail closed. Owner, group,
+mode, character-device identity, and major/minor checks still apply.
+
+This opt-in does not make logind seat state optional. If a `uaccess` ACL is
+removed during a headless boot, SSH session, or seat transition, Sigil refuses
+to start. Prefer the shipped dedicated-group scheme for an appliance; use the
+one-user ACL form only when the operator owns and verifies that distribution's
+seat lifecycle.
+
 ## 2. Create the host identity once
 
 ```bash

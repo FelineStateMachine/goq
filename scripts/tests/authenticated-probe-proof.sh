@@ -101,12 +101,6 @@ printf '%s\n' \
   >"$host_config"
 chmod 0600 "$host_config"
 "$host_bin" config check --config "$host_config" >/dev/null
-"$host_bin" invitation create \
-  --config "$host_config" \
-  --peer "$probe_node_id" \
-  --pointer-keyboard \
-  --output "$invitation" \
-  >/dev/null
 
 RUST_LOG='info,sigil::server=debug' "$host_bin" serve \
   --config "$host_config" \
@@ -117,6 +111,12 @@ wait_for_ready || {
   sed -n '1,160p' "$host_log" >&2 || true
   die 'configured host did not become ready'
 }
+"$host_bin" invitation create \
+  --config "$host_config" \
+  --peer "$probe_node_id" \
+  --pointer-keyboard \
+  --output "$invitation" \
+  >/dev/null
 
 "$probe_bin" \
   --node-id "$host_node_id" \

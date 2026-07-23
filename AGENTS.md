@@ -208,22 +208,24 @@ Sigil host.
   and observing that it listens is also not an end-to-end test: Portal must
   connect to that exact daemon, the host must admit the session, live media
   diagnostics must advance, and the affected interaction or recovery path must
-  be exercised from Portal.
-- Fresh exact-commit builds are not expected to be enrolled. When authentication
-  is not the behavior under test, use the development bypass proactively rather
-  than skipping the connection, attempting ordinary auth, or reporting the
-  daemon-only result as hardware proof. Build Sigil with `demo-auth-bypass`, run
-  it with
+  be exercised from Portal. Fresh exact-commit builds are not
+  expected to be enrolled. This also applies when authentication or identity
+  code changed: do not skip the connection because ordinary authentication
+  blocks it. For development hardware testing, build Sigil with
+  `demo-auth-bypass`, run it with
   `--dev-allow-unauthorized` and a bounded `--max-runtime-seconds`, and connect
   a debug Portal with `--dev-connect`. Verify the affected live diagnostics
   and interaction path, then stop the bypass process, undo temporary Gamescope
   controls, and restore and verify the ordinary authenticated
   `sigil-host.service` before calling the test complete.
-- When authentication, enrollment, identity, grants, invitations, or reconnect
-  authorization is the behavior under test, the bypass is not evidence. Use
-  the real `LA_key` flow, complete an authenticated Portal -> UMPC session, and
-  verify a ticket-free reconnect where applicable without exposing the PIN or
-  credential material.
+- The bypass proves the exact runtime connection, not authorization semantics.
+  For authentication, enrollment, identity, grants, invitation, and reconnect
+  changes, supplement that session with deterministic FIDO-response tests and
+  a persistent software Iroh identity using signed invitations and
+  authenticated probes. Cover the relevant grant, replay, expiry, peer/host
+  binding, and ticket-free reconnect behavior. A physical security-key PIN or
+  tap is not required unless the operator explicitly requests authenticator
+  hardware acceptance.
 
 - On Linux with NVIDIA, set `WEBKIT_DISABLE_DMABUF_RENDERER=1` for Portal.
 - Treat `experimental-non-macos-pointer-capture` as an explicit non-release

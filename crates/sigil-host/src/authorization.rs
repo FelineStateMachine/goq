@@ -1,7 +1,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use iroh::EndpointId;
@@ -19,11 +20,28 @@ const STATE_FILE_NAME: &str = "authorization-v1.json";
 const LOCK_FILE_NAME: &str = "authorization-v1.lock";
 const MAX_STATE_FILE_LEN: u64 = 64 * 1024;
 const MAX_CONSUMED_INVITATIONS: usize = 64;
+const WRITER_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
+const WRITER_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug)]
 pub struct AuthorizationStore {
+    location: AuthorizationLocation,
+    writer: Arc<AuthorizationWriter>,
+}
+
+#[derive(Clone, Debug)]
+struct AuthorizationLocation {
     state_directory: PathBuf,
     host: EndpointId,
+}
+
+#[derive(Debug)]
+struct AuthorizationWriter {
+    state: Mutex<AuthorizationState>,
+    /// The process that owns this descriptor is the only durable writer.
+    /// Configured service and offline recovery paths acquire their lifecycle
+    /// lease before this authorization lease.
+    _lease: File,
 }
 
 #[derive(Clone, Debug)]
@@ -58,7 +76,26 @@ pub struct RevocationOutcome {
     pub current_epoch: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl AuthorizationSnapshot {
+    fn from_state(state: &AuthorizationState) -> Result<Self> {
+        let (peer, grants, enrolled_at_unix) = match &state.enrollment {
+            Some(enrollment) => (
+                Some(enrollment.peer_node_id.parse::<EndpointId>()?),
+                Some(enrollment.grants),
+                Some(enrollment.enrolled_at_unix),
+            ),
+            None => (None, None, None),
+        };
+        Ok(Self {
+            epoch: state.enrollment_epoch,
+            peer,
+            grants,
+            enrolled_at_unix,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthorizationState {
     version: u16,
@@ -68,7 +105,7 @@ struct AuthorizationState {
     consumed_invitations: Vec<ConsumedInvitation>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Enrollment {
     peer_node_id: String,
@@ -76,7 +113,7 @@ struct Enrollment {
     enrolled_at_unix: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConsumedInvitation {
     nonce: [u8; 32],
@@ -151,20 +188,51 @@ impl AuthorizationState {
 
 impl AuthorizationStore {
     pub fn open(state_directory: impl Into<PathBuf>, host: EndpointId) -> Result<Self> {
-        let store = Self {
+        let location = AuthorizationLocation {
             state_directory: state_directory.into(),
             host,
         };
-        store.ensure_state_directory()?;
-        let lock = store.open_lock()?;
-        store.lock_exclusive(&lock)?;
-        let state = store.load_state()?;
+        location.ensure_state_directory()?;
+        let lock = location.open_lock()?;
+        location.lock_exclusive_bounded(&lock, WRITER_LOCK_TIMEOUT)?;
+        let state = location.load_state()?;
         state.validate(host)?;
-        Ok(store)
+        Ok(Self {
+            location,
+            writer: Arc::new(AuthorizationWriter {
+                state: Mutex::new(state),
+                _lease: lock,
+            }),
+        })
     }
 
-    pub fn issue_claims(
+    #[cfg(test)]
+    fn issue_claims(
         &self,
+        peer: EndpointId,
+        grants: InvitationGrants,
+        ttl_seconds: u64,
+        now: u64,
+        nonce: [u8; 32],
+    ) -> Result<InvitationClaims> {
+        let state = self.lock_state()?;
+        state.validate(self.location.host)?;
+        Self::issue_claims_from_snapshot(
+            self.location.host,
+            AuthorizationSnapshot::from_state(&state)?,
+            peer,
+            grants,
+            ttl_seconds,
+            now,
+            nonce,
+        )
+    }
+
+    /// Issue claims from one validated atomic read. Invitation creation is
+    /// read-only: the daemon may remain the sole writer while it is running.
+    pub fn issue_claims_from_snapshot(
+        host: EndpointId,
+        snapshot: AuthorizationSnapshot,
         peer: EndpointId,
         grants: InvitationGrants,
         ttl_seconds: u64,
@@ -180,21 +248,17 @@ impl AuthorizationStore {
             (1..=MAX_INVITATION_TTL_SECS).contains(&ttl_seconds),
             "invitation TTL must be between 1 and {MAX_INVITATION_TTL_SECS} seconds"
         );
-        let lock = self.open_lock()?;
-        self.lock_exclusive(&lock)?;
-        let state = self.load_state()?;
-        state.validate(self.host)?;
         ensure!(
-            state.enrollment.is_none(),
+            snapshot.peer.is_none() && snapshot.grants.is_none(),
             "a Portal peer is already enrolled; revoke it before issuing another invitation"
         );
         InvitationClaims::new(
-            *self.host.as_bytes(),
+            *host.as_bytes(),
             *peer.as_bytes(),
             now,
             now.checked_add(ttl_seconds)
                 .context("invitation expiry overflow")?,
-            state.enrollment_epoch,
+            snapshot.epoch,
             nonce,
             grants,
         )
@@ -207,15 +271,17 @@ impl AuthorizationStore {
         invitation_token: Option<&str>,
         now: u64,
     ) -> Result<InvitationGrants> {
-        let lock = self.open_lock()?;
-        self.lock_exclusive(&lock)?;
-        let mut state = self.load_state()?;
-        state.validate(self.host)?;
-        let mut changed = state.prune_expired(now);
+        // Admission never waits for another in-process authorization operation.
+        // A concurrent redemption or durable write fails this handshake closed
+        // and lets the client retry instead of growing accept-path latency.
+        let mut state = self.lock_state()?;
+        state.validate(self.location.host)?;
+        let mut candidate = state.clone();
+        let mut changed = candidate.prune_expired(now);
 
         let result = match invitation_token {
             None => {
-                let enrollment = state
+                let enrollment = candidate
                     .enrollment
                     .as_ref()
                     .context("Portal peer is not enrolled")?;
@@ -227,14 +293,14 @@ impl AuthorizationStore {
             }
             Some(token) => {
                 ensure!(
-                    state.enrollment.is_none(),
+                    candidate.enrollment.is_none(),
                     "an invitation cannot be used after enrollment"
                 );
                 let invitation = SignedInvitation::decode(token)
                     .context("decoding and verifying enrollment invitation")?;
                 let claims = invitation.claims;
                 ensure!(
-                    claims.host_node_id == *self.host.as_bytes(),
+                    claims.host_node_id == *self.location.host.as_bytes(),
                     "invitation belongs to a different Sigil host"
                 );
                 ensure!(
@@ -242,7 +308,7 @@ impl AuthorizationStore {
                     "invitation is bound to a different Portal peer"
                 );
                 ensure!(
-                    claims.enrollment_epoch == state.enrollment_epoch,
+                    claims.enrollment_epoch == candidate.enrollment_epoch,
                     "invitation enrollment epoch is stale"
                 );
                 ensure!(
@@ -255,22 +321,22 @@ impl AuthorizationStore {
                     "invitation does not grant view permission"
                 );
                 ensure!(
-                    !state
+                    !candidate
                         .consumed_invitations
                         .iter()
                         .any(|consumed| consumed.nonce == claims.nonce),
                     "invitation has already been consumed"
                 );
                 ensure!(
-                    state.consumed_invitations.len() < MAX_CONSUMED_INVITATIONS,
+                    candidate.consumed_invitations.len() < MAX_CONSUMED_INVITATIONS,
                     "authorization replay ledger is full"
                 );
-                state.enrollment = Some(Enrollment {
+                candidate.enrollment = Some(Enrollment {
                     peer_node_id: remote.to_string(),
                     grants: claims.grants,
                     enrolled_at_unix: now,
                 });
-                state.consumed_invitations.push(ConsumedInvitation {
+                candidate.consumed_invitations.push(ConsumedInvitation {
                     nonce: claims.nonce,
                     expires_at_unix: claims.expires_at_unix,
                 });
@@ -280,30 +346,17 @@ impl AuthorizationStore {
         };
 
         if changed {
-            self.write_state(&state)?;
+            self.location.write_state(&candidate)?;
+            *state = candidate;
         }
         Ok(result)
     }
 
-    pub fn snapshot(&self) -> Result<AuthorizationSnapshot> {
-        let lock = self.open_lock()?;
-        self.lock_exclusive(&lock)?;
-        let state = self.load_state()?;
-        state.validate(self.host)?;
-        let (peer, grants, enrolled_at_unix) = match state.enrollment {
-            Some(enrollment) => (
-                Some(enrollment.peer_node_id.parse::<EndpointId>()?),
-                Some(enrollment.grants),
-                Some(enrollment.enrolled_at_unix),
-            ),
-            None => (None, None, None),
-        };
-        Ok(AuthorizationSnapshot {
-            epoch: state.enrollment_epoch,
-            peer,
-            grants,
-            enrolled_at_unix,
-        })
+    #[cfg(test)]
+    fn snapshot(&self) -> Result<AuthorizationSnapshot> {
+        let state = self.lock_state()?;
+        state.validate(self.location.host)?;
+        AuthorizationSnapshot::from_state(&state)
     }
 
     /// Inspect durable enrollment without creating the state directory or lock.
@@ -313,11 +366,11 @@ impl AuthorizationStore {
         state_directory: impl Into<PathBuf>,
         host: EndpointId,
     ) -> Result<AuthorizationInspection> {
-        let store = Self {
+        let location = AuthorizationLocation {
             state_directory: state_directory.into(),
             host,
         };
-        let directory_metadata = match fs::symlink_metadata(&store.state_directory) {
+        let directory_metadata = match fs::symlink_metadata(&location.state_directory) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(AuthorizationInspection {
@@ -352,7 +405,7 @@ impl AuthorizationStore {
             );
         }
 
-        let path = store.state_path();
+        let path = location.state_path();
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -372,7 +425,7 @@ impl AuthorizationStore {
             }
             Err(error) => return Err(error).context("opening authorization state"),
         };
-        store.validate_secure_file(&file, &path)?;
+        location.validate_secure_file(&file, &path)?;
         let metadata = file.metadata()?;
         ensure!(
             metadata.len() <= MAX_STATE_FILE_LEN,
@@ -390,20 +443,7 @@ impl AuthorizationStore {
         let state: AuthorizationState =
             serde_json::from_slice(&bytes).context("parsing authorization state")?;
         state.validate(host)?;
-        let snapshot = match state.enrollment {
-            Some(enrollment) => AuthorizationSnapshot {
-                epoch: state.enrollment_epoch,
-                peer: Some(enrollment.peer_node_id.parse::<EndpointId>()?),
-                grants: Some(enrollment.grants),
-                enrolled_at_unix: Some(enrollment.enrolled_at_unix),
-            },
-            None => AuthorizationSnapshot {
-                epoch: state.enrollment_epoch,
-                peer: None,
-                grants: None,
-                enrolled_at_unix: None,
-            },
-        };
+        let snapshot = AuthorizationSnapshot::from_state(&state)?;
         Ok(AuthorizationInspection {
             snapshot,
             storage_present: true,
@@ -411,18 +451,18 @@ impl AuthorizationStore {
     }
 
     pub fn revoke_with_outcome(&self, now: u64) -> Result<RevocationOutcome> {
-        let lock = self.open_lock()?;
-        self.lock_exclusive(&lock)?;
-        let mut state = self.load_state()?;
-        state.validate(self.host)?;
-        let previous_epoch = state.enrollment_epoch;
-        let had_enrollment = state.enrollment.take().is_some();
-        state.enrollment_epoch = state
+        let mut state = self.lock_state()?;
+        state.validate(self.location.host)?;
+        let mut candidate = state.clone();
+        let previous_epoch = candidate.enrollment_epoch;
+        let had_enrollment = candidate.enrollment.take().is_some();
+        candidate.enrollment_epoch = candidate
             .enrollment_epoch
             .checked_add(1)
             .context("authorization epoch exhausted")?;
-        state.prune_expired(now);
-        self.write_state(&state)?;
+        candidate.prune_expired(now);
+        self.location.write_state(&candidate)?;
+        *state = candidate;
         Ok(RevocationOutcome {
             had_enrollment,
             previous_epoch,
@@ -430,6 +470,20 @@ impl AuthorizationStore {
         })
     }
 
+    fn lock_state(&self) -> Result<MutexGuard<'_, AuthorizationState>> {
+        match self.writer.state.try_lock() {
+            Ok(state) => Ok(state),
+            Err(TryLockError::WouldBlock) => {
+                anyhow::bail!("authorization writer is busy; retry the operation")
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                anyhow::bail!("authorization writer state is poisoned")
+            }
+        }
+    }
+}
+
+impl AuthorizationLocation {
     fn state_path(&self) -> PathBuf {
         self.state_directory.join(STATE_FILE_NAME)
     }
@@ -489,16 +543,31 @@ impl AuthorizationStore {
         Ok(file)
     }
 
-    fn lock_exclusive(&self, file: &File) -> Result<()> {
+    fn lock_exclusive_bounded(&self, file: &File, timeout: Duration) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            ensure!(
-                status == 0,
-                "locking authorization state failed: {}",
-                std::io::Error::last_os_error()
-            );
+            let started = Instant::now();
+            loop {
+                let status =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if status == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(error).context("locking authorization state failed");
+                }
+                if started.elapsed() >= timeout {
+                    anyhow::bail!(
+                        "authorization writer is busy after {} ms; stop or terminate the current writer and retry",
+                        timeout.as_millis()
+                    );
+                }
+                std::thread::sleep(
+                    WRITER_LOCK_RETRY_INTERVAL.min(timeout.saturating_sub(started.elapsed())),
+                );
+            }
         }
         Ok(())
     }
@@ -640,6 +709,8 @@ mod tests {
     use sigil_protocol::SignedInvitation;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::process::Command;
 
     fn store() -> (tempfile::TempDir, SecretKey, SecretKey, AuthorizationStore) {
         let directory = tempfile::tempdir().unwrap();
@@ -690,8 +761,9 @@ mod tests {
                 .contains("after enrollment")
         );
 
-        let reopened =
-            AuthorizationStore::open(store.state_directory.clone(), host.public()).unwrap();
+        let state_directory = store.location.state_directory.clone();
+        drop(store);
+        let reopened = AuthorizationStore::open(state_directory, host.public()).unwrap();
         assert_eq!(
             reopened
                 .authorize_or_redeem(peer.public(), None, 1_003)
@@ -820,7 +892,8 @@ mod tests {
             .unwrap();
         let other_host = SecretKey::from_bytes(&[12; 32]);
         assert!(
-            AuthorizationStore::open(store.state_directory.clone(), other_host.public()).is_err()
+            AuthorizationStore::open(store.location.state_directory.clone(), other_host.public())
+                .is_err()
         );
         let snapshot = store.snapshot().unwrap();
         assert!(
@@ -849,8 +922,9 @@ mod tests {
             .unwrap();
         assert!(store.revoke_with_outcome(1_002).unwrap().had_enrollment);
 
-        let reopened =
-            AuthorizationStore::open(store.state_directory.clone(), host.public()).unwrap();
+        let state_directory = store.location.state_directory.clone();
+        drop(store);
+        let reopened = AuthorizationStore::open(state_directory, host.public()).unwrap();
         let replay = token(
             &reopened,
             &host,
@@ -859,13 +933,16 @@ mod tests {
             nonce,
             InvitationGrants::VIEW,
         );
-        let state_before = fs::read(reopened.state_path()).unwrap();
+        let state_before = fs::read(reopened.location.state_path()).unwrap();
         let error = reopened
             .authorize_or_redeem(peer.public(), Some(&replay), 1_004)
             .unwrap_err();
 
         assert!(error.to_string().contains("already been consumed"));
-        assert_eq!(fs::read(reopened.state_path()).unwrap(), state_before);
+        assert_eq!(
+            fs::read(reopened.location.state_path()).unwrap(),
+            state_before
+        );
         let snapshot = reopened.snapshot().unwrap();
         assert_eq!(snapshot.epoch, 2);
         assert!(snapshot.peer.is_none());
@@ -934,5 +1011,154 @@ mod tests {
             .authorize_or_redeem(peer.public(), Some(&outside_skew), 1_000)
             .unwrap_err();
         assert!(error.to_string().contains("too far in the future"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_contention_is_bounded_and_recovers_after_release() {
+        let (directory, host, _peer, store) = store();
+        let started = Instant::now();
+        let error = AuthorizationStore::open(directory.path(), host.public()).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(error.to_string().contains("authorization writer is busy"));
+        assert!(elapsed >= WRITER_LOCK_TIMEOUT);
+        assert!(elapsed < Duration::from_secs(2));
+
+        drop(store);
+        AuthorizationStore::open(directory.path(), host.public()).unwrap();
+    }
+
+    #[test]
+    fn admission_fails_fast_while_in_process_writer_is_hung() {
+        let (_directory, _host, peer, store) = store();
+        let _hung_writer = store.writer.state.lock().unwrap();
+        let started = Instant::now();
+
+        let error = store
+            .authorize_or_redeem(peer.public(), None, 1_000)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("authorization writer is busy"));
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn read_only_invitation_creation_remains_available_with_live_writer() {
+        let (directory, host, peer, _store) = store();
+        let inspection =
+            AuthorizationStore::inspect_existing(directory.path(), host.public()).unwrap();
+        let claims = AuthorizationStore::issue_claims_from_snapshot(
+            host.public(),
+            inspection.snapshot,
+            peer.public(),
+            InvitationGrants::ALL,
+            600,
+            1_000,
+            [42; 32],
+        )
+        .unwrap();
+
+        assert_eq!(claims.enrollment_epoch, 1);
+        assert_eq!(claims.intended_peer_id, *peer.public().as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crashed_writer_releases_lease_and_preserves_durable_state() {
+        const CHILD_DIRECTORY: &str = "SIGIL_AUTHORIZATION_CRASH_TEST_DIRECTORY";
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = directory.path().join("writer-ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "authorization::tests::writer_crash_helper",
+                "--nocapture",
+            ])
+            .env(CHILD_DIRECTORY, directory.path())
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "writer crash helper did not acquire its lease"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "writer crash helper exited before acquiring its lease"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let host = SecretKey::from_bytes(&[7; 32]);
+        assert!(
+            AuthorizationStore::open(directory.path(), host.public())
+                .unwrap_err()
+                .to_string()
+                .contains("authorization writer is busy")
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let recovered = AuthorizationStore::open(directory.path(), host.public()).unwrap();
+        assert_eq!(recovered.snapshot().unwrap().epoch, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_crash_helper() {
+        const CHILD_DIRECTORY: &str = "SIGIL_AUTHORIZATION_CRASH_TEST_DIRECTORY";
+        let Ok(directory) = std::env::var(CHILD_DIRECTORY) else {
+            return;
+        };
+        let host = SecretKey::from_bytes(&[7; 32]);
+        let store = AuthorizationStore::open(&directory, host.public()).unwrap();
+        store.revoke_with_outcome(1_000).unwrap();
+        fs::write(Path::new(&directory).join("writer-ready"), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adversarial_lock_files_and_crash_temps_fail_closed_or_recover_atomically() {
+        use std::os::unix::fs::symlink;
+
+        let host = SecretKey::from_bytes(&[7; 32]);
+        let symlink_directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(symlink_directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let target = symlink_directory.path().join("target");
+        fs::write(&target, b"target").unwrap();
+        symlink(&target, symlink_directory.path().join(LOCK_FILE_NAME)).unwrap();
+        assert!(AuthorizationStore::open(symlink_directory.path(), host.public()).is_err());
+
+        let permissive_directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(
+            permissive_directory.path(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let permissive_lock = permissive_directory.path().join(LOCK_FILE_NAME);
+        fs::write(&permissive_lock, b"").unwrap();
+        fs::set_permissions(&permissive_lock, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(AuthorizationStore::open(permissive_directory.path(), host.public()).is_err());
+
+        let recovery_directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(recovery_directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let store = AuthorizationStore::open(recovery_directory.path(), host.public()).unwrap();
+        store.revoke_with_outcome(1_000).unwrap();
+        drop(store);
+        fs::write(
+            recovery_directory
+                .path()
+                .join(".authorization-v1.json.crashed.tmp"),
+            b"{not valid json",
+        )
+        .unwrap();
+
+        let recovered = AuthorizationStore::open(recovery_directory.path(), host.public()).unwrap();
+        assert_eq!(recovered.snapshot().unwrap().epoch, 2);
     }
 }

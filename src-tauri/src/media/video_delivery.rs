@@ -1,11 +1,8 @@
-use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use openh264::{formats::YUVSource, nal_units};
-use sigil_protocol::{FrameFlags, KeyframeRequestReasonV3, MediaCodec, read_media_frame};
+use sigil_protocol::{FrameFlags, KeyframeRequestReasonV3, MediaCodec};
 use tauri::{
     AppHandle, Emitter,
     ipc::{Channel, Response},
@@ -13,8 +10,8 @@ use tauri::{
 
 use crate::commands::state::MediaControlRequestSender;
 use crate::media::frame_channel::{
-    FrameEnvelopeMetadata, FramePayload, byte_to_codec, emit_frame_error, encode_frame_envelope,
-    release_frame_channel_slot, try_reserve_frame_channel_slot, validate_legacy_media_header,
+    FrameEnvelopeMetadata, emit_frame_error, encode_frame_envelope, release_frame_channel_slot,
+    try_reserve_frame_channel_slot,
 };
 use crate::media::media_control::try_queue_media_keyframe_request;
 use crate::media::metrics::{ClientMediaMetrics, lock_client_media_metrics};
@@ -25,13 +22,11 @@ use crate::media::network_diagnostics::{
     NetworkLeg, NetworkSessionDiagnostics, lock_network_diagnostics,
 };
 use crate::media::object_receiver::{
-    MediaObjectReadOutcome, MediaObjectReadOutcomeV3, MediaObjectReceiver, MediaObjectReceiverV3,
-    MediaObjectSequence, MediaObjectSequenceDecision, MediaObjectSequenceDecisionV3,
+    MediaObjectReadOutcomeV3, MediaObjectReceiverV3, MediaObjectSequenceDecisionV3,
     MediaObjectSequenceV3,
 };
 use crate::media::transport::MediaTransport;
 
-const LEGACY_MEDIA_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_FRAME_STATS_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) struct VideoDeliveryRequest {
@@ -49,14 +44,15 @@ pub(crate) struct VideoDeliveryRequest {
     pub(crate) media_transport: MediaTransport,
     pub(crate) media_generation: u64,
     pub(crate) connected_audio_generation: Option<u64>,
-    pub(crate) use_webcodecs: bool,
 }
 
 pub(crate) async fn run_video_delivery(request: VideoDeliveryRequest) {
     let VideoDeliveryRequest {
         app,
         endpoint,
-        mut frame_recv,
+        // The negotiated control/v3 handshake recv leg carries no media but
+        // must stay open for the session's lifetime.
+        frame_recv: _control_recv_keepalive,
         frame_connection: frame_connection_for_stats,
         input_connection,
         audio_connection: audio_connection_for_stats,
@@ -68,7 +64,6 @@ pub(crate) async fn run_video_delivery(request: VideoDeliveryRequest) {
         media_transport,
         media_generation,
         connected_audio_generation,
-        use_webcodecs,
     } = request;
 
     let metrics_started = Instant::now();
@@ -80,33 +75,10 @@ pub(crate) async fn run_video_delivery(request: VideoDeliveryRequest) {
     let metrics = Arc::new(StdMutex::new(initial_metrics));
     let mut previous_sequence: Option<u64> = None;
     let mut frontend_waiting_for_keyframe = true;
-    let mut media_objects = (media_transport == MediaTransport::IndependentObjectsV2)
-        .then(|| MediaObjectReceiver::new(frame_connection_for_stats.clone()));
-    let mut media_object_sequence = MediaObjectSequence::new();
     let mut media_objects_v3 = (media_transport == MediaTransport::GroupedObjectsV3)
         .then(|| MediaObjectReceiverV3::new(frame_connection_for_stats.clone()));
     let mut media_object_sequence_v3 = MediaObjectSequenceV3::new();
     let mut upstream_moq_media = upstream_moq_media;
-
-    let mut decoder = if use_webcodecs {
-        None
-    } else {
-        match openh264::decoder::Decoder::new() {
-            Ok(d) => Some(d),
-            Err(e) => {
-                emit_frame_error(&app, media_generation, format!("Decoder init failed: {e}"));
-                if media_transport == MediaTransport::UpstreamMoq {
-                    retire_upstream_moq_generation(
-                        &app,
-                        media_generation,
-                        connected_audio_generation,
-                    )
-                    .await;
-                }
-                return;
-            }
-        }
-    };
 
     let (stats_stop, mut stats_stop_rx) = tokio::sync::watch::channel(false);
     let stats_app = app.clone();
@@ -308,180 +280,6 @@ pub(crate) async fn run_video_delivery(request: VideoDeliveryRequest) {
                     }
                 }
             }
-            MediaTransport::IndependentObjectsV2 => {
-                let receiver = media_objects
-                    .as_mut()
-                    .expect("media v2 receiver must exist for media v2 transport");
-                loop {
-                    let outcome = match receiver.next().await {
-                        Ok(Some(outcome)) => outcome,
-                        Ok(None) => {
-                            emit_frame_error(&app, media_generation, "Connection closed");
-                            break 'frames;
-                        }
-                        Err(error) => {
-                            emit_frame_error(&app, media_generation, error);
-                            break 'frames;
-                        }
-                    };
-                    match outcome {
-                        MediaObjectReadOutcome::Dropped { object_index } => {
-                            let begins_resync =
-                                media_object_sequence.note_dropped_object(object_index);
-                            let mut metrics = lock_client_media_metrics(&metrics);
-                            metrics.observe_transport_object_drop(!begins_resync);
-                            if begins_resync {
-                                frontend_waiting_for_keyframe = true;
-                                metrics.begin_frontend_resync(metrics_started.elapsed());
-                            }
-                        }
-                        MediaObjectReadOutcome::Malformed(error) => {
-                            emit_frame_error(&app, media_generation, error);
-                            break 'frames;
-                        }
-                        MediaObjectReadOutcome::Frame {
-                            object_index,
-                            frame,
-                        } => {
-                            let discontinuity =
-                                match media_object_sequence.classify(object_index, &frame) {
-                                    MediaObjectSequenceDecision::Deliver { discontinuity } => {
-                                        discontinuity
-                                    }
-                                    MediaObjectSequenceDecision::DropLate => {
-                                        lock_client_media_metrics(&metrics)
-                                            .observe_transport_object_drop(true);
-                                        continue;
-                                    }
-                                    MediaObjectSequenceDecision::DropUntilKeyframe => {
-                                        frontend_waiting_for_keyframe = true;
-                                        let mut metrics = lock_client_media_metrics(&metrics);
-                                        metrics.observe_transport_object_drop(false);
-                                        metrics.begin_frontend_resync(metrics_started.elapsed());
-                                        continue;
-                                    }
-                                };
-                            let codec = match frame.header.codec {
-                                MediaCodec::H264 => "h264".to_string(),
-                            };
-                            break (
-                                u32::from(frame.header.width),
-                                u32::from(frame.header.height),
-                                frame.payload,
-                                frame.header.flags.contains(FrameFlags::KEYFRAME),
-                                codec,
-                                Some(frame.header.sequence),
-                                Some(frame.header.capture_timestamp_us),
-                                Some(frame.header.pts_us),
-                                discontinuity,
-                                frame.header.flags.contains(FrameFlags::CODEC_CONFIG),
-                            );
-                        }
-                    }
-                }
-            }
-            MediaTransport::ReliableStreamV1 => {
-                // Gamescope's PipeWire stream is damage-driven: a static
-                // screen can legitimately produce no encoded frame for an
-                // arbitrary period. Connection closure and parser/source
-                // errors remain terminal; frame silence does not.
-                let frame = match read_media_frame(&mut frame_recv).await {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) => {
-                        emit_frame_error(&app, media_generation, "Connection closed");
-                        break;
-                    }
-                    Err(error) => {
-                        emit_frame_error(
-                            &app,
-                            media_generation,
-                            format!("Invalid media stream: {error}"),
-                        );
-                        break;
-                    }
-                };
-                let codec = match frame.header.codec {
-                    MediaCodec::H264 => "h264".to_string(),
-                };
-                (
-                    u32::from(frame.header.width),
-                    u32::from(frame.header.height),
-                    frame.payload,
-                    frame.header.flags.contains(FrameFlags::KEYFRAME),
-                    codec,
-                    Some(frame.header.sequence),
-                    Some(frame.header.capture_timestamp_us),
-                    Some(frame.header.pts_us),
-                    frame.header.flags.contains(FrameFlags::DISCONTINUITY),
-                    frame.header.flags.contains(FrameFlags::CODEC_CONFIG),
-                )
-            }
-            MediaTransport::LegacyV0 => {
-                let mut header = [0u8; 14];
-                match tokio::time::timeout(
-                    LEGACY_MEDIA_IDLE_TIMEOUT,
-                    frame_recv.read_exact(&mut header),
-                )
-                .await
-                {
-                    Err(_) => {
-                        emit_frame_error(&app, media_generation, "Media stream idle timeout");
-                        break;
-                    }
-                    Ok(Err(_)) => {
-                        emit_frame_error(&app, media_generation, "Connection lost");
-                        break;
-                    }
-                    Ok(Ok(_)) => {}
-                }
-                let w = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-                let h = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
-                let frame_len =
-                    u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
-                if let Err(error) = validate_legacy_media_header(w, h, frame_len) {
-                    emit_frame_error(&app, media_generation, error);
-                    break;
-                }
-
-                let is_keyframe = header[12] == 1;
-                let codec = match byte_to_codec(header[13]) {
-                    Ok(codec) => codec.to_string(),
-                    Err(error) => {
-                        emit_frame_error(&app, media_generation, error);
-                        break;
-                    }
-                };
-
-                let mut frame_buf = vec![0u8; frame_len];
-                match tokio::time::timeout(
-                    LEGACY_MEDIA_IDLE_TIMEOUT,
-                    frame_recv.read_exact(&mut frame_buf),
-                )
-                .await
-                {
-                    Err(_) => {
-                        emit_frame_error(&app, media_generation, "Media payload idle timeout");
-                        break;
-                    }
-                    Ok(Err(_)) => {
-                        emit_frame_error(&app, media_generation, "Connection lost");
-                        break;
-                    }
-                    Ok(Ok(_)) => {}
-                }
-                (
-                    w,
-                    h,
-                    frame_buf,
-                    is_keyframe,
-                    codec,
-                    None,
-                    None,
-                    None,
-                    false,
-                    false,
-                )
-            }
         };
         lock_client_media_metrics(&metrics).observe_transport_receive(
             metrics_started.elapsed(),
@@ -526,100 +324,40 @@ pub(crate) async fn run_video_delivery(request: VideoDeliveryRequest) {
         lock_client_media_metrics(&metrics)
             .observe_frontend_queue_depth(frame_events_in_flight.load(Ordering::SeqCst));
 
-        let delivered_to_frontend;
-        if use_webcodecs {
-            let envelope = match encode_frame_envelope(
-                FrameEnvelopeMetadata {
-                    width: w,
-                    height: h,
-                    codec: &codec,
-                    keyframe: is_keyframe,
-                    discontinuity,
-                    codec_config,
-                    sequence,
-                    capture_timestamp_micros,
-                    pts_micros,
-                },
-                &frame_buf,
-            ) {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    emit_frame_error(&app, media_generation, error);
-                    release_frame_channel_slot(&frame_events_in_flight);
-                    break;
-                }
-            };
-            let ipc_send_started = Instant::now();
-            let send_result = frame_channel.send(Response::new(envelope));
-            lock_client_media_metrics(&metrics).observe_frontend_ipc_send_duration(
-                metrics_started.elapsed(),
-                ipc_send_started.elapsed(),
-            );
-            if send_result.is_err() {
+        let envelope = match encode_frame_envelope(
+            FrameEnvelopeMetadata {
+                width: w,
+                height: h,
+                codec: &codec,
+                keyframe: is_keyframe,
+                discontinuity,
+                codec_config,
+                sequence,
+                capture_timestamp_micros,
+                pts_micros,
+            },
+            &frame_buf,
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                emit_frame_error(&app, media_generation, error);
                 release_frame_channel_slot(&frame_events_in_flight);
                 break;
             }
-            delivered_to_frontend = true;
-        } else if let Some(ref mut dec) = decoder {
-            let mut emitted = false;
-            for nal in nal_units(&frame_buf) {
-                if let Ok(Some(yuv)) = dec.decode(nal) {
-                    let (yw, yh) = yuv.dimensions();
-                    let rgb_len = yuv.rgb8_len();
-                    let mut rgb_raw = vec![0u8; rgb_len];
-                    yuv.write_rgb8(&mut rgb_raw);
-
-                    let img = match image::RgbImage::from_raw(yw as u32, yh as u32, rgb_raw) {
-                        Some(img) => img,
-                        None => continue,
-                    };
-                    let mut jpeg_buf = Vec::with_capacity(30_000);
-                    if image::DynamicImage::ImageRgb8(img)
-                        .write_to(&mut Cursor::new(&mut jpeg_buf), image::ImageFormat::Jpeg)
-                        .is_err()
-                    {
-                        continue;
-                    }
-
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
-                    let ipc_send_started = Instant::now();
-                    let send_result = app.emit(
-                        "frame",
-                        FramePayload {
-                            generation: media_generation,
-                            width: yw as u32,
-                            height: yh as u32,
-                            data: b64,
-                            keyframe: is_keyframe,
-                            codec: codec.clone(),
-                            capture_timestamp_micros,
-                            pts_micros,
-                            discontinuity,
-                        },
-                    );
-                    lock_client_media_metrics(&metrics).observe_frontend_ipc_send_duration(
-                        metrics_started.elapsed(),
-                        ipc_send_started.elapsed(),
-                    );
-                    if send_result.is_err() {
-                        release_frame_channel_slot(&frame_events_in_flight);
-                        break 'frames;
-                    }
-                    emitted = true;
-                    break;
-                }
-            }
-            if !emitted {
-                release_frame_channel_slot(&frame_events_in_flight);
-            }
-            delivered_to_frontend = emitted;
-        } else {
+        };
+        let ipc_send_started = Instant::now();
+        let send_result = frame_channel.send(Response::new(envelope));
+        lock_client_media_metrics(&metrics).observe_frontend_ipc_send_duration(
+            metrics_started.elapsed(),
+            ipc_send_started.elapsed(),
+        );
+        if send_result.is_err() {
             release_frame_channel_slot(&frame_events_in_flight);
-            delivered_to_frontend = false;
+            break;
         }
 
-        if delivered_to_frontend {
-            frontend_waiting_for_keyframe = false;
+        frontend_waiting_for_keyframe = false;
+        {
             let mut metrics = lock_client_media_metrics(&metrics);
             let elapsed = metrics_started.elapsed();
             metrics.observe_frontend_send(elapsed);

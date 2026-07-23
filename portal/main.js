@@ -261,12 +261,6 @@ async function cancelInvitation() {
 async function checkDevelopmentConnectionMode() {
   const mode = await invoke('development_connection_mode');
   connectionState.setDevelopmentMode(mode.enabled);
-  if (mode.force_jpeg) {
-    const jpegBadge = document.getElementById('dev-jpeg-badge');
-    jpegBadge.classList.remove('hidden');
-    jpegBadge.title = mode.jpeg_warning;
-    console.warn('[development JPEG compatibility mode]', mode.jpeg_warning);
-  }
   if (!mode.enabled) return;
 
   const badge = document.getElementById('dev-connect-badge');
@@ -578,10 +572,10 @@ function togglePanel(force) {
 }
 
 // ─── WebCodecs detection ──────────────────────────────────────────────────────
-// Finish the codec probe and publish the same delivery mode to Rust before
-// exposing any connect handlers. This keeps raw WebCodecs frames and the Rust
-// JPEG compatibility path from disagreeing during startup.
-const hasWebCodecs = await detectAndPublishVideoDeliveryMode({ invokeCommand: invoke });
+// Finish the codec probe and publish the result to Rust before exposing any
+// connect handlers. Rust refuses to connect when WebCodecs is unavailable, so
+// the pipeline below can assume binary WebCodecs delivery.
+await detectAndPublishVideoDeliveryMode({ invokeCommand: invoke });
 
 // ─── Frame decoding ───────────────────────────────────────────────────────────
 const canvas = document.getElementById('frame-canvas');
@@ -628,7 +622,6 @@ controlRuntime = createControlRuntime({
   onReleaseFailure: () => setStatus('err', 'cursor release failed · quit app'),
 });
 videoPipeline = createVideoPipelineSession({
-  hasWebCodecs,
   canvas,
   context: ctx,
   requestKeyframe: (reason) => streamRuntime?.requestKeyframe(reason),
@@ -765,12 +758,6 @@ function updateStreamStats() {
 setInterval(() => {
   if (connectionState.connected) updateStreamStats();
 }, 250);
-
-// The software decoder/JPEG compatibility path intentionally remains an event:
-// it is only selected when WebCodecs is unavailable and is not latency-critical.
-listen('frame', (event) => {
-  streamRuntime.handleLegacyFrame(event.payload);
-});
 
 listen('frame-stats', (event) => {
   if (streamRuntime.handleFrameStats(event.payload)) updateStreamStats();

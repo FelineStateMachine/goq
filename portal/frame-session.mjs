@@ -8,7 +8,6 @@ export function newFrameSession() {
   return {
     expectedGeneration: null,
     pendingAcknowledgments: [],
-    pendingLegacyFrames: [],
     pendingFrameErrors: [],
     failed: false,
     failureDetail: null,
@@ -47,44 +46,9 @@ export function activateFrameSession(session, generation) {
     (pendingGeneration) => pendingGeneration ?? generation,
   );
   session.pendingAcknowledgments.length = 0;
-  const legacyFrames = session.pendingLegacyFrames.splice(0);
-  acknowledgments.push(...legacyFrames.map((frame) => frame.generation));
-  return { acknowledgments, legacyFrames };
+  return { acknowledgments };
 }
 
 export function isActiveFrameSession(session, activeSession) {
   return session !== null && session === activeSession && !session.closing;
-}
-
-export function stageLegacyFrame(session, payload) {
-  if (!session || session.closing || !validGeneration(payload?.generation)) {
-    throw new TypeError('invalid legacy frame delivery');
-  }
-  const generation = payload.generation;
-  if (session.expectedGeneration !== null) {
-    return {
-      acknowledgments: [generation],
-      staged: false,
-      accepted: generation === session.expectedGeneration,
-    };
-  }
-
-  const highestPendingGeneration = session.pendingLegacyFrames.reduce(
-    (highest, frame) => Math.max(highest, frame.generation),
-    0,
-  );
-  if (generation < highestPendingGeneration) {
-    return { acknowledgments: [generation], staged: false, accepted: false };
-  }
-
-  const acknowledgments = [];
-  if (generation > highestPendingGeneration && highestPendingGeneration > 0) {
-    acknowledgments.push(...session.pendingLegacyFrames.map((frame) => frame.generation));
-    session.pendingLegacyFrames.length = 0;
-  }
-  if (session.pendingLegacyFrames.length >= FRAME_CHANNEL_CAPACITY) {
-    throw new Error('pre-connect legacy frame capacity exceeded');
-  }
-  session.pendingLegacyFrames.push(payload);
-  return { acknowledgments, staged: true, accepted: false };
 }

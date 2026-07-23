@@ -14,7 +14,6 @@ use crate::media::network_diagnostics::{NetworkSessionDiagnostics, lock_network_
 use crate::media::transport::{NegotiatedV1Stream, negotiate_v1};
 use crate::platform_capabilities::relative_pointer_capture_enabled;
 
-const INPUT_ALPN: &[u8] = sigil_protocol::LEGACY_INPUT_ALPN_V0;
 pub(crate) const CLIENT_INPUT_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,23 +270,14 @@ fn input_event_allowed(capabilities: &[Capability], event: &InputEvent) -> bool 
 async fn write_client_input_event(
     stream: &mut iroh::endpoint::SendStream,
     event: &InputEvent,
-    use_v1: bool,
     diagnostics: Option<&Arc<StdMutex<NetworkSessionDiagnostics>>>,
 ) -> Result<(), String> {
     if let Some(diagnostics) = diagnostics {
         lock_network_diagnostics(diagnostics).begin_input_send(Instant::now());
     }
-    if use_v1 {
-        write_input_event(stream, event)
-            .await
-            .map_err(|error| error.to_string())
-    } else {
-        let json = serde_json::to_string(event).map_err(|error| error.to_string())?;
-        stream
-            .write_all(format!("{json}\n").as_bytes())
-            .await
-            .map_err(|error| error.to_string())
-    }
+    write_input_event(stream, event)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn observe_input_ack_if_negotiated(
@@ -314,58 +304,30 @@ pub(crate) async fn open_input_session(
     endpoint: &Endpoint,
     address: &iroh::EndpointAddr,
     nonce: [u8; 16],
-    media_session_id: Option<u64>,
+    media_session_id: u64,
     grants: InvitationGrants,
-    use_v1: bool,
 ) -> Result<InputSession, String> {
-    let input_alpn = if use_v1 { INPUT_ALPN_V1 } else { INPUT_ALPN };
-    let (connection, send, recv, capabilities) = if use_v1 {
-        let mut errors = Vec::new();
-        let mut accepted = None;
-        // Older hosts reject unknown capability enum values. Try all four
-        // pointer feature levels with ACK first, then repeat the exact legacy
-        // offers without ACK so lack of diagnostics never forces absolute
-        // pointer input prematurely.
-        for capabilities in input_capability_offers(grants) {
-            match open_negotiated_input_stream(endpoint, address, nonce, capabilities).await {
-                Ok(result) => {
-                    accepted = Some(result);
-                    break;
-                }
-                Err(error) => errors.push(error),
+    let mut errors = Vec::new();
+    let mut accepted = None;
+    // Older hosts reject unknown capability enum values. Try all four
+    // pointer feature levels with ACK first, then repeat the exact legacy
+    // offers without ACK so lack of diagnostics never forces absolute
+    // pointer input prematurely.
+    for capabilities in input_capability_offers(grants) {
+        match open_negotiated_input_stream(endpoint, address, nonce, capabilities).await {
+            Ok(result) => {
+                accepted = Some(result);
+                break;
             }
+            Err(error) => errors.push(error),
         }
-        let (connection, send, recv, input_negotiation) = accepted
-            .ok_or_else(|| format!("All input capability offers failed: {}", errors.join("; ")))?;
-        if Some(input_negotiation.session_id) != media_session_id {
-            return Err("Host returned mismatched media and input sessions".to_string());
-        }
-        (connection, send, recv, input_negotiation.capabilities)
-    } else {
-        let input_conn = endpoint
-            .connect(address.clone(), input_alpn)
-            .await
-            .map_err(|e| format!("Failed to connect input stream: {}", e))?;
-        let (mut send, recv) = input_conn
-            .open_bi()
-            .await
-            .map_err(|e| format!("Failed to open input stream: {}", e))?;
-        send.write_all(&[1u8])
-            .await
-            .map_err(|e| format!("Failed to send input start: {}", e))?;
-        // The inherited protocol predates negotiation and supports the current
-        // absolute-pointer, keyboard, and text event set.
-        (
-            input_conn,
-            send,
-            recv,
-            vec![
-                Capability::AbsolutePointer,
-                Capability::Keyboard,
-                Capability::Text,
-            ],
-        )
-    };
+    }
+    let (connection, send, recv, input_negotiation) = accepted
+        .ok_or_else(|| format!("All input capability offers failed: {}", errors.join("; ")))?;
+    if input_negotiation.session_id != media_session_id {
+        return Err("Host returned mismatched media and input sessions".to_string());
+    }
+    let capabilities = input_negotiation.capabilities;
     // A malformed or future host must not be able to re-enable a local input
     // path that this Portal build deliberately withheld from its offers.
     let capabilities = mask_unavailable_relative_pointer_capabilities(
@@ -438,7 +400,6 @@ pub(crate) async fn run_input_feedback(
 pub(crate) async fn run_input_forwarder(
     mut input_stream: iroh::endpoint::SendStream,
     rx: tokio::sync::mpsc::Receiver<InputEvent>,
-    use_v1: bool,
     input_capabilities: Vec<Capability>,
     input_send_diagnostics: Arc<StdMutex<NetworkSessionDiagnostics>>,
 ) {
@@ -460,7 +421,6 @@ pub(crate) async fn run_input_forwarder(
                 if let Err(error) = write_client_input_event(
                     &mut input_stream,
                     &event,
-                    use_v1,
                     Some(&input_send_diagnostics),
                 )
                 .await
@@ -480,7 +440,6 @@ pub(crate) async fn run_input_forwarder(
                     if let Err(error) = write_client_input_event(
                         &mut input_stream,
                         &event,
-                        use_v1,
                         Some(&input_send_diagnostics),
                     ).await {
                         eprintln!("[client] input stream write failed: {error}; disconnecting");
@@ -512,7 +471,6 @@ pub(crate) async fn run_input_forwarder(
             if let Err(error) = write_client_input_event(
                 &mut input_stream,
                 &relative_barrier,
-                use_v1,
                 Some(&input_send_diagnostics),
             )
             .await
@@ -536,26 +494,16 @@ pub(crate) async fn run_input_forwarder(
             }
             last_absolute_mouse_time = now;
         }
-        if let Err(error) = write_client_input_event(
-            &mut input_stream,
-            &event,
-            use_v1,
-            Some(&input_send_diagnostics),
-        )
-        .await
+        if let Err(error) =
+            write_client_input_event(&mut input_stream, &event, Some(&input_send_diagnostics)).await
         {
             eprintln!("[client] input stream write failed: {error}; disconnecting");
             break;
         }
     }
     while let Some(event) = pending_relative.take() {
-        if let Err(error) = write_client_input_event(
-            &mut input_stream,
-            &event,
-            use_v1,
-            Some(&input_send_diagnostics),
-        )
-        .await
+        if let Err(error) =
+            write_client_input_event(&mut input_stream, &event, Some(&input_send_diagnostics)).await
         {
             eprintln!("[client] final relative input write failed: {error}");
             break;

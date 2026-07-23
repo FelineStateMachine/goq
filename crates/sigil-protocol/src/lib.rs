@@ -41,8 +41,7 @@ pub use invitation::{
 };
 pub use media::{
     FrameFlags, MEDIA_HEADER_LEN, MediaCodec, MediaFrame, MediaFrameHeader,
-    decode_media_frame_object, encode_media_frame_object, read_media_frame, read_media_object,
-    write_media_frame,
+    decode_media_frame_object, encode_media_frame_object,
 };
 pub use media_v3::{
     KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,
@@ -60,10 +59,6 @@ pub use moq_catalog::{
 /// Protocol version encoded in v1 messages.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// ALPN for the v1 encoded video stream.
-pub const MEDIA_ALPN_V1: &[u8] = b"sigil/media/1";
-/// ALPN for one encoded video object per host-opened unidirectional stream.
-pub const MEDIA_ALPN_V2: &[u8] = b"sigil/media/2";
 /// ALPN for custom MoQ-style grouped media objects and keyframe control.
 ///
 /// This is a Sigil protocol and is not IETF MoQ Transport compatible.
@@ -78,14 +73,6 @@ pub const CONTROL_ALPN_V1: &[u8] = b"sigil/control/1";
 pub const MOQ_VIDEO_H264_TRACK: &str = "video/h264";
 /// ALPN for the v1 low-latency Opus datagram connection.
 pub const AUDIO_ALPN_V1: &[u8] = b"sigil/audio/1";
-
-/// The inherited frame-stream ALPN, provided only for an explicit migration
-/// adapter. New peers should prefer [`MEDIA_ALPN_V2`] and may retain
-/// [`MEDIA_ALPN_V1`] only as a compatibility fallback.
-pub const LEGACY_FRAME_ALPN_V0: &[u8] = b"sigil/frame-stream/0";
-/// The inherited input-stream ALPN, provided only for an explicit migration
-/// adapter. New peers must advertise [`INPUT_ALPN_V1`].
-pub const LEGACY_INPUT_ALPN_V0: &[u8] = b"sigil/input-stream/0";
 
 /// Maximum encoded video access-unit size accepted from the network (16 MiB).
 pub const MAX_MEDIA_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
@@ -124,15 +111,11 @@ mod tests {
 
     #[test]
     fn alpn_values_are_deployment_golden_vectors() {
-        assert_eq!(MEDIA_ALPN_V1, b"sigil/media/1");
-        assert_eq!(MEDIA_ALPN_V2, b"sigil/media/2");
         assert_eq!(MEDIA_ALPN_V3, b"sigil/media/3");
         assert_eq!(MEDIA_FEEDBACK_ALPN_V1, b"sigil/media-feedback/1");
         assert_eq!(INPUT_ALPN_V1, b"sigil/input/1");
         assert_eq!(CONTROL_ALPN_V1, b"sigil/control/1");
         assert_eq!(AUDIO_ALPN_V1, b"sigil/audio/1");
-        assert_eq!(LEGACY_FRAME_ALPN_V0, b"sigil/frame-stream/0");
-        assert_eq!(LEGACY_INPUT_ALPN_V0, b"sigil/input-stream/0");
     }
 
     #[test]

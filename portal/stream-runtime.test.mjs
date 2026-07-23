@@ -128,30 +128,26 @@ test('closing a partially constructed attempt falls back to the active frame ses
   assert.equal(runtime.generation, null);
 });
 
-test('activation flushes binary and legacy acknowledgments before staged legacy decode', () => {
+test('activation flushes pre-connect binary acknowledgments', () => {
   const { runtime, events } = subject();
   runtime.prepareConnection();
   const session = runtime.openFrameSession();
   assert.equal(runtime.handleBinaryFrame(frameEnvelope(), session), true);
-  assert.equal(runtime.handleLegacyFrame({ generation: 7, sequence: 12, data: 'jpeg' }), false);
 
   events.length = 0;
   activate(runtime, session, 7);
   assert.deepEqual(events.map((event) => event.type), [
     'invoke',
-    'invoke',
-    'process',
     'publisher-start',
   ]);
-  assert.deepEqual(events.slice(0, 2).map((event) => event.args.generation), [7, 7]);
-  assert.equal(events[2].payload.sequence, 12);
+  assert.equal(events[0].args.generation, 7);
 });
 
-test('a current pending frame error aborts activation after acknowledgments and before legacy decode', () => {
+test('a current pending frame error aborts activation after acknowledgments', () => {
   const { runtime, events } = subject();
   runtime.prepareConnection();
   const session = runtime.openFrameSession();
-  runtime.handleLegacyFrame({ generation: 9, sequence: 1, data: 'jpeg' });
+  runtime.handleBinaryFrame(frameEnvelope(), session);
   runtime.handleFrameError({ generation: 9, error: 'native failed' });
   events.length = 0;
 
@@ -179,19 +175,6 @@ test('active binary delivery acknowledges before decode and malformed delivery s
   assert.match(session.failureDetail, /shorter than its header/);
   assert.deepEqual(events.map((event) => event.type), ['error', 'disconnect', 'invoke']);
   assert.equal(events[2].args.generation, 5);
-});
-
-test('legacy deliveries acknowledge every active generation but decode only the current one', () => {
-  const { runtime, events } = subject();
-  runtime.prepareConnection();
-  const session = runtime.openFrameSession();
-  activate(runtime, session, 8);
-  events.length = 0;
-
-  assert.equal(runtime.handleLegacyFrame({ generation: 7, sequence: 1 }), false);
-  assert.equal(runtime.handleLegacyFrame({ generation: 8, sequence: 2 }), true);
-  assert.deepEqual(events.map((event) => event.type), ['invoke', 'invoke', 'process']);
-  assert.deepEqual(events.slice(0, 2).map((event) => event.args.generation), [7, 8]);
 });
 
 test('pre-connect frame errors are bounded and stale active errors are ignored', () => {
@@ -336,7 +319,7 @@ test('adaptive feedback preserves bounded queue fallbacks and pressure signals',
   });
 });
 
-test('adaptive feedback projects the bounded JPEG decode-plus-latest queue and overwrite counter', () => {
+test('adaptive feedback projects the bounded presenter queue and overwrite counter', () => {
   const { runtime, events } = subject();
   runtime.prepareConnection();
   const session = runtime.openFrameSession();

@@ -1,5 +1,3 @@
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
 use crate::{
     MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS, PROTOCOL_VERSION, ProtocolError,
     Result,
@@ -274,74 +272,8 @@ impl MediaFrame {
     }
 }
 
-/// Read one complete frame. A clean EOF before the next header returns `None`.
-pub async fn read_media_frame<R>(reader: &mut R) -> Result<Option<MediaFrame>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut wire = [0; MEDIA_HEADER_LEN];
-    let read = reader.read(&mut wire[..1]).await?;
-    if read == 0 {
-        return Ok(None);
-    }
-    reader.read_exact(&mut wire[1..]).await?;
-    let header = MediaFrameHeader::decode(&wire)?;
-
-    // Header validation happens before allocation.
-    let mut payload = vec![0; header.payload_len as usize];
-    reader.read_exact(&mut payload).await?;
-    Ok(Some(MediaFrame { header, payload }))
-}
-
-/// Read exactly one complete frame followed by a clean stream EOF.
-///
-/// This is the object boundary used by the v2 media ALPN. An empty stream or
-/// any bytes after the declared frame are rejected so one QUIC stream can
-/// never be interpreted as zero or multiple media objects.
-pub async fn read_media_object<R>(reader: &mut R) -> Result<MediaFrame>
-where
-    R: AsyncRead + Unpin,
-{
-    let frame = read_media_frame(reader)
-        .await?
-        .ok_or(ProtocolError::InvalidMessage {
-            message_type: "media object",
-            reason: "stream ended before the media frame",
-        })?;
-    let mut trailing = [0_u8; 1];
-    if reader.read(&mut trailing).await? != 0 {
-        return Err(ProtocolError::InvalidMessage {
-            message_type: "media object",
-            reason: "trailing bytes after the media frame",
-        });
-    }
-    Ok(frame)
-}
-
-/// Validate and write one complete frame.
-pub async fn write_media_frame<W>(writer: &mut W, frame: &MediaFrame) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    frame.header.validate()?;
-    if frame.payload.len() != frame.header.payload_len as usize {
-        return Err(ProtocolError::InvalidMessage {
-            message_type: "media frame",
-            reason: "payload does not match declared length",
-        });
-    }
-    writer.write_all(&frame.header.encode()?).await?;
-    writer.write_all(&frame.payload).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
-
-    use tokio::io::{AsyncWriteExt, duplex};
-
     use super::*;
 
     fn header() -> MediaFrameHeader {
@@ -415,30 +347,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn async_frame_round_trip_and_clean_eof() {
-        let expected = MediaFrame::new(header(), vec![0, 0, 0, 1]).unwrap();
-        let (mut sender, mut receiver) = duplex(256);
-        write_media_frame(&mut sender, &expected).await.unwrap();
-        sender.shutdown().await.unwrap();
-
-        assert_eq!(
-            read_media_frame(&mut receiver).await.unwrap(),
-            Some(expected)
-        );
-        assert_eq!(read_media_frame(&mut receiver).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn media_object_requires_exactly_one_frame_and_clean_eof() {
-        let expected = MediaFrame::new(header(), vec![0, 0, 0, 1]).unwrap();
-        let (mut sender, mut receiver) = duplex(256);
-        write_media_frame(&mut sender, &expected).await.unwrap();
-        sender.shutdown().await.unwrap();
-
-        assert_eq!(read_media_object(&mut receiver).await.unwrap(), expected);
-    }
-
     #[test]
     fn object_transport_envelope_round_trips_exactly() {
         let frame = MediaFrame::new(header(), vec![0, 0, 0, 1]).unwrap();
@@ -450,57 +358,5 @@ mod tests {
         trailing.push(0);
         assert!(decode_media_frame_object(&trailing).is_err());
         assert!(decode_media_frame_object(&object[..MEDIA_HEADER_LEN - 1]).is_err());
-    }
-
-    #[tokio::test]
-    async fn media_object_rejects_empty_and_trailing_streams() {
-        let (mut empty_sender, mut empty_receiver) = duplex(16);
-        empty_sender.shutdown().await.unwrap();
-        assert!(matches!(
-            read_media_object(&mut empty_receiver).await,
-            Err(ProtocolError::InvalidMessage {
-                message_type: "media object",
-                ..
-            })
-        ));
-
-        let frame = MediaFrame::new(header(), vec![0, 0, 0, 1]).unwrap();
-        let (mut sender, mut receiver) = duplex(256);
-        write_media_frame(&mut sender, &frame).await.unwrap();
-        sender.write_all(&[0xff]).await.unwrap();
-        sender.shutdown().await.unwrap();
-        assert!(matches!(
-            read_media_object(&mut receiver).await,
-            Err(ProtocolError::InvalidMessage {
-                message_type: "media object",
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn truncated_payload_is_an_io_error() {
-        let (mut sender, mut receiver) = duplex(256);
-        sender.write_all(&header().encode().unwrap()).await.unwrap();
-        sender.write_all(&[1, 2]).await.unwrap();
-        sender.shutdown().await.unwrap();
-
-        let error = read_media_frame(&mut receiver).await.unwrap_err();
-        assert!(
-            matches!(error, ProtocolError::Io(ref io) if io.kind() == ErrorKind::UnexpectedEof)
-        );
-    }
-
-    #[tokio::test]
-    async fn oversized_payload_is_rejected_before_body_read() {
-        let mut wire = header().encode().unwrap();
-        wire[16..20].copy_from_slice(&((MAX_MEDIA_PAYLOAD_LEN as u32) + 1).to_be_bytes());
-        let (mut sender, mut receiver) = duplex(128);
-        sender.write_all(&wire).await.unwrap();
-
-        assert!(matches!(
-            read_media_frame(&mut receiver).await,
-            Err(ProtocolError::InvalidMediaPayloadLength { .. })
-        ));
     }
 }

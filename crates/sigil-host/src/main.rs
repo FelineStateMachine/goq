@@ -30,7 +30,7 @@ use iroh::{Endpoint, EndpointId};
 use moq_net::Origin;
 use sigil_protocol::{
     AUDIO_ALPN_V1, CONTROL_ALPN_V1, INPUT_ALPN_V1, InvitationGrants, MAX_INVITATION_TTL_SECS,
-    MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, SignedInvitation,
+    MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, SignedInvitation,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -43,7 +43,7 @@ use crate::cursor::PointerPositionTracker;
 use crate::input::InputBackend;
 use crate::server::{
     AudioHandler, AuthorizedMoqHandler, ControlHandler, InputHandler, MediaFeedbackHandler,
-    MediaHandler, MediaV2Handler, MediaV3Handler, SessionRegistry,
+    MediaV3Handler, SessionRegistry,
 };
 
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1013,22 +1013,6 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         .accept(
             MEDIA_ALPN_V3,
             MediaV3Handler {
-                config: config.clone(),
-                sessions: Arc::clone(&sessions),
-                authorization: authorization.clone(),
-            },
-        )
-        .accept(
-            MEDIA_ALPN_V2,
-            MediaV2Handler {
-                config: config.clone(),
-                sessions: Arc::clone(&sessions),
-                authorization: authorization.clone(),
-            },
-        )
-        .accept(
-            MEDIA_ALPN_V1,
-            MediaHandler {
                 config: config.clone(),
                 sessions: Arc::clone(&sessions),
                 authorization: authorization.clone(),

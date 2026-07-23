@@ -51,20 +51,6 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub struct MediaHandler {
-    pub config: HostConfig,
-    pub sessions: Arc<SessionRegistry>,
-    pub authorization: AuthorizationPolicy,
-}
-
-#[derive(Clone, Debug)]
-pub struct MediaV2Handler {
-    pub config: HostConfig,
-    pub sessions: Arc<SessionRegistry>,
-    pub authorization: AuthorizationPolicy,
-}
-
-#[derive(Clone, Debug)]
 pub struct MediaV3Handler {
     pub config: HostConfig,
     pub sessions: Arc<SessionRegistry>,
@@ -95,40 +81,6 @@ pub struct MediaFeedbackHandler {
 pub struct AuthorizedMoqHandler {
     pub sessions: Arc<SessionRegistry>,
     pub origin: Origin,
-}
-
-impl ProtocolHandler for MediaHandler {
-    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
-        let remote = connection.remote_id();
-        if let Err(error) = serve_media(
-            connection,
-            self.config.clone(),
-            &self.sessions,
-            &self.authorization,
-        )
-        .await
-        {
-            warn!(%remote, %error, "media connection ended");
-        }
-        Ok(())
-    }
-}
-
-impl ProtocolHandler for MediaV2Handler {
-    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
-        let remote = connection.remote_id();
-        if let Err(error) = serve_media_v2(
-            connection,
-            self.config.clone(),
-            &self.sessions,
-            &self.authorization,
-        )
-        .await
-        {
-            warn!(%remote, %error, "media v2 connection ended");
-        }
-        Ok(())
-    }
 }
 
 impl ProtocolHandler for MediaV3Handler {

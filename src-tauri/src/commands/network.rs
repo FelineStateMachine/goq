@@ -4,12 +4,9 @@ use crate::media::adaptive_feedback::send_media_feedback;
 use crate::media::audio_delivery;
 pub use crate::media::connect::ConnectResult;
 use crate::media::connect::{connect_client, disconnect_client};
-#[allow(unused_imports)]
-pub use crate::media::frame_channel::FramePayload;
 use crate::media::frame_channel::acknowledge_frame_delivery;
+use crate::media::input_delivery::PointerFeedbackPayload;
 use crate::media::input_delivery::send_input;
-#[allow(unused_imports)]
-pub use crate::media::input_delivery::{PointerFeedbackPayload, PointerFeedbackTerminalReason};
 use crate::media::media_control::request_keyframe;
 use sigil_protocol::InputEvent;
 use tauri::{

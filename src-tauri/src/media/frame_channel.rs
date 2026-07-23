@@ -6,28 +6,6 @@ use tauri::{AppHandle, Emitter};
 
 use crate::commands::state::AppState;
 
-pub(crate) fn byte_to_codec(value: u8) -> Result<&'static str, String> {
-    match value {
-        1 => Ok("h264"),
-        unsupported => Err(format!(
-            "Unsupported legacy media codec: {unsupported}; Portal supports H.264 only"
-        )),
-    }
-}
-
-#[derive(Serialize, Clone)]
-pub struct FramePayload {
-    pub generation: u64,
-    pub width: u32,
-    pub height: u32,
-    pub data: String,
-    pub keyframe: bool,
-    pub codec: String,
-    pub capture_timestamp_micros: Option<u64>,
-    pub pts_micros: Option<i64>,
-    pub discontinuity: bool,
-}
-
 #[derive(Serialize, Clone)]
 struct FrameErrorPayload {
     generation: u64,
@@ -420,15 +398,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_codec_bytes_fail_closed_to_h264_only() {
-        assert_eq!(byte_to_codec(1).unwrap(), "h264");
-        for unsupported in [0, 2, 3, u8::MAX] {
-            let error = byte_to_codec(unsupported).unwrap_err();
-            assert!(error.contains("H.264 only"));
-        }
-    }
-
-    #[test]
     fn frame_channel_slots_are_bounded_and_cannot_underflow() {
         let in_flight = AtomicUsize::new(0);
         release_frame_channel_slot(&in_flight);
@@ -472,25 +441,12 @@ mod tests {
 
     #[test]
     fn global_frame_events_serialize_their_media_generation() {
-        let frame = serde_json::to_value(FramePayload {
-            generation: 17,
-            width: 1280,
-            height: 800,
-            data: "jpeg".to_string(),
-            keyframe: true,
-            codec: "h264".to_string(),
-            capture_timestamp_micros: Some(1),
-            pts_micros: Some(2),
-            discontinuity: false,
-        })
-        .unwrap();
         let error = serde_json::to_value(FrameErrorPayload {
             generation: 17,
             error: "closed".to_string(),
         })
         .unwrap();
 
-        assert_eq!(frame["generation"], 17);
         assert_eq!(error["generation"], 17);
         assert_eq!(error["error"], "closed");
     }

@@ -9,7 +9,6 @@ import {
   isActiveFrameSession,
   newFrameSession,
   stageFrameAcknowledgment,
-  stageLegacyFrame,
 } from './frame-session.mjs';
 import {
   AdaptiveFeedbackPublisher,
@@ -131,11 +130,6 @@ export function createStreamRuntime({
       (payload) => isCurrentFrameGeneration(payload?.generation, generation),
     );
     if (pendingError) throw new Error(pendingError.error || 'Media connection failed');
-    for (const payload of activation.legacyFrames) {
-      if (isCurrentFrameGeneration(payload?.generation, generation)) {
-        videoPipeline.processFramePayload(payload);
-      }
-    }
     adaptiveFeedbackAvailable = feedbackAvailable === true;
     adaptiveFeedbackError = typeof feedbackError === 'string' ? feedbackError : null;
     feedbackPublisher.start(generation, adaptiveFeedbackAvailable);
@@ -190,7 +184,6 @@ export function createStreamRuntime({
       videoPipeline.processFramePayload({
         width: frame.width,
         height: frame.height,
-        data: null,
         codec: frame.codec,
         keyframe: frame.keyframe,
         codecConfig: frame.codecConfig,
@@ -212,22 +205,6 @@ export function createStreamRuntime({
           failFrameSession(session, error);
         }
       }
-    }
-  }
-
-  function handleLegacyFrame(payload) {
-    const session = activeFrameSession;
-    if (!isActiveFrameSession(session, activeFrameSession)) return false;
-    try {
-      const delivery = stageLegacyFrame(session, payload);
-      for (const generation of delivery.acknowledgments) {
-        sendFrameAcknowledgment(generation);
-      }
-      if (delivery.accepted) videoPipeline.processFramePayload(payload);
-      return delivery.accepted;
-    } catch (error) {
-      failFrameSession(session, error);
-      return false;
     }
   }
 
@@ -348,7 +325,6 @@ export function createStreamRuntime({
     teardown,
     requestKeyframe,
     handleBinaryFrame,
-    handleLegacyFrame,
     handleFrameStats,
     handleAdaptiveDecision,
     handleAdaptiveFeedbackState,

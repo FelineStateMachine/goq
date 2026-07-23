@@ -145,7 +145,7 @@ fn encode_audio_channel_packet(
 pub(crate) struct AudioStartRequest {
     pub(crate) address: iroh::EndpointAddr,
     pub(crate) handshake_nonce: [u8; 16],
-    pub(crate) media_session_id: Option<u64>,
+    pub(crate) media_session_id: u64,
     pub(crate) audio_supported: bool,
     pub(crate) audio_channel: Channel<Response>,
     pub(crate) audio_deliveries: Arc<StdMutex<AudioDeliveryState>>,
@@ -161,9 +161,7 @@ pub(crate) async fn try_start_audio(
     if !request.audio_supported {
         return Err("WebCodecs Opus AudioDecoder is unavailable".to_string());
     }
-    let media_session_id = request
-        .media_session_id
-        .ok_or_else(|| "The connected host protocol does not negotiate audio".to_string())?;
+    let media_session_id = request.media_session_id;
     let audio_connection = tokio::time::timeout(
         Duration::from_secs(3),
         endpoint.connect(request.address, AUDIO_ALPN_V1),

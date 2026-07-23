@@ -23,10 +23,8 @@ import {
 export const MAX_DECODE_QUEUE_SIZE = 2;
 const MAX_DECODE_TIMINGS = 8;
 const PRESENTER_QUEUE_CAPACITY = 2;
-const JPEG_PRESENTER_QUEUE_CAPACITY = 2;
 
 export function createVideoPipelineSession({
-  hasWebCodecs,
   canvas,
   context,
   requestKeyframe = () => {},
@@ -36,12 +34,6 @@ export function createVideoPipelineSession({
   now = () => performance.now(),
   createDecoder = (callbacks) => new VideoDecoder(callbacks),
   createEncodedChunk = (init) => new EncodedVideoChunk(init),
-  decodeBase64 = (data) => Uint8Array.from(atob(data), c => c.charCodeAt(0)),
-  createBlob = (parts, options) => new Blob(parts, options),
-  createObjectUrl = (blob) => URL.createObjectURL(blob),
-  revokeObjectUrl = (url) => URL.revokeObjectURL(url),
-  createImage = () => new Image(),
-  abortImage = (image) => image.removeAttribute('src'),
   requestFrame = (callback) => requestAnimationFrame(callback),
   cancelFrame = (handle) => cancelAnimationFrame(handle),
   setTimer = (callback, delayMs) => setTimeout(callback, delayMs),
@@ -60,9 +52,6 @@ export function createVideoPipelineSession({
   let presentedFrames = 0;
   let presentationDroppedFrames = 0;
   let lastVideoDrawCompletedAtMs = null;
-  let jpegFrameSequence = 0;
-  let activeJpegDecode = null;
-  let queuedJpegFrame = null;
 
   const frontendDeliveryRate = new RollingRateWindow();
   const decoderInputRate = new RollingRateWindow();
@@ -118,107 +107,8 @@ export function createVideoPipelineSession({
     resetAudioSync(...args);
   }
 
-  function releaseActiveJpegDecode(frame, { abort = false } = {}) {
-    if (!frame || frame.released) return;
-    frame.released = true;
-    frame.image.onload = null;
-    frame.image.onerror = null;
-    if (abort) {
-      try {
-        abortImage(frame.image);
-      } catch (error) {
-        console.warn('could not abort stale JPEG decode:', error);
-      }
-    }
-    revokeObjectUrl(frame.url);
-  }
-
-  function startQueuedJpegDecode() {
-    if (activeJpegDecode || !queuedJpegFrame) return;
-    const pending = queuedJpegFrame;
-    queuedJpegFrame = null;
-
-    let url = null;
-    let image;
-    try {
-      url = createObjectUrl(pending.blob);
-      image = createImage();
-    } catch (error) {
-      if (url !== null) revokeObjectUrl(url);
-      droppedFrames++;
-      console.warn('could not start JPEG decode:', error);
-      startQueuedJpegDecode();
-      return;
-    }
-
-    const frame = {
-      ...pending,
-      image,
-      url,
-      released: false,
-      superseded: false,
-    };
-    activeJpegDecode = frame;
-    image.onload = () => {
-      if (activeJpegDecode !== frame) return;
-      activeJpegDecode = null;
-      try {
-        if (!frame.superseded && queuedJpegFrame === null) {
-          const drawStartedAt = now();
-          context.drawImage(image, 0, 0, canvas.width, canvas.height);
-          const presentedAt = now();
-          presentedFrames++;
-          presentationRate.record(presentedAt);
-          presentationCadence.record(presentedAt);
-          drawLatency.record(presentedAt - drawStartedAt, presentedAt);
-          clientPresentationLatency.record(
-            presentedAt - frame.receivedAt,
-            presentedAt,
-          );
-        }
-      } finally {
-        releaseActiveJpegDecode(frame);
-        startQueuedJpegDecode();
-      }
-    };
-    image.onerror = () => {
-      if (activeJpegDecode !== frame) return;
-      activeJpegDecode = null;
-      if (!frame.superseded && queuedJpegFrame === null) droppedFrames++;
-      releaseActiveJpegDecode(frame);
-      startQueuedJpegDecode();
-    };
-    try {
-      image.src = url;
-    } catch (error) {
-      if (activeJpegDecode === frame) activeJpegDecode = null;
-      droppedFrames++;
-      releaseActiveJpegDecode(frame, { abort: true });
-      console.warn('could not assign JPEG decode source:', error);
-      startQueuedJpegDecode();
-    }
-  }
-
-  function enqueueJpegFrame(frame) {
-    if (!activeJpegDecode) {
-      queuedJpegFrame = frame;
-      startQueuedJpegDecode();
-      return;
-    }
-    if (!activeJpegDecode.superseded) {
-      activeJpegDecode.superseded = true;
-      presentationDroppedFrames++;
-    }
-    if (queuedJpegFrame) presentationDroppedFrames++;
-    queuedJpegFrame = frame;
-  }
-
   function teardown() {
     resetAvSync();
-    queuedJpegFrame = null;
-    const active = activeJpegDecode;
-    activeJpegDecode = null;
-    releaseActiveJpegDecode(active, { abort: true });
     framePresenter.clear();
     decodeTimings.clear();
     if (videoDecoder) {
@@ -367,14 +257,13 @@ export function createVideoPipelineSession({
     return true;
   }
 
-  function processFramePayload(payload, binaryData = null) {
+  function processFramePayload(payload, binaryData) {
     const receivedAt = now();
     frontendDeliveryRate.record(receivedAt);
     frontendDeliveryCadence.record(receivedAt);
     const {
       width,
       height,
-      data,
       codec = 'h264',
       keyframe,
       codecConfig = keyframe,
@@ -387,117 +276,89 @@ export function createVideoPipelineSession({
     }
     receivedFrames++;
 
-    if (hasWebCodecs) {
-      // Binary channels provide an exact view over the IPC ArrayBuffer. The
-      // base64 branch only supports an older in-process sender during migration.
-      const raw = binaryData ?? decodeBase64(data);
-      const decoderBacklogged = videoDecoder?.decodeQueueSize >= MAX_DECODE_QUEUE_SIZE;
-      if (decoderBacklogged) {
-        enterDecoderRecovery(DECODER_RECOVERY_REASONS.FRONTEND_BACKPRESSURE);
-      }
-      const decoderBoundary = discontinuity || !decoderConfigured;
-      let formatPlan;
-      try {
-        formatPlan = videoFormatTransition.plan({
-          sequence,
-          codec,
-          width,
-          height,
-          keyframe,
-          codecConfig,
-          discontinuity: decoderBoundary,
+    // Binary channels provide an exact view over the IPC ArrayBuffer.
+    const raw = binaryData;
+    const decoderBacklogged = videoDecoder?.decodeQueueSize >= MAX_DECODE_QUEUE_SIZE;
+    if (decoderBacklogged) {
+      enterDecoderRecovery(DECODER_RECOVERY_REASONS.FRONTEND_BACKPRESSURE);
+    }
+    const decoderBoundary = discontinuity || !decoderConfigured;
+    let formatPlan;
+    try {
+      formatPlan = videoFormatTransition.plan({
+        sequence,
+        codec,
+        width,
+        height,
+        keyframe,
+        codecConfig,
+        discontinuity: decoderBoundary,
+      });
+    } catch (error) {
+      console.warn('invalid video format transition:', error);
+      droppedFrames++;
+      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
+      return;
+    }
+    if (formatPlan.action === 'drop-stale') {
+      droppedFrames++;
+      return;
+    }
+    if (formatPlan.action === 'recover') {
+      droppedFrames++;
+      enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
+      return;
+    }
+    if (formatPlan.reconfigure) {
+      // A delivered discontinuity keyframe is the recovery boundary we were
+      // waiting for, not evidence that another keyframe is missing.
+      if (discontinuity) {
+        enterDecoderRecovery(DECODER_RECOVERY_REASONS.DISCONTINUITY, {
+          requestKeyframe: !keyframe,
         });
-      } catch (error) {
-        console.warn('invalid video format transition:', error);
-        droppedFrames++;
+      } else {
+        enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET, {
+          requestKeyframe: false,
+        });
+      }
+    }
+    if (decoderRecovery.shouldDropFrame({ keyframe })) {
+      if (!decoderRecovery.requestIssued) {
         enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
-        return;
       }
-      if (formatPlan.action === 'drop-stale') {
-        droppedFrames++;
-        return;
-      }
-      if (formatPlan.action === 'recover') {
-        droppedFrames++;
-        enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
-        return;
-      }
-      if (formatPlan.reconfigure) {
-        // A delivered discontinuity keyframe is the recovery boundary we were
-        // waiting for, not evidence that another keyframe is missing.
-        if (discontinuity) {
-          enterDecoderRecovery(DECODER_RECOVERY_REASONS.DISCONTINUITY, {
-            requestKeyframe: !keyframe,
-          });
-        } else {
-          enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET, {
-            requestKeyframe: false,
-          });
-        }
-      }
-      if (decoderRecovery.shouldDropFrame({ keyframe })) {
-        if (!decoderRecovery.requestIssued) {
-          enterDecoderRecovery(DECODER_RECOVERY_REASONS.DECODER_RESET);
-        }
-        droppedFrames++;
-        return;
-      }
-      const mediaPtsMicros = exactMediaTimestampMicros(ptsMicros);
-      const chunkTimestamp = mediaPtsMicros !== null
-        ? mediaPtsMicros
-        : now() * 1000;
+      droppedFrames++;
+      return;
+    }
+    const mediaPtsMicros = exactMediaTimestampMicros(ptsMicros);
+    const chunkTimestamp = mediaPtsMicros !== null
+      ? mediaPtsMicros
+      : now() * 1000;
 
-      const nals = parseAnnexBNals(raw);
-      if (keyframe) {
-        let sps = null, pps = null;
-        for (const nal of nals) {
-          const type = h264NalType(nal);
-          if (type === 7) sps = nal;
-          else if (type === 8) pps = nal;
-        }
-        if (sps && pps && formatPlan.reconfigure) {
-          initWebCodecsDecoder(width, height, buildAvcDescription(sps, pps), avcCodecStr(sps));
-        }
-      }
-      if (!decoderConfigured || !videoDecoder) { droppedFrames++; return; }
-      const sliceNals = nals.filter(nal => {
+    const nals = parseAnnexBNals(raw);
+    if (keyframe) {
+      let sps = null, pps = null;
+      for (const nal of nals) {
         const type = h264NalType(nal);
-        return type !== 7 && type !== 8 && type !== 9;
-      });
-      if (sliceNals.length > 0) {
-        const chunk = createEncodedChunk({
-          type: keyframe ? 'key' : 'delta',
-          timestamp: chunkTimestamp,
-          data: nalsToLengthPrefixed(sliceNals),
-        });
-        const enqueued = enqueueVideoChunk(chunk, receivedAt, 'h264', mediaPtsMicros);
-        commitVideoFrame(formatPlan, keyframe, enqueued);
+        if (type === 7) sps = nal;
+        else if (type === 8) pps = nal;
       }
-    } else {
-      // JPEG fallback (openh264 decode → JPEG encode in Rust)
-      const dimensionsChanged = frameWidth !== width || frameHeight !== height;
-      frameWidth = width;
-      frameHeight = height;
-      if (canvas.width !== width) canvas.width = width;
-      if (canvas.height !== height) canvas.height = height;
-      if (dimensionsChanged) {
-        onFormatChanged({
-          codec: activeCodec,
-          width: frameWidth,
-          height: frameHeight,
-          epoch: activeVideoFormatEpoch,
-        });
+      if (sps && pps && formatPlan.reconfigure) {
+        initWebCodecsDecoder(width, height, buildAvcDescription(sps, pps), avcCodecStr(sps));
       }
-      // Keep exactly one browser decode active and one coalesced latest payload.
-      // Receipt order is authoritative: once a newer payload is queued, the
-      // active decode may finish to release its resources but can never draw.
-      const bytes = decodeBase64(data);
-      const blob = createBlob([bytes], { type: 'image/jpeg' });
-      enqueueJpegFrame({
-        sequence: ++jpegFrameSequence,
-        blob,
-        receivedAt,
+    }
+    if (!decoderConfigured || !videoDecoder) { droppedFrames++; return; }
+    const sliceNals = nals.filter(nal => {
+      const type = h264NalType(nal);
+      return type !== 7 && type !== 8 && type !== 9;
+    });
+    if (sliceNals.length > 0) {
+      const chunk = createEncodedChunk({
+        type: keyframe ? 'key' : 'delta',
+        timestamp: chunkTimestamp,
+        data: nalsToLengthPrefixed(sliceNals),
       });
+      const enqueued = enqueueVideoChunk(chunk, receivedAt, 'h264', mediaPtsMicros);
+      commitVideoFrame(formatPlan, keyframe, enqueued);
     }
   }
 
@@ -527,12 +388,8 @@ export function createVideoPipelineSession({
       avSkewPercentiles: avSkew.summary(at),
       decoderQueueDepth: videoDecoder?.decodeQueueSize ?? 0,
       decoderQueueCapacity: MAX_DECODE_QUEUE_SIZE,
-      presenterQueueDepth: hasWebCodecs
-        ? framePresenter.depth
-        : Number(activeJpegDecode !== null) + Number(queuedJpegFrame !== null),
-      presenterQueueCapacity: hasWebCodecs
-        ? PRESENTER_QUEUE_CAPACITY
-        : JPEG_PRESENTER_QUEUE_CAPACITY,
+      presenterQueueDepth: framePresenter.depth,
+      presenterQueueCapacity: PRESENTER_QUEUE_CAPACITY,
       recovering: decoderRecovery.recovering,
     };
   }

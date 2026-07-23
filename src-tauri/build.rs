@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
+
+const PORTAL_PAYLOAD_MANIFEST: &str = "runtime-files.txt";
 
 fn main() {
     assemble_portal_dist();
@@ -23,37 +25,46 @@ fn assemble_portal_dist() {
     let source_dir = Path::new(&manifest_dir).join("../portal");
     let dist_dir = Path::new(&manifest_dir).join("../portal-dist");
 
-    // Fixed, non-module runtime entry points. Anything not matched here or by
-    // the module sweep below does not ship.
-    let mut wanted: BTreeSet<String> = [
-        "index.html",
-        "style.css",
-        "main.js",
-        "codecs.js",
-        "audio-worklet.js",
-    ]
-    .iter()
-    .map(|name| (*name).to_string())
-    .collect();
-    for name in &wanted {
-        if !source_dir.join(name).is_file() {
-            panic!("allowlisted portal payload file is missing: {name}");
-        }
-    }
-
-    // Every top-level ES module except test suites.
-    for entry in fs::read_dir(&source_dir).expect("portal source directory must exist") {
-        let entry = entry.expect("readable portal source entry");
-        let is_file = entry
-            .file_type()
-            .map(|kind| kind.is_file())
-            .unwrap_or(false);
-        if !is_file {
+    let manifest_path = source_dir.join(PORTAL_PAYLOAD_MANIFEST);
+    let manifest = fs::read_to_string(&manifest_path)
+        .expect("portal runtime payload manifest must be readable");
+    let mut wanted = BTreeSet::new();
+    for (line_index, raw_name) in manifest.lines().enumerate() {
+        let line_number = line_index + 1;
+        let name = raw_name.trim();
+        if name.is_empty() || name.starts_with('#') {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".mjs") && !name.ends_with(".test.mjs") {
-            wanted.insert(name);
+        if name != raw_name {
+            panic!("portal runtime payload manifest line {line_number} has surrounding whitespace");
+        }
+        let path = Path::new(name);
+        if !matches!(
+            path.components().collect::<Vec<_>>().as_slice(),
+            [Component::Normal(_)]
+        ) {
+            panic!(
+                "portal runtime payload manifest line {line_number} is not one top-level file: {name}"
+            );
+        }
+        if name.ends_with(".test.mjs") {
+            panic!(
+                "portal runtime payload manifest line {line_number} includes a test suite: {name}"
+            );
+        }
+        if !wanted.insert(name.to_owned()) {
+            panic!("portal runtime payload manifest repeats {name}");
+        }
+    }
+    if wanted.is_empty() {
+        panic!("portal runtime payload manifest must name at least one file");
+    }
+    for name in &wanted {
+        let metadata = fs::symlink_metadata(source_dir.join(name)).unwrap_or_else(|error| {
+            panic!("allowlisted portal payload file {name} is missing: {error}")
+        });
+        if !metadata.file_type().is_file() {
+            panic!("allowlisted portal payload file is missing: {name}");
         }
     }
 
@@ -72,10 +83,22 @@ fn assemble_portal_dist() {
         let entry = entry.expect("readable portal-dist entry");
         let name = entry.file_name().to_string_lossy().into_owned();
         if !wanted.contains(&name) {
-            let _ = fs::remove_file(entry.path());
+            let file_type = entry
+                .file_type()
+                .expect("portal-dist entry type is readable");
+            if file_type.is_dir() {
+                fs::remove_dir_all(entry.path()).unwrap_or_else(|error| {
+                    panic!("failed to prune portal-dist directory {name}: {error}")
+                });
+            } else {
+                fs::remove_file(entry.path()).unwrap_or_else(|error| {
+                    panic!("failed to prune portal-dist file {name}: {error}")
+                });
+            }
         }
     }
 
     // Watch the directory itself so added or removed source files re-run this.
+    println!("cargo:rerun-if-changed=../portal/{PORTAL_PAYLOAD_MANIFEST}");
     println!("cargo:rerun-if-changed=../portal");
 }

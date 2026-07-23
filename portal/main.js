@@ -29,6 +29,7 @@ import { createWindowRuntime } from './window-runtime.mjs';
 import {
   createVideoPipelineSession,
 } from './video-pipeline.mjs';
+import { detectAndPublishVideoDeliveryMode } from './video-capability.mjs';
 import {
   formatAdaptiveDecision,
 } from './adaptive-feedback.mjs';
@@ -572,11 +573,10 @@ function togglePanel(force) {
 }
 
 // ─── WebCodecs detection ──────────────────────────────────────────────────────
-let hasWebCodecs = ('VideoDecoder' in window);
-
-(async function detectWebCodecs() {
-  await invoke('set_webcodecs_available', { available: hasWebCodecs });
-})();
+// Finish the codec probe and publish the same delivery mode to Rust before
+// exposing any connect handlers. This keeps raw WebCodecs frames and the Rust
+// JPEG compatibility path from disagreeing during startup.
+const hasWebCodecs = await detectAndPublishVideoDeliveryMode({ invokeCommand: invoke });
 
 // ─── Frame decoding ───────────────────────────────────────────────────────────
 const canvas = document.getElementById('frame-canvas');

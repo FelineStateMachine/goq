@@ -69,8 +69,9 @@ in a production package.
 
 `--dev-connect` alone does not authorize its ephemeral Portal identity. For an
 explicit configured-host hardware test without a security key, run a debug
-Sigil build with `serve --config <host.toml> --dev-allow-unauthorized`, or build
-the optimized test binary with `--features demo-auth-bypass`. This host flag
+Sigil build with
+`serve --config <host.toml> --dev-allow-unauthorized --max-runtime-seconds 1800`,
+or build the optimized test binary with `--features demo-auth-bypass`. This host flag
 admits any peer that knows the node ID, grants all session capabilities, prints
 a startup warning, and deliberately avoids reading or mutating enrollment
 state. It requires `--max-runtime-seconds` between 1 and 3600 so the exposure

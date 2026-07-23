@@ -35,3 +35,10 @@ test('raw invitation bytes stay in native commands instead of the DOM', () => {
   assert.match(main, /portal_import_invitation_file/);
   assert.doesNotMatch(main, /readAsText|FileReader/);
 });
+
+test('forced JPEG development mode is visibly labeled without bypassing enrollment', () => {
+  assert.match(html, /id="dev-jpeg-badge"[^>]*>dev JPEG forced</);
+  assert.match(main, /if \(mode\.force_jpeg\)/);
+  assert.match(main, /getElementById\('dev-jpeg-badge'\)/);
+  assert.match(main, /if \(!mode\.enabled\) return;/);
+});

@@ -82,22 +82,19 @@ pub fn extract_hmac_secret(assertions: &[Assertion]) -> anyhow::Result<[u8; 32]>
     )?;
 
     for ext in &assertion.extensions {
-        if let Gext::HmacSecret(Some(output)) = ext {
-            return validate_hmac_secret_output(output);
+        match ext {
+            Gext::HmacSecret(Some(output)) => return Ok(*output),
+            Gext::HmacSecret2(Some(_)) => {
+                anyhow::bail!(
+                    "Security key returned a two-output hmac-secret response (64 bytes); Portal requires exactly one 32-byte output. Reconnect the key or use a compatible FIDO2 key."
+                )
+            }
+            _ => {}
         }
     }
     anyhow::bail!(
         "Security key assertion did not contain hmac-secret output. Use a compatible FIDO2 key and try again."
     )
-}
-
-fn validate_hmac_secret_output(output: &[u8]) -> anyhow::Result<[u8; 32]> {
-    output.try_into().map_err(|_| {
-        anyhow::anyhow!(
-            "Security key returned malformed hmac-secret output: expected 32 bytes, received {}. Reconnect the key or try a compatible FIDO2 key.",
-            output.len()
-        )
-    })
 }
 
 pub fn derive_iroh_secret_from_key(pin: &str) -> anyhow::Result<SecretKey> {
@@ -268,16 +265,42 @@ mod tests {
     }
 
     #[test]
-    fn validate_hmac_secret_output_rejects_non_32_byte_values() {
-        for output in [&[0x2a; 31][..], &[0x2a; 33][..]] {
-            let error =
-                validate_hmac_secret_output(output).expect_err("invalid length must fail closed");
-            assert!(
-                error
-                    .to_string()
-                    .contains(&format!("expected 32 bytes, received {}", output.len()))
-            );
-        }
+    fn extract_hmac_secret_rejects_two_output_response() {
+        let assertion = Assertion {
+            extensions: vec![Gext::HmacSecret2(Some(([0x2a; 32], [0x2b; 32])))],
+            ..Default::default()
+        };
+
+        let error =
+            extract_hmac_secret(&[assertion]).expect_err("two-output response must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Security key returned a two-output hmac-secret response (64 bytes); Portal requires exactly one 32-byte output. Reconnect the key or use a compatible FIDO2 key."
+        );
+    }
+
+    #[test]
+    fn extract_hmac_secret_rejects_extension_without_output() {
+        let assertion = Assertion {
+            extensions: vec![Gext::HmacSecret(None)],
+            ..Default::default()
+        };
+
+        let error = extract_hmac_secret(&[assertion]).expect_err("absent output must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Security key assertion did not contain hmac-secret output. Use a compatible FIDO2 key and try again."
+        );
+    }
+
+    #[test]
+    fn extract_hmac_secret_rejects_assertion_without_extension() {
+        let error = extract_hmac_secret(&[Assertion::default()])
+            .expect_err("missing extension must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Security key assertion did not contain hmac-secret output. Use a compatible FIDO2 key and try again."
+        );
     }
 
     #[test]

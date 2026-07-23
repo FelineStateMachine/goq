@@ -10,11 +10,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+CHECKOUT_ACTION = "actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8"
 CACHE_ACTION = "actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809"
 CACHE_PATH = "~/.cargo/bin/cargo-zigbuild"
 CACHE_KEY = "cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.0"
 LINUX_CROSS_BUILD_GATE = "./scripts/run-linux-cross-build-gate.sh"
 MAPPING_KEY = r"""(?:[A-Za-z0-9_-]+|"[A-Za-z0-9_-]+"|'[A-Za-z0-9_-]+')"""
+REQUIRED_STEP_NAMES = [
+    "Check out repository",
+    "Install Linux build dependencies",
+    "Restore pinned cargo-zigbuild",
+    "Install pinned cross-build tools",
+    "Run complete demo gate",
+]
 GATE_SCRIPT_PREFIX = """\
 #!/usr/bin/env bash
 set -euo pipefail
@@ -30,6 +38,29 @@ fi
 
 ./scripts/run-linux-cross-build-gate.sh
 """
+
+DEPENDENCY_RUN = """\
+sudo apt-get update
+sudo apt-get install --yes --no-install-recommends \\
+  build-essential \\
+  file \\
+  ffmpeg \\
+  gstreamer1.0-plugins-base \\
+  gstreamer1.0-plugins-bad \\
+  gstreamer1.0-plugins-good \\
+  gstreamer1.0-plugins-ugly \\
+  gstreamer1.0-tools \\
+  libayatana-appindicator3-dev \\
+  libgstreamer-plugins-base1.0-dev \\
+  libgstreamer1.0-dev \\
+  librsvg2-dev \\
+  libssl-dev \\
+  libudev-dev \\
+  libwebkit2gtk-4.1-dev \\
+  libxdo-dev \\
+  pkg-config \\
+  python3-venv \\
+  shellcheck"""
 
 INSTALL_RUN = """\
 python3 -m venv "$RUNNER_TEMP/zig-venv"
@@ -402,6 +433,7 @@ def verify(workflow: str) -> None:
     _validate_workflow_layout(workflow)
     steps = _parse_steps(_job_lines(workflow, "demo-gate"))
 
+    checkout_index, checkout = _named_step(steps, "Check out repository")
     dependency_index, dependency = _named_step(
         steps, "Install Linux build dependencies"
     )
@@ -409,13 +441,20 @@ def verify(workflow: str) -> None:
     install_index, install = _named_step(steps, "Install pinned cross-build tools")
     gate_index, gate = _named_step(steps, "Run complete demo gate")
 
-    dependency_run = dependency.blocks.get("run", "")
-    if "  python3-venv \\" not in dependency_run.splitlines():
+    if [step.name for step in steps] != REQUIRED_STEP_NAMES:
         raise PolicyError(
-            "Linux dependency step must install python3-venv for the pinned Zig venv"
+            "demo-gate step list or order changed from the CI policy contract"
         )
-    if "if" in dependency.field_names:
-        raise PolicyError("Linux dependency step must not be conditionally disabled")
+
+    if checkout.field_names != {"name", "uses"}:
+        raise PolicyError("checkout step has unexpected or missing fields")
+    if checkout.scalars.get("uses") != CHECKOUT_ACTION:
+        raise PolicyError("checkout action is not digest-pinned to the policy contract")
+
+    if dependency.field_names != {"name", "run"}:
+        raise PolicyError("Linux dependency step has unexpected or missing fields")
+    if dependency.blocks.get("run") != DEPENDENCY_RUN:
+        raise PolicyError("Linux dependency step body changed")
 
     if cache.field_names != {"name", "uses", "with"}:
         raise PolicyError("cargo-zigbuild cache step has unexpected or missing fields")
@@ -439,9 +478,15 @@ def verify(workflow: str) -> None:
     if gate.scalars.get("run") != "./scripts/verify-demo-build.sh":
         raise PolicyError("complete demo gate does not execute the repository gate")
 
-    if not dependency_index < cache_index < install_index < gate_index:
+    if [
+        checkout_index,
+        dependency_index,
+        cache_index,
+        install_index,
+        gate_index,
+    ] != list(range(len(REQUIRED_STEP_NAMES))):
         raise PolicyError(
-            "dependency, cache, cross-tool install, and demo-gate steps are misordered"
+            "demo-gate step list or order changed from the CI policy contract"
         )
 
 

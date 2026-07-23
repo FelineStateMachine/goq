@@ -29,6 +29,13 @@ def remove_named_step(source: str, name: str, next_name: str) -> tuple[str, str]
     return source[:start] + source[end:], source[start:end]
 
 
+def replace_once_in_demo_gate(source: str, old: str, new: str) -> str:
+    prefix, marker, demo_gate = source.partition("  demo-gate:\n")
+    if not marker:
+        raise AssertionError("fixture source must contain the demo-gate job")
+    return prefix + marker + replace_once(demo_gate, old, new)
+
+
 class CiCrossBuildPolicyTests(unittest.TestCase):
     def test_repository_workflow_passes(self) -> None:
         verify(WORKFLOW)
@@ -105,6 +112,147 @@ class CiCrossBuildPolicyTests(unittest.TestCase):
             "        run: |",
         )
         with self.assertRaisesRegex(PolicyError, "unexpected or missing fields"):
+            verify(mutated)
+
+    def test_rejects_checkout_ref_override(self) -> None:
+        mutated = replace_once_in_demo_gate(
+            WORKFLOW,
+            "        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1",
+            "        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1\n"
+            "        with:\n"
+            "          ref: main",
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "checkout step has unexpected or missing fields"
+        ):
+            verify(mutated)
+
+    def test_rejects_checkout_action_change(self) -> None:
+        mutated = replace_once_in_demo_gate(
+            WORKFLOW,
+            "actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1",
+            "actions/checkout@main",
+        )
+        with self.assertRaisesRegex(PolicyError, "checkout action is not digest-pinned"):
+            verify(mutated)
+
+    def test_rejects_step_poisoning_cargo_environment(self) -> None:
+        mutated = replace_once(
+            WORKFLOW,
+            "      - name: Install Linux build dependencies\n",
+            "      - name: Poison Cargo environment\n"
+            "        run: printf '%s\\n' 'export RUSTC_WRAPPER=true' >> ~/.cargo/env\n\n"
+            "      - name: Install Linux build dependencies\n",
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "step list or order changed from the CI policy contract"
+        ):
+            verify(mutated)
+
+    def test_rejects_step_replacing_cargo_zigbuild(self) -> None:
+        mutated = replace_once(
+            WORKFLOW,
+            "      - name: Run complete demo gate\n",
+            "      - name: Replace cargo-zigbuild\n"
+            "        run: |\n"
+            "          printf '%s\\n' '#!/usr/bin/env bash' 'exit 0' "
+            "> ~/.cargo/bin/cargo-zigbuild\n"
+            "          chmod 0755 ~/.cargo/bin/cargo-zigbuild\n\n"
+            "      - name: Run complete demo gate\n",
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "step list or order changed from the CI policy contract"
+        ):
+            verify(mutated)
+
+    def test_rejects_extra_steps_at_every_boundary(self) -> None:
+        markers = [
+            "      - name: Check out repository\n",
+            "      - name: Install Linux build dependencies\n",
+            "      - name: Restore pinned cargo-zigbuild\n",
+            "      - name: Install pinned cross-build tools\n",
+            "      - name: Run complete demo gate\n",
+        ]
+        for position, marker in enumerate(markers):
+            with self.subTest(position=position):
+                mutated = replace_once_in_demo_gate(
+                    WORKFLOW,
+                    marker,
+                    f"      - name: Extra step {position}\n"
+                    "        run: echo unexpected\n\n"
+                    f"{marker}",
+                )
+                with self.assertRaisesRegex(
+                    PolicyError, "step list or order changed from the CI policy contract"
+                ):
+                    verify(mutated)
+
+        mutated = WORKFLOW + (
+            "\n"
+            "      - name: Extra trailing step\n"
+            "        run: echo unexpected\n"
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "step list or order changed from the CI policy contract"
+        ):
+            verify(mutated)
+
+    def test_rejects_required_step_reordering(self) -> None:
+        cache_marker = "      - name: Restore pinned cargo-zigbuild\n"
+        install_marker = "      - name: Install pinned cross-build tools\n"
+        gate_marker = "      - name: Run complete demo gate\n"
+        cache_start = WORKFLOW.index(cache_marker)
+        install_start = WORKFLOW.index(install_marker, cache_start)
+        gate_start = WORKFLOW.index(gate_marker, install_start)
+        cache_step = WORKFLOW[cache_start:install_start]
+        install_step = WORKFLOW[install_start:gate_start]
+        mutated = (
+            WORKFLOW[:cache_start]
+            + install_step
+            + cache_step
+            + WORKFLOW[gate_start:]
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "step list or order changed from the CI policy contract"
+        ):
+            verify(mutated)
+
+    def test_rejects_partial_linux_dependency_body_mutations(self) -> None:
+        mutations = [
+            (
+                "            ffmpeg \\\n",
+                "",
+            ),
+            (
+                "            shellcheck\n",
+                "            shellcheck \\\n"
+                "            unzip\n",
+            ),
+            (
+                "          sudo apt-get update\n",
+                "          sudo apt-get update --quiet\n",
+            ),
+        ]
+        for old, new in mutations:
+            with self.subTest(replacement=new):
+                mutated = replace_once(WORKFLOW, old, new)
+                with self.assertRaisesRegex(
+                    PolicyError, "Linux dependency step body changed"
+                ):
+                    verify(mutated)
+
+    def test_rejects_linux_dependency_step_field_changes(self) -> None:
+        mutated = replace_once(
+            WORKFLOW,
+            "      - name: Install Linux build dependencies\n        run: |",
+            "      - name: Install Linux build dependencies\n"
+            "        env:\n"
+            "          BASH_ENV: ~/.cargo/env\n"
+            "        run: |",
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "Linux dependency step has unexpected or missing fields"
+        ):
             verify(mutated)
 
     def test_rejects_conditionally_disabled_demo_job(self) -> None:

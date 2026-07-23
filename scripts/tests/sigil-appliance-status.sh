@@ -48,8 +48,7 @@ config_path="$config_directory/host.toml"
 unsafe_config_path="$unsafe_config_directory/host.toml"
 gamescope_probe_config="$config_directory/gamescope-probe.toml"
 fake_pw_dump="$temp_root/fake-pw-dump"
-fake_gst_inspect="$temp_root/fake-gst-inspect"
-gamescope_preflight_marker="$temp_root/gamescope-preflight-ran"
+fake_render_node="$temp_root/renderD999"
 host_log="$temp_root/host.log"
 second_log="$temp_root/second.log"
 live_status="$temp_root/live-status.json"
@@ -94,12 +93,6 @@ printf '%s\n' \
   "printf '[]\\n'" \
   >"$fake_pw_dump"
 chmod 0700 "$fake_pw_dump"
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  "touch '$gamescope_preflight_marker'" \
-  'exit 1' \
-  >"$fake_gst_inspect"
-chmod 0700 "$fake_gst_inspect"
 false_path="/usr/bin/false"
 [[ -x "$false_path" ]]
 printf '%s\n' \
@@ -119,9 +112,9 @@ printf '%s\n' \
   'xwayland_display = ":0"' \
   "pw_dump_path = \"$fake_pw_dump\"" \
   "gst_launch_path = \"$false_path\"" \
-  "gst_inspect_path = \"$fake_gst_inspect\"" \
+  "gst_inspect_path = \"$false_path\"" \
   'vaapi_encoder = "vah264enc"' \
-  'vaapi_render_node = "/dev/dri/renderD128"' \
+  "vaapi_render_node = \"$fake_render_node\"" \
   'rate_control = "cqp"' \
   'quantizer = 24' \
   >"$gamescope_probe_config"
@@ -238,7 +231,10 @@ if XDG_RUNTIME_DIR="$runtime_directory" \
 fi
 grep -Fq 'another Sigil daemon or capture probe already owns this lifecycle scope' \
   "$temp_root/contended-capture.error"
-[[ ! -e "$gamescope_preflight_marker" ]]
+if grep -Fq 'inspecting VAAPI render node' "$temp_root/contended-capture.error"; then
+  printf 'contended capture reached hardware preflight before acquiring the lifecycle lock\n' >&2
+  exit 1
+fi
 
 python3 - "$live_status" "$host_node_id" <<'PY'
 import json
@@ -328,7 +324,8 @@ if XDG_RUNTIME_DIR="$runtime_directory" \
   printf 'fake Gamescope capture unexpectedly completed\n' >&2
   exit 1
 fi
-[[ -e "$gamescope_preflight_marker" ]]
+grep -Fq "inspecting VAAPI render node $fake_render_node" \
+  "$temp_root/released-capture.error"
 XDG_RUNTIME_DIR="$runtime_directory" \
   "$sigil" serve \
     --identity "$identity_path" \

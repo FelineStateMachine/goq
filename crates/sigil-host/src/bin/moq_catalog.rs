@@ -2,36 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use moq_net::{BroadcastConsumer, Error as MoqError, Track, TrackConsumer};
-use serde::{Deserialize, Serialize};
-use sigil_protocol::{MAX_MOQ_CATALOG_BYTES, MoqCatalogExtensionV1};
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GoqCatalogDocument {
-    #[serde(flatten)]
-    media: hang::Catalog,
-    goq: MoqCatalogExtensionV1,
-}
-
-impl GoqCatalogDocument {
-    #[cfg(test)]
-    fn video_h264() -> Self {
-        Self {
-            media: hang::Catalog::default(),
-            goq: MoqCatalogExtensionV1::video_h264(),
-        }
-    }
-
-    fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.media == hang::Catalog::default(),
-            "Goq catalog must not advertise a standard Hang rendition for enveloped media"
-        );
-        self.goq
-            .validate()
-            .context("validating Goq catalog extension")
-    }
-}
+use sigil_protocol::{GoqCatalogDocument, MAX_MOQ_CATALOG_BYTES};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MoqCatalogMode {
@@ -118,7 +89,9 @@ pub(crate) async fn subscribe_goq_video_track(
         .context("reading Goq catalog frame")?;
     let document: GoqCatalogDocument =
         serde_json::from_slice(&snapshot).context("decoding Goq catalog snapshot")?;
-    document.validate()?;
+    document
+        .validate()
+        .context("validating Goq catalog document")?;
     let track = broadcast
         .subscribe_track(&Track::new(document.goq.video.track.name))
         .context("subscribing to catalog-selected Goq video track")?;
@@ -232,9 +205,7 @@ mod tests {
             subscribe_goq_video_track(&invalid_broadcast.consume(), Duration::from_millis(100))
                 .await;
         assert!(result.err().is_some_and(|error| {
-            error
-                .to_string()
-                .contains("validating Goq catalog extension")
+            format!("{error:#}").contains("validating Goq catalog document")
         }));
 
         let mut stalled_broadcast = Broadcast::new().produce();

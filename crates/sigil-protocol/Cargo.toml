@@ -10,6 +10,7 @@ rust-version = "1.85"
 [dependencies]
 base64 = "0.22"
 ed25519-dalek = "3.0"
+hang.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -89,6 +89,37 @@ impl MoqCatalogExtensionV1 {
     }
 }
 
+/// The immutable catalog.json document both peers must agree on byte-for-byte:
+/// a default (empty) Hang catalog envelope carrying the Goq extension. This is
+/// the single definition — the host producer, Portal subscriber, and probe all
+/// consume it from here so the wire shape cannot drift between peers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoqCatalogDocument {
+    #[serde(flatten)]
+    pub media: hang::Catalog,
+    pub goq: MoqCatalogExtensionV1,
+}
+
+impl GoqCatalogDocument {
+    pub fn video_h264() -> Self {
+        Self {
+            media: hang::Catalog::default(),
+            goq: MoqCatalogExtensionV1::video_h264(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.media != hang::Catalog::default() {
+            return Err(ProtocolError::InvalidMessage {
+                message_type: "Goq MoQ catalog document",
+                reason: "catalog must not advertise a standard Hang rendition for enveloped media",
+            });
+        }
+        self.goq.validate()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +132,19 @@ mod tests {
             serde_json::to_string(&extension).unwrap(),
             r#"{"version":1,"video":{"track":{"name":"video/h264","priority":255},"codec":"h264","objectFormat":"sigil/media-frame/1","groupFormat":"sigil/moq-gop/1"}}"#
         );
+    }
+
+    #[test]
+    fn goq_catalog_document_has_a_stable_golden_envelope() {
+        let document = GoqCatalogDocument::video_h264();
+        document.validate().unwrap();
+        let json = serde_json::to_value(&document).unwrap();
+        assert_eq!(
+            json["goq"],
+            serde_json::to_value(MoqCatalogExtensionV1::video_h264()).unwrap()
+        );
+        let round_trip: GoqCatalogDocument = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip, document);
     }
 
     #[test]

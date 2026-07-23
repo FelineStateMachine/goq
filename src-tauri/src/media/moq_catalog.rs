@@ -1,38 +1,7 @@
 use std::time::Duration;
 
 use moq_net::{BroadcastConsumer, Error as MoqError, Track, TrackConsumer};
-use serde::{Deserialize, Serialize};
-use sigil_protocol::{MAX_MOQ_CATALOG_BYTES, MoqCatalogExtensionV1};
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GoqCatalogDocument {
-    #[serde(flatten)]
-    media: hang::Catalog,
-    goq: MoqCatalogExtensionV1,
-}
-
-impl GoqCatalogDocument {
-    #[cfg(test)]
-    fn video_h264() -> Self {
-        Self {
-            media: hang::Catalog::default(),
-            goq: MoqCatalogExtensionV1::video_h264(),
-        }
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        if self.media != hang::Catalog::default() {
-            return Err(
-                "Goq catalog falsely advertises a standard Hang rendition for enveloped media"
-                    .to_string(),
-            );
-        }
-        self.goq
-            .validate()
-            .map_err(|error| format!("Invalid Goq catalog extension: {error}"))
-    }
-}
+use sigil_protocol::{GoqCatalogDocument, MAX_MOQ_CATALOG_BYTES};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MoqCatalogMode {
@@ -126,7 +95,9 @@ pub(crate) async fn subscribe_goq_video_track(
         .map_err(|error| format!("Failed to read Goq catalog frame: {error}"))?;
     let document: GoqCatalogDocument = serde_json::from_slice(&snapshot)
         .map_err(|error| format!("Failed to decode Goq catalog snapshot: {error}"))?;
-    document.validate()?;
+    document
+        .validate()
+        .map_err(|error| format!("Invalid Goq catalog: {error}"))?;
     let track = broadcast
         .subscribe_track(&Track::new(document.goq.video.track.name))
         .map_err(|error| {
@@ -244,7 +215,7 @@ mod tests {
         assert!(
             result
                 .err()
-                .is_some_and(|error| error.contains("Invalid Goq catalog extension"))
+                .is_some_and(|error| error.contains("Invalid Goq catalog"))
         );
 
         let mut stalled_broadcast = Broadcast::new().produce();

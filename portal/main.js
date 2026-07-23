@@ -467,7 +467,7 @@ async function showConnectedAttempt({ result, attempt }) {
   document.getElementById('frame-canvas').style.display = 'block';
   document.getElementById('placeholder').classList.add('hidden');
   document.getElementById('control-bar').classList.add('visible');
-  void windowRuntime.fitWindowToIncomingStream();
+  windowRuntime.sizeSurfaceToIncomingStream();
   updateControlUI();
   // Land controller users on the deliberate view-only/control boundary.
   // The connect button is hidden at this point, so retaining its focus
@@ -497,7 +497,6 @@ async function teardownConnectedResources() {
 }
 
 async function showDisconnectedState() {
-  windowRuntime.reset();
   controlRuntime.resetDisconnected();
   updatePanelVisibility();
   setStatus('', 'idle');
@@ -589,19 +588,7 @@ const canvas = document.getElementById('frame-canvas');
 const remotePointer = document.getElementById('remote-pointer');
 const ctx = canvas.getContext('2d');
 const windowRuntime = createWindowRuntime({
-  isConnected: () => connectionState.connected,
   getFormat: () => videoPipeline.format,
-  getGeneration: () => streamRuntime.generation,
-  getChromeHeight: () => {
-    const topbar = document.querySelector('.topbar');
-    const bottombar = document.querySelector('.bottombar');
-    return Math.max(0, (topbar?.offsetHeight ?? 0) + (bottombar?.offsetHeight ?? 0));
-  },
-  getScreenBounds: () => ({
-    width: window.screen.availWidth,
-    height: window.screen.availHeight,
-  }),
-  getWindowSize: () => ({ width: window.innerWidth, height: window.innerHeight }),
   getSurfaceBounds: () => {
     const main = canvas.parentElement;
     if (!main) return null;
@@ -612,11 +599,6 @@ const windowRuntime = createWindowRuntime({
     canvas.style.width = `${width}px`;
     canvas.style.height = `${height}px`;
   },
-  applyNativeGeometry: (geometry, unmaximize) => invoke('set_client_window_size', {
-    logicalWidth: geometry.width,
-    logicalHeight: geometry.height,
-    unmaximize,
-  }),
 });
 controlRuntime = createControlRuntime({
   getConnection: () => ({
@@ -654,7 +636,6 @@ videoPipeline = createVideoPipelineSession({
   sampleAudioSkew: audioPipeline.sampleSkew,
   onFormatChanged: () => {
     windowRuntime.sizeSurfaceToIncomingStream();
-    if (connectionState.connected) void windowRuntime.fitWindowToIncomingStream();
   },
 });
 streamRuntime = createStreamRuntime({
@@ -1185,7 +1166,6 @@ document.addEventListener('pointerdown', () => {
 window.addEventListener('resize', () => {
   windowRuntime.sizeSurfaceToIncomingStream();
   renderRemotePointer();
-  windowRuntime.scheduleAspectCorrection();
 });
 
 window.addEventListener('focus', () => {

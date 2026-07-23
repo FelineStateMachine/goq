@@ -34,6 +34,10 @@ fn main() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
+        // The native window belongs to the user, not the current stream.
+        // Persist its last size/position across relaunches; incoming video is
+        // letterboxed inside those bounds by the frontend.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         // Packet-level transport logs are catastrophically expensive in an
         // interactive media client. Keep actionable warnings and errors
         // without formatting every QUIC packet on the UI-critical machine.
@@ -91,7 +95,6 @@ fn main() {
             commands::enrollment::portal_reset_enrollment,
             commands::state::development_connection_mode,
             commands::state::set_client_cursor_grab,
-            commands::state::set_client_window_size,
             commands::state::set_webcodecs_available,
             commands::state::is_webcodecs_available,
             commands::network::iroh_client_connect,

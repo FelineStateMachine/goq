@@ -275,6 +275,18 @@ evidence="$case_dir/docs/hardware-uat/${commit:0:12}/native-1280x800-handheld/EV
 replace_text "$evidence" 'gpu_topology=integrated' 'gpu_topology=discrete'
 expect_fail wrong-row-topology "$case_dir"
 
+case_dir="$fixture_root/overflowing-numeric-evidence"
+make_fixture "$case_dir"
+commit="$(git -C "$case_dir" rev-parse HEAD)"
+evidence="$case_dir/docs/hardware-uat/${commit:0:12}/physically-headless-desktop-dgpu/EVIDENCE.env"
+replace_text \
+  "$evidence" 'native_width=1920' \
+  'native_width=18446744073709551616'
+replace_text \
+  "$evidence" 'native_refresh_millihz=60000' \
+  'native_refresh_millihz=18446744073709551616'
+expect_fail overflowing-numeric-evidence "$case_dir"
+
 case_dir="$fixture_root/pending-matrix-claim"
 make_fixture "$case_dir"
 write_pending_matrix "$case_dir/docs/hardware-uat/MATRIX.md"

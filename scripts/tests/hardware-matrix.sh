@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+export LC_ALL=C
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 default_repo_dir="$(cd "$script_dir/../.." && pwd)"
@@ -98,6 +99,30 @@ require_positive_integer() {
   local field="$2"
 
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$field must be a positive integer"
+}
+
+require_bounded_positive_integer() {
+  local value="$1"
+  local maximum="$2"
+  local field="$3"
+
+  require_positive_integer "$value" "$field"
+  if ((${#value} > ${#maximum})) ||
+    { ((${#value} == ${#maximum})) && [[ "$value" > "$maximum" ]]; }; then
+    fail "$field exceeds $maximum"
+  fi
+}
+
+require_minimum_positive_integer() {
+  local value="$1"
+  local minimum="$2"
+  local field="$3"
+
+  require_positive_integer "$value" "$field"
+  if ((${#value} < ${#minimum})) ||
+    { ((${#value} == ${#minimum})) && [[ "$value" < "$minimum" ]]; }; then
+    fail "$field is below $minimum"
+  fi
 }
 
 require_regular_file "$matrix" "hardware matrix"
@@ -205,7 +230,8 @@ for row_id in "${row_ids[@]}"; do
 
       workflow_run="$(exact_report_value "$report_path" "Workflow run")" \
         || fail "passing report does not bind exactly one workflow run: $report"
-      require_positive_integer "$workflow_run" "workflow run"
+      require_bounded_positive_integer \
+        "$workflow_run" 999999999999999999 "workflow run"
       artifact_set="$(exact_report_value \
         "$report_path" "Candidate artifact set SHA256")" \
         || fail "passing report does not bind exactly one candidate artifact set: $report"
@@ -274,13 +300,10 @@ for row_id in "${row_ids[@]}"; do
       native_width="$(exact_env_value "$evidence_path" native_width)"
       native_height="$(exact_env_value "$evidence_path" native_height)"
       native_refresh="$(exact_env_value "$evidence_path" native_refresh_millihz)"
-      require_positive_integer "$native_width" "native width"
-      require_positive_integer "$native_height" "native height"
-      require_positive_integer "$native_refresh" "native refresh"
-      ((native_width <= 16384 && native_height <= 16384)) \
-        || fail "native dimensions exceed the protocol bound: $evidence"
-      ((native_refresh <= 1000000)) \
-        || fail "native refresh exceeds the evidence bound: $evidence"
+      require_bounded_positive_integer "$native_width" 16384 "native width"
+      require_bounded_positive_integer "$native_height" 16384 "native height"
+      require_bounded_positive_integer \
+        "$native_refresh" 1000000 "native refresh"
 
       case "$row_id" in
         native-1280x800-handheld)
@@ -313,15 +336,16 @@ for row_id in "${row_ids[@]}"; do
       [[ "$(exact_env_value "$evidence_path" fixed_capture_result)" == pass ]] \
         || fail "fixed capture did not pass: $evidence"
       fixed_fps="$(exact_env_value "$evidence_path" fixed_capture_fps_milli)"
-      require_positive_integer "$fixed_fps" "fixed capture fps"
-      ((fixed_fps >= 55000)) \
-        || fail "fixed capture did not sustain 55 fps: $evidence"
+      require_bounded_positive_integer \
+        "$fixed_fps" 1000000 "fixed capture fps"
+      require_minimum_positive_integer "$fixed_fps" 55000 "fixed capture fps"
       [[ "$(exact_env_value "$evidence_path" fixed_post_encode_drops)" == 0 ]] \
         || fail "fixed capture has post-encode drops: $evidence"
       [[ "$(exact_env_value "$evidence_path" native_capture_result)" == pass ]] \
         || fail "native capture did not pass: $evidence"
       native_fps="$(exact_env_value "$evidence_path" native_capture_fps_milli)"
-      require_positive_integer "$native_fps" "native capture fps"
+      require_bounded_positive_integer \
+        "$native_fps" 1000000 "native capture fps"
       [[ "$(exact_env_value "$evidence_path" native_post_encode_drops)" == 0 ]] \
         || fail "native capture has post-encode drops: $evidence"
       [[ "$(exact_env_value "$evidence_path" portal_transport)" == iroh-moq ]] \

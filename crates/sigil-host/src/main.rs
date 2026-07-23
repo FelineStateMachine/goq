@@ -201,6 +201,24 @@ enum ConfigCommand {
 enum CaptureCommand {
     /// Consume a finite number of frames without starting iroh.
     Probe(CaptureProbeArgs),
+    /// Validate one GstVA encoder against an exact render node.
+    EncoderPreflight(EncoderPreflightArgs),
+}
+
+#[derive(Debug, Args)]
+struct EncoderPreflightArgs {
+    #[arg(long)]
+    vaapi_encoder: String,
+    #[arg(long)]
+    vaapi_render_node: PathBuf,
+    #[arg(long, value_enum, required = true)]
+    rate_control: Vec<RateControlArg>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RateControlArg {
+    Cbr,
+    Cqp,
 }
 
 #[derive(Debug, Subcommand)]
@@ -588,6 +606,23 @@ async fn config_command(command: ConfigCommand) -> Result<()> {
 
 async fn capture_command(command: CaptureCommand) -> Result<()> {
     match command {
+        CaptureCommand::EncoderPreflight(args) => {
+            let rate_controls = args
+                .rate_control
+                .into_iter()
+                .map(|rate_control| match rate_control {
+                    RateControlArg::Cbr => crate::config::VaapiRateControl::Cbr,
+                    RateControlArg::Cqp => crate::config::VaapiRateControl::Cqp,
+                })
+                .collect::<Vec<_>>();
+            source::probe_encoder_properties(
+                &args.vaapi_encoder,
+                &args.vaapi_render_node,
+                &rate_controls,
+            )?;
+            println!("encoder_preflight=ok");
+            Ok(())
+        }
         CaptureCommand::Probe(args) => {
             ensure!(
                 (1..=36_000).contains(&args.frames),

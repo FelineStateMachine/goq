@@ -748,6 +748,8 @@ run_probe_cycle() {
   if [[ "$pointer_feedback_smoke" == true ]]; then
     grep -Fxq pointer_smoke=ok "$log"
     grep -Fxq pointer_feedback_smoke=ok "$log"
+    grep -Eq '^pointer_sync_position=[0-9]+,[0-9]+$' "$log"
+    grep -Eq '^pointer_motion_position=[0-9]+,[0-9]+$' "$log"
   fi
 }
 

@@ -286,6 +286,9 @@ struct ServeArgs {
     /// Strict TOML host configuration.
     #[arg(long, conflicts_with_all = ["identity", "source", "state_path"])]
     config: Option<PathBuf>,
+    /// INSECURE: admit an un-enrolled Portal peer for configured-host testing.
+    #[arg(long, requires = "config", conflicts_with = "identity")]
+    dev_allow_unauthorized: bool,
     /// Host identity for direct proof-mode configuration.
     #[arg(long, requires = "source")]
     identity: Option<PathBuf>,
@@ -307,6 +310,8 @@ struct ServeArgs {
     #[arg(long)]
     max_runtime_seconds: Option<u64>,
 }
+
+const MAX_DEVELOPMENT_AUTH_BYPASS_SECONDS: u64 = 3_600;
 
 enum CliFailure {
     General(anyhow::Error),
@@ -786,6 +791,7 @@ fn validate_capture_probe_args(args: &CaptureProbeArgs, configured_framerate: u3
 }
 
 async fn serve_command(args: ServeArgs) -> Result<()> {
+    validate_development_auth_bypass(args.dev_allow_unauthorized, args.max_runtime_seconds)?;
     let configured_service = args.config.is_some();
     let (config, loaded_config_revision, _lifecycle) = if let Some(config_path) = &args.config {
         let (loaded, lifecycle) =
@@ -806,12 +812,21 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         configured_service,
         loaded_config_revision,
     )?;
-    let authorization_result = if configured_service {
-        AuthorizationStore::open(config.state_path.clone(), secret.public())
-            .map(AuthorizationPolicy::Required)
-    } else {
-        Ok(AuthorizationPolicy::TestPatternProof)
-    };
+    let authorization_result = select_authorization_policy(
+        configured_service,
+        args.dev_allow_unauthorized,
+        &config.state_path,
+        secret.public(),
+    );
+    if args.dev_allow_unauthorized {
+        warn!(
+            max_runtime_seconds = args.max_runtime_seconds,
+            "DEVELOPMENT AUTHORIZATION BYPASS ACTIVE: any peer with this host node ID may request a session"
+        );
+        eprintln!(
+            "warning=development-authorization-bypass-active; do not expose or ship this host"
+        );
+    }
     let authorization = match authorization_result {
         Ok(authorization) => authorization,
         Err(error) => {
@@ -1046,6 +1061,45 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+const fn development_auth_bypass_available() -> bool {
+    cfg!(any(debug_assertions, feature = "demo-auth-bypass"))
+}
+
+fn validate_development_auth_bypass(
+    requested: bool,
+    max_runtime_seconds: Option<u64>,
+) -> Result<()> {
+    ensure!(
+        !requested || development_auth_bypass_available(),
+        "--dev-allow-unauthorized requires a debug build or the explicit demo-auth-bypass feature; ordinary release builds always require enrollment"
+    );
+    if requested {
+        ensure!(
+            matches!(
+                max_runtime_seconds,
+                Some(1..=MAX_DEVELOPMENT_AUTH_BYPASS_SECONDS)
+            ),
+            "--dev-allow-unauthorized requires --max-runtime-seconds between 1 and {MAX_DEVELOPMENT_AUTH_BYPASS_SECONDS}"
+        );
+    }
+    Ok(())
+}
+
+fn select_authorization_policy(
+    configured_service: bool,
+    development_bypass: bool,
+    state_path: &Path,
+    host: EndpointId,
+) -> Result<AuthorizationPolicy> {
+    if development_bypass {
+        Ok(AuthorizationPolicy::DevelopmentBypass)
+    } else if configured_service {
+        AuthorizationStore::open(state_path.to_owned(), host).map(AuthorizationPolicy::Required)
+    } else {
+        Ok(AuthorizationPolicy::TestPatternProof)
+    }
+}
+
 async fn wait_for_shutdown_signal() -> Result<&'static str> {
     #[cfg(unix)]
     {
@@ -1127,6 +1181,7 @@ fn parse_size(value: &str) -> std::result::Result<(u32, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -1166,6 +1221,94 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn development_auth_bypass_requires_configured_host_syntax() {
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "serve",
+                "--config",
+                "/tmp/host.toml",
+                "--dev-allow-unauthorized",
+                "--max-runtime-seconds",
+                "600",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "serve",
+                "--identity",
+                "/tmp/host.key",
+                "--source",
+                "test-pattern",
+                "--dev-allow-unauthorized",
+                "--max-runtime-seconds",
+                "600",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sigil",
+                "serve",
+                "--config",
+                "/tmp/host.toml",
+                "--dev-allow-unauthorized",
+            ])
+            .is_ok()
+        );
+        assert!(validate_development_auth_bypass(true, None).is_err());
+        assert!(validate_development_auth_bypass(true, Some(0)).is_err());
+        assert!(
+            validate_development_auth_bypass(true, Some(MAX_DEVELOPMENT_AUTH_BYPASS_SECONDS + 1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ordinary_release_excludes_configured_host_auth_bypass() {
+        if cfg!(not(debug_assertions)) && cfg!(not(feature = "demo-auth-bypass")) {
+            assert!(!development_auth_bypass_available());
+            assert!(validate_development_auth_bypass(true, Some(60)).is_err());
+        }
+    }
+
+    #[test]
+    fn configured_host_auth_bypass_is_explicitly_build_contained() {
+        assert_eq!(
+            validate_development_auth_bypass(true, Some(60)).is_ok(),
+            development_auth_bypass_available()
+        );
+    }
+
+    #[test]
+    fn development_auth_bypass_does_not_open_persistent_authorization_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path();
+        let state_file = state_path.join("authorization-v1.json");
+        fs::write(&state_file, b"malformed-sentinel").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::read(&state_file).unwrap();
+        let host = iroh::SecretKey::from_bytes(&[31; 32]).public();
+
+        assert!(matches!(
+            select_authorization_policy(true, true, state_path, host).unwrap(),
+            AuthorizationPolicy::DevelopmentBypass
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), before);
+        assert!(!state_path.join("authorization-v1.lock").exists());
+
+        let required_directory = tempfile::tempdir().unwrap();
+        let required_state = required_directory.path().join("authorization-v1.json");
+        fs::write(&required_state, b"malformed-sentinel").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&required_state, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(select_authorization_policy(true, false, required_directory.path(), host).is_err());
     }
 
     #[test]

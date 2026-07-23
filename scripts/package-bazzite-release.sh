@@ -203,7 +203,8 @@ else
     PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 \
       CARGO_TARGET_DIR="$build_target" \
         cargo zigbuild --locked -p sigil-host --bins \
-          --target "$linux_target" --release --features in-process-gstreamer
+          --target "$linux_target" --release --no-default-features \
+          --features in-process-gstreamer
   )
   host_binary="$build_target/$linux_output_target/release/sigil"
   probe_binary="$build_target/$linux_output_target/release/sigil-probe"
@@ -284,7 +285,8 @@ manifest = {
     "version": version,
     "target": target,
     "profile": "release",
-    "features": ["default", "in-process-gstreamer"],
+    "features": ["in-process-gstreamer"],
+    "demo_auth_bypass": False,
     "demo_direct_node": False,
     "git_commit": commit,
     "git_dirty": dirty == "true",

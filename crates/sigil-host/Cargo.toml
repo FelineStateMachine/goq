@@ -11,6 +11,7 @@ default-run = "sigil"
 
 [features]
 default = []
+demo-auth-bypass = []
 in-process-gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [[bin]]

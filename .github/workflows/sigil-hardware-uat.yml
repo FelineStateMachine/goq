@@ -113,8 +113,9 @@ jobs:
           test "$(jq -r .release_kind "$manifest")" = development
           test "$(jq -r .release_tag "$manifest")" = development
           test "$(jq -r .asset_name "$manifest")" = "$(basename -- "$archive")"
+          test "$(jq -r .demo_auth_bypass "$manifest")" = false
           test "$(jq -r .demo_direct_node "$manifest")" = false
-          test "$(jq -c .features "$manifest")" = '["default","in-process-gstreamer"]'
+          test "$(jq -c .features "$manifest")" = '["in-process-gstreamer"]'
           printf '%s\n' \
             "repository=$GITHUB_REPOSITORY" \
             "source_commit=$UAT_COMMIT" \

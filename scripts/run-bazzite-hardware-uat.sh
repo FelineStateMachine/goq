@@ -363,7 +363,8 @@ jq -e --arg commit "$uat_commit" '
   and .release_kind == "development"
   and .release_tag == "development"
   and .target == "x86_64-unknown-linux-gnu.2.17"
-  and .features == ["default", "in-process-gstreamer"]
+  and .features == ["in-process-gstreamer"]
+  and .demo_auth_bypass == false
   and .demo_direct_node == false
 ' "$manifest" >/dev/null
 [[ -x "$sigil" && -x "$probe" ]]

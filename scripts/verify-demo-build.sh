@@ -95,9 +95,7 @@ node --test portal/*.test.mjs
 
 cargo build --locked -p sigil-host --bin sigil
 find scripts -type f -name '*.sh' -exec shellcheck {} +
-while IFS= read -r script_test; do
-  "$script_test"
-done < <(find scripts/tests -maxdepth 1 -type f -name '*.sh' -perm -u+x -print | sort)
+./scripts/run-shell-tests.sh scripts/tests
 
 host_dependencies="$(cargo tree --locked -p sigil-host --edges normal)"
 if grep -Eiq '(^|[[:space:]├└│─])(tauri|wry|webkit)([[:space:]-]|$)' <<<"$host_dependencies"; then

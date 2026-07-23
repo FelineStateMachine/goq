@@ -76,13 +76,6 @@ printf 'revision=%s\n' "$(git rev-parse HEAD)"
 rustc --version
 cargo --version
 
-# Assemble the Portal webview payload before any plain-cargo compile of the
-# portal crate. tauri::generate_context! resolves frontendDist at compile time,
-# and portal-dist/ is generated (gitignored), not committed. Tauri's
-# beforeBuildCommand only runs under the Tauri CLI, so the plain cargo builds
-# below would otherwise panic on a missing frontendDist.
-"$script_dir/build-portal-dist.sh"
-
 require_rust_test 'resolves_pinned_upstream_gamescope_pipewire_contract' \
   -p sigil-host --bin sigil
 cargo fmt --all -- --check

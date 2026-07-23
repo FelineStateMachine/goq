@@ -30,12 +30,23 @@ and Iroh endpoint ID
 Portal has a golden test for the complete derivation. This vector is test data,
 not a deployed credential.
 
-## Sigil local-management runtime
+## Sigil host filesystem namespace
 
-Sigil appends the frozen child `sigil-spark` to the validated
-`XDG_RUNTIME_DIR` or explicit management runtime root. The daemon lifecycle
-lock and status document live below that child, and the Decky plugin and
-offline management commands consume the same path.
+The following host paths are frozen because the installer, service, rollback
+tooling, Decky plugin, and recovery documentation consume them independently:
+
+| Purpose | Frozen path |
+| --- | --- |
+| Installed releases and current link | `~/.local/libexec/sigil-spark` |
+| Host configuration | `~/.config/sigil-spark/host.toml` |
+| Identity and package-owned shared data | `~/.local/share/sigil-spark` |
+| Authorization and configuration state | `~/.local/state/sigil-spark` |
+| Volatile daemon management runtime | `$XDG_RUNTIME_DIR/sigil-spark` |
+
+For an explicit management runtime root, Sigil also appends the frozen child
+`sigil-spark`. The daemon lifecycle lock and status document live below that
+child. A repository gate keeps the independent Decky, systemd, installer,
+activation, staging, and Rust consumers synchronized.
 
 ## Linux virtual-input ABI
 
@@ -49,7 +60,8 @@ version `1`.
 | Keyboard | `3` | `Sigil Spark Virtual Keyboard` |
 
 These values are visible to Gamescope, udev, libinput, games, diagnostics, and
-hardware evidence. Host tests pin the complete tuple.
+hardware evidence. Host tests pin the complete tuple, and a package test
+requires the shipped udev rule to match its checked-in frozen source exactly.
 
 ## Change policy
 

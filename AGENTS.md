@@ -125,6 +125,9 @@ Sigil host.
   measured end to end. Do not select codecs by compression ratio alone.
 - Preserve native pointer coordinates independently from encoded resolution or
   client window size.
+- Map a differently shaped focused Xwayland root through a centered aspect-fit
+  region in the native pointer surface; never stretch pointer axes
+  independently.
 - Session teardown must release all held input transitions and emit a neutral
   gamepad state even after an error or disconnect.
 

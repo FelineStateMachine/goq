@@ -1205,21 +1205,33 @@ acknowledged only after exact property readback. CQP remains on the external
 compatibility backend until its in-process force-keyframe path is implemented
 and proven separately.
 
-The configured `:0` is a bootstrap connection, not a fixed input target.
-Gamescope may move mouse focus between its `:0` and `:1` Xwayland servers.
-Sigil reads `GAMESCOPE_MOUSE_FOCUS_DISPLAY` from the bootstrap root, reconnects
-to the active local display, and samples `QueryPointer` at no more than 60 Hz.
-It also reads `GAMESCOPE_CURSOR_VISIBLE_FEEDBACK` from that active root so the
-client overlay disappears when Gamescope hides its cursor. Missing, malformed,
-or unreachable Xwayland state during startup disables the separately
-negotiated pointer feedback capability. After successful startup, losing
-Gamescope publishes pointer feedback as unavailable, then reconnects the
-bootstrap display with a bounded 100 ms to 2 second backoff. A complete
-reconnect re-interns both Gamescope atoms, discovers the replacement native
-surface, and validates one active-display sample before publishing coordinates
-again. Relative uinput remains available without guessed cursor coordinates.
-The service `DISPLAY=:0` line is retained as an explicit fallback for
-configurations created before `xwayland_display` was added.
+The configured `:0` is the bootstrap connection. Gamescope builds that publish
+`GAMESCOPE_MOUSE_FOCUS_DISPLAY` may move mouse focus between their `:0` and
+`:1` Xwayland servers; Sigil follows that property and reconnects to the active
+local display. Upstream SteamOS and older Gamescope builds need not ship this
+extension. Sigil detects that absence without creating the atom, logs the
+degraded discovery mode, and safely samples only the explicitly configured
+display instead of disabling pointer feedback.
+
+Sigil samples `QueryPointer` at no more than 60 Hz. If the active Xwayland root
+has a different aspect ratio than the native captured surface, Sigil maps it
+into a centered aspect-fit region (letterbox or pillarbox) so coordinates stay
+in the compositor's native pointer space without independent-axis stretching.
+Zero-sized, unrepresentable, off-root, or cross-screen geometry still fails
+closed.
+
+Gamescope builds that publish `GAMESCOPE_CURSOR_VISIBLE_FEEDBACK` provide exact
+cursor visibility. When that optional extension is absent or malformed, Sigil
+logs the fallback and shows the client cursor only for a bounded three seconds
+after authoritative pointer motion. Missing or unreachable Xwayland state
+during startup still disables the separately negotiated pointer feedback
+capability. After successful startup, losing Gamescope publishes pointer
+feedback as unavailable, then reconnects the bootstrap display with a bounded
+100 ms to 2 second backoff. A complete reconnect re-detects both optional
+Gamescope properties, validates one active-display sample, and only then
+publishes coordinates again. Relative uinput remains available without guessed
+cursor coordinates. The service `DISPLAY=:0` line is retained as an explicit
+fallback for configurations created before `xwayland_display` was added.
 
 Audio is optional and must resolve one exact PipeWire sink, never a microphone.
 The appliance owns a persistent 48 kHz stereo null sink so capture does not

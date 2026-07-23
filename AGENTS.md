@@ -192,22 +192,26 @@ Sigil host.
   decoding, A/V, input, or session behavior requires a real Portal -> UMPC
   Gamescope connection from the exact candidate commit. A successful config
   check, capture probe, headless probe, or loopback is supporting evidence, not
-  a substitute for that end-to-end session. Fresh exact-commit builds are not
-  expected to be enrolled: do not skip the connection because ordinary
-  authentication blocks it. For development hardware testing, build Sigil with
-  `demo-auth-bypass`, run it with
+  a substitute for that end-to-end session. Starting a bypass-enabled daemon
+  and observing that it listens is also not an end-to-end test: Portal must
+  connect to that exact daemon, the host must admit the session, live media
+  diagnostics must advance, and the affected interaction or recovery path must
+  be exercised from Portal.
+- Fresh exact-commit builds are not expected to be enrolled. When authentication
+  is not the behavior under test, use the development bypass proactively rather
+  than skipping the connection, attempting ordinary auth, or reporting the
+  daemon-only result as hardware proof. Build Sigil with `demo-auth-bypass`, run
+  it with
   `--dev-allow-unauthorized` and a bounded `--max-runtime-seconds`, and connect
   a debug Portal with `--dev-connect`. Verify the affected live diagnostics
   and interaction path, then stop the bypass process, undo temporary Gamescope
   controls, and restore and verify the ordinary authenticated
   `sigil-host.service` before calling the test complete.
-
-- Do not report a runtime-affecting change as hardware-tested unless Portal
-  actually established the UMPC session and exercised the affected live path.
-  When authentication or identity is itself under test, the development bypass
-  is not evidence for that behavior: complete the real LA_key PIN/tap
-  enrollment, disconnect, and ticket-free reconnect with the exact candidate
-  instead.
+- When authentication, enrollment, identity, grants, invitations, or reconnect
+  authorization is the behavior under test, the bypass is not evidence. Use
+  the real `LA_key` flow, complete an authenticated Portal -> UMPC session, and
+  verify a ticket-free reconnect where applicable without exposing the PIN or
+  credential material.
 
 - On Linux with NVIDIA, set `WEBKIT_DISABLE_DMABUF_RENDERER=1` for Portal.
 - Preserve `/Users/dami/Developer/sigil` untouched; it is the inherited source,

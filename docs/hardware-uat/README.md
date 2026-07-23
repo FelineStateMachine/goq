@@ -22,6 +22,12 @@ authenticated Iroh/MoQ sessions, ten grouped-v3 sessions, bounded forced-IDR
 recovery, input acknowledgement, direct-path confirmation, and zero sequence
 gaps.
 
+When the panel's native mode is already 1280x800, the native leg still runs with
+width and height omitted from its Sigil configuration. The evidence records
+`native_mode_relation=identical-to-fixed`; this proves native-mode resolution
+without requiring a second pixel size that the panel cannot provide. Other
+panels record `native_mode_relation=distinct-from-fixed`.
+
 Each evidence directory is named after the first 12 characters of its exact
 source commit. It contains the aggregate result, both bounded capture logs, and
 the GitHub Actions provenance used to obtain the candidate. Probe session IDs

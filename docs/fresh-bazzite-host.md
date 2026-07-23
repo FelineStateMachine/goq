@@ -1566,7 +1566,10 @@ feedback reconnected` event per restart. The packaged hardware UAT performs
 this sequence after its fixed-mode session checks. That runner independently
 enumerates `amdgpu` render nodes and matches the exact GstVA H.264 factory by
 its inspected `device-path`; it never assumes `renderD128` is the AMD device or
-that the matching factory is named `vah264enc`.
+that the matching factory is named `vah264enc`. If the panel's resolved native
+mode is the same 1280x800 mode as the fixed performance leg, the native-config
+leg still runs and records that the two pixel sizes are identical instead of
+rejecting the host.
 
 For a deterministic pre-demo gamepad proof, leave `evtest "$gamepad_node"`
 running on the host and run this from the client checkout:

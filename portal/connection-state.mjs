@@ -3,12 +3,10 @@ import {
   disconnectRejectedRustConnection,
 } from './connection-attempt.mjs';
 
+// Mirrors MEDIA_TRANSPORT_NAMES in src-tauri/src/media/transport.rs.
 export const MEDIA_TRANSPORT_ALLOWLIST = Object.freeze([
   'iroh-moq',
   'grouped-v3',
-  'independent-v2',
-  'reliable-v1',
-  'reliable-v0',
 ]);
 
 export function normalizeMediaTransport(value) {

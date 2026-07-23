@@ -842,7 +842,7 @@ fn media_v3_object_for_encoded(
         frame.presentation_timestamp_micros,
         delivery_timeout_ms,
     )?;
-    MediaObjectV3::new(header, frame.data.as_ref().to_vec()).map_err(Into::into)
+    MediaObjectV3::new(header, frame.data.clone()).map_err(Into::into)
 }
 
 async fn send_media_v3_object(

@@ -1,34 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use moq_net::BroadcastProducer;
-use serde::{Deserialize, Serialize};
-use sigil_protocol::{MAX_MOQ_CATALOG_BYTES, MoqCatalogExtensionV1};
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GoqCatalogDocument {
-    #[serde(flatten)]
-    media: hang::Catalog,
-    goq: MoqCatalogExtensionV1,
-}
-
-impl GoqCatalogDocument {
-    fn video_h264() -> Self {
-        Self {
-            media: hang::Catalog::default(),
-            goq: MoqCatalogExtensionV1::video_h264(),
-        }
-    }
-
-    fn validate(&self) -> Result<()> {
-        ensure!(
-            self.media == hang::Catalog::default(),
-            "Goq catalog must not advertise a standard Hang rendition for enveloped media"
-        );
-        self.goq
-            .validate()
-            .context("validating Goq catalog extension")
-    }
-}
+use sigil_protocol::{GoqCatalogDocument, MAX_MOQ_CATALOG_BYTES};
 
 pub(crate) struct GoqCatalogProducer {
     producer: moq_json::Producer<GoqCatalogDocument>,
@@ -48,7 +20,9 @@ pub(crate) fn publish_goq_catalog(broadcast: &mut BroadcastProducer) -> Result<G
         .context("creating catalog.json track")?;
     let mut producer = moq_json::Producer::new(track, moq_json::Config::default());
     let document = GoqCatalogDocument::video_h264();
-    document.validate()?;
+    document
+        .validate()
+        .context("validating Goq catalog document")?;
     let snapshot = serde_json::to_vec(&document).context("serializing Goq catalog snapshot")?;
     ensure!(
         snapshot.len() <= MAX_MOQ_CATALOG_BYTES,

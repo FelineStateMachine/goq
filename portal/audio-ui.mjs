@@ -38,13 +38,13 @@ export function audioButtonPresentation({ available, muted, state, detail }) {
     ? detail
     : normalizedState;
 
-  let glyph;
+  let label;
   if (!available || muted || normalizedState === 'error' || normalizedState === 'unavailable') {
-    glyph = '🔇';
+    label = 'vol off';
   } else if (normalizedState === 'playing') {
-    glyph = '🔊';
+    label = 'vol on';
   } else {
-    glyph = 'audio ...';
+    label = 'vol ...';
   }
 
   const action = available
@@ -52,7 +52,7 @@ export function audioButtonPresentation({ available, muted, state, detail }) {
     : 'Audio unavailable';
   const audibleState = muted && available ? 'muted' : normalizedState;
   return {
-    glyph,
+    label,
     ariaLabel: `${action}. Audio ${audibleState}. ${normalizedDetail}`,
     title: `Audio ${audibleState}: ${normalizedDetail}`,
   };

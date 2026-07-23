@@ -30,7 +30,7 @@ use iroh::{Endpoint, EndpointId};
 use moq_net::Origin;
 use sigil_protocol::{
     AUDIO_ALPN_V1, CONTROL_ALPN_V1, INPUT_ALPN_V1, InvitationGrants, MAX_INVITATION_TTL_SECS,
-    MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, SignedInvitation,
+    MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, SignedInvitation,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -43,7 +43,7 @@ use crate::cursor::PointerPositionTracker;
 use crate::input::InputBackend;
 use crate::server::{
     AudioHandler, AuthorizedMoqHandler, ControlHandler, InputHandler, MediaFeedbackHandler,
-    MediaHandler, MediaV2Handler, MediaV3Handler, SessionRegistry,
+    MediaV3Handler, SessionRegistry,
 };
 
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -837,6 +837,23 @@ fn validate_capture_probe_args(args: &CaptureProbeArgs, configured_framerate: u3
     Ok(())
 }
 
+/// Report the failing startup/shutdown step as a degraded appliance status
+/// before surfacing the error. Every fallible step between publisher creation
+/// and clean shutdown must flow through this helper so no failure class can
+/// exit the daemon without updating the published status.
+async fn degrade_on_error<T>(
+    publisher: Option<&appliance::RuntimePublisher>,
+    code: appliance::RuntimeErrorCode,
+    result: Result<T>,
+) -> Result<T> {
+    if result.is_err()
+        && let Some(publisher) = publisher
+    {
+        let _ = publisher.mark_degraded(code).await;
+    }
+    result
+}
+
 async fn serve_command(args: ServeArgs) -> Result<()> {
     validate_development_auth_bypass(args.dev_allow_unauthorized, args.max_runtime_seconds)?;
     let configured_service = args.config.is_some();
@@ -874,17 +891,12 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
             "warning=development-authorization-bypass-active; do not expose or ship this host"
         );
     }
-    let authorization = match authorization_result {
-        Ok(authorization) => authorization,
-        Err(error) => {
-            if let Some(publisher) = publisher.as_ref() {
-                let _ = publisher
-                    .mark_degraded(appliance::RuntimeErrorCode::AuthorizationState)
-                    .await;
-            }
-            return Err(error);
-        }
-    };
+    let authorization = degrade_on_error(
+        publisher.as_ref(),
+        appliance::RuntimeErrorCode::AuthorizationState,
+        authorization_result,
+    )
+    .await?;
 
     let preflight_result: Result<(InputBackend, Option<PointerPositionTracker>)> = async {
         let pointer_surface_dimensions = if config.source == VideoSource::TestPattern {
@@ -950,41 +962,36 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         Ok((input_backend, pointer_positions))
     }
     .await;
-    let (input_backend, pointer_positions) = match preflight_result {
-        Ok(preflight) => preflight,
-        Err(error) => {
-            if let Some(publisher) = publisher.as_ref() {
-                let _ = publisher
-                    .mark_degraded(appliance::RuntimeErrorCode::Preflight)
-                    .await;
-            }
-            return Err(error);
-        }
-    };
+    let (input_backend, pointer_positions) = degrade_on_error(
+        publisher.as_ref(),
+        appliance::RuntimeErrorCode::Preflight,
+        preflight_result,
+    )
+    .await?;
 
-    let idle_timeout = CONNECTION_IDLE_TIMEOUT
-        .try_into()
-        .context("converting bounded QUIC idle timeout")?;
+    let idle_timeout = degrade_on_error(
+        publisher.as_ref(),
+        appliance::RuntimeErrorCode::EndpointBind,
+        CONNECTION_IDLE_TIMEOUT
+            .try_into()
+            .context("converting bounded QUIC idle timeout"),
+    )
+    .await?;
     let transport_config = QuicTransportConfig::builder()
         .max_idle_timeout(Some(idle_timeout))
         .keep_alive_interval(CONNECTION_KEEP_ALIVE_INTERVAL)
         .build();
-    let endpoint = match Endpoint::builder(presets::N0)
-        .secret_key(secret)
-        .transport_config(transport_config)
-        .bind()
-        .await
-    {
-        Ok(endpoint) => endpoint,
-        Err(error) => {
-            if let Some(publisher) = publisher.as_ref() {
-                let _ = publisher
-                    .mark_degraded(appliance::RuntimeErrorCode::EndpointBind)
-                    .await;
-            }
-            return Err(error).context("binding iroh endpoint");
-        }
-    };
+    let endpoint = degrade_on_error(
+        publisher.as_ref(),
+        appliance::RuntimeErrorCode::EndpointBind,
+        Endpoint::builder(presets::N0)
+            .secret_key(secret)
+            .transport_config(transport_config)
+            .bind()
+            .await
+            .context("binding iroh endpoint"),
+    )
+    .await?;
     let node_id = endpoint.id();
     match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
         Ok(()) => info!(%node_id, "iroh endpoint is online"),
@@ -1013,22 +1020,6 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         .accept(
             MEDIA_ALPN_V3,
             MediaV3Handler {
-                config: config.clone(),
-                sessions: Arc::clone(&sessions),
-                authorization: authorization.clone(),
-            },
-        )
-        .accept(
-            MEDIA_ALPN_V2,
-            MediaV2Handler {
-                config: config.clone(),
-                sessions: Arc::clone(&sessions),
-                authorization: authorization.clone(),
-            },
-        )
-        .accept(
-            MEDIA_ALPN_V1,
-            MediaHandler {
                 config: config.clone(),
                 sessions: Arc::clone(&sessions),
                 authorization: authorization.clone(),
@@ -1073,17 +1064,12 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         tokio::time::sleep(Duration::from_secs(seconds)).await;
         info!(seconds, "maximum runtime reached");
     } else {
-        let signal = match wait_for_shutdown_signal().await {
-            Ok(signal) => signal,
-            Err(error) => {
-                if let Some(publisher) = publisher.as_ref() {
-                    let _ = publisher
-                        .mark_degraded(appliance::RuntimeErrorCode::ShutdownSignal)
-                        .await;
-                }
-                return Err(error);
-            }
-        };
+        let signal = degrade_on_error(
+            publisher.as_ref(),
+            appliance::RuntimeErrorCode::ShutdownSignal,
+            wait_for_shutdown_signal().await,
+        )
+        .await?;
         info!(signal, "shutdown signal received");
     }
 
@@ -1092,14 +1078,12 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     {
         warn!(%error, "publishing stopping appliance status failed; continuing shutdown");
     }
-    if let Err(error) = router.shutdown().await {
-        if let Some(publisher) = publisher.as_ref() {
-            let _ = publisher
-                .mark_degraded(appliance::RuntimeErrorCode::RouterShutdown)
-                .await;
-        }
-        return Err(error).context("shutting down iroh router");
-    }
+    degrade_on_error(
+        publisher.as_ref(),
+        appliance::RuntimeErrorCode::RouterShutdown,
+        router.shutdown().await.context("shutting down iroh router"),
+    )
+    .await?;
     if let Some(publisher) = publisher
         && let Err(error) = publisher.finish_clean().await
     {

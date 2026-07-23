@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -21,7 +20,7 @@ use sigil_protocol::{
     MediaFrame, MediaFrameHeader, MediaObjectHeaderV3, MediaObjectV3, encode_media_frame_object,
     media_moq_broadcast_name, read_client_hello, read_input_event, read_media_control_request_v3,
     read_media_feedback_report_v1, write_adaptive_bitrate_decision_v1, write_host_hello,
-    write_input_ack, write_media_frame, write_media_object_v3,
+    write_input_ack, write_media_object_v3,
 };
 use tracing::{debug, error, info, warn};
 
@@ -45,24 +44,20 @@ const ENCODER_CONTROL_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 mod adaptive;
 mod handlers;
-mod media_v2;
 mod media_v3;
 mod moq;
 mod session;
 mod startup;
 
-#[allow(unused_imports)]
-pub(crate) use adaptive::MotionResolutionPolicy;
 pub(crate) use adaptive::VideoDimensions;
 use adaptive::serve_media_feedback;
 pub use handlers::{
     AudioHandler, AuthorizedMoqHandler, ControlHandler, InputHandler, MediaFeedbackHandler,
-    MediaHandler, MediaV2Handler, MediaV3Handler,
+    MediaV3Handler,
 };
 use handlers::{
     HANDSHAKE_TIMEOUT, MEDIA_CAPABILITIES, negotiated_capabilities, receive_hello, send_rejection,
 };
-use media_v2::{media_frame_for_encoded, serve_media, serve_media_v2};
 use media_v3::{
     MediaV3GroupCursor, forward_media_v3_control_requests, new_current_gop_frames, serve_media_v3,
 };

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "sh.goq.portal",
   "build": {
-    "frontendDist": "../portal"
+    "frontendDist": "../portal-dist"
   },
   "app": {
     "windows": [

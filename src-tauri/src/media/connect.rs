@@ -14,9 +14,7 @@ use tauri::{
 
 use crate::commands::auth::derive_iroh_secret_from_key;
 use crate::commands::enrollment::{connection_enrollment, mark_invitation_redeemed};
-use crate::commands::state::{
-    AppState, FRAME_ALPN, MediaFeedbackSender, development_direct_node_available,
-};
+use crate::commands::state::{AppState, MediaFeedbackSender, development_direct_node_available};
 use crate::media::adaptive_feedback::{
     CLIENT_MEDIA_FEEDBACK_CONNECT_TIMEOUT, open_negotiated_feedback_stream,
     run_media_feedback_session,
@@ -103,6 +101,16 @@ pub(crate) async fn connect_client(
     })?;
     let connect_guard = ClientConnectGuard::acquire(Arc::clone(&state.client_connection_active))?;
 
+    // Binary WebCodecs delivery is the only video path; fail before any
+    // network work so a webview without H.264 WebCodecs support surfaces a
+    // clear error instead of a black stream.
+    if !state.webcodecs.load(Ordering::SeqCst) {
+        return Err(
+            "WebCodecs H.264 decoding is unavailable in this webview; Portal cannot stream video"
+                .to_string(),
+        );
+    }
+
     let (client_secret, development_mode) = if let Some(node_id) = state.dev_connect_node_id {
         if !development_direct_node_available() {
             return Err(
@@ -165,67 +173,37 @@ pub(crate) async fn connect_client(
     // routing and fallback across all N0 relays automatically.
     let addr = iroh::EndpointAddr::new(host_node_id);
 
-    // Public Sigil authorization exists only on the bounded, negotiated v1
-    // protocols. The inherited v0 leg is retained below solely as migration
-    // code and is no longer selected by an ordinary Portal connection.
-    let use_v1 = true;
-    let (frame_conn, frame_recv, media_control_stream, media_negotiation, media_transport) =
-        if use_v1 {
-            let first_attempt = open_negotiated_media_stream(
-                &endpoint,
-                &addr,
-                handshake_nonce,
-                invitation.as_deref(),
-            )
+    let first_attempt =
+        open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, invitation.as_deref())
             .await;
-            let (connection, recv, control, negotiation, transport) = match first_attempt {
-                Ok(result) => result,
-                Err(invitation_error)
-                    if invitation.is_some()
-                        && invitation_error.contains("Portal peer is not authorized") =>
-                {
-                    // Recover only the narrow crash window where Sigil durably
-                    // consumed the invitation but Portal did not durably clear it.
-                    // The replay itself remains rejected; a second, ticket-free
-                    // connection can succeed only as the already-enrolled Iroh
-                    // peer authenticated by the exact invited host.
-                    open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, None)
+    let (frame_conn, frame_recv, media_control_stream, media_negotiation, media_transport) =
+        match first_attempt {
+            Ok(result) => result,
+            Err(invitation_error)
+                if invitation.is_some()
+                    && invitation_error.contains("Portal peer is not authorized") =>
+            {
+                // Recover only the narrow crash window where Sigil durably
+                // consumed the invitation but Portal did not durably clear it.
+                // The replay itself remains rejected; a second, ticket-free
+                // connection can succeed only as the already-enrolled Iroh
+                // peer authenticated by the exact invited host.
+                open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, None)
                     .await
                     .map_err(|retry_error| {
                         format!(
                             "{invitation_error}; ticket-free enrollment recovery also failed: {retry_error}"
                         )
                     })?
-                }
-                Err(error) => return Err(error),
-            };
-            (connection, recv, control, Some(negotiation), transport)
-        } else {
-            let connection = endpoint
-                .connect(addr.clone(), FRAME_ALPN)
-                .await
-                .map_err(|e| format!("Failed to connect frame stream: {e}"))?;
-            let (mut send, recv) = connection
-                .open_bi()
-                .await
-                .map_err(|e| format!("Failed to open frame stream: {e}"))?;
-            send.write_all(&[1u8])
-                .await
-                .map_err(|e| format!("Failed to send start: {e}"))?;
-            send.finish()
-                .map_err(|e| format!("Failed to finish frame start stream: {e}"))?;
-            (connection, recv, None, None, MediaTransport::LegacyV0)
+            }
+            Err(error) => return Err(error),
         };
-    let media_session_id = media_negotiation
-        .as_ref()
-        .map(|negotiation| negotiation.session_id);
+    let media_session_id = media_negotiation.session_id;
     let (upstream_moq_media, frame_connection_for_stats) = if media_transport
         == MediaTransport::UpstreamMoq
     {
-        let session_id = media_session_id
-            .ok_or_else(|| "Host omitted the control session ID required by MoQ".to_string())?;
         let (receiver, diagnostics_connection) =
-            match open_upstream_moq_media(&endpoint, &addr, session_id).await {
+            match open_upstream_moq_media(&endpoint, &addr, media_session_id).await {
                 Ok(media) => media,
                 Err(error) => {
                     // CONTROL already authenticated and owns the host's
@@ -242,9 +220,7 @@ pub(crate) async fn connect_client(
     } else {
         (None, frame_conn.clone())
     };
-    let pointer_surface_dimensions = media_negotiation
-        .as_ref()
-        .and_then(|negotiation| negotiation.pointer_surface_dimensions);
+    let pointer_surface_dimensions = media_negotiation.pointer_surface_dimensions;
     if !development_mode && let Some(expected_invitation) = invitation.as_deref() {
         // An accepted media hello means Sigil durably committed the one-time
         // enrollment before returning. Future PIN/tap/play sessions send no
@@ -256,33 +232,22 @@ pub(crate) async fn connect_client(
     // and the grouped-v3 compatibility path. Unsupported ALPN is normal
     // compatibility with older Sigil hosts; all other failures remain visible
     // diagnostics but never downgrade the authenticated media session.
-    let (adaptive_feedback_stream, adaptive_feedback_error) = if media_transport
-        .supports_adaptive_feedback()
+    let (adaptive_feedback_stream, adaptive_feedback_error) = match tokio::time::timeout(
+        CLIENT_MEDIA_FEEDBACK_CONNECT_TIMEOUT,
+        open_negotiated_feedback_stream(&endpoint, &addr, handshake_nonce, media_session_id),
+    )
+    .await
     {
-        match tokio::time::timeout(
-            CLIENT_MEDIA_FEEDBACK_CONNECT_TIMEOUT,
-            open_negotiated_feedback_stream(
-                &endpoint,
-                &addr,
-                handshake_nonce,
-                media_session_id.ok_or_else(|| "Media v3 omitted its session ID".to_string())?,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => (stream, None),
-            Ok(Err(error)) => {
-                eprintln!("[client] adaptive feedback unavailable: {error}");
-                (None, Some(error))
-            }
-            Err(_) => {
-                let error = "Adaptive feedback negotiation timed out".to_string();
-                eprintln!("[client] adaptive feedback unavailable: {error}");
-                (None, Some(error))
-            }
+        Ok(Ok(stream)) => (stream, None),
+        Ok(Err(error)) => {
+            eprintln!("[client] adaptive feedback unavailable: {error}");
+            (None, Some(error))
         }
-    } else {
-        (None, None)
+        Err(_) => {
+            let error = "Adaptive feedback negotiation timed out".to_string();
+            eprintln!("[client] adaptive feedback unavailable: {error}");
+            (None, Some(error))
+        }
     };
 
     let InputSession {
@@ -291,15 +256,7 @@ pub(crate) async fn connect_client(
         recv: input_recv,
         capabilities: input_capabilities,
         availability: input_availability,
-    } = open_input_session(
-        &endpoint,
-        &addr,
-        handshake_nonce,
-        media_session_id,
-        grants,
-        use_v1,
-    )
-    .await?;
+    } = open_input_session(&endpoint, &addr, handshake_nonce, media_session_id, grants).await?;
 
     let network_diagnostics = Arc::new(StdMutex::new(NetworkSessionDiagnostics::new(
         Instant::now(),
@@ -379,17 +336,17 @@ pub(crate) async fn connect_client(
     } else {
         *state.media_feedback.lock().await = None;
     }
-    let media_control_requests = if let Some(control_stream) = media_control_stream {
+    let media_control_requests = {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
         *state.media_control.lock().await = Some((media_generation, control_tx.clone()));
-        tokio::spawn(run_media_control_writer_v3(control_stream, control_rx));
+        tokio::spawn(run_media_control_writer_v3(
+            media_control_stream,
+            control_rx,
+        ));
         if media_transport == MediaTransport::GroupedObjectsV3 {
             let _ = control_tx.try_send((KeyframeRequestReasonV3::Join, None));
         }
         Some(control_tx)
-    } else {
-        *state.media_control.lock().await = None;
-        None
     };
     let frame_events_in_flight = Arc::new(AtomicUsize::new(0));
     *state.frame_delivery.lock().await =
@@ -402,13 +359,10 @@ pub(crate) async fn connect_client(
     tokio::spawn(run_input_forwarder(
         input_send,
         rx,
-        use_v1,
         input_capabilities,
         input_send_diagnostics,
     ));
 
-    // Frame reader — dual path: WebCodecs (raw bytes) or software JPEG decode
-    let use_webcodecs = state.webcodecs.load(Ordering::SeqCst);
     tokio::spawn(run_video_delivery(VideoDeliveryRequest {
         app,
         endpoint,
@@ -424,7 +378,6 @@ pub(crate) async fn connect_client(
         media_transport,
         media_generation,
         connected_audio_generation,
-        use_webcodecs,
     }));
 
     let result = ConnectResult {

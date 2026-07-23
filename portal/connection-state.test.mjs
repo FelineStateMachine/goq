@@ -68,9 +68,6 @@ test('pins every Rust diagnostic transport name including preferred iroh-moq', (
   assert.deepEqual([...MEDIA_TRANSPORT_ALLOWLIST], [
     'iroh-moq',
     'grouped-v3',
-    'independent-v2',
-    'reliable-v1',
-    'reliable-v0',
   ]);
   for (const transport of MEDIA_TRANSPORT_ALLOWLIST) {
     assert.equal(normalizeMediaTransport(transport), transport);

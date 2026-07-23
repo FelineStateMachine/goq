@@ -42,12 +42,9 @@ export async function detectAndPublishVideoDeliveryMode({
     if (typeof effectiveAvailable !== 'boolean') {
       throw new TypeError('native video delivery publication returned an invalid mode');
     }
-    if (available && !effectiveAvailable) {
-      logger.warn('development JPEG compatibility mode forced; WebCodecs probe passed but is not selected');
-    }
     return effectiveAvailable;
   } catch (error) {
-    logger.error('could not publish WebCodecs capability; using JPEG fallback:', error);
+    logger.error('could not publish WebCodecs capability; connecting will fail fast:', error);
     return false;
   }
 }

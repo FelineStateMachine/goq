@@ -176,11 +176,15 @@ tests.
 
 Sigil is machine setup, not a desktop download: the public bootstrap is
 `https://goq.sh/install-sigil`, and it intentionally fails closed until the
-Minisign publisher trust root and the first signed release exist. Portal is a
-compiled, signed desktop application, never a shell install; the first public
-target is macOS arm64. The packaging, signing, and publication ceremonies are
-documented in [public release delivery](docs/public-release-delivery.md) and
-the [Portal release runbook](docs/portal-release.md).
+Minisign publisher trust root and the first signed release exist. Its release
+assets carry a single frozen build-target suffix, `linux-glibc2.17-x86_64`,
+pinned by `release/sigil-target-contract.txt`; that name describes the binary
+ABI (glibc 2.17, x86-64), not a distribution, so one build runs across the
+supported AMD hosts. Portal is a compiled, signed desktop application, never a
+shell install; the first public target is macOS arm64. The packaging, signing,
+and publication ceremonies are documented in
+[public release delivery](docs/public-release-delivery.md) and the
+[Portal release runbook](docs/portal-release.md).
 
 ## License
 

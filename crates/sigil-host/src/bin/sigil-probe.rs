@@ -17,12 +17,11 @@ use sigil_protocol::{
     CONTROL_ALPN_V1, Capability, ClientHello, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN,
     GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, INVITATION_CLOCK_SKEW_SECS, InputAck,
     InputEvent, InvitationGrants, KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN,
-    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V1, MEDIA_ALPN_V2, MEDIA_ALPN_V3,
-    MEDIA_FEEDBACK_ALPN_V1, MediaCodec, MediaControlRequestV3, MediaFeedbackFlags,
-    MediaFeedbackReportV1, MediaFrame, MediaObjectV3, PointerPosition, PointerSurfaceDimensions,
-    ProtocolError, SignedInvitation, decode_media_frame_object, media_moq_broadcast_name,
-    read_adaptive_bitrate_decision_v1, read_host_hello, read_input_ack, read_media_frame,
-    read_media_object, read_media_object_v3, write_client_hello, write_input_event,
+    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1,
+    MediaCodec, MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame,
+    MediaObjectV3, PointerPosition, PointerSurfaceDimensions, ProtocolError, SignedInvitation,
+    decode_media_frame_object, media_moq_broadcast_name, read_adaptive_bitrate_decision_v1,
+    read_host_hello, read_input_ack, read_media_object_v3, write_client_hello, write_input_event,
     write_media_control_request_v3, write_media_feedback_report_v1,
 };
 
@@ -69,16 +68,8 @@ struct Args {
     expect_size: Option<(u16, u16)>,
     /// Exercise custom grouped v3 media instead of upstream MoQ. Intended only
     /// for compatibility validation.
-    #[arg(long, conflicts_with_all = ["media_v2", "media_v1"])]
+    #[arg(long)]
     media_v3: bool,
-    /// Exercise independent v2 media objects instead of upstream MoQ.
-    /// Intended only for compatibility validation.
-    #[arg(long, conflicts_with_all = ["media_v3", "media_v1"])]
-    media_v2: bool,
-    /// Exercise the reliable ordered v1 media stream instead of upstream MoQ.
-    /// Intended only for compatibility validation.
-    #[arg(long, conflicts_with_all = ["media_v3", "media_v2"])]
-    media_v1: bool,
     /// Request a configured recovery keyframe after three accepted frames,
     /// then prove no delta history is delivered before the recovery barrier.
     #[arg(long)]
@@ -92,7 +83,7 @@ struct Args {
     #[arg(
         long,
         value_parser = clap::value_parser!(u64).range(250..=5_000),
-        conflicts_with_all = ["media_v3", "media_v2", "media_v1"]
+        conflicts_with = "media_v3"
     )]
     slow_consumer_ms: Option<u64>,
     /// Require gamepad negotiation and emit one bounded non-neutral snapshot
@@ -112,7 +103,7 @@ struct Args {
     /// validating shadow-only encoder configurations.
     #[arg(
         long,
-        conflicts_with_all = ["media_v3", "media_v2", "media_v1", "resolution_stall_smoke"]
+        conflicts_with_all = ["media_v3", "resolution_stall_smoke"]
     )]
     feedback_smoke: bool,
     /// Prove adaptive-resolution liveness across a controlled Gamescope stall.
@@ -122,8 +113,6 @@ struct Args {
         value_name = "GATE_DIR",
         conflicts_with_all = [
             "media_v3",
-            "media_v2",
-            "media_v1",
             "keyframe_smoke",
             "slow_consumer_ms",
             "minimum_fps",
@@ -137,8 +126,6 @@ struct Args {
 enum MediaTransport {
     UpstreamMoq,
     GroupedV3,
-    IndependentV2,
-    ReliableV1,
 }
 
 impl MediaTransport {
@@ -146,8 +133,6 @@ impl MediaTransport {
         match self {
             Self::UpstreamMoq => CONTROL_ALPN_V1,
             Self::GroupedV3 => MEDIA_ALPN_V3,
-            Self::IndependentV2 => MEDIA_ALPN_V2,
-            Self::ReliableV1 => MEDIA_ALPN_V1,
         }
     }
 
@@ -155,8 +140,6 @@ impl MediaTransport {
         match self {
             Self::UpstreamMoq => "iroh-moq",
             Self::GroupedV3 => "grouped-v3",
-            Self::IndependentV2 => "independent-v2",
-            Self::ReliableV1 => "reliable-v1",
         }
     }
 
@@ -165,8 +148,6 @@ impl MediaTransport {
             Self::UpstreamMoq => std::str::from_utf8(iroh_moq::ALPN)
                 .expect("pinned iroh-moq ALPN must be printable UTF-8"),
             Self::GroupedV3 => "sigil/media/3",
-            Self::IndependentV2 => "sigil/media/2",
-            Self::ReliableV1 => "sigil/media/1",
         }
     }
 }
@@ -181,167 +162,6 @@ const RESOLUTION_STALL_FEEDBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOLUTION_STALL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const RESOLUTION_STALL_GATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_INVITATION_FILE_BYTES: u64 = (MAX_INVITATION_TOKEN_LEN + 2) as u64;
-
-#[derive(Debug)]
-enum MediaObjectOutcome {
-    Frame { index: u64, frame: MediaFrame },
-    Dropped { index: u64 },
-    Malformed { index: u64, error: ProtocolError },
-}
-
-impl MediaObjectOutcome {
-    fn index(&self) -> u64 {
-        match self {
-            Self::Frame { index, .. } | Self::Dropped { index } | Self::Malformed { index, .. } => {
-                *index
-            }
-        }
-    }
-
-    fn is_fast_forward_barrier(&self) -> bool {
-        let Self::Frame { frame, .. } = self else {
-            return false;
-        };
-        frame.header.flags.contains(FrameFlags::KEYFRAME)
-            && frame.header.flags.contains(FrameFlags::CODEC_CONFIG)
-            && frame.header.flags.contains(FrameFlags::DISCONTINUITY)
-    }
-}
-
-#[derive(Debug)]
-struct MediaObjectReorder {
-    next_index: u64,
-    completed: BTreeMap<u64, MediaObjectOutcome>,
-}
-
-impl MediaObjectReorder {
-    fn new(first_index: u64) -> Self {
-        Self {
-            next_index: first_index,
-            completed: BTreeMap::new(),
-        }
-    }
-
-    fn pending_len(&self) -> usize {
-        self.completed.len()
-    }
-
-    fn push(&mut self, outcome: MediaObjectOutcome) -> Result<Option<MediaObjectOutcome>> {
-        if matches!(outcome, MediaObjectOutcome::Malformed { .. }) {
-            // Malformed objects remain terminal as soon as their read completes.
-            return Ok(Some(outcome));
-        }
-        let index = outcome.index();
-        if index < self.next_index {
-            return Ok(Some(outcome));
-        }
-        if outcome.is_fast_forward_barrier() {
-            self.completed
-                .retain(|completed_index, _| *completed_index > index);
-            self.next_index = index
-                .checked_add(1)
-                .context("media object reorder overflowed")?;
-            return Ok(Some(outcome));
-        }
-        ensure!(
-            self.completed.insert(index, outcome).is_none(),
-            "media object {index} completed more than once"
-        );
-        self.take_next()
-    }
-
-    fn take_next(&mut self) -> Result<Option<MediaObjectOutcome>> {
-        let Some(outcome) = self.completed.remove(&self.next_index) else {
-            return Ok(None);
-        };
-        self.next_index = self
-            .next_index
-            .checked_add(1)
-            .context("media object reorder overflowed")?;
-        Ok(Some(outcome))
-    }
-}
-
-struct MediaObjectReceiver {
-    connection: iroh::endpoint::Connection,
-    reads: tokio::task::JoinSet<MediaObjectOutcome>,
-    reorder: MediaObjectReorder,
-    next_index: u64,
-    accepting: bool,
-    read_timeout: Duration,
-}
-
-impl MediaObjectReceiver {
-    fn new(connection: iroh::endpoint::Connection, read_timeout: Duration) -> Self {
-        Self {
-            connection,
-            reads: tokio::task::JoinSet::new(),
-            reorder: MediaObjectReorder::new(0),
-            next_index: 0,
-            accepting: true,
-            read_timeout,
-        }
-    }
-
-    async fn next(&mut self) -> Result<Option<MediaObjectOutcome>> {
-        loop {
-            if let Some(completed) = self.reorder.take_next()? {
-                return Ok(Some(completed));
-            }
-            if !self.accepting && self.reads.is_empty() {
-                ensure!(
-                    self.reorder.pending_len() == 0,
-                    "media connection closed with an incomplete object order"
-                );
-                return Ok(None);
-            }
-
-            tokio::select! {
-                accepted = self.connection.accept_uni(),
-                    if self.accepting
-                        && self.reads.len() + self.reorder.pending_len()
-                            < MEDIA_OBJECT_CAPACITY => {
-                    match accepted {
-                        Ok(mut stream) => {
-                            let index = self.next_index;
-                            self.next_index = self
-                                .next_index
-                                .checked_add(1)
-                                .context("media object index overflowed")?;
-                            let read_timeout = self.read_timeout;
-                            self.reads.spawn(async move {
-                                match tokio::time::timeout(read_timeout, read_media_object(&mut stream)).await {
-                                    Ok(Ok(frame)) => MediaObjectOutcome::Frame { index, frame },
-                                    Ok(Err(ProtocolError::Io(_))) => MediaObjectOutcome::Dropped { index },
-                                    Ok(Err(error)) => MediaObjectOutcome::Malformed { index, error },
-                                    Err(_) => MediaObjectOutcome::Dropped { index },
-                                }
-                            });
-                        }
-                        Err(_) => self.accepting = false,
-                    }
-                }
-                completed = self.reads.join_next(), if !self.reads.is_empty() => {
-                    match completed.expect("guarded by non-empty media object task set") {
-                        Ok(outcome) => {
-                            if let Some(completed) = self.reorder.push(outcome)? {
-                                return Ok(Some(completed));
-                            }
-                        }
-                        Err(error) if error.is_cancelled() => continue,
-                        Err(error) => return Err(error).context("media object read task failed"),
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Drop for MediaObjectReceiver {
-    fn drop(&mut self) {
-        self.reads.abort_all();
-    }
-}
 
 #[derive(Debug)]
 enum MediaObjectOutcomeV3 {
@@ -521,71 +341,6 @@ impl MediaObjectReceiverV3 {
 impl Drop for MediaObjectReceiverV3 {
     fn drop(&mut self) {
         self.reads.abort_all();
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MediaObjectDecision {
-    Deliver,
-    DropLate,
-    DropUntilKeyframe,
-}
-
-#[derive(Debug, Default)]
-struct MediaObjectSequence {
-    completion_watermark: Option<u64>,
-    last_sequence: Option<u64>,
-    waiting_for_keyframe: bool,
-}
-
-impl MediaObjectSequence {
-    fn new() -> Self {
-        Self {
-            waiting_for_keyframe: true,
-            ..Self::default()
-        }
-    }
-
-    fn note_drop(&mut self, index: u64) -> bool {
-        if self
-            .completion_watermark
-            .is_some_and(|watermark| index <= watermark)
-        {
-            return false;
-        }
-        self.completion_watermark = Some(index);
-        self.waiting_for_keyframe = true;
-        true
-    }
-
-    fn classify(&mut self, index: u64, frame: &MediaFrame) -> MediaObjectDecision {
-        if self
-            .completion_watermark
-            .is_some_and(|watermark| index <= watermark)
-        {
-            return MediaObjectDecision::DropLate;
-        }
-        self.completion_watermark = Some(index);
-
-        let independently_decodable = frame.header.flags.contains(FrameFlags::KEYFRAME)
-            && frame.header.flags.contains(FrameFlags::CODEC_CONFIG);
-        let sequence_contiguous = self
-            .last_sequence
-            .is_none_or(|last| last.checked_add(1) == Some(frame.header.sequence));
-        let sequence_monotonic = self
-            .last_sequence
-            .is_none_or(|last| frame.header.sequence > last);
-
-        let resync_required =
-            !sequence_monotonic || self.waiting_for_keyframe || !sequence_contiguous;
-        if resync_required && (!independently_decodable || !sequence_monotonic) {
-            self.waiting_for_keyframe = true;
-            return MediaObjectDecision::DropUntilKeyframe;
-        }
-
-        self.last_sequence = Some(frame.header.sequence);
-        self.waiting_for_keyframe = false;
-        MediaObjectDecision::Deliver
     }
 }
 
@@ -983,20 +738,6 @@ struct AcceptedMedia {
     capture_timestamp_us: u64,
     payload_len: usize,
     v3_group_id: Option<u64>,
-}
-
-impl From<MediaFrame> for AcceptedMedia {
-    fn from(frame: MediaFrame) -> Self {
-        Self {
-            flags: frame.header.flags,
-            width: frame.header.width,
-            height: frame.header.height,
-            sequence: frame.header.sequence,
-            capture_timestamp_us: frame.header.capture_timestamp_us,
-            payload_len: frame.payload.len(),
-            v3_group_id: None,
-        }
-    }
 }
 
 impl From<MediaObjectV3> for AcceptedMedia {
@@ -1466,10 +1207,6 @@ async fn main() -> Result<()> {
         "--timeout-seconds must be greater than zero"
     );
     ensure!(
-        !args.keyframe_smoke || (!args.media_v1 && !args.media_v2),
-        "--keyframe-smoke requires upstream MoQ or grouped v3 media"
-    );
-    ensure!(
         !args.keyframe_smoke || args.frames >= KEYFRAME_SMOKE_MINIMUM_FRAMES,
         "--keyframe-smoke requires at least {KEYFRAME_SMOKE_MINIMUM_FRAMES} accepted frames"
     );
@@ -1506,11 +1243,7 @@ async fn main() -> Result<()> {
         .context("binding probe endpoint")?;
     let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
     let address = EndpointAddr::new(args.node_id);
-    let media_transport = if args.media_v1 {
-        MediaTransport::ReliableV1
-    } else if args.media_v2 {
-        MediaTransport::IndependentV2
-    } else if args.media_v3 {
+    let media_transport = if args.media_v3 {
         MediaTransport::GroupedV3
     } else {
         MediaTransport::UpstreamMoq
@@ -1540,24 +1273,9 @@ async fn main() -> Result<()> {
     )
     .await?;
     let session_id = media_negotiation.session_id;
-    let mut media_send = Some(media_send);
-    let mut media_recv = Some(media_recv);
-    match media_transport {
-        MediaTransport::UpstreamMoq | MediaTransport::GroupedV3 => {
-            // Sigil finishes its response half after HostHello. Keep our send
-            // half alive as the bounded keyframe-control stream.
-            drop(media_recv.take());
-        }
-        MediaTransport::IndependentV2 => {
-            media_send
-                .take()
-                .expect("media handshake stream is present")
-                .finish()
-                .context("finishing media v2 handshake request")?;
-            drop(media_recv.take());
-        }
-        MediaTransport::ReliableV1 => {}
-    }
+    // Sigil finishes its response half after HostHello. Keep our send half
+    // alive as the bounded keyframe-control stream.
+    drop(media_recv);
 
     let mut moq_receiver = if media_transport == MediaTransport::UpstreamMoq {
         Some(
@@ -1780,11 +1498,9 @@ async fn main() -> Result<()> {
             .finish()
             .context("finishing media feedback stream")?;
         input_send.finish().context("finishing input stream")?;
-        if let Some(mut media_send) = media_send {
-            media_send
-                .finish()
-                .context("finishing media request stream")?;
-        }
+        media_send
+            .finish()
+            .context("finishing media request stream")?;
         feedback_connection.close(0_u32.into(), b"probe complete");
         input_connection.close(0_u32.into(), b"probe complete");
         moq_receiver
@@ -1844,13 +1560,6 @@ async fn main() -> Result<()> {
     let mut dimensions = None;
     let mut first_accepted_at = None;
     let mut last_accepted_at = None;
-    let mut object_receiver = (media_transport == MediaTransport::IndependentV2).then(|| {
-        MediaObjectReceiver::new(
-            media_connection.clone(),
-            Duration::from_secs(args.timeout_seconds),
-        )
-    });
-    let mut object_sequence = MediaObjectSequence::new();
     let mut object_receiver_v3 = (media_transport == MediaTransport::GroupedV3).then(|| {
         MediaObjectReceiverV3::new(
             media_connection.clone(),
@@ -2029,57 +1738,6 @@ async fn main() -> Result<()> {
                     }
                 }
             },
-            MediaTransport::ReliableV1 => (
-                tokio::time::timeout(
-                    Duration::from_secs(args.timeout_seconds),
-                    read_media_frame(
-                        media_recv
-                            .as_mut()
-                            .expect("v1 media receive stream is present"),
-                    ),
-                )
-                .await
-                .context("timed out waiting for media frame")??
-                .context("host closed the media stream")?
-                .into(),
-                false,
-            ),
-            MediaTransport::IndependentV2 => loop {
-                let outcome = tokio::time::timeout(
-                    Duration::from_secs(args.timeout_seconds)
-                        .saturating_add(Duration::from_secs(1)),
-                    object_receiver
-                        .as_mut()
-                        .expect("v2 media object receiver is present")
-                        .next(),
-                )
-                .await
-                .context("timed out waiting for media object")??
-                .context("host closed the media object connection")?;
-                match outcome {
-                    MediaObjectOutcome::Dropped { index } => {
-                        if object_sequence.note_drop(index) {
-                            media_objects_dropped = media_objects_dropped.saturating_add(1);
-                        } else {
-                            media_objects_late = media_objects_late.saturating_add(1);
-                        }
-                    }
-                    MediaObjectOutcome::Malformed { index, error } => {
-                        bail!("media object {index} is malformed: {error}");
-                    }
-                    MediaObjectOutcome::Frame { index, frame } => {
-                        match object_sequence.classify(index, &frame) {
-                            MediaObjectDecision::Deliver => break (frame.into(), false),
-                            MediaObjectDecision::DropLate => {
-                                media_objects_late = media_objects_late.saturating_add(1);
-                            }
-                            MediaObjectDecision::DropUntilKeyframe => {
-                                media_objects_dropped = media_objects_dropped.saturating_add(1);
-                            }
-                        }
-                    }
-                }
-            },
             MediaTransport::GroupedV3 => loop {
                 let outcome = tokio::time::timeout(
                     Duration::from_secs(args.timeout_seconds)
@@ -2235,12 +1893,7 @@ async fn main() -> Result<()> {
             );
             tokio::time::timeout(
                 Duration::from_secs(1),
-                write_media_control_request_v3(
-                    media_send
-                        .as_mut()
-                        .expect("v3 media control stream is present"),
-                    &request,
-                ),
+                write_media_control_request_v3(&mut media_send, &request),
             )
             .await
             .context("timed out writing v3 keyframe request")??;
@@ -2260,9 +1913,6 @@ async fn main() -> Result<()> {
                     );
                 }
                 MediaTransport::GroupedV3 => object_sequence_v3.request_recovery(),
-                MediaTransport::IndependentV2 | MediaTransport::ReliableV1 => {
-                    unreachable!("keyframe smoke excludes v2 and v1")
-                }
             }
         }
     }
@@ -2355,11 +2005,9 @@ async fn main() -> Result<()> {
         )
     });
     input_send.finish().context("finishing input stream")?;
-    if let Some(mut media_send) = media_send {
-        media_send
-            .finish()
-            .context("finishing media request stream")?;
-    }
+    media_send
+        .finish()
+        .context("finishing media request stream")?;
     // Close both protocol connections explicitly. Relying only on endpoint
     // teardown can leave a peer waiting for QUIC idle timeout during repeated
     // short-lived probes, which obscures whether the host released its
@@ -3167,13 +2815,6 @@ mod tests {
         .unwrap()
     }
 
-    fn media_outcome(index: u64, sequence: u64, flags: FrameFlags) -> MediaObjectOutcome {
-        MediaObjectOutcome::Frame {
-            index,
-            frame: media_frame(sequence, flags),
-        }
-    }
-
     fn media_object_v3(
         group_id: u64,
         object_id: u32,
@@ -3209,62 +2850,6 @@ mod tests {
             accept_index,
             object: media_object_v3(group_id, object_id, sequence, flags),
         }
-    }
-
-    #[test]
-    fn media_object_reorder_restores_accept_order_before_sequence_checks() {
-        let keyframe = FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG);
-        let mut reorder = MediaObjectReorder::new(0);
-
-        assert!(
-            reorder
-                .push(media_outcome(1, 11, FrameFlags::NONE))
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(reorder.pending_len(), 1);
-        assert_eq!(
-            reorder
-                .push(media_outcome(0, 10, keyframe))
-                .unwrap()
-                .unwrap()
-                .index(),
-            0
-        );
-        assert_eq!(reorder.take_next().unwrap().unwrap().index(), 1);
-        assert_eq!(reorder.pending_len(), 0);
-    }
-
-    #[test]
-    fn discontinuity_keyframe_is_an_explicit_latest_frame_barrier() {
-        let barrier = FrameFlags::KEYFRAME
-            .union(FrameFlags::CODEC_CONFIG)
-            .union(FrameFlags::DISCONTINUITY);
-        let mut reorder = MediaObjectReorder::new(0);
-
-        assert!(
-            reorder
-                .push(media_outcome(1, 11, FrameFlags::NONE))
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            reorder
-                .push(media_outcome(2, 20, barrier))
-                .unwrap()
-                .unwrap()
-                .index(),
-            2
-        );
-        assert_eq!(reorder.pending_len(), 0);
-        assert_eq!(
-            reorder
-                .push(media_outcome(0, 10, FrameFlags::NONE))
-                .unwrap()
-                .unwrap()
-                .index(),
-            0
-        );
     }
 
     #[test]
@@ -3329,79 +2914,6 @@ mod tests {
         assert_eq!(accepted_frame_rate(2, Duration::ZERO), None);
         assert!(accepted_frame_rate(56, Duration::from_secs(1)).unwrap() >= 55.0);
         assert!(accepted_frame_rate(55, Duration::from_secs(1)).unwrap() < 55.0);
-    }
-
-    #[test]
-    fn media_objects_wait_for_a_decodable_keyframe_then_deliver_contiguous_frames() {
-        let mut sequence = MediaObjectSequence::new();
-        let delta = media_frame(1, FrameFlags::NONE);
-        let keyframe = media_frame(2, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
-        let next_delta = media_frame(3, FrameFlags::NONE);
-
-        assert_eq!(
-            sequence.classify(0, &delta),
-            MediaObjectDecision::DropUntilKeyframe
-        );
-        assert_eq!(
-            sequence.classify(1, &keyframe),
-            MediaObjectDecision::Deliver
-        );
-        assert_eq!(
-            sequence.classify(2, &next_delta),
-            MediaObjectDecision::Deliver
-        );
-    }
-
-    #[test]
-    fn dropped_objects_force_resync_and_late_completions_cannot_rewind() {
-        let mut sequence = MediaObjectSequence::new();
-        let first_keyframe = media_frame(10, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
-        let stale_delta = media_frame(11, FrameFlags::NONE);
-        let replacement_keyframe =
-            media_frame(20, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
-
-        assert_eq!(
-            sequence.classify(0, &first_keyframe),
-            MediaObjectDecision::Deliver
-        );
-        assert!(sequence.note_drop(1));
-        assert_eq!(
-            sequence.classify(2, &replacement_keyframe),
-            MediaObjectDecision::Deliver
-        );
-        assert_eq!(
-            sequence.classify(1, &stale_delta),
-            MediaObjectDecision::DropLate
-        );
-        assert!(!sequence.note_drop(1));
-
-        let next_delta = media_frame(21, FrameFlags::NONE);
-        assert_eq!(
-            sequence.classify(3, &next_delta),
-            MediaObjectDecision::Deliver
-        );
-    }
-
-    #[test]
-    fn media_sequence_gap_drops_deltas_until_replacement_keyframe() {
-        let mut sequence = MediaObjectSequence::new();
-        let keyframe = media_frame(40, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
-        let gap_delta = media_frame(42, FrameFlags::NONE);
-        let replacement_keyframe =
-            media_frame(50, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
-
-        assert_eq!(
-            sequence.classify(0, &keyframe),
-            MediaObjectDecision::Deliver
-        );
-        assert_eq!(
-            sequence.classify(1, &gap_delta),
-            MediaObjectDecision::DropUntilKeyframe
-        );
-        assert_eq!(
-            sequence.classify(2, &replacement_keyframe),
-            MediaObjectDecision::Deliver
-        );
     }
 
     #[test]
@@ -3810,11 +3322,9 @@ mod tests {
     }
 
     #[test]
-    fn media_compatibility_flags_are_mutually_exclusive() {
+    fn media_compatibility_flag_defaults_and_conflicts_are_enforced() {
         let node_id = SecretKey::from_bytes(&[0x2a; 32]).public().to_string();
         let default = Args::try_parse_from(["sigil-probe", "--node-id", &node_id]).unwrap();
-        assert!(!default.media_v1);
-        assert!(!default.media_v2);
         assert!(!default.media_v3);
         assert_eq!(default.identity, None);
         assert_eq!(default.invitation, None);
@@ -3833,16 +3343,6 @@ mod tests {
             Args::try_parse_from(["sigil-probe", "--node-id", &node_id, "--feedback-smoke"])
                 .unwrap();
         assert!(feedback.feedback_smoke);
-        for flags in [
-            ["--media-v1", "--media-v2"],
-            ["--media-v1", "--media-v3"],
-            ["--media-v2", "--media-v3"],
-        ] {
-            assert!(
-                Args::try_parse_from(["sigil-probe", "--node-id", &node_id, flags[0], flags[1],])
-                    .is_err()
-            );
-        }
         assert!(
             Args::try_parse_from([
                 "sigil-probe",

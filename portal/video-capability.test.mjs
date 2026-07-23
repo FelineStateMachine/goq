@@ -77,9 +77,8 @@ test('awaits the probe before publishing the exact raw delivery mode', async () 
   ]);
 });
 
-test('keeps the real probe but obeys native forced-JPEG publication', async () => {
+test('keeps the real probe but obeys native publication of the effective mode', async () => {
   const calls = [];
-  const warnings = [];
   class SupportedDecoder {
     static async isConfigSupported(config) {
       calls.push(['probe', config]);
@@ -93,7 +92,7 @@ test('keeps the real probe but obeys native forced-JPEG publication', async () =
       calls.push(args);
       return false;
     },
-    logger: { warn: (...args) => warnings.push(args), error() {} },
+    logger: { warn() {}, error() {} },
   }), false);
   assert.deepEqual(calls, [
     ['probe', {
@@ -102,11 +101,9 @@ test('keeps the real probe but obeys native forced-JPEG publication', async () =
     }],
     ['set_webcodecs_available', { available: true }],
   ]);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0][0], /JPEG compatibility mode forced/);
 });
 
-test('keeps frontend on JPEG when capability publication fails', async () => {
+test('reports unavailable when capability publication fails', async () => {
   const errors = [];
   class SupportedDecoder {
     static async isConfigSupported() { return { supported: true }; }
@@ -118,7 +115,7 @@ test('keeps frontend on JPEG when capability publication fails', async () => {
     logger: { warn() {}, error: (...args) => errors.push(args) },
   }), false);
   assert.equal(errors.length, 1);
-  assert.match(errors[0][0], /using JPEG fallback/);
+  assert.match(errors[0][0], /could not publish WebCodecs capability/);
 });
 
 test('rejects a missing native publication boundary', async () => {

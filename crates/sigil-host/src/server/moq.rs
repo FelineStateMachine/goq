@@ -546,6 +546,33 @@ async fn run_control_moq_session(
     result
 }
 
+pub(super) fn media_frame_for_encoded(
+    _config: &HostConfig,
+    frame: &EncodedFrame,
+    discontinuity: bool,
+) -> Result<MediaFrame> {
+    let mut flags = FrameFlags::NONE;
+    if frame.keyframe {
+        flags = flags.union(FrameFlags::KEYFRAME);
+    }
+    if frame.codec_config {
+        flags = flags.union(FrameFlags::CODEC_CONFIG);
+    }
+    if discontinuity || frame.discontinuity {
+        flags = flags.union(FrameFlags::DISCONTINUITY);
+    }
+    let header = MediaFrameHeader::h264(
+        frame.width,
+        frame.height,
+        frame.data.len(),
+        frame.sequence,
+        frame.capture_timestamp_micros,
+        frame.presentation_timestamp_micros,
+        flags,
+    )?;
+    MediaFrame::new(header, frame.data.clone()).map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{media_v3_encoded_frame, moq_test_config};

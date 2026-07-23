@@ -49,17 +49,17 @@ require_exact_line scripts/stage-bazzite-release.sh \
 
 # Linux virtual-input producer and the packaged udev consumer must remain
 # byte-for-byte synchronized around the names that udev matches.
-require_exact_line crates/sigil-host/src/input.rs \
+require_exact_line crates/sigil-host/src/input/mod.rs \
   'const UINPUT_BUS_TYPE: u16 = 0x06; // Linux BUS_VIRTUAL'
-require_exact_line crates/sigil-host/src/input.rs \
+require_exact_line crates/sigil-host/src/input/mod.rs \
   'const UINPUT_VENDOR_ID: u16 = 0x5347;'
-require_exact_line crates/sigil-host/src/input.rs \
+require_exact_line crates/sigil-host/src/input/mod.rs \
   'const UINPUT_DEVICE_VERSION: u16 = 1;'
-require_exact_line crates/sigil-host/src/input.rs \
+require_exact_line crates/sigil-host/src/input/mod.rs \
   'const POINTER_DEVICE_NAME: &[u8] = b"Sigil Spark Virtual Pointer";'
-require_exact_line crates/sigil-host/src/input.rs \
+require_exact_line crates/sigil-host/src/input/mod.rs \
   'const KEYBOARD_DEVICE_NAME: &[u8] = b"Sigil Spark Virtual Keyboard";'
-require_exact_line crates/sigil-host/src/input.rs \
+require_exact_line crates/sigil-host/src/input/mod.rs \
   'const GAMEPAD_DEVICE_NAME: &[u8] = b"Sigil Spark Virtual Gamepad";'
 require_exact_line scripts/70-sigil-remote-input.rules \
   'ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Sigil Spark Virtual Pointer", GROUP="sigil-uinput", MODE="0660", TAG+="uaccess"'

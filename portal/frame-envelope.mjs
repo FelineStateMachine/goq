@@ -5,10 +5,12 @@ export const MAX_FRAME_PIXELS = 7680 * 4320;
 
 const MAGIC = [0x53, 0x47, 0x46, 0x52]; // SGFR
 const VERSION = 1;
+// Flag bits mirror sigil-protocol's FrameFlags (crates/sigil-protocol/src/media.rs)
+// exactly; the Rust channel encoder derives its values from that type.
 const KNOWN_FLAGS = 0b00000111;
 const KEYFRAME_FLAG = 1 << 0;
-const DISCONTINUITY_FLAG = 1 << 1;
-const CODEC_CONFIG_FLAG = 1 << 2;
+const CODEC_CONFIG_FLAG = 1 << 1;
+const DISCONTINUITY_FLAG = 1 << 2;
 const OPTIONAL_U64_NONE = 0xffffffffffffffffn;
 const OPTIONAL_I64_NONE = -0x8000000000000000n;
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);

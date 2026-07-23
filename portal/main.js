@@ -5,6 +5,7 @@ import {
   validatePointerSurfaceDimensions,
   validatePointerPositionFeedback,
   browserMouseButtonCode,
+  inputCapabilityLabel,
 } from './input-state.mjs';
 import { createInputRuntime } from './input-runtime.mjs';
 import { createControlRuntime } from './control-runtime.mjs';
@@ -261,12 +262,6 @@ async function cancelInvitation() {
 async function checkDevelopmentConnectionMode() {
   const mode = await invoke('development_connection_mode');
   connectionState.setDevelopmentMode(mode.enabled);
-  if (mode.force_jpeg) {
-    const jpegBadge = document.getElementById('dev-jpeg-badge');
-    jpegBadge.classList.remove('hidden');
-    jpegBadge.title = mode.jpeg_warning;
-    console.warn('[development JPEG compatibility mode]', mode.jpeg_warning);
-  }
   if (!mode.enabled) return;
 
   const badge = document.getElementById('dev-connect-badge');
@@ -334,7 +329,7 @@ function updateAudioUI() {
       state: session.state,
       detail: session.stateDetail,
     });
-    toggle.textContent = presentation.glyph;
+    toggle.textContent = presentation.label;
     toggle.classList.toggle('active', session.available && !session.muted);
     toggle.classList.toggle('disabled', !session.available);
     toggle.setAttribute('aria-disabled', session.available ? 'false' : 'true');
@@ -578,10 +573,10 @@ function togglePanel(force) {
 }
 
 // ─── WebCodecs detection ──────────────────────────────────────────────────────
-// Finish the codec probe and publish the same delivery mode to Rust before
-// exposing any connect handlers. This keeps raw WebCodecs frames and the Rust
-// JPEG compatibility path from disagreeing during startup.
-const hasWebCodecs = await detectAndPublishVideoDeliveryMode({ invokeCommand: invoke });
+// Finish the codec probe and publish the result to Rust before exposing any
+// connect handlers. Rust refuses to connect when WebCodecs is unavailable, so
+// the pipeline below can assume binary WebCodecs delivery.
+await detectAndPublishVideoDeliveryMode({ invokeCommand: invoke });
 
 // ─── Frame decoding ───────────────────────────────────────────────────────────
 const canvas = document.getElementById('frame-canvas');
@@ -628,7 +623,6 @@ controlRuntime = createControlRuntime({
   onReleaseFailure: () => setStatus('err', 'cursor release failed · quit app'),
 });
 videoPipeline = createVideoPipelineSession({
-  hasWebCodecs,
   canvas,
   context: ctx,
   requestKeyframe: (reason) => streamRuntime?.requestKeyframe(reason),
@@ -766,12 +760,6 @@ setInterval(() => {
   if (connectionState.connected) updateStreamStats();
 }, 250);
 
-// The software decoder/JPEG compatibility path intentionally remains an event:
-// it is only selected when WebCodecs is unavailable and is not latency-critical.
-listen('frame', (event) => {
-  streamRuntime.handleLegacyFrame(event.payload);
-});
-
 listen('frame-stats', (event) => {
   if (streamRuntime.handleFrameStats(event.payload)) updateStreamStats();
 });
@@ -804,14 +792,7 @@ async function toggleControl() {
 }
 
 function describeInputCapabilities() {
-  const accepted = [];
-  const capabilities = connectionState.inputCapabilities;
-  if (capabilities.relativePointer) accepted.push('relative pointer');
-  else if (capabilities.absolutePointer) accepted.push('pointer');
-  if (capabilities.keyboard) accepted.push('keyboard');
-  if (capabilities.text) accepted.push('text');
-  if (capabilities.gamepad) accepted.push('gamepad');
-  return accepted.length > 0 ? accepted.join(' + ') : 'view only';
+  return inputCapabilityLabel(connectionState.inputCapabilities);
 }
 
 function pointerInputAvailable() {
@@ -942,6 +923,18 @@ window.addEventListener('mouseup', (e) => {
   if (controlRuntime.active && connectionState.inputCapabilities.relativePointer) e.stopPropagation();
   releaseMouseButton(e);
 }, { capture: true });
+
+function suppressLocalClickDuringRelativeControl(e) {
+  if (!controlRuntime.active || !connectionState.inputCapabilities.relativePointer) return;
+  // mousedown/mouseup are forwarded to the host above, but WebKit synthesizes
+  // a separate click at the native cursor's frozen local position. Prevent
+  // that click from reaching the underlying Portal control that acquired the
+  // cursor, where it would immediately toggle controlling mode back off.
+  e.preventDefault();
+  e.stopImmediatePropagation();
+}
+
+window.addEventListener('click', suppressLocalClickDuringRelativeControl, { capture: true });
 
 window.addEventListener('contextmenu', (e) => {
   if (!controlRuntime.active || !pointerInputAvailable()) return;

@@ -4,6 +4,8 @@
 //! delivery-timeout semantics. It is intentionally not an implementation of
 //! the IETF MoQ Transport protocol.
 
+use std::sync::Arc;
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
@@ -225,12 +227,16 @@ impl MediaObjectHeaderV3 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaObjectV3 {
     pub header: MediaObjectHeaderV3,
-    pub payload: Vec<u8>,
+    /// The compressed access unit. Held behind an `Arc` so the host can fan the
+    /// same encoded object out to every connected client without copying the
+    /// payload per connection.
+    pub payload: Arc<[u8]>,
 }
 
 impl MediaObjectV3 {
-    pub fn new(header: MediaObjectHeaderV3, payload: Vec<u8>) -> Result<Self> {
+    pub fn new(header: MediaObjectHeaderV3, payload: impl Into<Arc<[u8]>>) -> Result<Self> {
         header.validate()?;
+        let payload = payload.into();
         if payload.len() != header.payload_len as usize {
             return Err(ProtocolError::InvalidMessage {
                 message_type: "v3 media object",
@@ -261,7 +267,10 @@ where
             reason: "trailing bytes after the media object",
         });
     }
-    Ok(MediaObjectV3 { header, payload })
+    Ok(MediaObjectV3 {
+        header,
+        payload: payload.into(),
+    })
 }
 
 /// Validate and write one complete v3 media object.

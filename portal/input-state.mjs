@@ -6,6 +6,20 @@ export const MAX_POINTER_SURFACE_WIDTH = 7680;
 export const MIN_POINTER_SURFACE_HEIGHT = 64;
 export const MAX_POINTER_SURFACE_HEIGHT = 4320;
 
+export function inputCapabilityLabel(capabilities = {}) {
+  const accepted = [];
+  const pointer = capabilities.relativePointer === true
+    || capabilities.absolutePointer === true;
+  if (pointer && capabilities.keyboard === true) accepted.push('kbm');
+  else {
+    if (pointer) accepted.push('mouse');
+    if (capabilities.keyboard === true) accepted.push('keyboard');
+  }
+  if (capabilities.text === true) accepted.push('text');
+  if (capabilities.gamepad === true) accepted.push('controller');
+  return accepted.length > 0 ? accepted.join(' + ') : 'view only';
+}
+
 function roundedRelativeAxis(value) {
   if (!Number.isFinite(value)) return 0;
   const rounded = Math.round(value);

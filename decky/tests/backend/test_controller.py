@@ -232,6 +232,41 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ControllerError, "service_ready_timeout"):
             await self.controller.restart_service()
 
+    async def test_wait_ready_timeout_reports_last_polling_error(self):
+        controller = Controller(self.runner)
+
+        async def failing_status() -> dict[str, Any]:
+            raise ControllerError("command_timeout")
+
+        controller._status = failing_status
+        with (
+            mock.patch("goq_sigil.controller.READY_TIMEOUT_SECONDS", 0.02),
+            mock.patch("goq_sigil.controller.POLL_SECONDS", 0.0),
+            self.assertRaises(ControllerError) as caught,
+        ):
+            await controller._wait_ready(previous_instance="0" * 32)
+        self.assertEqual(caught.exception.code, "service_ready_timeout")
+        self.assertEqual(caught.exception.detail, "command_timeout")
+        self.assertIsInstance(caught.exception.__cause__, ControllerError)
+        self.assertEqual(caught.exception.__cause__.code, "command_timeout")
+
+    async def test_wait_ready_timeout_reports_unmet_condition(self):
+        controller = Controller(self.runner)
+
+        async def degraded_status() -> dict[str, Any]:
+            return {"overall": "degraded", "runtime": {}}
+
+        controller._status = degraded_status
+        with (
+            mock.patch("goq_sigil.controller.READY_TIMEOUT_SECONDS", 0.02),
+            mock.patch("goq_sigil.controller.POLL_SECONDS", 0.0),
+            self.assertRaises(ControllerError) as caught,
+        ):
+            await controller._wait_ready(previous_instance="0" * 32)
+        self.assertEqual(caught.exception.code, "service_ready_timeout")
+        self.assertEqual(caught.exception.detail, "overall='degraded'")
+        self.assertIsNone(caught.exception.__cause__)
+
     async def test_restart_from_proven_absent_runtime_accepts_first_instance(self):
         self.runner.instance = None
         self.runner.active = False

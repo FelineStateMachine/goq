@@ -21,8 +21,6 @@ keyframe_request_log="accepted MoQ keyframe request"
 session_gate_name="control"
 keyframe_recovery="ok"
 media_v3=false
-media_v2=false
-media_v1=false
 relay_only=false
 expected_path_mode=direct
 
@@ -42,10 +40,6 @@ Options:
   --reconnect-frames COUNT      Frames per reconnect session (default: 30)
   --probe-timeout-seconds SEC   Probe per-operation timeout (default: 15)
   --media-v3                    Exercise custom grouped media v3 compatibility
-                                instead of upstream MoQ
-  --media-v2                    Exercise independent media v2 compatibility
-                                instead of upstream MoQ
-  --media-v1                    Exercise ordered media v1 compatibility
                                 instead of upstream MoQ
   --relay-only                  Remove direct probe transports and require the
                                 control, media, and input paths to stay relayed
@@ -96,38 +90,12 @@ while [[ $# -gt 0 ]]; do
       probe_timeout_seconds="$2"
       shift 2
       ;;
-    --media-v1)
-      [[ "$media_v2" == false && "$media_v3" == false ]] \
-        || die "media compatibility flags cannot be combined"
-      media_transport="reliable-v1"
-      media_alpn="sigil/media/1"
-      media_accept_log="media client accepted"
-      media_release_log="media client released"
-      session_gate_name="media"
-      keyframe_recovery="not-requested"
-      media_v1=true
-      shift
-      ;;
     --relay-only)
       relay_only=true
       expected_path_mode=relay
       shift
       ;;
-    --media-v2)
-      [[ "$media_v1" == false && "$media_v3" == false ]] \
-        || die "media compatibility flags cannot be combined"
-      media_transport="independent-v2"
-      media_alpn="sigil/media/2"
-      media_accept_log="media v2 client accepted"
-      media_release_log="media v2 client released"
-      session_gate_name="media"
-      keyframe_recovery="not-requested"
-      media_v2=true
-      shift
-      ;;
     --media-v3)
-      [[ "$media_v1" == false && "$media_v2" == false ]] \
-        || die "media compatibility flags cannot be combined"
       media_transport="grouped-v3"
       media_alpn="sigil/media/3"
       media_accept_log="media v3 client accepted"
@@ -160,12 +128,10 @@ require_positive_integer "--primary-frames" "$primary_frames"
 require_positive_integer "--reconnect-cycles" "$reconnect_cycles"
 require_positive_integer "--reconnect-frames" "$reconnect_frames"
 require_positive_integer "--probe-timeout-seconds" "$probe_timeout_seconds"
-if [[ "$media_v1" == false && "$media_v2" == false ]]; then
-  [[ "$primary_frames" -ge 4 ]] \
-    || die "--primary-frames must be at least 4 for keyframe recovery"
-  [[ "$reconnect_frames" -ge 4 ]] \
-    || die "--reconnect-frames must be at least 4 for keyframe recovery"
-fi
+[[ "$primary_frames" -ge 4 ]] \
+  || die "--primary-frames must be at least 4 for keyframe recovery"
+[[ "$reconnect_frames" -ge 4 ]] \
+  || die "--reconnect-frames must be at least 4 for keyframe recovery"
 
 # A fresh Iroh endpoint performs relay discovery and path establishment on
 # every reconnect. Keep the default three-cycle proof fast, but scale the host
@@ -412,9 +378,6 @@ validate_probe_log() {
   local log_path="$1"
   local expected_frames="$2"
   local expected_request_id="$3"
-  if [[ "$media_v1" == true || "$media_v2" == true ]]; then
-    expected_request_id="not-requested"
-  fi
   grep -Fxq 'probe=ok' "$log_path" || return 1
   grep -Fxq "frames=${expected_frames}" "$log_path" || return 1
   grep -Fxq 'dimensions=1280x800' "$log_path" || return 1
@@ -488,11 +451,7 @@ run_probe() {
   if [[ "$relay_only" == true ]]; then
     set -- --relay-only "$@"
   fi
-  if [[ "$media_v1" == true ]]; then
-    "$probe_bin" --media-v1 "$@"
-  elif [[ "$media_v2" == true ]]; then
-    "$probe_bin" --media-v2 "$@"
-  elif [[ "$media_v3" == true ]]; then
+  if [[ "$media_v3" == true ]]; then
     "$probe_bin" --media-v3 "$@"
   else
     "$probe_bin" "$@"
@@ -502,11 +461,7 @@ run_probe() {
 run_proof_probe() {
   local request_id="$1"
   shift
-  if [[ "$media_v1" == false && "$media_v2" == false ]]; then
-    run_probe --keyframe-smoke --keyframe-request-id "$request_id" "$@"
-  else
-    run_probe "$@"
-  fi
+  run_probe --keyframe-smoke --keyframe-request-id "$request_id" "$@"
 }
 
 cd "$workspace_dir"
@@ -555,7 +510,7 @@ primary_probe_args=(
   --timeout-seconds "$probe_timeout_seconds"
   --expect-size 1280x800
 )
-if [[ "$media_v1" == false && "$media_v2" == false && "$media_v3" == false ]]; then
+if [[ "$media_v3" == false ]]; then
   primary_probe_args+=(--slow-consumer-ms 1500)
 fi
 run_proof_probe 1 "${primary_probe_args[@]}" >"$primary_log" 2>&1 &
@@ -602,10 +557,8 @@ validate_probe_log "$primary_log" "$primary_frames" 1 || {
   sed -n '1,240p' "$primary_log" >&2 || true
   die "primary probe evidence is incomplete"
 }
-if [[ "$media_v1" == false && "$media_v2" == false ]]; then
-  wait_for_keyframe_request "$host_log" 1 "$host_pid" 'sigil' \
-    || die "primary keyframe request was not accepted by the host"
-fi
+wait_for_keyframe_request "$host_log" 1 "$host_pid" 'sigil' \
+  || die "primary keyframe request was not accepted by the host"
 
 wait_for_log_count "$host_log" "$media_release_log" 1 "$host_pid" 'sigil' \
   || die "primary session was not released"
@@ -626,10 +579,8 @@ while [[ "$cycle" -le "$reconnect_cycles" ]]; do
     sed -n '1,240p' "$reconnect_log" >&2 || true
     die "reconnect cycle $cycle evidence is incomplete"
   }
-  if [[ "$media_v1" == false && "$media_v2" == false ]]; then
-    wait_for_keyframe_request "$host_log" "$reconnect_request_id" "$host_pid" 'sigil' \
-      || die "reconnect cycle $cycle keyframe request was not accepted by the host"
-  fi
+  wait_for_keyframe_request "$host_log" "$reconnect_request_id" "$host_pid" 'sigil' \
+    || die "reconnect cycle $cycle keyframe request was not accepted by the host"
   wait_for_log_count "$host_log" "$media_release_log" "$((cycle + 1))" "$host_pid" 'sigil' \
     || die "reconnect cycle $cycle was not released"
   wait_for_log_count "$host_log" 'input client released' "$((cycle + 1))" "$host_pid" 'sigil' \
@@ -637,15 +588,13 @@ while [[ "$cycle" -le "$reconnect_cycles" ]]; do
   cycle=$((cycle + 1))
 done
 
-if [[ "$media_v1" == false && "$media_v2" == false ]]; then
-  request_id=1
-  while [[ "$request_id" -le $((reconnect_cycles + 1)) ]]; do
-    request_count="$(host_keyframe_request_count "$host_log" "$request_id")"
-    [[ "$request_count" -eq 1 ]] \
-      || die "keyframe request $request_id was accepted $request_count times; expected exactly once"
-    request_id=$((request_id + 1))
-  done
-fi
+request_id=1
+while [[ "$request_id" -le $((reconnect_cycles + 1)) ]]; do
+  request_count="$(host_keyframe_request_count "$host_log" "$request_id")"
+  [[ "$request_count" -eq 1 ]] \
+    || die "keyframe request $request_id was accepted $request_count times; expected exactly once"
+  request_id=$((request_id + 1))
+done
 
 kill -TERM "$host_pid" 2>/dev/null || true
 if wait "$host_pid"; then
@@ -672,8 +621,7 @@ printf 'probe_sha256=%s\n' "$(sha256_file "$probe_bin")"
 printf 'node_id=%s\n' "$node_id"
 printf 'primary_frames=%s\n' "$primary_frames"
 grep -E '^(transport|control_alpn|transport_alpn|first_configured_idr|frame_sequence|group_sequence|keyframe_recovery|keyframe_recovery_micros|keyframe_request_id|keyframes|sequence_gaps|media_objects_dropped|media_objects_late|moq_catalog|moq_group_capacity|moq_cancelled_groups|moq_group_gaps|moq_unrecovered_group_gaps|moq_maximum_group_objects|moq_maximum_group_bytes|moq_historical_suffix_frames|recovery_barrier|slow_consumer|slow_consumer_stall_ms|slow_consumer_first_post_stall|slow_consumer_historical_suffix_frames|slow_consumer_recovery_micros|slow_consumer_cancellation_delta|slow_consumer_group_advance|slow_consumer_sequence_advance|slow_consumer_capture_advance_micros|slow_consumer_input_ack_micros|input_ack_micros|path_mode|path_rtt_ms|control_path_mode|control_path_rtt_ms|media_path_mode|media_path_rtt_ms|input_path_mode|input_path_rtt_ms|forced_relay)=' "$primary_log"
-printf 'keyframe_request_correlation=%s\n' \
-  "$([[ "$media_v1" == false && "$media_v2" == false ]] && printf unique || printf not-requested)"
+printf 'keyframe_request_correlation=unique\n'
 printf 'active_client_rejection=ok\n'
 printf 'reconnect_cycles=%s\n' "$reconnect_cycles"
 printf 'cleanup=ok\n'

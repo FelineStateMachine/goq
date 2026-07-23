@@ -1,32 +1,10 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde::Serialize;
-use sigil_protocol::{MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS};
+use sigil_protocol::{FrameFlags, MAX_MEDIA_PAYLOAD_LEN, MAX_VIDEO_DIMENSION, MAX_VIDEO_PIXELS};
 use tauri::{AppHandle, Emitter};
 
 use crate::commands::state::AppState;
-
-pub(crate) fn byte_to_codec(value: u8) -> Result<&'static str, String> {
-    match value {
-        1 => Ok("h264"),
-        unsupported => Err(format!(
-            "Unsupported legacy media codec: {unsupported}; Portal supports H.264 only"
-        )),
-    }
-}
-
-#[derive(Serialize, Clone)]
-pub struct FramePayload {
-    pub generation: u64,
-    pub width: u32,
-    pub height: u32,
-    pub data: String,
-    pub keyframe: bool,
-    pub codec: String,
-    pub capture_timestamp_micros: Option<u64>,
-    pub pts_micros: Option<i64>,
-    pub discontinuity: bool,
-}
 
 #[derive(Serialize, Clone)]
 struct FrameErrorPayload {
@@ -52,9 +30,12 @@ pub(crate) const CLIENT_FRAME_CHANNEL_CAPACITY: usize = 4;
 const FRAME_CHANNEL_MAGIC: [u8; 4] = *b"SGFR";
 const FRAME_CHANNEL_VERSION: u8 = 1;
 const FRAME_CHANNEL_HEADER_LEN: usize = 40;
-const FRAME_CHANNEL_FLAG_KEYFRAME: u8 = 1 << 0;
-const FRAME_CHANNEL_FLAG_DISCONTINUITY: u8 = 1 << 1;
-const FRAME_CHANNEL_FLAG_CODEC_CONFIG: u8 = 1 << 2;
+// The channel flag byte uses the exact sigil-protocol wire bit assignments;
+// deriving them here keeps the two layers incapable of drifting apart.
+// portal/frame-envelope.mjs mirrors the same values.
+const FRAME_CHANNEL_FLAG_KEYFRAME: u8 = FrameFlags::KEYFRAME.bits();
+const FRAME_CHANNEL_FLAG_CODEC_CONFIG: u8 = FrameFlags::CODEC_CONFIG.bits();
+const FRAME_CHANNEL_FLAG_DISCONTINUITY: u8 = FrameFlags::DISCONTINUITY.bits();
 const FRAME_CHANNEL_OPTIONAL_U64_NONE: u64 = u64::MAX;
 const FRAME_CHANNEL_OPTIONAL_I64_NONE: i64 = i64::MIN;
 
@@ -314,6 +295,27 @@ mod tests {
     }
 
     #[test]
+    fn channel_flag_bits_match_protocol_wire_assignments() {
+        let envelope = encode_frame_envelope(
+            FrameEnvelopeMetadata {
+                width: 1,
+                height: 1,
+                codec: "h264",
+                keyframe: false,
+                discontinuity: true,
+                codec_config: false,
+                sequence: None,
+                capture_timestamp_micros: None,
+                pts_micros: None,
+            },
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(envelope[6], FrameFlags::DISCONTINUITY.bits());
+        assert_eq!(envelope[6], 0b100);
+    }
+
+    #[test]
     fn binary_frame_envelope_uses_explicit_optional_sentinels() {
         let envelope = encode_frame_envelope(
             FrameEnvelopeMetadata {
@@ -396,15 +398,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_codec_bytes_fail_closed_to_h264_only() {
-        assert_eq!(byte_to_codec(1).unwrap(), "h264");
-        for unsupported in [0, 2, 3, u8::MAX] {
-            let error = byte_to_codec(unsupported).unwrap_err();
-            assert!(error.contains("H.264 only"));
-        }
-    }
-
-    #[test]
     fn frame_channel_slots_are_bounded_and_cannot_underflow() {
         let in_flight = AtomicUsize::new(0);
         release_frame_channel_slot(&in_flight);
@@ -448,25 +441,12 @@ mod tests {
 
     #[test]
     fn global_frame_events_serialize_their_media_generation() {
-        let frame = serde_json::to_value(FramePayload {
-            generation: 17,
-            width: 1280,
-            height: 800,
-            data: "jpeg".to_string(),
-            keyframe: true,
-            codec: "h264".to_string(),
-            capture_timestamp_micros: Some(1),
-            pts_micros: Some(2),
-            discontinuity: false,
-        })
-        .unwrap();
         let error = serde_json::to_value(FrameErrorPayload {
             generation: 17,
             error: "closed".to_string(),
         })
         .unwrap();
 
-        assert_eq!(frame["generation"], 17);
         assert_eq!(error["generation"], 17);
         assert_eq!(error["error"], "closed");
     }

@@ -20,7 +20,16 @@ class Plugin:
             value = await operation(*arguments)
             return {"ok": True, "value": value}
         except ControllerError as error:
-            decky.logger.warning("Sigil controller operation failed: %s", error.code)
+            if error.detail:
+                decky.logger.warning(
+                    "Sigil controller operation failed: %s (%s)",
+                    error.code,
+                    error.detail,
+                )
+            else:
+                decky.logger.warning(
+                    "Sigil controller operation failed: %s", error.code
+                )
             return {"ok": False, "error": error.code}
         except Exception:
             decky.logger.exception("Unexpected Sigil controller failure")

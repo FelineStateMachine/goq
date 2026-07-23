@@ -38,11 +38,8 @@ iroh-moq.workspace = true
 moq-net.workspace = true
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time"] }
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
-base64 = "0.22"
 url = "2"
 sha2 = "0.10"
-openh264 = "0.7"
 sigil-protocol = { path = "../crates/sigil-protocol" }
 
 [dev-dependencies]

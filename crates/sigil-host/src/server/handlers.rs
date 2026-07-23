@@ -404,6 +404,11 @@ async fn serve_input(
     let reset_result = session_guard
         .finish()
         .context("releasing held input transitions at session end");
+    if session_result.is_err()
+        && let Err(error) = &reset_result
+    {
+        error!(%error, "input session and held-transition release both failed");
+    }
     let result = session_result.and(reset_result);
     info!(%remote, "input client released");
     result

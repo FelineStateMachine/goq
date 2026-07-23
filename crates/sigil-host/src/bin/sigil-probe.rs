@@ -2637,6 +2637,20 @@ fn load_invitation_file(
     expected_peer: EndpointId,
     required_grants: InvitationGrants,
 ) -> Result<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    load_invitation_file_at(path, expected_host, expected_peer, required_grants, now)
+}
+
+fn load_invitation_file_at(
+    path: &Path,
+    expected_host: EndpointId,
+    expected_peer: EndpointId,
+    required_grants: InvitationGrants,
+    now: u64,
+) -> Result<String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -2713,10 +2727,6 @@ fn load_invitation_file(
             || invitation.claims.grants.contains(InvitationGrants::GAMEPAD),
         "invitation must grant pointer/keyboard or gamepad for the probe input acknowledgment"
     );
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_secs();
     ensure!(
         now >= invitation
             .claims
@@ -3398,34 +3408,54 @@ mod tests {
 
         write_private_invitation(&path, &token, b"\n");
         assert_eq!(
-            load_invitation_file(
+            load_invitation_file_at(
                 &path,
                 host.public(),
                 peer.public(),
                 InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD),
+                now,
             )
             .unwrap(),
             token
         );
         write_private_invitation(&path, &token, b"\r\n");
         assert!(
-            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
-                .is_ok()
+            load_invitation_file_at(
+                &path,
+                host.public(),
+                peer.public(),
+                InvitationGrants::VIEW,
+                now,
+            )
+            .is_ok()
         );
         assert!(
-            load_invitation_file(&path, other.public(), peer.public(), InvitationGrants::VIEW,)
-                .is_err()
+            load_invitation_file_at(
+                &path,
+                other.public(),
+                peer.public(),
+                InvitationGrants::VIEW,
+                now,
+            )
+            .is_err()
         );
         assert!(
-            load_invitation_file(&path, host.public(), other.public(), InvitationGrants::VIEW,)
-                .is_err()
+            load_invitation_file_at(
+                &path,
+                host.public(),
+                other.public(),
+                InvitationGrants::VIEW,
+                now,
+            )
+            .is_err()
         );
         assert!(
-            load_invitation_file(
+            load_invitation_file_at(
                 &path,
                 host.public(),
                 peer.public(),
                 InvitationGrants::POINTER_KEYBOARD,
+                now,
             )
             .is_err()
         );
@@ -3439,10 +3469,16 @@ mod tests {
         );
         write_private_invitation(&path, &view_only, b"\n");
         assert!(
-            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
-                .unwrap_err()
-                .to_string()
-                .contains("input acknowledgment")
+            load_invitation_file_at(
+                &path,
+                host.public(),
+                peer.public(),
+                InvitationGrants::VIEW,
+                now,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("input acknowledgment")
         );
 
         let expired = test_invitation(
@@ -3454,15 +3490,27 @@ mod tests {
         );
         write_private_invitation(&path, &expired, b"\n");
         assert!(
-            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
-                .unwrap_err()
-                .to_string()
-                .contains("expired")
+            load_invitation_file_at(
+                &path,
+                host.public(),
+                peer.public(),
+                InvitationGrants::VIEW,
+                now,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("expired")
         );
         write_private_invitation(&path, &token, b"\n\n");
         assert!(
-            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
-                .is_err()
+            load_invitation_file_at(
+                &path,
+                host.public(),
+                peer.public(),
+                InvitationGrants::VIEW,
+                now,
+            )
+            .is_err()
         );
         let future = test_invitation(
             &host,
@@ -3473,10 +3521,16 @@ mod tests {
         );
         write_private_invitation(&path, &future, b"\n");
         assert!(
-            load_invitation_file(&path, host.public(), peer.public(), InvitationGrants::VIEW,)
-                .unwrap_err()
-                .to_string()
-                .contains("future")
+            load_invitation_file_at(
+                &path,
+                host.public(),
+                peer.public(),
+                InvitationGrants::VIEW,
+                now,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("future")
         );
     }
 

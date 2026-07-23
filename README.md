@@ -41,9 +41,10 @@ Steam and games.
   derives the encoded size from its bounded native caps by default, and uses
   AMD GstVA H.264. An explicit width/height pair remains available for
   downscale proofs; 1280×800/60 is the first measured target, not a product
-  constraint. Bazzite remains the only packaged and hardware-proven appliance;
-  SteamOS packaging, cold boot, encoder availability, and hardware UAT remain
-  unproven.
+  constraint. Bazzite remains the only packaged appliance, and the GPD Pocket
+  4 run is reference-host evidence rather than a completed hardware matrix.
+  SteamOS packaging, cold boot, encoder availability, and cross-host hardware
+  UAT remain unproven.
 - Gamescope video keeps the proven external `gst-launch` pipeline as its
   configuration default. Linux builds made explicitly with
   `in-process-gstreamer` can opt into an in-process pipeline for bounded
@@ -107,10 +108,11 @@ not authentication.
 ## Immediate milestones
 
 1. **Done:** split Sigil into a pure Rust host binary; keep Portal client-only.
-2. **Hardware-proven on the attached-display GPD host:** capture the exact
-   Gamescope PipeWire node without an XDG portal. Physically headless cold boot
-   and service startup remain public-alpha acceptance gates.
-3. **Hardware-proven:** encode H.264 at 1280x800/60 with bounded buffers and no B-frames.
+2. **GPD Pocket 4/Bazzite reference-host evidence:** capture the exact Gamescope
+   PipeWire node without an XDG portal. Physically headless cold boot and
+   service startup remain public-alpha acceptance gates.
+3. **GPD Pocket 4/Bazzite reference-host evidence:** encode H.264 at
+   1280x800/60 with bounded buffers and no B-frames.
 4. **Done:** replace base64 WebCodecs delivery with a bounded binary Tauri channel.
 5. **Upstream Iroh/MoQ transport implemented; hardware proof pending:** an
    authenticated control lease gates a session-scoped upstream MoQ broadcast;
@@ -119,15 +121,17 @@ not authentication.
    into coalesced forced IDRs without blocking media publication; the external
    encoder responds at its next natural configured IDR. Bazzite/package
    acceptance and induced-loss relay proof remain in issue #7.
-6. **Host hardware-proven; physical client controller pending:** the virtual
-   Xbox-style controller negotiated over Iroh and produced the expected
-   button, stick, trigger, D-pad, and neutral-release events on the Bazzite
-   host. Client controller navigation and mapping are covered by focused tests;
-   the remaining integration gate is forwarding a physical controller attached
-   to the client. Keyboard injection is hardware-proven, and the conventional
-   relative mouse replaces Gamescope-incompatible absolute motion.
-7. **Live-proven:** bounded PipeWire audio capture, a persistent headless sink,
-   Opus delivery, and client playback. Quantify longer-run A/V synchronization.
+6. **GPD Pocket 4/Bazzite reference-host evidence; physical client controller
+   pending:** the virtual Xbox-style controller negotiated over Iroh and
+   produced the expected button, stick, trigger, D-pad, and neutral-release
+   events on that host. Client controller navigation and mapping are covered
+   by focused tests; the remaining integration gate is forwarding a physical
+   controller attached to the client. Keyboard injection was exercised on the
+   same reference host, and the conventional relative mouse replaces
+   Gamescope-incompatible absolute motion.
+7. **GPD Pocket 4/Bazzite reference-host evidence:** bounded PipeWire audio
+   capture, a persistent headless sink, Opus delivery, and client playback.
+   Quantify longer-run A/V synchronization.
 8. **Done:** add signed, peer-bound, one-time capability enrollment with
    durable replay protection and controller-usable Portal onboarding.
 9. **Adaptive control implemented; hardware proof pending:** feedback remains

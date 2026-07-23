@@ -170,6 +170,10 @@ Sigil host.
 - Treat `docs/fresh-bazzite-host.md`, `docs/public-release-delivery.md`, and
   GitHub issues #3-#10 as the current acceptance sources. Distinguish local
   tests from hardware proof and from still-pending operator acceptance.
+- Treat `docs/hardware-uat/MATRIX.md` as the claim contract. Until both
+  required rows pass the same exact candidate, name hardware results as
+  reference-host evidence; do not use unqualified `hardware-proven` language.
+  A development matrix pass is not release-matrix proof.
 - Use the strict live capture gate on Bazzite when capture changes:
 
   ```bash

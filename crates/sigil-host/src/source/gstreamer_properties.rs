@@ -191,11 +191,12 @@ mod linux {
             );
             let class = class.cast::<GEnumClass>();
             let count = unsafe { (*class).n_values as usize };
+            let values = unsafe { (*class).values };
             ensure!(
-                count <= 1024,
-                "encoder rate-control enum is unreasonably large"
+                (1..=1024).contains(&count) && !values.is_null(),
+                "encoder rate-control enum metadata is empty or unreasonably large"
             );
-            let values = unsafe { std::slice::from_raw_parts((*class).values, count) };
+            let values = unsafe { std::slice::from_raw_parts(values, count) };
             let mut nicks = Vec::with_capacity(values.len());
             for value in values {
                 if !value.value_nick.is_null() {

@@ -44,26 +44,45 @@ not say `hardware-proven` without qualification.
 
 ## Evidence contract
 
-Each passing row must link a committed report under `docs/hardware-uat/`. The
-report and its sanitized supporting files must bind:
+Each passing row must link a distinct committed report at
+`docs/hardware-uat/<12-char-commit>/<row-id>/REPORT.md`. Both reports must
+reference the same
+`docs/hardware-uat/<12-char-commit>/candidate-artifacts.env`; its SHA-256 is
+the `Candidate artifact set SHA256`. The manifest uses the exact
+`goq-hardware-matrix-artifacts-v1` schema and binds the full commit, whether the
+candidate is `development` or `release`, and distinct safe Sigil and Portal
+asset names plus their nonzero SHA-256 digests. The repository gate recomputes
+the manifest digest instead of trusting a report-provided value.
 
-- the matrix row ID, exact source commit, workflow run, and one shared
-  `Candidate artifact set SHA256` digest;
+Each report must bind exactly one matrix row, exact source commit, numeric
+workflow run, candidate-manifest path and digest, and adjacent `EVIDENCE.env`.
+The evidence file uses the exact `goq-hardware-matrix-evidence-v1` schema.
+Unknown, missing, empty, duplicated, or unterminated fields fail the gate. Its
+structured fields bind:
+
 - host model, integrated/discrete topology, connector state, native resolution
-  and refresh rate;
+  and refresh rate; the handheld row requires upstream SteamOS, an integrated
+  GPU, and a connected native 1280x800 panel, while the desktop row requires a
+  discrete GPU and a physically headless SteamOS or SteamOS-inspired host;
 - OS, kernel, Gamescope, Mesa, GStreamer, and encoder plugin versions;
 - the capability-discovered render node and encoder factory, without assuming
   `/dev/dri/renderD128`, `amdgpu`, or `vah264enc`;
-- fixed and native capture outcomes, post-encode drops, and measured cadence;
-- exact Portal session evidence for transport, video, audio, input,
-  reconnects, and second-client rejection appropriate to the claim;
+- passing fixed and native capture outcomes, zero post-encode drops, measured
+  cadence, and at least 55 fps for the fixed 1280x800 leg;
+- a preferred-Iroh/MoQ Portal session with passing video, audio, input,
+  reconnect, and second-client rejection evidence;
 - restoration of the installed service, configuration, identity, and release
   activation after the run.
 
 The two reports must name the same exact commit and `Candidate artifact set
 SHA256`. Unsigned development evidence can establish `matrix-proven`, but
-never `release-matrix-proven`.
+never `release-matrix-proven`; the gate rejects that public claim unless both
+reports use one release candidate manifest.
 
 Committed evidence must retain the existing redaction boundary: no endpoint or
 peer IDs, invitations, identities, secrets, private addresses, or unsanitized
-raw logs.
+raw logs. The gate proves that the committed evidence is complete, internally
+consistent, commit-reachable, and bound to explicit candidate digests. Human
+review still confirms that the sanitized values came from the named workflow
+and machines; the repository must not fabricate replacement evidence merely to
+make the gate pass.

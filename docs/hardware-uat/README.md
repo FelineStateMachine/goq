@@ -6,6 +6,12 @@ named reference-host evidence; it does not prove a hardware class or transfer
 to another commit. Both required matrix rows must pass the same exact candidate
 before unqualified hardware-proof language is allowed.
 
+Matrix pass reports use the structured report, shared candidate-manifest, and
+row evidence layout defined by `MATRIX.md`. Run
+`scripts/tests/hardware-matrix.sh` before committing a status change. Its
+fixture suite rejects incomplete reports, fabricated commits or artifact-set
+digests, row/class mismatches, and premature claims in public documentation.
+
 The repository's hardware acceptance is a two-stage, commit-pinned gate:
 
 1. `.github/workflows/sigil-hardware-uat.yml` builds and inspects an unsigned

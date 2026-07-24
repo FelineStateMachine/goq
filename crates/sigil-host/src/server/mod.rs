@@ -19,12 +19,14 @@ use sigil_protocol::{
     MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MAX_MEDIA_OBJECT_ID_V3,
     MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MOQ_VIDEO_H264_TRACK, MOQ_VIDEO_TRACK_PRIORITY,
     MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame, MediaFrameHeader,
-    MediaObjectHeaderV3, MediaObjectV3, ServerControlEnvelopeV2, encode_media_frame_object,
-    media_moq_broadcast_name, read_client_control_v2, read_client_hello, read_client_hello_v2,
-    read_input_client_hello_v2, read_input_event, read_input_event_v2,
-    read_media_control_request_v3, read_media_feedback_report_v1,
-    write_adaptive_bitrate_decision_v1, write_host_hello, write_host_hello_v2, write_input_ack,
-    write_input_ack_v2, write_input_host_hello_v2, write_media_object_v3, write_server_control_v2,
+    MediaGenerationSigningKey, MediaObjectCoordinates, MediaObjectHeaderV3, MediaObjectV3,
+    MediaTrack, ServerControlEnvelopeV2, SignedSubscriptionCapability, SubscriptionClaims,
+    SubscriptionTracks, encode_media_frame_object, media_moq_broadcast_name,
+    read_client_control_v2, read_client_hello, read_client_hello_v2, read_input_client_hello_v2,
+    read_input_event, read_input_event_v2, read_media_control_request_v3,
+    read_media_feedback_report_v1, write_adaptive_bitrate_decision_v1, write_host_hello,
+    write_host_hello_v2, write_input_ack, write_input_ack_v2, write_input_host_hello_v2,
+    write_media_object_v3, write_server_control_v2,
 };
 use tracing::{debug, error, info, warn};
 
@@ -34,7 +36,7 @@ use crate::clock::SessionClock;
 use crate::config::{GamescopeEncoderBackend, HostConfig, VaapiRateControl, VideoSource};
 use crate::cursor::{PointerPositionTracker, PointerState};
 use crate::input::{InputBackend, InputDisposition};
-use crate::moq_catalog::publish_goq_catalog;
+use crate::moq_catalog::{publish_goq_catalog, publish_goq_catalog_v2};
 use crate::source::{
     EncodedFrame, EncodedGop, EncodedSource, EncoderControl,
     spawn_gamescope_pipewire_after_static_preflight, spawn_test_pattern,

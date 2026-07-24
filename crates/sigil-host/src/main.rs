@@ -870,6 +870,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         (loaded.config, loaded.revision, lifecycle)
     };
     let secret = identity::load(&config.identity_path)?;
+    let host_secret = secret.to_bytes();
     let sessions = Arc::new(SessionRegistry::default());
     let publisher = appliance::RuntimePublisher::start(
         secret.public(),
@@ -1011,6 +1012,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
                 sessions: Arc::clone(&sessions),
                 authorization: authorization.clone(),
                 input_operations: Arc::clone(&input_operations),
+                host_secret,
             },
         )
         .accept(

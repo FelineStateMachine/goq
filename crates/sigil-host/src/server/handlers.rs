@@ -71,6 +71,7 @@ pub struct ControlV2Handler {
     pub sessions: Arc<SessionRegistry>,
     pub authorization: AuthorizationPolicy,
     pub input_operations: Arc<InputOperations>,
+    pub host_secret: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -270,6 +271,7 @@ impl ProtocolHandler for ControlV2Handler {
             &self.sessions,
             &self.authorization,
             &self.input_operations,
+            self.host_secret,
         )
         .await
         {

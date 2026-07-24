@@ -1,5 +1,7 @@
 use std::{
     collections::VecDeque,
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard},
     time::{Duration, Instant},
 };
@@ -44,6 +46,52 @@ pub(crate) enum NetworkLeg {
     Media,
     Input,
     Audio,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MediaDeliveryRole {
+    #[default]
+    DirectHost,
+    ViewerRelay,
+}
+
+#[derive(Clone, Debug)]
+struct MediaAuthenticationDiagnostics {
+    mode: &'static str,
+    generation_certified: bool,
+    delivery_role: MediaDeliveryRole,
+    verification_failures: Arc<AtomicU64>,
+}
+
+impl Default for MediaAuthenticationDiagnostics {
+    fn default() -> Self {
+        Self {
+            mode: "transport-authenticated-v1",
+            generation_certified: false,
+            delivery_role: MediaDeliveryRole::DirectHost,
+            verification_failures: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl MediaAuthenticationDiagnostics {
+    fn snapshot(&self) -> MediaAuthenticationSnapshot {
+        MediaAuthenticationSnapshot {
+            mode: self.mode,
+            generation_certified: self.generation_certified,
+            delivery_role: self.delivery_role,
+            verification_failures: self.verification_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct MediaAuthenticationSnapshot {
+    mode: &'static str,
+    generation_certified: bool,
+    delivery_role: MediaDeliveryRole,
+    verification_failures: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -487,6 +535,7 @@ pub(crate) struct NetworkSessionDiagnostics {
     input: LegDiagnostics,
     audio: Option<LegDiagnostics>,
     input_ack: InputAckDiagnostics,
+    media_authentication: MediaAuthenticationDiagnostics,
 }
 
 impl NetworkSessionDiagnostics {
@@ -497,7 +546,23 @@ impl NetworkSessionDiagnostics {
             input: LegDiagnostics::default(),
             audio: None,
             input_ack: InputAckDiagnostics::new(input_ack_negotiated),
+            media_authentication: MediaAuthenticationDiagnostics::default(),
         }
+    }
+
+    pub(crate) fn configure_authenticated_media(&mut self, delivery_role: MediaDeliveryRole) {
+        self.media_authentication.mode = sigil_protocol::MediaAuthMode::Ed25519.label();
+        self.media_authentication.generation_certified = true;
+        self.media_authentication.delivery_role = delivery_role;
+    }
+
+    pub(crate) fn media_verification_failure_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.media_authentication.verification_failures)
+    }
+
+    pub(crate) fn set_input_ack_negotiated(&mut self, negotiated: bool) {
+        debug_assert_eq!(self.input_ack.sent_total, 0);
+        self.input_ack = InputAckDiagnostics::new(negotiated);
     }
 
     pub(crate) fn observe_connection(&mut self, leg: NetworkLeg, connection: &Connection) {
@@ -540,6 +605,7 @@ impl NetworkSessionDiagnostics {
             input: self.input.snapshot(),
             audio: self.audio.as_ref().map(LegDiagnostics::snapshot),
             input_ack: self.input_ack.snapshot(),
+            media_authentication: self.media_authentication.snapshot(),
         }
     }
 }
@@ -552,6 +618,7 @@ pub(crate) struct NetworkDiagnosticsSnapshot {
     input: NetworkLegSnapshot,
     audio: Option<NetworkLegSnapshot>,
     input_ack: InputAckSnapshot,
+    media_authentication: MediaAuthenticationSnapshot,
 }
 
 #[cfg(test)]
@@ -732,5 +799,27 @@ mod tests {
                 "serialized forbidden field {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn authenticated_media_diagnostics_are_truthful_and_expose_no_key_material() {
+        let now = Instant::now();
+        let mut diagnostics = NetworkSessionDiagnostics::new(now, false);
+        diagnostics.configure_authenticated_media(MediaDeliveryRole::ViewerRelay);
+        diagnostics
+            .media_verification_failure_counter()
+            .fetch_add(2, Ordering::Relaxed);
+        let json = serde_json::to_value(diagnostics.snapshot(now)).unwrap();
+        assert_eq!(json["media_authentication"]["mode"], "ed25519-v1");
+        assert_eq!(json["media_authentication"]["generation_certified"], true);
+        assert_eq!(
+            json["media_authentication"]["delivery_role"],
+            "viewer_relay"
+        );
+        assert_eq!(json["media_authentication"]["verification_failures"], 2);
+        let serialized = json.to_string();
+        assert!(!serialized.contains("certificate"));
+        assert!(!serialized.contains("capability"));
+        assert!(!serialized.contains("public_key"));
     }
 }

@@ -24,6 +24,10 @@ path = "src/main.rs"
 name = "sigil-probe"
 path = "src/bin/sigil-probe.rs"
 
+[[bin]]
+name = "sigil-relay-spike"
+path = "src/bin/sigil-relay-spike.rs"
+
 [dependencies]
 anyhow = "1"
 bytes.workspace = true

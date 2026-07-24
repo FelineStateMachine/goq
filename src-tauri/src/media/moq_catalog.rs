@@ -1,10 +1,14 @@
 use std::time::Duration;
 
 use moq_net::{BroadcastConsumer, Error as MoqError, Track, TrackConsumer};
-use sigil_protocol::{GoqCatalogDocument, MAX_MOQ_CATALOG_BYTES};
+use sigil_protocol::{
+    GoqCatalogDocument, GoqCatalogDocumentV2, MAX_MOQ_CATALOG_BYTES,
+    SignedMediaGenerationCertificate,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MoqCatalogMode {
+    GoqV2Authenticated,
     GoqV1,
     AbsentStaticTrackCompat,
 }
@@ -12,6 +16,7 @@ pub(crate) enum MoqCatalogMode {
 impl MoqCatalogMode {
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::GoqV2Authenticated => "goq-v2-authenticated",
             Self::GoqV1 => "goq-v1",
             Self::AbsentStaticTrackCompat => "absent-static-track-compat",
         }
@@ -21,6 +26,7 @@ impl MoqCatalogMode {
 pub(crate) struct MoqCatalogSelection {
     pub(crate) track: TrackConsumer,
     pub(crate) mode: MoqCatalogMode,
+    pub(crate) certificate: Option<SignedMediaGenerationCertificate>,
 }
 
 fn is_track_not_found(error: &MoqError) -> bool {
@@ -39,6 +45,7 @@ fn subscribe_static_video_track(
     Ok(MoqCatalogSelection {
         track,
         mode: MoqCatalogMode::AbsentStaticTrackCompat,
+        certificate: None,
     })
 }
 
@@ -58,13 +65,68 @@ pub(crate) async fn subscribe_goq_video_track(
         }
     };
 
-    let mut catalog_track = catalog_track;
+    let snapshot = match read_catalog_snapshot(catalog_track, timeout).await {
+        Err(error) if error == "catalog-not-found" => {
+            return subscribe_static_video_track(broadcast);
+        }
+        result => result?,
+    };
+    let document: GoqCatalogDocument = serde_json::from_slice(&snapshot)
+        .map_err(|error| format!("Failed to decode Goq catalog snapshot: {error}"))?;
+    document
+        .validate()
+        .map_err(|error| format!("Invalid Goq catalog: {error}"))?;
+    let track = broadcast
+        .subscribe_track(&Track::new(document.goq.video.track.name))
+        .map_err(|error| {
+            format!("Failed to subscribe to catalog-selected Goq video track: {error}")
+        })?;
+    Ok(MoqCatalogSelection {
+        track,
+        mode: MoqCatalogMode::GoqV1,
+        certificate: None,
+    })
+}
+
+pub(crate) async fn subscribe_authenticated_goq_video_track(
+    broadcast: &BroadcastConsumer,
+    timeout: Duration,
+    expected_host: [u8; 32],
+    expected_generation: u64,
+    now_unix: u64,
+) -> Result<MoqCatalogSelection, String> {
+    let catalog_track = broadcast
+        .subscribe_track(&hang::Catalog::default_track())
+        .map_err(|error| format!("Authenticated v2 media requires catalog.json: {error}"))?;
+    let snapshot = read_catalog_snapshot(catalog_track, timeout).await?;
+    let document: GoqCatalogDocumentV2 = serde_json::from_slice(&snapshot)
+        .map_err(|error| format!("Failed to decode authenticated Goq catalog: {error}"))?;
+    let certificate = document
+        .validate()
+        .map_err(|error| format!("Invalid authenticated Goq catalog: {error}"))?;
+    certificate
+        .verify_binding(expected_host, expected_generation, now_unix)
+        .map_err(|error| format!("Invalid media generation certificate: {error}"))?;
+    let track = broadcast
+        .subscribe_track(&Track::new(document.goq.video.track.name))
+        .map_err(|error| {
+            format!("Failed to subscribe to authenticated Goq video track: {error}")
+        })?;
+    Ok(MoqCatalogSelection {
+        track,
+        mode: MoqCatalogMode::GoqV2Authenticated,
+        certificate: Some(certificate),
+    })
+}
+
+async fn read_catalog_snapshot(
+    mut catalog_track: TrackConsumer,
+    timeout: Duration,
+) -> Result<bytes::Bytes, String> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut group = match tokio::time::timeout_at(deadline, catalog_track.next_group()).await {
         Err(_) => return Err("Timed out waiting for Goq catalog snapshot".to_string()),
-        Ok(Err(error)) if is_track_not_found(&error) => {
-            return subscribe_static_video_track(broadcast);
-        }
+        Ok(Err(error)) if is_track_not_found(&error) => return Err("catalog-not-found".to_string()),
         Ok(Err(error)) => return Err(format!("Failed to read Goq catalog snapshot: {error}")),
         Ok(Ok(None)) => return Err("Goq catalog track ended before its snapshot".to_string()),
         Ok(Ok(Some(group))) => group,
@@ -89,34 +151,52 @@ pub(crate) async fn subscribe_goq_video_track(
             "Goq catalog snapshot exceeds {MAX_MOQ_CATALOG_BYTES} bytes"
         ));
     }
-    let snapshot = tokio::time::timeout_at(deadline, frame.read_all())
+    tokio::time::timeout_at(deadline, frame.read_all())
         .await
         .map_err(|_| "Timed out reading Goq catalog frame".to_string())?
-        .map_err(|error| format!("Failed to read Goq catalog frame: {error}"))?;
-    let document: GoqCatalogDocument = serde_json::from_slice(&snapshot)
-        .map_err(|error| format!("Failed to decode Goq catalog snapshot: {error}"))?;
-    document
-        .validate()
-        .map_err(|error| format!("Invalid Goq catalog: {error}"))?;
-    let track = broadcast
-        .subscribe_track(&Track::new(document.goq.video.track.name))
-        .map_err(|error| {
-            format!("Failed to subscribe to catalog-selected Goq video track: {error}")
-        })?;
-    Ok(MoqCatalogSelection {
-        track,
-        mode: MoqCatalogMode::GoqV1,
-    })
+        .map_err(|error| format!("Failed to read Goq catalog frame: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use moq_net::Broadcast;
+
+    fn v2_document() -> (GoqCatalogDocumentV2, [u8; 32]) {
+        let host = SigningKey::from_bytes(&[7; 32]);
+        let generation = sigil_protocol::MediaGenerationSigningKey::from_bytes(&[9; 32]);
+        let certificate = generation
+            .certify(
+                host.verifying_key().to_bytes(),
+                &[7; 32],
+                42,
+                1_700_000_000,
+                1_700_000_600,
+            )
+            .unwrap();
+        (
+            GoqCatalogDocumentV2::video_h264(42, &certificate).unwrap(),
+            host.verifying_key().to_bytes(),
+        )
+    }
 
     fn publish_catalog(
         broadcast: &mut moq_net::BroadcastProducer,
         document: &GoqCatalogDocument,
+    ) -> moq_net::TrackProducer {
+        let mut track = broadcast
+            .create_track(hang::Catalog::default_track())
+            .unwrap();
+        track
+            .write_frame(serde_json::to_vec(document).unwrap())
+            .unwrap();
+        track
+    }
+
+    fn publish_catalog_v2(
+        broadcast: &mut moq_net::BroadcastProducer,
+        document: &GoqCatalogDocumentV2,
     ) -> moq_net::TrackProducer {
         let mut track = broadcast
             .create_track(hang::Catalog::default_track())
@@ -138,6 +218,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selection.mode, MoqCatalogMode::GoqV1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_catalog_verifies_host_generation_and_mode() {
+        let mut broadcast = Broadcast::new().produce();
+        let _video = broadcast
+            .create_track(Track::new(sigil_protocol::MOQ_VIDEO_H264_TRACK))
+            .unwrap();
+        let (document, host) = v2_document();
+        let _catalog = publish_catalog_v2(&mut broadcast, &document);
+        let selection = subscribe_authenticated_goq_video_track(
+            &broadcast.consume(),
+            Duration::from_millis(100),
+            host,
+            42,
+            1_700_000_300,
+        )
+        .await
+        .unwrap();
+        assert_eq!(selection.mode, MoqCatalogMode::GoqV2Authenticated);
+        assert_eq!(selection.certificate.unwrap().claims.generation_id, 42);
+
+        let mut wrong_host_broadcast = Broadcast::new().produce();
+        let _video = wrong_host_broadcast
+            .create_track(Track::new(sigil_protocol::MOQ_VIDEO_H264_TRACK))
+            .unwrap();
+        let _catalog = publish_catalog_v2(&mut wrong_host_broadcast, &document);
+        assert!(
+            subscribe_authenticated_goq_video_track(
+                &wrong_host_broadcast.consume(),
+                Duration::from_millis(100),
+                [1; 32],
+                42,
+                1_700_000_300,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

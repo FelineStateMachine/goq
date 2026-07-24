@@ -14,19 +14,21 @@ use iroh_moq::{Moq, MoqSession};
 use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
 use sigil_protocol::{
     AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1,
-    CONTROL_ALPN_V1, CONTROL_ALPN_V2, Capability, ClientControlEnvelopeV2, ClientHello,
-    ClientHelloV2, ControllerSlot, FocusCommandActionV2, FocusCommandV2, FocusStateV2, FrameFlags,
-    GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN, GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1,
-    INPUT_ALPN_V2, INVITATION_CLOCK_SKEW_SECS, InputAck, InputClientHelloV2, InputEvent,
-    InputEventV2, InvitationGrants, KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN,
-    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1,
-    MediaCodec, MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame,
-    MediaObjectV3, PointerPosition, PointerSurfaceDimensions, ProtocolError,
-    ServerControlEnvelopeV2, SignedInvitation, decode_media_frame_object, media_moq_broadcast_name,
-    read_adaptive_bitrate_decision_v1, read_host_hello, read_host_hello_v2, read_input_ack,
-    read_input_ack_v2, read_input_host_hello_v2, read_media_object_v3, read_server_control_v2,
-    write_client_control_v2, write_client_hello, write_client_hello_v2,
-    write_input_client_hello_v2, write_input_event, write_input_event_v2,
+    AuthenticatedMediaObject, CONTROL_ALPN_V1, CONTROL_ALPN_V2, Capability,
+    ClientControlEnvelopeV2, ClientHello, ClientHelloV2, ControllerSlot, FocusCommandActionV2,
+    FocusCommandV2, FocusStateV2, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN,
+    GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, INPUT_ALPN_V2, INVITATION_CLOCK_SKEW_SECS,
+    InputAck, InputClientHelloV2, InputEvent, InputEventV2, InvitationGrants,
+    KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN, MAX_MEDIA_GROUP_BYTES_V3,
+    MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, MediaCodec,
+    MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame,
+    MediaObjectCoordinates, MediaObjectV3, MediaTrack, PointerPosition, PointerSurfaceDimensions,
+    ProtocolError, ServerControlEnvelopeV2, SignedInvitation, SignedMediaGenerationCertificate,
+    SignedSubscriptionCapability, SubscriptionTracks, decode_media_frame_object,
+    media_moq_broadcast_name, read_adaptive_bitrate_decision_v1, read_host_hello,
+    read_host_hello_v2, read_input_ack, read_input_ack_v2, read_input_host_hello_v2,
+    read_media_object_v3, read_server_control_v2, write_client_control_v2, write_client_hello,
+    write_client_hello_v2, write_input_client_hello_v2, write_input_event, write_input_event_v2,
     write_media_control_request_v3, write_media_feedback_report_v1,
 };
 
@@ -39,7 +41,9 @@ mod identity;
 
 mod moq_catalog;
 
-use moq_catalog::{MoqCatalogMode, subscribe_goq_video_track};
+use moq_catalog::{
+    MoqCatalogMode, subscribe_authenticated_goq_video_track, subscribe_goq_video_track,
+};
 
 const MEDIA_OBJECT_CAPACITY: usize = 4;
 
@@ -490,6 +494,13 @@ struct MoqProbeReceiver {
     maximum_group_objects: usize,
     maximum_group_bytes: usize,
     historical_suffix_frames: u64,
+    certificate: Option<SignedMediaGenerationCertificate>,
+}
+
+struct MoqProbeAuthentication {
+    expected_host: [u8; 32],
+    subscription_capability: String,
+    now_unix: u64,
 }
 
 impl MoqProbeReceiver {
@@ -498,6 +509,7 @@ impl MoqProbeReceiver {
         address: EndpointAddr,
         session_id: u64,
         timeout: Duration,
+        authentication: Option<MoqProbeAuthentication>,
     ) -> Result<Self> {
         let broadcast_name = media_moq_broadcast_name(session_id)
             .context("deriving session-scoped MoQ broadcast name")?;
@@ -518,9 +530,30 @@ impl MoqProbeReceiver {
                 format!("timed out subscribing to upstream MoQ broadcast {broadcast_name}")
             })?
             .with_context(|| format!("subscribing to upstream MoQ broadcast {broadcast_name}"))?;
-        let catalog = subscribe_goq_video_track(&broadcast, timeout)
+        let catalog = if let Some(authentication) = authentication {
+            SignedSubscriptionCapability::decode(&authentication.subscription_capability)?
+                .verify_binding(
+                    authentication.expected_host,
+                    session_id,
+                    *endpoint.id().as_bytes(),
+                    SubscriptionTracks::VIDEO_H264,
+                    1,
+                    authentication.now_unix,
+                )?;
+            subscribe_authenticated_goq_video_track(
+                &broadcast,
+                timeout,
+                authentication.expected_host,
+                session_id,
+                authentication.now_unix,
+            )
             .await
-            .context("resolving Goq MoQ catalog")?;
+            .context("resolving authenticated Goq MoQ catalog")?
+        } else {
+            subscribe_goq_video_track(&broadcast, timeout)
+                .await
+                .context("resolving Goq MoQ catalog")?
+        };
         Ok(Self {
             lifetime: MoqProbeLifetime {
                 _moq: moq,
@@ -539,6 +572,7 @@ impl MoqProbeReceiver {
             maximum_group_objects: 0,
             maximum_group_bytes: 0,
             historical_suffix_frames: 0,
+            certificate: catalog.certificate,
         })
     }
 
@@ -625,12 +659,53 @@ impl MoqProbeReceiver {
                 cursor.object_bytes,
                 object.len(),
             )?;
-            let frame = decode_media_frame_object(&object).with_context(|| {
+            let authenticated_coordinates = self
+                .certificate
+                .as_ref()
+                .map(|_| AuthenticatedMediaObject::coordinates(&object))
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "decoding authenticated upstream MoQ group {} object {}",
+                        cursor.sequence, cursor.object_count
+                    )
+                })?;
+            let payload = if let (Some(certificate), Some(coordinates)) =
+                (&self.certificate, authenticated_coordinates)
+            {
+                AuthenticatedMediaObject::verify(
+                    &object,
+                    certificate,
+                    MediaObjectCoordinates {
+                        generation_id: certificate.claims.generation_id,
+                        track: MediaTrack::VideoH264,
+                        group_id: cursor.sequence,
+                        object_id: u32::try_from(cursor.object_count)
+                            .context("authenticated MoQ object index overflow")?,
+                        flags: coordinates.flags,
+                    },
+                )
+                .with_context(|| {
+                    format!(
+                        "verifying authenticated upstream MoQ group {} object {}",
+                        cursor.sequence, cursor.object_count
+                    )
+                })?
+            } else {
+                object.as_ref()
+            };
+            let frame = decode_media_frame_object(payload).with_context(|| {
                 format!(
                     "decoding upstream MoQ group {} object {}",
                     cursor.sequence, cursor.object_count
                 )
             })?;
+            ensure!(
+                authenticated_coordinates.is_none_or(|coordinates| {
+                    coordinates.flags == u16::from(frame.header.flags.bits())
+                }),
+                "authenticated media flags do not match the decoded media envelope"
+            );
             let first_object = cursor.object_count == 0;
             let contiguous = validate_moq_probe_frame(
                 cursor.sequence,
@@ -703,6 +778,9 @@ async fn run_control_v2_smoke(
     let session_id = host
         .session_id
         .context("host omitted control v2 session id")?;
+    let subscription_capability = host
+        .media_subscription_capability
+        .context("host omitted control v2 media subscription capability")?;
     let initial = host
         .snapshot
         .context("host omitted initial control v2 snapshot")?;
@@ -716,6 +794,14 @@ async fn run_control_v2_smoke(
         address.clone(),
         session_id,
         Duration::from_secs(timeout_seconds),
+        Some(MoqProbeAuthentication {
+            expected_host: *address.id.as_bytes(),
+            subscription_capability,
+            now_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before the Unix epoch")?
+                .as_secs(),
+        }),
     )
     .await?;
     let focus_request = FocusCommandV2 {
@@ -857,6 +943,9 @@ async fn run_control_v2_smoke(
     println!("transport=iroh-moq");
     println!("control_alpn=sigil/control/2");
     println!("input_alpn=sigil/input/2");
+    println!("media_authentication=ed25519-v1");
+    println!("media_generation_certified=ok");
+    println!("subscription_endpoint_binding=ok");
     println!("frames={accepted}");
     println!("initial_snapshot_revision={}", initial.revision);
     println!("focus_grant_revision={}", focused.revision);
@@ -1541,6 +1630,7 @@ async fn main() -> Result<()> {
                 address.clone(),
                 session_id,
                 Duration::from_secs(args.timeout_seconds),
+                None,
             )
             .await?,
         )

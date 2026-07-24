@@ -1,4 +1,5 @@
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use iroh::Endpoint;
@@ -9,16 +10,20 @@ use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
 #[cfg(test)]
 use sigil_protocol::MOQ_VIDEO_H264_TRACK;
 use sigil_protocol::{
-    FrameFlags, KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3,
+    AuthenticatedMediaObject, FrameFlags, KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3,
     MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MAX_MEDIA_OBJECT_ID_V3, MediaCodec, MediaFrame,
-    decode_media_frame_object, media_moq_broadcast_name,
+    MediaObjectCoordinates, MediaTrack, SignedMediaGenerationCertificate,
+    SignedSubscriptionCapability, SubscriptionTracks, decode_media_frame_object,
+    media_moq_broadcast_name,
 };
 use tauri::{AppHandle, Manager};
 
 use crate::commands::state::AppState;
 use crate::media::audio_delivery::cancel_audio_generation;
 use crate::media::frame_channel::{take_generation_owned, take_generation_owned_triple};
-use crate::media::moq_catalog::subscribe_goq_video_track;
+use crate::media::moq_catalog::{
+    subscribe_authenticated_goq_video_track, subscribe_goq_video_track,
+};
 #[cfg(test)]
 use crate::media::object_receiver::media_object_frame;
 use crate::media::transport::CLIENT_ENDPOINT_CLOSE_TIMEOUT;
@@ -154,6 +159,8 @@ pub(crate) struct MoqMediaReceiver {
     last_frame_sequence: Option<u64>,
     waiting_for_keyframe: bool,
     pending_group_recovery: Option<MoqGroupRecovery>,
+    certificate: Option<SignedMediaGenerationCertificate>,
+    verification_failures: Option<Arc<AtomicU64>>,
 }
 
 impl MoqMediaReceiver {
@@ -162,6 +169,8 @@ impl MoqMediaReceiver {
         session: MoqSession,
         broadcast: BroadcastConsumer,
         track: TrackConsumer,
+        certificate: Option<SignedMediaGenerationCertificate>,
+        verification_failures: Option<Arc<AtomicU64>>,
     ) -> Self {
         Self {
             _lifetime: Some(MoqMediaLifetime {
@@ -175,6 +184,8 @@ impl MoqMediaReceiver {
             last_frame_sequence: None,
             waiting_for_keyframe: true,
             pending_group_recovery: None,
+            certificate,
+            verification_failures,
         }
     }
 
@@ -192,6 +203,27 @@ impl MoqMediaReceiver {
             last_frame_sequence: None,
             waiting_for_keyframe: true,
             pending_group_recovery: None,
+            certificate: None,
+            verification_failures: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn authenticated_for_test(
+        track: TrackConsumer,
+        certificate: SignedMediaGenerationCertificate,
+        verification_failures: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            _lifetime: None,
+            track,
+            current_group: None,
+            last_group_sequence: None,
+            last_frame_sequence: None,
+            waiting_for_keyframe: true,
+            pending_group_recovery: None,
+            certificate: Some(certificate),
+            verification_failures: Some(verification_failures),
         }
     }
 
@@ -328,7 +360,47 @@ impl MoqMediaReceiver {
                 Ok(next_group_bytes) => next_group_bytes,
                 Err(error) => return Ok(Some(MoqMediaReadOutcome::Malformed(error))),
             };
-            let frame = match decode_media_frame_object(&object) {
+            let authenticated_coordinates = if self.certificate.is_some() {
+                match AuthenticatedMediaObject::coordinates(&object) {
+                    Ok(coordinates) => Some(coordinates),
+                    Err(error) => {
+                        record_verification_failure(&self.verification_failures);
+                        return Ok(Some(MoqMediaReadOutcome::Malformed(format!(
+                            "Invalid authenticated MoQ media header in group {} object {}: {error}",
+                            cursor.sequence, cursor.object_count
+                        ))));
+                    }
+                }
+            } else {
+                None
+            };
+            let payload = if let (Some(certificate), Some(coordinates)) =
+                (&self.certificate, authenticated_coordinates)
+            {
+                let expected_object_id = u32::try_from(cursor.object_count).map_err(|_| {
+                    "Authenticated MoQ object index exceeded the protocol range".to_string()
+                })?;
+                let expected = MediaObjectCoordinates {
+                    generation_id: certificate.claims.generation_id,
+                    track: MediaTrack::VideoH264,
+                    group_id: cursor.sequence,
+                    object_id: expected_object_id,
+                    flags: coordinates.flags,
+                };
+                match AuthenticatedMediaObject::verify(&object, certificate, expected) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        record_verification_failure(&self.verification_failures);
+                        return Ok(Some(MoqMediaReadOutcome::Malformed(format!(
+                            "Authenticated upstream MoQ media verification failed in group {} object {}: {error}",
+                            cursor.sequence, cursor.object_count
+                        ))));
+                    }
+                }
+            } else {
+                object.as_ref()
+            };
+            let frame = match decode_media_frame_object(payload) {
                 Ok(frame) => frame,
                 Err(error) => {
                     return Ok(Some(MoqMediaReadOutcome::Malformed(format!(
@@ -337,6 +409,15 @@ impl MoqMediaReceiver {
                     ))));
                 }
             };
+            if authenticated_coordinates.is_some_and(|coordinates| {
+                coordinates.flags != u16::from(frame.header.flags.bits())
+            }) {
+                record_verification_failure(&self.verification_failures);
+                return Ok(Some(MoqMediaReadOutcome::Malformed(format!(
+                    "Authenticated upstream MoQ flags do not match the media payload in group {} object {}",
+                    cursor.sequence, cursor.object_count
+                ))));
+            }
 
             let first_object = cursor.object_count == 0;
             let frame_contiguous = match validate_moq_group_frame(
@@ -464,6 +545,8 @@ pub(crate) async fn open_upstream_moq_media(
     endpoint: &Endpoint,
     address: &iroh::EndpointAddr,
     session_id: u64,
+    authentication: Option<MoqAuthenticationExpectation>,
+    verification_failures: Arc<AtomicU64>,
 ) -> Result<(MoqMediaReceiver, iroh::endpoint::Connection), String> {
     let broadcast_name = media_moq_broadcast_name(session_id)
         .map_err(|error| format!("Invalid MoQ media session name: {error}"))?;
@@ -491,17 +574,78 @@ pub(crate) async fn open_upstream_moq_media(
     .map_err(|error| {
         format!("Failed to subscribe to upstream MoQ broadcast {broadcast_name}: {error}")
     })?;
-    let catalog = subscribe_goq_video_track(&broadcast, CLIENT_MOQ_SUBSCRIBE_TIMEOUT).await?;
+    let catalog = if let Some(authentication) = authentication {
+        let capability =
+            SignedSubscriptionCapability::decode(&authentication.subscription_capability)
+                .map_err(|error| format!("Invalid subscription capability: {error}"))?;
+        capability
+            .verify_binding(
+                authentication.expected_host,
+                session_id,
+                *endpoint.id().as_bytes(),
+                SubscriptionTracks::VIDEO_H264,
+                1,
+                authentication.now_unix,
+            )
+            .map_err(|error| format!("Subscription capability rejected: {error}"))?;
+        subscribe_authenticated_goq_video_track(
+            &broadcast,
+            CLIENT_MOQ_SUBSCRIBE_TIMEOUT,
+            authentication.expected_host,
+            session_id,
+            authentication.now_unix,
+        )
+        .await?
+    } else {
+        subscribe_goq_video_track(&broadcast, CLIENT_MOQ_SUBSCRIBE_TIMEOUT).await?
+    };
     eprintln!("[client] moq catalog: {}", catalog.mode.label());
     Ok((
-        MoqMediaReceiver::new(moq, session, broadcast, catalog.track),
+        MoqMediaReceiver::new(
+            moq,
+            session,
+            broadcast,
+            catalog.track,
+            catalog.certificate,
+            Some(verification_failures),
+        ),
         diagnostics_connection,
     ))
+}
+
+fn record_verification_failure(counter: &Option<Arc<AtomicU64>>) {
+    if let Some(counter) = counter {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) struct MoqAuthenticationExpectation {
+    pub(crate) expected_host: [u8; 32],
+    pub(crate) subscription_capability: String,
+    pub(crate) now_unix: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authentication_fixture() -> (
+        sigil_protocol::MediaGenerationSigningKey,
+        SignedMediaGenerationCertificate,
+    ) {
+        let host = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let generation = sigil_protocol::MediaGenerationSigningKey::from_bytes(&[9; 32]);
+        let certificate = generation
+            .certify(
+                host.verifying_key().to_bytes(),
+                &[7; 32],
+                42,
+                1_700_000_000,
+                1_700_000_600,
+            )
+            .unwrap();
+        (generation, certificate)
+    }
 
     #[test]
     fn upstream_moq_group_ids_detect_only_real_transport_gaps() {
@@ -510,6 +654,66 @@ mod tests {
         assert!(classify_moq_group_sequence(Some(42), 44).unwrap());
         assert!(classify_moq_group_sequence(Some(44), 44).is_err());
         assert!(classify_moq_group_sequence(Some(44), 43).is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticated_receiver_verifies_before_codec_validation_and_counts_tampering() {
+        let mut producer = Track::new(MOQ_VIDEO_H264_TRACK).produce();
+        let (generation, certificate) = authentication_fixture();
+        let failures = Arc::new(AtomicU64::new(0));
+        let mut receiver = MoqMediaReceiver::authenticated_for_test(
+            producer.consume(),
+            certificate,
+            Arc::clone(&failures),
+        );
+        let frame = media_object_frame(1, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        let payload = sigil_protocol::encode_media_frame_object(&frame).unwrap();
+        let mut group = producer.append_group().unwrap();
+        let object = generation
+            .authenticate(
+                MediaObjectCoordinates {
+                    generation_id: 42,
+                    track: MediaTrack::VideoH264,
+                    group_id: group.sequence,
+                    object_id: 0,
+                    flags: u16::from(frame.header.flags.bits()),
+                },
+                &payload,
+            )
+            .unwrap();
+        group.write_frame(object.into_bytes()).unwrap();
+        group.finish().unwrap();
+        assert!(matches!(
+            receiver.next().await.unwrap(),
+            Some(MoqMediaReadOutcome::Frame { .. })
+        ));
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+
+        let mut tampered_group = producer.append_group().unwrap();
+        let tampered_frame =
+            media_object_frame(2, FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG));
+        let payload = sigil_protocol::encode_media_frame_object(&tampered_frame).unwrap();
+        let mut object = generation
+            .authenticate(
+                MediaObjectCoordinates {
+                    generation_id: 42,
+                    track: MediaTrack::VideoH264,
+                    group_id: tampered_group.sequence,
+                    object_id: 0,
+                    flags: u16::from(tampered_frame.header.flags.bits()),
+                },
+                &payload,
+            )
+            .unwrap()
+            .into_bytes();
+        *object.last_mut().unwrap() ^= 1;
+        tampered_group.write_frame(object).unwrap();
+        tampered_group.finish().unwrap();
+        assert!(matches!(
+            receiver.next().await.unwrap(),
+            Some(MoqMediaReadOutcome::Malformed(_))
+        ));
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
     }
 
     #[test]

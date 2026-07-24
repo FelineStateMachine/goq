@@ -15,8 +15,10 @@ mod input;
 mod input_v2;
 mod invitation;
 mod media;
+mod media_auth;
 mod media_v3;
 mod moq_catalog;
+mod subscription;
 
 pub use audio::{AUDIO_HEADER_LEN, AudioCodec, AudioFlags, AudioPacket, AudioPacketHeader};
 pub use control_v2::{
@@ -59,6 +61,12 @@ pub use media::{
     FrameFlags, MEDIA_HEADER_LEN, MediaCodec, MediaFrame, MediaFrameHeader,
     decode_media_frame_object, encode_media_frame_object,
 };
+pub use media_auth::{
+    AUTHENTICATED_MEDIA_OBJECT_HEADER_LEN, AuthenticatedMediaObject,
+    MAX_MEDIA_GENERATION_CERTIFICATE_TOKEN_LEN, MEDIA_GENERATION_CERTIFICATE_TOKEN_PREFIX,
+    MediaAuthMode, MediaGenerationCertificateClaims, MediaGenerationSigningKey,
+    MediaObjectCoordinates, MediaTrack, SignedMediaGenerationCertificate,
+};
 pub use media_v3::{
     KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,
     MAX_MEDIA_OBJECT_ID_V3, MEDIA_CONTROL_REQUEST_V3_LEN, MEDIA_OBJECT_V3_HEADER_LEN,
@@ -67,9 +75,16 @@ pub use media_v3::{
     write_media_control_request_v3, write_media_object_v3,
 };
 pub use moq_catalog::{
-    GoqCatalogDocument, MAX_MOQ_CATALOG_BYTES, MOQ_CATALOG_EXTENSION_VERSION_V1,
-    MOQ_GOP_GROUP_FORMAT_V1, MOQ_MEDIA_OBJECT_FORMAT_V1, MOQ_VIDEO_TRACK_PRIORITY,
-    MoqCatalogExtensionV1, MoqTrackDescriptorV1, MoqVideoCatalogV1,
+    GoqCatalogDocument, GoqCatalogDocumentV2, MAX_MOQ_CATALOG_BYTES,
+    MOQ_AUTHENTICATED_MEDIA_OBJECT_FORMAT_V1, MOQ_CATALOG_EXTENSION_VERSION_V1,
+    MOQ_CATALOG_EXTENSION_VERSION_V2, MOQ_GOP_GROUP_FORMAT_V1, MOQ_MEDIA_OBJECT_FORMAT_V1,
+    MOQ_VIDEO_TRACK_PRIORITY, MoqCatalogExtensionV1, MoqCatalogExtensionV2,
+    MoqTrackAuthenticationV2, MoqTrackDescriptorV1, MoqVideoCatalogV1, MoqVideoCatalogV2,
+};
+pub use subscription::{
+    MAX_SUBSCRIPTION_CAPABILITY_TOKEN_LEN, MAX_SUBSCRIPTION_TTL_SECS,
+    SUBSCRIPTION_CAPABILITY_TOKEN_PREFIX, SignedSubscriptionCapability, SubscriptionClaims,
+    SubscriptionTracks,
 };
 
 /// Protocol version encoded in v1 messages.

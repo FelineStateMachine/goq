@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::EndpointId;
@@ -9,7 +10,8 @@ use moq_net::BroadcastConsumer;
 use sigil_protocol::{
     ControllerSlot, FocusCommandActionV2, FocusCommandV2, FocusStateV2, FocusTransitionReasonV2,
     InvitationGrants, KeyframeRequestReasonV3, MediaGenerationDescriptorV2, SessionSnapshotV2,
-    ViewerPresenceId, ViewerPresenceV2, media_moq_broadcast_name,
+    SignedSubscriptionCapability, SubscriptionTracks, ViewerPresenceId, ViewerPresenceV2,
+    media_moq_broadcast_name,
 };
 use tracing::{debug, warn};
 
@@ -39,6 +41,7 @@ struct PendingMoqAttachment {
     attached: tokio::sync::oneshot::Sender<()>,
     closed: tokio::sync::oneshot::Sender<()>,
     telemetry: Arc<MediaV3Telemetry>,
+    subscription_capability: Option<SignedSubscriptionCapability>,
 }
 
 impl std::fmt::Debug for PendingMoqAttachment {
@@ -888,6 +891,59 @@ impl SessionRegistry {
             attached,
             closed,
             telemetry,
+            subscription_capability: None,
+        });
+        Ok(MoqAttachmentWait {
+            attached: attached_rx,
+            closed: closed_rx,
+        })
+    }
+
+    pub(super) fn expect_moq_v2(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        broadcast_name: String,
+        broadcast: BroadcastConsumer,
+        subscription_capability: SignedSubscriptionCapability,
+    ) -> Result<MoqAttachmentWait> {
+        ensure!(
+            subscription_capability.claims.media_generation_id == session_id
+                && subscription_capability.claims.subscriber_endpoint_id == *remote.as_bytes()
+                && subscription_capability
+                    .claims
+                    .tracks
+                    .contains(SubscriptionTracks::VIDEO_H264)
+                && subscription_capability.claims.authorization_revision == 1,
+            "subscription capability does not match the v2 viewer attachment"
+        );
+        let active = self.active.lock().expect("session registry poisoned");
+        let telemetry = active
+            .as_ref()
+            .filter(|session| {
+                session.mode == SessionMode::V2Single
+                    && session.media_active
+                    && session.remote == remote
+                    && session.session_id == session_id
+            })
+            .map(|session| Arc::clone(&session.media_v3_telemetry))
+            .context("authenticated MoQ expectation does not match the active v2 session")?;
+        let mut pending = self.pending_moq.lock().expect("MoQ registry poisoned");
+        ensure!(
+            pending.is_none(),
+            "active control session already expects MoQ"
+        );
+        let (attached, attached_rx) = tokio::sync::oneshot::channel();
+        let (closed, closed_rx) = tokio::sync::oneshot::channel();
+        *pending = Some(PendingMoqAttachment {
+            remote,
+            session_id,
+            broadcast_name,
+            broadcast,
+            attached,
+            closed,
+            telemetry,
+            subscription_capability: Some(subscription_capability),
         });
         Ok(MoqAttachmentWait {
             attached: attached_rx,
@@ -896,6 +952,14 @@ impl SessionRegistry {
     }
 
     pub(super) fn claim_moq(&self, remote: EndpointId) -> Result<ClaimedMoqAttachment> {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_secs();
+        self.claim_moq_at(remote, now_unix)
+    }
+
+    fn claim_moq_at(&self, remote: EndpointId, now_unix: u64) -> Result<ClaimedMoqAttachment> {
         let active = self.active.lock().expect("session registry poisoned");
         let session = active
             .as_ref()
@@ -908,6 +972,27 @@ impl SessionRegistry {
                 attachment.remote == remote && attachment.session_id == session.session_id
             })
             .context("active control session is not expecting a MoQ connection")?;
+        if session.mode == SessionMode::V2Single {
+            let capability = attachment
+                .subscription_capability
+                .as_ref()
+                .context("v2 MoQ attachment has no subscription capability")?;
+            capability
+                .verify_binding(
+                    capability.claims.host_node_id,
+                    session.session_id,
+                    *remote.as_bytes(),
+                    SubscriptionTracks::VIDEO_H264,
+                    1,
+                    now_unix,
+                )
+                .context("verifying endpoint-bound MoQ subscription capability")?;
+        } else {
+            ensure!(
+                attachment.subscription_capability.is_none(),
+                "legacy MoQ attachment unexpectedly carries a subscription capability"
+            );
+        }
         debug_assert_eq!(attachment.remote, session.remote);
         let attachment = pending
             .take()
@@ -1377,6 +1462,31 @@ mod tests {
         (producer, consumer)
     }
 
+    fn test_subscription(
+        host: &iroh::SecretKey,
+        remote: EndpointId,
+        generation_id: u64,
+        issued_at_unix: u64,
+        expires_at_unix: u64,
+    ) -> SignedSubscriptionCapability {
+        SignedSubscriptionCapability::issue(
+            sigil_protocol::SubscriptionClaims::new(
+                *host.public().as_bytes(),
+                generation_id,
+                *remote.as_bytes(),
+                SubscriptionTracks::VIDEO_H264,
+                1,
+                issued_at_unix,
+                expires_at_unix,
+                [7; 32],
+                1,
+            )
+            .unwrap(),
+            &host.to_bytes(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn moq_attachment_requires_exact_active_control_remote_and_is_single_use() {
         let sessions = Arc::new(SessionRegistry::default());
@@ -1404,6 +1514,47 @@ mod tests {
         );
         // The pending token was atomically consumed before the MoQ handshake.
         assert!(sessions.claim_moq(endpoint(1)).is_err());
+    }
+
+    #[test]
+    fn v2_moq_attachment_requires_a_fresh_endpoint_bound_subscription() {
+        let host = iroh::SecretKey::from_bytes(&[9; 32]);
+        let remote = endpoint(1);
+        let sessions = Arc::new(SessionRegistry::default());
+        let lease = sessions
+            .claim_v2(remote, [1; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let capability = test_subscription(&host, remote, lease.session_id, 100, 200);
+        let (_producer, consumer) = test_moq_broadcast();
+        let _wait = sessions
+            .expect_moq_v2(
+                remote,
+                lease.session_id,
+                media_moq_broadcast_name(lease.session_id).unwrap(),
+                consumer,
+                capability,
+            )
+            .unwrap();
+        assert!(sessions.claim_moq_at(endpoint(2), 150).is_err());
+        assert!(sessions.claim_moq_at(remote, 150).is_ok());
+        assert!(sessions.claim_moq_at(remote, 150).is_err());
+
+        let expired_sessions = Arc::new(SessionRegistry::default());
+        let expired_lease = expired_sessions
+            .claim_v2(remote, [2; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let expired = test_subscription(&host, remote, expired_lease.session_id, 100, 200);
+        let (_producer, consumer) = test_moq_broadcast();
+        let _wait = expired_sessions
+            .expect_moq_v2(
+                remote,
+                expired_lease.session_id,
+                media_moq_broadcast_name(expired_lease.session_id).unwrap(),
+                consumer,
+                expired,
+            )
+            .unwrap();
+        assert!(expired_sessions.claim_moq_at(remote, 201).is_err());
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub(crate) struct NegotiatedV2Stream {
     pub(crate) session_id: u64,
     pub(crate) pointer_surface_dimensions: Option<PointerSurfaceDimensions>,
     pub(crate) initial_snapshot: SessionSnapshotV2,
+    pub(crate) media_subscription_capability: String,
 }
 
 pub(crate) enum NegotiatedMediaStream {
@@ -172,6 +173,9 @@ async fn negotiate_v2(
         initial_snapshot: response
             .snapshot
             .ok_or_else(|| "Host omitted initial control v2 snapshot".to_string())?,
+        media_subscription_capability: response
+            .media_subscription_capability
+            .ok_or_else(|| "Host omitted control v2 media subscription capability".to_string())?,
     })
 }
 

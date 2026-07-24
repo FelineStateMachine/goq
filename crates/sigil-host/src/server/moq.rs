@@ -22,6 +22,12 @@ struct MoqGroupPublisher {
     current_group: Option<GroupProducer>,
     cursor: MediaV3GroupCursor,
     object_bytes: usize,
+    authentication: Option<MoqObjectAuthentication>,
+}
+
+struct MoqObjectAuthentication {
+    generation_id: u64,
+    signing_key: MediaGenerationSigningKey,
 }
 
 impl MoqGroupPublisher {
@@ -31,6 +37,24 @@ impl MoqGroupPublisher {
             current_group: None,
             cursor: MediaV3GroupCursor::default(),
             object_bytes: 0,
+            authentication: None,
+        }
+    }
+
+    fn authenticated(
+        track: TrackProducer,
+        generation_id: u64,
+        signing_key: MediaGenerationSigningKey,
+    ) -> Self {
+        Self {
+            track,
+            current_group: None,
+            cursor: MediaV3GroupCursor::default(),
+            object_bytes: 0,
+            authentication: Some(MoqObjectAuthentication {
+                generation_id,
+                signing_key,
+            }),
         }
     }
 
@@ -50,23 +74,12 @@ impl MoqGroupPublisher {
                 return Ok(MoqGroupDecision::EnterResync);
             }
         };
-        let object = encode_media_frame_object(&media_frame_for_encoded(
+        let media_frame = media_frame_for_encoded(
             config,
             frame,
             replay_discontinuity || position.discontinuity,
-        )?)?;
-        let next_object_bytes = if position.object_id == 0 {
-            Some(object.len())
-        } else {
-            self.object_bytes.checked_add(object.len())
-        };
-        let Some(next_object_bytes) =
-            next_object_bytes.filter(|bytes| *bytes <= MAX_MEDIA_GROUP_BYTES_V3)
-        else {
-            self.cursor.request_keyframe();
-            self.abort_current();
-            return Ok(MoqGroupDecision::EnterResync);
-        };
+        )?;
+        let payload = encode_media_frame_object(&media_frame)?;
 
         if position.object_id == 0 {
             // A new independently-decodable GOP supersedes the previous one.
@@ -78,10 +91,22 @@ impl MoqGroupPublisher {
                 .append_group()
                 .context("creating sequential MoQ video group")?;
             let group_id = group.sequence;
+            let object = self.authenticate_object(
+                group_id,
+                position.object_id,
+                u16::from(media_frame.header.flags.bits()),
+                payload,
+            )?;
+            let object_len = object.len();
+            if object.len() > MAX_MEDIA_GROUP_BYTES_V3 {
+                let _ = group.abort(MoqError::Cancel);
+                self.cursor.request_keyframe();
+                return Ok(MoqGroupDecision::EnterResync);
+            }
             group
                 .write_frame(object)
                 .context("writing configured keyframe to MoQ group")?;
-            self.object_bytes = next_object_bytes;
+            self.object_bytes = object_len;
             self.current_group = Some(group);
             return Ok(MoqGroupDecision::Published {
                 group_id,
@@ -90,11 +115,30 @@ impl MoqGroupPublisher {
             });
         }
 
+        let group_id = self
+            .current_group
+            .as_ref()
+            .map(|group| group.sequence)
+            .context("MoQ delta frame has no active configured-keyframe group")?;
+        let object = self.authenticate_object(
+            group_id,
+            position.object_id,
+            u16::from(media_frame.header.flags.bits()),
+            payload,
+        )?;
+        let Some(next_object_bytes) = self
+            .object_bytes
+            .checked_add(object.len())
+            .filter(|bytes| *bytes <= MAX_MEDIA_GROUP_BYTES_V3)
+        else {
+            self.cursor.request_keyframe();
+            self.abort_current();
+            return Ok(MoqGroupDecision::EnterResync);
+        };
         let group = self
             .current_group
             .as_mut()
-            .context("MoQ delta frame has no active configured-keyframe group")?;
-        let group_id = group.sequence;
+            .context("MoQ delta frame lost its configured-keyframe group")?;
         group
             .write_frame(object)
             .context("writing delta access unit to MoQ group")?;
@@ -104,6 +148,32 @@ impl MoqGroupPublisher {
             frame_id: position.object_id,
             cancelled_previous: false,
         })
+    }
+
+    fn authenticate_object(
+        &self,
+        group_id: u64,
+        object_id: u32,
+        flags: u16,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let Some(authentication) = &self.authentication else {
+            return Ok(payload);
+        };
+        authentication
+            .signing_key
+            .authenticate(
+                MediaObjectCoordinates {
+                    generation_id: authentication.generation_id,
+                    track: MediaTrack::VideoH264,
+                    group_id,
+                    object_id,
+                    flags,
+                },
+                &payload,
+            )
+            .map(|object| object.into_bytes())
+            .map_err(Into::into)
     }
 
     fn request_keyframe(&mut self) -> Option<u64> {
@@ -331,6 +401,7 @@ pub(super) async fn serve_control_moq(
         &mut broadcast,
         encoder_control,
         Arc::clone(&lease.media_v3_telemetry),
+        None,
     )
     .await;
     let catalog_result = catalog.finish();
@@ -352,6 +423,7 @@ pub(super) async fn serve_control_moq_v2(
     sessions: &Arc<SessionRegistry>,
     authorization: &AuthorizationPolicy,
     input_operations: &Arc<InputOperations>,
+    host_secret: [u8; 32],
 ) -> Result<()> {
     let remote = connection.remote_id();
     let handshake_permit = sessions
@@ -423,6 +495,39 @@ pub(super) async fn serve_control_moq_v2(
     let source_task = SourceTaskGuard::new(source_task);
     sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
 
+    let mut generation_secret = [0_u8; 32];
+    getrandom::fill(&mut generation_secret)
+        .context("generating ephemeral media authentication key")?;
+    let generation_signing_key = MediaGenerationSigningKey::from_bytes(&generation_secret);
+    generation_secret.fill(0);
+    let issued_at_unix = unix_timestamp_now()?;
+    let certificate = generation_signing_key.certify(
+        *iroh::SecretKey::from_bytes(&host_secret)
+            .public()
+            .as_bytes(),
+        &host_secret,
+        lease.session_id,
+        issued_at_unix,
+        issued_at_unix.saturating_add(60 * 60),
+    )?;
+    let mut subscription_nonce = [0_u8; 32];
+    getrandom::fill(&mut subscription_nonce).context("generating subscription capability nonce")?;
+    let subscription_capability = SignedSubscriptionCapability::issue(
+        SubscriptionClaims::new(
+            certificate.claims.host_node_id,
+            lease.session_id,
+            *remote.as_bytes(),
+            SubscriptionTracks::VIDEO_H264,
+            1,
+            issued_at_unix,
+            issued_at_unix.saturating_add(15 * 60),
+            subscription_nonce,
+            1,
+        )?,
+        &host_secret,
+    )?;
+    let subscription_token = subscription_capability.encode();
+
     let mut broadcast = Broadcast::new().produce();
     let track = broadcast
         .create_track(Track {
@@ -430,13 +535,14 @@ pub(super) async fn serve_control_moq_v2(
             priority: MOQ_VIDEO_TRACK_PRIORITY,
         })
         .context("creating static MoQ H.264 track for control v2")?;
-    let catalog = publish_goq_catalog(&mut broadcast)?;
+    let catalog = publish_goq_catalog_v2(&mut broadcast, lease.session_id, &certificate)?;
     let broadcast_name = media_moq_broadcast_name(lease.session_id)?;
-    let attachment = sessions.expect_moq(
+    let attachment = sessions.expect_moq_v2(
         remote,
         lease.session_id,
         broadcast_name.clone(),
         broadcast.consume(),
+        subscription_capability,
     )?;
 
     let negotiated = MEDIA_CAPABILITIES
@@ -445,7 +551,8 @@ pub(super) async fn serve_control_moq_v2(
         .filter(|capability| hello.capabilities.contains(capability))
         .collect();
     let mut control_hello =
-        HostHelloV2::accepted(lease.session_id, negotiated, lease.initial_snapshot.clone());
+        HostHelloV2::accepted(lease.session_id, negotiated, lease.initial_snapshot.clone())
+            .with_media_subscription_capability(subscription_token);
     if let Some(dimensions) = pointer_surface_dimensions {
         control_hello = control_hello.with_pointer_surface_dimensions(dimensions);
     }
@@ -487,6 +594,7 @@ pub(super) async fn serve_control_moq_v2(
         &mut broadcast,
         encoder_control,
         Arc::clone(&lease.media_v3_telemetry),
+        Some((lease.session_id, generation_signing_key)),
     )
     .await;
     let catalog_result = catalog.finish();
@@ -604,10 +712,16 @@ async fn run_control_moq_session(
     broadcast: &mut BroadcastProducer,
     encoder_control: Option<EncoderControl>,
     telemetry: Arc<MediaV3Telemetry>,
+    authentication: Option<(u64, MediaGenerationSigningKey)>,
 ) -> Result<()> {
     let maximum_replay_age = maximum_media_replay_age(config.framerate);
     let mut replay_cursor = MediaReplayCursor::default();
-    let mut publisher = MoqGroupPublisher::new(track);
+    let mut publisher = match authentication {
+        Some((generation_id, signing_key)) => {
+            MoqGroupPublisher::authenticated(track, generation_id, signing_key)
+        }
+        None => MoqGroupPublisher::new(track),
+    };
     let (control_sender, mut control_requests) = tokio::sync::watch::channel(None);
     let mut control_task = match control_reader {
         MoqControlReader::V1(control_recv) => tokio::spawn(forward_media_v3_control_requests(
@@ -841,6 +955,29 @@ mod tests {
     use super::super::{media_v3_encoded_frame, moq_test_config};
     use super::*;
 
+    fn authenticated_publisher(
+        track: TrackProducer,
+    ) -> (
+        MoqGroupPublisher,
+        sigil_protocol::SignedMediaGenerationCertificate,
+    ) {
+        let host = iroh::SecretKey::from_bytes(&[7; 32]);
+        let signing_key = MediaGenerationSigningKey::from_bytes(&[9; 32]);
+        let certificate = signing_key
+            .certify(
+                *host.public().as_bytes(),
+                &host.to_bytes(),
+                42,
+                1_700_000_000,
+                1_700_000_600,
+            )
+            .unwrap();
+        (
+            MoqGroupPublisher::authenticated(track, 42, signing_key),
+            certificate,
+        )
+    }
+
     #[tokio::test]
     async fn upstream_moq_groups_are_sequential_and_cancel_the_superseded_gop() {
         let track_info = Track {
@@ -900,6 +1037,42 @@ mod tests {
         let frame = sigil_protocol::decode_media_frame_object(&object).unwrap();
         assert_eq!(frame.header.sequence, 200);
         assert!(frame.header.flags.contains(FrameFlags::DISCONTINUITY));
+    }
+
+    #[tokio::test]
+    async fn control_v2_objects_are_signed_after_final_moq_coordinates_are_known() {
+        let track_info = Track {
+            name: MOQ_VIDEO_H264_TRACK.to_owned(),
+            priority: MOQ_VIDEO_TRACK_PRIORITY,
+        };
+        let mut broadcast = Broadcast::new().produce();
+        let track = broadcast.create_track(track_info.clone()).unwrap();
+        let mut consumer = broadcast.consume().subscribe_track(&track_info).unwrap();
+        let (mut publisher, certificate) = authenticated_publisher(track);
+        let config = moq_test_config();
+        let encoded = media_v3_encoded_frame(100, true, true, 4);
+        publisher.publish(&config, &encoded, false).unwrap();
+        let mut group = consumer.recv_group().await.unwrap().unwrap();
+        let object = group.read_frame().await.unwrap().unwrap();
+        let payload = sigil_protocol::AuthenticatedMediaObject::verify(
+            &object,
+            &certificate,
+            MediaObjectCoordinates {
+                generation_id: 42,
+                track: MediaTrack::VideoH264,
+                group_id: group.sequence,
+                object_id: 0,
+                flags: u16::from(FrameFlags::KEYFRAME.union(FrameFlags::CODEC_CONFIG).bits()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sigil_protocol::decode_media_frame_object(payload)
+                .unwrap()
+                .header
+                .sequence,
+            100
+        );
     }
 
     #[tokio::test]

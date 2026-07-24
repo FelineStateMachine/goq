@@ -7,6 +7,7 @@ use crate::framing::{read_json, write_json};
 use crate::{
     Capability, ControllerSlot, KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN,
     PROTOCOL_VERSION_V2, PointerSurfaceDimensions, ProtocolError, Result, SignedInvitation,
+    SignedSubscriptionCapability,
 };
 
 const MAX_AGENT_LEN: usize = 128;
@@ -473,6 +474,8 @@ pub struct HostHelloV2 {
     pub pointer_surface_dimensions: Option<PointerSurfaceDimensions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SessionSnapshotV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_subscription_capability: Option<String>,
 }
 
 impl HostHelloV2 {
@@ -489,6 +492,7 @@ impl HostHelloV2 {
             message: None,
             pointer_surface_dimensions: None,
             snapshot: Some(snapshot),
+            media_subscription_capability: None,
         }
     }
 
@@ -501,11 +505,17 @@ impl HostHelloV2 {
             message: Some(message.into()),
             pointer_surface_dimensions: None,
             snapshot: None,
+            media_subscription_capability: None,
         }
     }
 
     pub fn with_pointer_surface_dimensions(mut self, dimensions: PointerSurfaceDimensions) -> Self {
         self.pointer_surface_dimensions = Some(dimensions);
+        self
+    }
+
+    pub fn with_media_subscription_capability(mut self, capability: impl Into<String>) -> Self {
+        self.media_subscription_capability = Some(capability.into());
         self
     }
 
@@ -536,8 +546,18 @@ impl HostHelloV2 {
                     "snapshot session does not match host hello",
                 );
             }
+            if let Some(capability) = &self.media_subscription_capability {
+                let capability = SignedSubscriptionCapability::decode(capability)?;
+                if capability.claims.media_generation_id != snapshot.media.generation_id {
+                    return invalid(
+                        "host hello v2",
+                        "subscription capability generation does not match the snapshot",
+                    );
+                }
+            }
         } else if self.session_id.is_some()
             || self.snapshot.is_some()
+            || self.media_subscription_capability.is_some()
             || self.message.as_ref().is_none_or(|message| {
                 message.is_empty() || message.len() > MAX_REJECTION_MESSAGE_LEN
             })

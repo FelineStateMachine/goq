@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iroh::{Endpoint, SecretKey, endpoint::presets};
 use serde::Serialize;
@@ -28,8 +28,10 @@ use crate::media::input_delivery::{
     open_input_session, run_input_feedback, run_input_forwarder, v2_input_eligibility,
 };
 use crate::media::media_control::run_media_control_writer_v3;
-use crate::media::moq_receiver::open_upstream_moq_media;
-use crate::media::network_diagnostics::NetworkSessionDiagnostics;
+use crate::media::moq_receiver::{MoqAuthenticationExpectation, open_upstream_moq_media};
+use crate::media::network_diagnostics::{
+    MediaDeliveryRole, NetworkSessionDiagnostics, lock_network_diagnostics,
+};
 use crate::media::session_control::{
     SESSION_CONTROL_COMMAND_CAPACITY, install_initial_snapshot, run_session_control,
 };
@@ -216,24 +218,51 @@ pub(crate) async fn connect_client(
         NegotiatedMediaStream::V2(negotiation) => Some(negotiation.initial_snapshot.clone()),
         NegotiatedMediaStream::V1(_) => None,
     };
+    let moq_authentication = match &media_negotiation {
+        NegotiatedMediaStream::V2(negotiation) => Some(MoqAuthenticationExpectation {
+            expected_host: *host_node_id.as_bytes(),
+            subscription_capability: negotiation.media_subscription_capability.clone(),
+            now_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| "System clock is before the Unix epoch".to_string())?
+                .as_secs(),
+        }),
+        NegotiatedMediaStream::V1(_) => None,
+    };
     let media_generation = next_media_generation(&state.client_media_generation)?;
+    let network_diagnostics = Arc::new(StdMutex::new(NetworkSessionDiagnostics::new(
+        Instant::now(),
+        false,
+    )));
+    if moq_authentication.is_some() {
+        lock_network_diagnostics(&network_diagnostics)
+            .configure_authenticated_media(MediaDeliveryRole::DirectHost);
+    }
+    let media_verification_failures =
+        lock_network_diagnostics(&network_diagnostics).media_verification_failure_counter();
     let (upstream_moq_media, frame_connection_for_stats) = if media_transport
         == MediaTransport::UpstreamMoq
     {
-        let (receiver, diagnostics_connection) =
-            match open_upstream_moq_media(&endpoint, &addr, media_session_id).await {
-                Ok(media) => media,
-                Err(error) => {
-                    // CONTROL already authenticated and owns the host's
-                    // one-client lease. A post-auth MoQ failure is
-                    // terminal, and must explicitly release that lease;
-                    // it must never fall through to a legacy media ALPN.
-                    frame_conn.close(1_u32.into(), b"upstream MoQ setup failed");
-                    let _ =
-                        tokio::time::timeout(CLIENT_ENDPOINT_CLOSE_TIMEOUT, endpoint.close()).await;
-                    return Err(error);
-                }
-            };
+        let (receiver, diagnostics_connection) = match open_upstream_moq_media(
+            &endpoint,
+            &addr,
+            media_session_id,
+            moq_authentication,
+            media_verification_failures,
+        )
+        .await
+        {
+            Ok(media) => media,
+            Err(error) => {
+                // CONTROL already authenticated and owns the host's
+                // one-client lease. A post-auth MoQ failure is
+                // terminal, and must explicitly release that lease;
+                // it must never fall through to a legacy media ALPN.
+                frame_conn.close(1_u32.into(), b"upstream MoQ setup failed");
+                let _ = tokio::time::timeout(CLIENT_ENDPOINT_CLOSE_TIMEOUT, endpoint.close()).await;
+                return Err(error);
+            }
+        };
         (Some(receiver), diagnostics_connection)
     } else {
         (None, frame_conn.clone())
@@ -267,10 +296,6 @@ pub(crate) async fn connect_client(
         }
     };
 
-    let mut network_diagnostics = Arc::new(StdMutex::new(NetworkSessionDiagnostics::new(
-        Instant::now(),
-        false,
-    )));
     let mut input_connection_for_stats = None;
     let (input_availability, v1_input_forwarder) = if control_protocol == ControlProtocol::V1 {
         let InputSession {
@@ -280,10 +305,8 @@ pub(crate) async fn connect_client(
             capabilities: input_capabilities,
             availability: input_availability,
         } = open_input_session(&endpoint, &addr, handshake_nonce, media_session_id, grants).await?;
-        network_diagnostics = Arc::new(StdMutex::new(NetworkSessionDiagnostics::new(
-            Instant::now(),
-            input_availability.input_ack,
-        )));
+        lock_network_diagnostics(&network_diagnostics)
+            .set_input_ack_negotiated(input_availability.input_ack);
         input_connection_for_stats = Some(input_connection.clone());
         if input_availability.pointer_position_feedback || input_availability.input_ack {
             tokio::spawn(run_input_feedback(

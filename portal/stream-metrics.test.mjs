@@ -8,7 +8,51 @@ import {
   LatestFramePresenter,
   MAX_STREAM_RATE_SAMPLES,
   RollingRateWindow,
+  mediaAuthenticationPresentation,
 } from './stream-metrics.mjs';
+
+test('media authentication presentation reports mode role certification and failures', () => {
+  assert.deepEqual(mediaAuthenticationPresentation({
+    media_authentication: {
+      mode: 'ed25519-v1',
+      generation_certified: true,
+      delivery_role: 'direct_host',
+      verification_failures: 0,
+    },
+  }), {
+    mode: 'ed25519-v1',
+    generationState: 'certified',
+    deliveryRole: 'direct_host',
+    verificationFailures: 0,
+    trusted: true,
+  });
+  assert.equal(mediaAuthenticationPresentation({
+    media_authentication: {
+      mode: 'ed25519-v1',
+      generation_certified: true,
+      delivery_role: 'viewer_relay',
+      verification_failures: 1,
+    },
+  }).trusted, false);
+});
+
+test('media authentication presentation fails closed on unknown or malformed diagnostics', () => {
+  for (const diagnostics of [
+    null,
+    {},
+    { media_authentication: { mode: 'shared-mac-v1', generation_certified: true, delivery_role: 'direct_host', verification_failures: 0 } },
+    { media_authentication: { mode: 'ed25519-v1', generation_certified: true, delivery_role: 'mesh', verification_failures: 0 } },
+    { media_authentication: { mode: 'ed25519-v1', generation_certified: true, delivery_role: 'direct_host', verification_failures: -1 } },
+  ]) {
+    assert.deepEqual(mediaAuthenticationPresentation(diagnostics), {
+      mode: 'invalid',
+      generationState: 'unverified',
+      deliveryRole: 'unknown',
+      verificationFailures: null,
+      trusted: false,
+    });
+  }
+});
 
 test('cadence reports bounded interval percentiles and hitch counts', () => {
   const cadence = new BoundedCadenceWindow(5000, 8);

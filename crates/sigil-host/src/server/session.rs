@@ -11,7 +11,7 @@ use sigil_protocol::{
     ControllerSlot, FocusCommandActionV2, FocusCommandV2, FocusStateV2, FocusTransitionReasonV2,
     InvitationGrants, KeyframeRequestReasonV3, MediaGenerationDescriptorV2, SessionSnapshotV2,
     SignedSubscriptionCapability, SubscriptionTracks, ViewerPresenceId, ViewerPresenceV2,
-    media_moq_broadcast_name,
+    media_generation_moq_broadcast_name, media_moq_broadcast_name,
 };
 use tracing::{debug, warn};
 
@@ -77,6 +77,8 @@ struct ActiveSession {
     session_id: u64,
     nonce: [u8; 16],
     session_clock: SessionClock,
+    media_generation_id: u64,
+    media_broadcast_name: String,
     grants: InvitationGrants,
     viewer_handle: Option<String>,
     authorization_revision: u64,
@@ -400,6 +402,8 @@ impl SessionRegistry {
             session_id,
             nonce,
             session_clock,
+            media_generation_id: session_id,
+            media_broadcast_name: media_moq_broadcast_name(session_id)?,
             grants,
             viewer_handle: None,
             authorization_revision: 1,
@@ -483,6 +487,8 @@ impl SessionRegistry {
             session_id,
             nonce,
             session_clock,
+            media_generation_id: session_id,
+            media_broadcast_name: media_moq_broadcast_name(session_id)?,
             grants: authorized.grants,
             viewer_handle: Some(authorized.handle),
             authorization_revision: authorized.authorization_revision,
@@ -512,6 +518,42 @@ impl SessionRegistry {
             authorization_revision: authorized.authorization_revision,
             authorization_committed_revision: authorized.committed_revision,
         })
+    }
+
+    pub(super) fn bind_v2_generation(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        generation_id: u64,
+        session_clock: SessionClock,
+        telemetry: Arc<MediaV3Telemetry>,
+        encoder_control: Option<EncoderControl>,
+    ) -> Result<SessionSnapshotV2> {
+        let mut active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_mut()
+            .filter(|session| {
+                session.mode == SessionMode::V2Single
+                    && session.media_active
+                    && session.remote == remote
+                    && session.session_id == session_id
+            })
+            .context("generation binding does not match the active v2 viewer")?;
+        ensure!(generation_id != 0, "media generation id must be non-zero");
+        session.session_clock = session_clock;
+        session.media_generation_id = generation_id;
+        session.media_broadcast_name = media_generation_moq_broadcast_name(generation_id)?;
+        session.media_v3_telemetry = telemetry;
+        session.encoder_control = encoder_control;
+        let v2_state = self.v2_state.lock().expect("v2 session state poisoned");
+        let snapshot = v2_snapshot_for(
+            session,
+            v2_state
+                .as_ref()
+                .context("active v2 viewer is missing snapshot state")?,
+        )?;
+        self.v2_snapshot.send_replace(Some(snapshot.clone()));
+        Ok(snapshot)
     }
 
     pub(super) fn claim_input(
@@ -1019,7 +1061,10 @@ impl SessionRegistry {
         let session = active
             .as_mut()
             .filter(|session| {
-                session.media_active && session.remote == remote && session.nonce == nonce
+                session.mode == SessionMode::LegacyExclusive
+                    && session.media_active
+                    && session.remote == remote
+                    && session.nonce == nonce
             })
             .context("audio connection does not match the active media session")?;
         ensure!(
@@ -1094,7 +1139,7 @@ impl SessionRegistry {
             })
             .context("authenticated MoQ expectation does not match the active v2 session")?;
         ensure!(
-            subscription_capability.claims.media_generation_id == session_id
+            subscription_capability.claims.media_generation_id == session.media_generation_id
                 && subscription_capability.claims.subscriber_endpoint_id == *remote.as_bytes()
                 && subscription_capability
                     .claims
@@ -1157,9 +1202,9 @@ impl SessionRegistry {
             capability
                 .verify_binding(
                     capability.claims.host_node_id,
-                    session.session_id,
+                    session.media_generation_id,
                     *remote.as_bytes(),
-                    SubscriptionTracks::VIDEO_H264,
+                    capability.claims.tracks,
                     session.authorization_revision,
                     now_unix,
                 )
@@ -1280,8 +1325,8 @@ fn v2_snapshot_for(session: &ActiveSession, v2: &V2SessionState) -> Result<Sessi
         focus: v2.focus.clone(),
         transition_reason: v2.transition_reason,
         media: MediaGenerationDescriptorV2 {
-            generation_id: session.session_id,
-            broadcast_name: media_moq_broadcast_name(session.session_id)?,
+            generation_id: session.media_generation_id,
+            broadcast_name: session.media_broadcast_name.clone(),
         },
     };
     snapshot.validate()?;

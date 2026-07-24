@@ -75,11 +75,12 @@ pub use media_v3::{
     write_media_control_request_v3, write_media_object_v3,
 };
 pub use moq_catalog::{
-    GoqCatalogDocument, GoqCatalogDocumentV2, MAX_MOQ_CATALOG_BYTES,
-    MOQ_AUTHENTICATED_MEDIA_OBJECT_FORMAT_V1, MOQ_CATALOG_EXTENSION_VERSION_V1,
-    MOQ_CATALOG_EXTENSION_VERSION_V2, MOQ_GOP_GROUP_FORMAT_V1, MOQ_MEDIA_OBJECT_FORMAT_V1,
-    MOQ_VIDEO_TRACK_PRIORITY, MoqCatalogExtensionV1, MoqCatalogExtensionV2,
-    MoqTrackAuthenticationV2, MoqTrackDescriptorV1, MoqVideoCatalogV1, MoqVideoCatalogV2,
+    GoqCatalogDocument, GoqCatalogDocumentV2, MAX_MOQ_CATALOG_BYTES, MOQ_AUDIO_GROUP_FORMAT_V1,
+    MOQ_AUDIO_OBJECT_FORMAT_V1, MOQ_AUDIO_TRACK_PRIORITY, MOQ_AUTHENTICATED_MEDIA_OBJECT_FORMAT_V1,
+    MOQ_CATALOG_EXTENSION_VERSION_V1, MOQ_CATALOG_EXTENSION_VERSION_V2, MOQ_GOP_GROUP_FORMAT_V1,
+    MOQ_MEDIA_OBJECT_FORMAT_V1, MOQ_VIDEO_TRACK_PRIORITY, MoqAudioCatalogV2, MoqCatalogExtensionV1,
+    MoqCatalogExtensionV2, MoqTrackAuthenticationV2, MoqTrackDescriptorV1, MoqVideoCatalogV1,
+    MoqVideoCatalogV2,
 };
 pub use subscription::{
     MAX_SUBSCRIPTION_CAPABILITY_TOKEN_LEN, MAX_SUBSCRIPTION_TTL_SECS,
@@ -108,6 +109,8 @@ pub const CONTROL_ALPN_V1: &[u8] = b"sigil/control/1";
 pub const CONTROL_ALPN_V2: &[u8] = b"sigil/control/2";
 /// Static upstream MoQ track carrying bounded H.264 access-unit objects.
 pub const MOQ_VIDEO_H264_TRACK: &str = "video/h264";
+/// Static upstream MoQ track carrying authenticated 20 ms Opus packets.
+pub const MOQ_AUDIO_OPUS_TRACK: &str = "audio/opus";
 /// ALPN for the v1 low-latency Opus datagram connection.
 pub const AUDIO_ALPN_V1: &[u8] = b"sigil/audio/1";
 
@@ -142,6 +145,17 @@ pub fn media_moq_broadcast_name(session_id: u64) -> Result<String> {
     Ok(format!("sigil/session/{session_id}/video"))
 }
 
+/// Derive the host-generation-scoped MoQ broadcast name used by control v2.
+pub fn media_generation_moq_broadcast_name(generation_id: u64) -> Result<String> {
+    if generation_id == 0 {
+        return Err(ProtocolError::InvalidMessage {
+            message_type: "MoQ generation broadcast name",
+            reason: "generation id must be non-zero",
+        });
+    }
+    Ok(format!("sigil/generation/{generation_id}/media"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,10 +174,16 @@ mod tests {
     #[test]
     fn moq_media_namespace_is_session_scoped_and_stable() {
         assert_eq!(MOQ_VIDEO_H264_TRACK, "video/h264");
+        assert_eq!(MOQ_AUDIO_OPUS_TRACK, "audio/opus");
         assert_eq!(
             media_moq_broadcast_name(42).unwrap(),
             "sigil/session/42/video"
         );
         assert!(media_moq_broadcast_name(0).is_err());
+        assert_eq!(
+            media_generation_moq_broadcast_name(42).unwrap(),
+            "sigil/generation/42/media"
+        );
+        assert!(media_generation_moq_broadcast_name(0).is_err());
     }
 }

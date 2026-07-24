@@ -25,6 +25,7 @@ impl MoqCatalogMode {
 
 pub(crate) struct MoqCatalogSelection {
     pub(crate) track: TrackConsumer,
+    pub(crate) audio_track: Option<TrackConsumer>,
     pub(crate) mode: MoqCatalogMode,
     pub(crate) certificate: Option<SignedMediaGenerationCertificate>,
 }
@@ -44,6 +45,7 @@ fn subscribe_static_video_track(
         })?;
     Ok(MoqCatalogSelection {
         track,
+        audio_track: None,
         mode: MoqCatalogMode::AbsentStaticTrackCompat,
         certificate: None,
     })
@@ -83,6 +85,7 @@ pub(crate) async fn subscribe_goq_video_track(
         })?;
     Ok(MoqCatalogSelection {
         track,
+        audio_track: None,
         mode: MoqCatalogMode::GoqV1,
         certificate: None,
     })
@@ -112,8 +115,21 @@ pub(crate) async fn subscribe_authenticated_goq_video_track(
         .map_err(|error| {
             format!("Failed to subscribe to authenticated Goq video track: {error}")
         })?;
+    let audio_track = document
+        .goq
+        .audio
+        .as_ref()
+        .map(|audio| {
+            broadcast
+                .subscribe_track(&Track::new(audio.track.name.clone()))
+                .map_err(|error| {
+                    format!("Failed to subscribe to authenticated Goq audio track: {error}")
+                })
+        })
+        .transpose()?;
     Ok(MoqCatalogSelection {
         track,
+        audio_track,
         mode: MoqCatalogMode::GoqV2Authenticated,
         certificate: Some(certificate),
     })
@@ -176,7 +192,7 @@ mod tests {
             )
             .unwrap();
         (
-            GoqCatalogDocumentV2::video_h264(42, &certificate).unwrap(),
+            GoqCatalogDocumentV2::video_h264_opus(42, &certificate).unwrap(),
             host.verifying_key().to_bytes(),
         )
     }
@@ -227,6 +243,9 @@ mod tests {
             .create_track(Track::new(sigil_protocol::MOQ_VIDEO_H264_TRACK))
             .unwrap();
         let (document, host) = v2_document();
+        let _audio = broadcast
+            .create_track(Track::new(sigil_protocol::MOQ_AUDIO_OPUS_TRACK))
+            .unwrap();
         let _catalog = publish_catalog_v2(&mut broadcast, &document);
         let selection = subscribe_authenticated_goq_video_track(
             &broadcast.consume(),
@@ -238,6 +257,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(selection.mode, MoqCatalogMode::GoqV2Authenticated);
+        assert!(selection.audio_track.is_some());
         assert_eq!(selection.certificate.unwrap().claims.generation_id, 42);
 
         let mut wrong_host_broadcast = Broadcast::new().produce();

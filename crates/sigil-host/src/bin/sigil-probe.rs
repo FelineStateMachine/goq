@@ -508,11 +508,16 @@ impl MoqProbeReceiver {
         endpoint: &Endpoint,
         address: EndpointAddr,
         session_id: u64,
+        generation_id: u64,
+        advertised_broadcast_name: Option<&str>,
         timeout: Duration,
         authentication: Option<MoqProbeAuthentication>,
     ) -> Result<Self> {
-        let broadcast_name = media_moq_broadcast_name(session_id)
-            .context("deriving session-scoped MoQ broadcast name")?;
+        let broadcast_name = match advertised_broadcast_name {
+            Some(name) => name.to_owned(),
+            None => media_moq_broadcast_name(session_id)
+                .context("deriving session-scoped MoQ broadcast name")?,
+        };
         let moq = Moq::new(endpoint.clone());
         let mut session = tokio::time::timeout(timeout, moq.connect(address.clone()))
             .await
@@ -534,7 +539,7 @@ impl MoqProbeReceiver {
             SignedSubscriptionCapability::decode(&authentication.subscription_capability)?
                 .verify_binding(
                     authentication.expected_host,
-                    session_id,
+                    generation_id,
                     *endpoint.id().as_bytes(),
                     SubscriptionTracks::VIDEO_H264,
                     1,
@@ -544,7 +549,7 @@ impl MoqProbeReceiver {
                 &broadcast,
                 timeout,
                 authentication.expected_host,
-                session_id,
+                generation_id,
                 authentication.now_unix,
             )
             .await
@@ -788,11 +793,15 @@ async fn run_control_v2_smoke(
         initial.revision > 0 && matches!(initial.focus, FocusStateV2::Vacant { .. }),
         "initial control v2 snapshot was not a revisioned vacant slot"
     );
+    let generation_id = initial.media.generation_id;
+    let broadcast_name = initial.media.broadcast_name.clone();
 
     let mut media = MoqProbeReceiver::connect(
         endpoint,
         address.clone(),
         session_id,
+        generation_id,
+        Some(&broadcast_name),
         Duration::from_secs(timeout_seconds),
         Some(MoqProbeAuthentication {
             expected_host: *address.id.as_bytes(),
@@ -945,6 +954,9 @@ async fn run_control_v2_smoke(
     println!("input_alpn=sigil/input/2");
     println!("media_authentication=ed25519-v1");
     println!("media_generation_certified=ok");
+    println!("media_generation_id={generation_id}");
+    println!("media_broadcast_name={broadcast_name}");
+    println!("media_generation_scope=host");
     println!("subscription_endpoint_binding=ok");
     println!("frames={accepted}");
     println!("initial_snapshot_revision={}", initial.revision);
@@ -1629,6 +1641,8 @@ async fn main() -> Result<()> {
                 &endpoint,
                 address.clone(),
                 session_id,
+                session_id,
+                None,
                 Duration::from_secs(args.timeout_seconds),
                 None,
             )

@@ -20,7 +20,8 @@ use crate::media::adaptive_feedback::{
     run_media_feedback_session,
 };
 use crate::media::audio_delivery::{
-    AudioStartRequest, lock_audio_deliveries, next_audio_generation, try_start_audio,
+    AudioStartRequest, MoqAudioStartRequest, lock_audio_deliveries, next_audio_generation,
+    try_start_audio, try_start_moq_audio,
 };
 use crate::media::frame_channel::{close_generation_connection, next_media_generation};
 use crate::media::input_delivery::{
@@ -218,6 +219,9 @@ pub(crate) async fn connect_client(
         NegotiatedMediaStream::V2(negotiation) => Some(negotiation.initial_snapshot.clone()),
         NegotiatedMediaStream::V1(_) => None,
     };
+    let advertised_media = initial_session_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.media.clone());
     let moq_authentication = match &media_negotiation {
         NegotiatedMediaStream::V2(negotiation) => Some(MoqAuthenticationExpectation {
             expected_host: *host_node_id.as_bytes(),
@@ -240,13 +244,17 @@ pub(crate) async fn connect_client(
     }
     let media_verification_failures =
         lock_network_diagnostics(&network_diagnostics).media_verification_failure_counter();
-    let (upstream_moq_media, frame_connection_for_stats) = if media_transport
+    let (upstream_moq_media, upstream_moq_audio, frame_connection_for_stats) = if media_transport
         == MediaTransport::UpstreamMoq
     {
-        let (receiver, diagnostics_connection) = match open_upstream_moq_media(
+        let (receiver, audio_receiver, diagnostics_connection) = match open_upstream_moq_media(
             &endpoint,
             &addr,
             media_session_id,
+            advertised_media.as_ref().map(|media| media.generation_id),
+            advertised_media
+                .as_ref()
+                .map(|media| media.broadcast_name.as_str()),
             moq_authentication,
             media_verification_failures,
         )
@@ -263,9 +271,9 @@ pub(crate) async fn connect_client(
                 return Err(error);
             }
         };
-        (Some(receiver), diagnostics_connection)
+        (Some(receiver), audio_receiver, diagnostics_connection)
     } else {
-        (None, frame_conn.clone())
+        (None, None, frame_conn.clone())
     };
     if !development_mode && let Some(expected_invitation) = invitation.as_deref() {
         // An accepted media hello means Sigil durably committed the one-time
@@ -336,26 +344,49 @@ pub(crate) async fn connect_client(
 
     let audio_generation = next_audio_generation(&state.audio_connection_generation)?;
     lock_audio_deliveries(&state.audio_deliveries).begin_generation(audio_generation)?;
-    let audio_result = try_start_audio(
-        app.clone(),
-        &endpoint,
-        AudioStartRequest {
-            address: addr.clone(),
-            handshake_nonce,
-            media_session_id,
-            audio_supported,
-            audio_channel,
-            audio_deliveries: Arc::clone(&state.audio_deliveries),
-            connection_generation: Arc::clone(&state.audio_connection_generation),
-            generation: audio_generation,
-        },
-    )
-    .await;
+    let audio_result = if control_protocol == ControlProtocol::V2 {
+        let receiver = upstream_moq_audio
+            .ok_or_else(|| "Host did not advertise an authenticated MoQ Opus track".to_string());
+        match receiver {
+            Ok(receiver) => try_start_moq_audio(
+                app.clone(),
+                receiver,
+                MoqAudioStartRequest {
+                    audio_supported,
+                    audio_channel,
+                    audio_deliveries: Arc::clone(&state.audio_deliveries),
+                    connection_generation: Arc::clone(&state.audio_connection_generation),
+                    generation: audio_generation,
+                },
+            )
+            .map(|()| None),
+            Err(error) => Err(error),
+        }
+    } else {
+        try_start_audio(
+            app.clone(),
+            &endpoint,
+            AudioStartRequest {
+                address: addr.clone(),
+                handshake_nonce,
+                media_session_id,
+                audio_supported,
+                audio_channel,
+                audio_deliveries: Arc::clone(&state.audio_deliveries),
+                connection_generation: Arc::clone(&state.audio_connection_generation),
+                generation: audio_generation,
+            },
+        )
+        .await
+        .map(Some)
+    };
     let mut audio_connection_for_stats = None;
     let (audio_available, connected_audio_generation, audio_error) = match audio_result {
         Ok(connection) => {
-            audio_connection_for_stats = Some(connection.clone());
-            *state.audio_connection.lock().await = Some((audio_generation, connection));
+            if let Some(connection) = connection {
+                audio_connection_for_stats = Some(connection.clone());
+                *state.audio_connection.lock().await = Some((audio_generation, connection));
+            }
             (true, Some(audio_generation), None)
         }
         Err(error) => {

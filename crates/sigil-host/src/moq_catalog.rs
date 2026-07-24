@@ -44,13 +44,18 @@ pub(crate) fn publish_goq_catalog_v2(
     broadcast: &mut BroadcastProducer,
     generation_id: u64,
     certificate: &SignedMediaGenerationCertificate,
+    audio_enabled: bool,
 ) -> Result<GoqCatalogProducer> {
     let track = broadcast
         .create_track(hang::Catalog::default_track())
         .context("creating authenticated catalog.json track")?;
     let mut producer = moq_json::Producer::new(track, moq_json::Config::default());
-    let document = GoqCatalogDocumentV2::video_h264(generation_id, certificate)
-        .context("constructing authenticated Goq catalog")?;
+    let document = if audio_enabled {
+        GoqCatalogDocumentV2::video_h264_opus(generation_id, certificate)
+    } else {
+        GoqCatalogDocumentV2::video_h264(generation_id, certificate)
+    }
+    .context("constructing authenticated Goq catalog")?;
     document
         .validate()
         .context("validating authenticated Goq catalog document")?;
@@ -134,7 +139,7 @@ mod tests {
             })
             .unwrap();
         let certificate = certificate();
-        let catalog = publish_goq_catalog_v2(&mut broadcast, 42, &certificate).unwrap();
+        let catalog = publish_goq_catalog_v2(&mut broadcast, 42, &certificate, false).unwrap();
         let document_track = broadcast
             .consume()
             .subscribe_track(&hang::Catalog::default_track())
@@ -146,6 +151,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(document.validate().unwrap(), certificate);
+        catalog.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_catalog_can_advertise_video_and_audio_tracks() {
+        let mut broadcast = Broadcast::new().produce();
+        let _video = broadcast
+            .create_track(Track::new(sigil_protocol::MOQ_VIDEO_H264_TRACK))
+            .unwrap();
+        let _audio = broadcast
+            .create_track(Track::new(sigil_protocol::MOQ_AUDIO_OPUS_TRACK))
+            .unwrap();
+        let certificate = certificate();
+        let catalog = publish_goq_catalog_v2(&mut broadcast, 42, &certificate, true).unwrap();
+        let track = broadcast
+            .consume()
+            .subscribe_track(&hang::Catalog::default_track())
+            .unwrap();
+        let mut consumer = moq_json::Consumer::<GoqCatalogDocumentV2>::new(track);
+        let document = consumer.next().await.unwrap().unwrap();
+        assert!(document.goq.audio.is_some());
         catalog.finish().unwrap();
     }
 }

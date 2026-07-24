@@ -42,7 +42,8 @@ use crate::cursor::PointerPositionTracker;
 use crate::input::InputBackend;
 use crate::server::{
     AudioHandler, AuthorizedMoqHandler, ControlHandler, ControlV2Handler, InputHandler,
-    InputOperations, InputV2Handler, MediaFeedbackHandler, MediaV3Handler, SessionRegistry,
+    InputOperations, InputV2Handler, MediaFeedbackHandler, MediaGenerationManager, MediaV3Handler,
+    SessionRegistry,
 };
 
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1111,6 +1112,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
 
     let moq_origin = Origin::random();
     let input_operations = Arc::new(InputOperations::new(input_backend.clone()));
+    let media_generations = MediaGenerationManager::new(config.clone(), host_secret);
     let authorization_admin = match &authorization {
         AuthorizationPolicy::Required(store) => Some(
             authorization_admin::AuthorizationAdminServer::start(
@@ -1128,8 +1130,8 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         .accept(
             CONTROL_ALPN_V2,
             ControlV2Handler {
-                config: config.clone(),
                 sessions: Arc::clone(&sessions),
+                generations: Arc::clone(&media_generations),
                 authorization: authorization.clone(),
                 input_operations: Arc::clone(&input_operations),
                 host_secret,

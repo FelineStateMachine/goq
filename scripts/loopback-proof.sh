@@ -25,6 +25,7 @@ relay_only=false
 expected_path_mode=direct
 control_v2=false
 viewers=1
+assert_shared_generation=false
 
 usage() {
   cat <<'EOF'
@@ -47,6 +48,8 @@ Options:
                                 control, media, and input paths to stay relayed
   --control-v2                  Exercise explicit control/2 and input/2 focus
   --viewers COUNT               Viewer count for control-v2 (Phase 1 requires 1)
+  --assert-shared-generation    Require host-scoped generation naming, one
+                                producer start, and final-viewer cleanup
   --help                        Show this help
 EOF
 }
@@ -120,6 +123,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "--viewers requires a value"
       viewers="$2"
       shift 2
+      ;;
+    --assert-shared-generation)
+      assert_shared_generation=true
+      shift
       ;;
     --help|-h)
       usage
@@ -541,6 +548,14 @@ if [[ "$control_v2" == true ]]; then
   grep -Fxq 'input_alpn=sigil/input/2' "$v2_log" || die "input-v2 ALPN evidence is missing"
   grep -Fxq 'slot_0_input=ok' "$v2_log" || die "slot-0 input evidence is missing"
   grep -Fxq 'focus_release=ok' "$v2_log" || die "focus release evidence is missing"
+  if [[ "$assert_shared_generation" == true ]]; then
+    grep -Fxq 'media_generation_scope=host' "$v2_log" \
+      || die "host-scoped media generation evidence is missing"
+    grep -Eq '^media_generation_id=[1-9][0-9]*$' "$v2_log" \
+      || die "media generation ID evidence is missing"
+    grep -Eq '^media_broadcast_name=sigil/generation/[1-9][0-9]*/media$' "$v2_log" \
+      || die "generation-scoped broadcast evidence is missing"
+  fi
   awk -F= '$1 == "initial_snapshot_revision" && $2 ~ /^[1-9][0-9]*$/ { found=1 } END { exit !found }' \
     "$v2_log" || die "initial snapshot evidence is missing"
   awk -F= '$1 == "focus_generation" && $2 ~ /^[1-9][0-9]*$/ { found=1 } END { exit !found }' \
@@ -549,6 +564,21 @@ if [[ "$control_v2" == true ]]; then
     || die "control-v2 session was not released"
   wait_for_log_count "$host_log" 'input v2 client released' 1 "$host_pid" 'sigil' \
     || die "input-v2 session was not neutralized and released"
+  if [[ "$assert_shared_generation" == true ]]; then
+    clean_host_log="$tmp_root/host-shared-generation.log"
+    sed $'s/\033\[[0-9;]*m//g' "$host_log" >"$clean_host_log"
+    wait_for_log_count "$host_log" 'shared media generation stopped with all sources cleaned up' \
+      1 "$host_pid" 'sigil' || die "shared generation did not clean up after the final viewer"
+    [[ "$(grep -Fc -- 'shared media generation started' "$host_log" || true)" -eq 1 ]] \
+      || die "control-v2 started more than one shared media generation"
+    [[ "$(grep -Fc -- 'shared media generation stopped with all sources cleaned up' "$host_log" || true)" -eq 1 ]] \
+      || die "control-v2 stopped the shared media generation more than once"
+    for resource_field in \
+      'video_sources=1' 'video_encoders=1' 'audio_sources=0' 'audio_encoders=0' 'publishers=1'; do
+      grep -F 'shared media generation started' "$clean_host_log" | grep -Fq -- "$resource_field" \
+        || die "shared generation resource-count evidence is missing $resource_field"
+    done
+  fi
 
   # The unchanged v1 path remains explicitly usable after a v2 generation.
   if ! run_bounded "$command_timeout_seconds" "$v1_log" \
@@ -574,6 +604,7 @@ if [[ "$control_v2" == true ]]; then
   printf 'input_v2=ok\n'
   printf 'neutralization=reset-before-input-lease-release\n'
   printf 'v1_compatibility=ok\n'
+  printf 'shared_generation=%s\n' "$([[ "$assert_shared_generation" == true ]] && printf ok || printf not-requested)"
   exit 0
 fi
 

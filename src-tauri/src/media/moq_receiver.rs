@@ -10,11 +10,11 @@ use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
 #[cfg(test)]
 use sigil_protocol::MOQ_VIDEO_H264_TRACK;
 use sigil_protocol::{
-    AuthenticatedMediaObject, FrameFlags, KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3,
-    MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MAX_MEDIA_OBJECT_ID_V3, MediaCodec, MediaFrame,
-    MediaObjectCoordinates, MediaTrack, SignedMediaGenerationCertificate,
-    SignedSubscriptionCapability, SubscriptionTracks, decode_media_frame_object,
-    media_moq_broadcast_name,
+    AudioFlags, AudioPacket, AudioPacketHeader, AuthenticatedMediaObject, FrameFlags,
+    KeyframeRequestReasonV3, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,
+    MAX_MEDIA_OBJECT_ID_V3, MediaCodec, MediaFrame, MediaObjectCoordinates, MediaTrack,
+    SignedMediaGenerationCertificate, SignedSubscriptionCapability, SubscriptionTracks,
+    decode_media_frame_object, media_moq_broadcast_name,
 };
 use tauri::{AppHandle, Manager};
 
@@ -161,6 +161,168 @@ pub(crate) struct MoqMediaReceiver {
     pending_group_recovery: Option<MoqGroupRecovery>,
     certificate: Option<SignedMediaGenerationCertificate>,
     verification_failures: Option<Arc<AtomicU64>>,
+}
+
+struct MoqAudioGroupCursor {
+    group: GroupConsumer,
+    sequence: u64,
+    object_count: usize,
+    object_bytes: usize,
+}
+
+pub(crate) struct MoqAudioReceiver {
+    track: TrackConsumer,
+    current_group: Option<MoqAudioGroupCursor>,
+    last_group_sequence: Option<u64>,
+    last_packet_sequence: Option<u64>,
+    discontinuity_pending: bool,
+    certificate: SignedMediaGenerationCertificate,
+    verification_failures: Arc<AtomicU64>,
+}
+
+impl MoqAudioReceiver {
+    fn new(
+        track: TrackConsumer,
+        certificate: SignedMediaGenerationCertificate,
+        verification_failures: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            track,
+            current_group: None,
+            last_group_sequence: None,
+            last_packet_sequence: None,
+            discontinuity_pending: true,
+            certificate,
+            verification_failures,
+        }
+    }
+
+    pub(crate) async fn next(&mut self) -> Result<Option<AudioPacket>, String> {
+        loop {
+            if self.current_group.is_none() {
+                let Some(group) = self
+                    .track
+                    .next_group()
+                    .await
+                    .map_err(|error| format!("Upstream MoQ audio track failed: {error}"))?
+                else {
+                    return Ok(None);
+                };
+                if self
+                    .last_group_sequence
+                    .is_some_and(|previous| previous.checked_add(1) != Some(group.sequence))
+                {
+                    self.discontinuity_pending = true;
+                }
+                if self
+                    .last_group_sequence
+                    .is_some_and(|previous| group.sequence <= previous)
+                {
+                    return Err("Upstream MoQ audio group sequence did not increase".to_string());
+                }
+                self.current_group = Some(MoqAudioGroupCursor {
+                    sequence: group.sequence,
+                    group,
+                    object_count: 0,
+                    object_bytes: 0,
+                });
+            }
+
+            let cursor = self
+                .current_group
+                .as_mut()
+                .expect("audio group initialized");
+            let object = match tokio::time::timeout(
+                CLIENT_MOQ_OBJECT_READ_TIMEOUT,
+                cursor.group.read_frame(),
+            )
+            .await
+            {
+                Err(_) => {
+                    self.last_group_sequence = Some(cursor.sequence);
+                    self.current_group = None;
+                    self.discontinuity_pending = true;
+                    continue;
+                }
+                Ok(Err(error)) if moq_group_error_is_recoverable(&error) => {
+                    self.last_group_sequence = Some(cursor.sequence);
+                    self.current_group = None;
+                    self.discontinuity_pending = true;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    return Err(format!(
+                        "Upstream MoQ audio group {} failed: {error}",
+                        cursor.sequence
+                    ));
+                }
+                Ok(Ok(None)) => {
+                    self.last_group_sequence = Some(cursor.sequence);
+                    self.current_group = None;
+                    continue;
+                }
+                Ok(Ok(Some(object))) => object,
+            };
+            if cursor.object_count >= 5 {
+                return Err("Upstream MoQ audio group exceeded five packets".to_string());
+            }
+            cursor.object_bytes = cursor
+                .object_bytes
+                .checked_add(object.len())
+                .filter(|bytes| {
+                    *bytes
+                        <= 5 * (sigil_protocol::AUDIO_HEADER_LEN
+                            + sigil_protocol::MAX_AUDIO_PAYLOAD_LEN
+                            + 256)
+                })
+                .ok_or_else(|| "Upstream MoQ audio group exceeded its byte bound".to_string())?;
+            let coordinates = AuthenticatedMediaObject::coordinates(&object).map_err(|error| {
+                self.verification_failures.fetch_add(1, Ordering::Relaxed);
+                format!("Invalid authenticated MoQ audio header: {error}")
+            })?;
+            let expected = MediaObjectCoordinates {
+                generation_id: self.certificate.claims.generation_id,
+                track: MediaTrack::AudioOpus,
+                group_id: cursor.sequence,
+                object_id: u32::try_from(cursor.object_count)
+                    .map_err(|_| "MoQ audio object index overflowed".to_string())?,
+                flags: coordinates.flags,
+            };
+            let payload = AuthenticatedMediaObject::verify(&object, &self.certificate, expected)
+                .map_err(|error| {
+                    self.verification_failures.fetch_add(1, Ordering::Relaxed);
+                    format!("Authenticated upstream MoQ audio verification failed: {error}")
+                })?;
+            let mut packet = AudioPacket::decode_datagram(payload)
+                .map_err(|error| format!("Invalid upstream MoQ Opus packet: {error}"))?;
+            if coordinates.flags != u16::from(packet.header.flags.bits()) {
+                self.verification_failures.fetch_add(1, Ordering::Relaxed);
+                return Err("Authenticated MoQ audio flags do not match the packet".to_string());
+            }
+            if self
+                .last_packet_sequence
+                .is_some_and(|previous| previous.checked_add(1) != Some(packet.header.sequence))
+            {
+                self.discontinuity_pending = true;
+            }
+            if self.discontinuity_pending
+                && !packet.header.flags.contains(AudioFlags::DISCONTINUITY)
+            {
+                packet.header = AudioPacketHeader::opus(
+                    packet.payload.len(),
+                    packet.header.sequence,
+                    packet.header.capture_timestamp_us,
+                    packet.header.pts_us,
+                    AudioFlags::DISCONTINUITY,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            cursor.object_count += 1;
+            self.last_packet_sequence = Some(packet.header.sequence);
+            self.discontinuity_pending = false;
+            return Ok(Some(packet));
+        }
+    }
 }
 
 impl MoqMediaReceiver {
@@ -545,11 +707,24 @@ pub(crate) async fn open_upstream_moq_media(
     endpoint: &Endpoint,
     address: &iroh::EndpointAddr,
     session_id: u64,
+    advertised_generation_id: Option<u64>,
+    advertised_broadcast_name: Option<&str>,
     authentication: Option<MoqAuthenticationExpectation>,
     verification_failures: Arc<AtomicU64>,
-) -> Result<(MoqMediaReceiver, iroh::endpoint::Connection), String> {
-    let broadcast_name = media_moq_broadcast_name(session_id)
-        .map_err(|error| format!("Invalid MoQ media session name: {error}"))?;
+) -> Result<
+    (
+        MoqMediaReceiver,
+        Option<MoqAudioReceiver>,
+        iroh::endpoint::Connection,
+    ),
+    String,
+> {
+    let generation_id = advertised_generation_id.unwrap_or(session_id);
+    let broadcast_name = match advertised_broadcast_name {
+        Some(name) => name.to_owned(),
+        None => media_moq_broadcast_name(session_id)
+            .map_err(|error| format!("Invalid MoQ media session name: {error}"))?,
+    };
     let moq = Moq::new(endpoint.clone());
     let mut session =
         tokio::time::timeout(CLIENT_MOQ_CONNECT_TIMEOUT, moq.connect(address.clone()))
@@ -581,7 +756,7 @@ pub(crate) async fn open_upstream_moq_media(
         capability
             .verify_binding(
                 authentication.expected_host,
-                session_id,
+                generation_id,
                 *endpoint.id().as_bytes(),
                 SubscriptionTracks::VIDEO_H264,
                 1,
@@ -592,7 +767,7 @@ pub(crate) async fn open_upstream_moq_media(
             &broadcast,
             CLIENT_MOQ_SUBSCRIBE_TIMEOUT,
             authentication.expected_host,
-            session_id,
+            generation_id,
             authentication.now_unix,
         )
         .await?
@@ -600,6 +775,14 @@ pub(crate) async fn open_upstream_moq_media(
         subscribe_goq_video_track(&broadcast, CLIENT_MOQ_SUBSCRIBE_TIMEOUT).await?
     };
     eprintln!("[client] moq catalog: {}", catalog.mode.label());
+    let audio = match (catalog.audio_track, catalog.certificate.clone()) {
+        (Some(track), Some(certificate)) => Some(MoqAudioReceiver::new(
+            track,
+            certificate,
+            Arc::clone(&verification_failures),
+        )),
+        _ => None,
+    };
     Ok((
         MoqMediaReceiver::new(
             moq,
@@ -609,6 +792,7 @@ pub(crate) async fn open_upstream_moq_media(
             catalog.certificate,
             Some(verification_failures),
         ),
+        audio,
         diagnostics_connection,
     ))
 }
@@ -714,6 +898,41 @@ mod tests {
             Some(MoqMediaReadOutcome::Malformed(_))
         ));
         assert_eq!(failures.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_audio_receiver_preserves_verified_discontinuity() {
+        let mut producer = Track::new(sigil_protocol::MOQ_AUDIO_OPUS_TRACK).produce();
+        let (generation, certificate) = authentication_fixture();
+        let failures = Arc::new(AtomicU64::new(0));
+        let mut receiver =
+            MoqAudioReceiver::new(producer.consume(), certificate, Arc::clone(&failures));
+        let packet = AudioPacket::new(
+            AudioPacketHeader::opus(3, 7, 140_000, 140_000, AudioFlags::NONE).unwrap(),
+            vec![0xf8, 0xff, 0xfe],
+        )
+        .unwrap();
+        let payload = packet.encode_datagram().unwrap();
+        let mut group = producer.append_group().unwrap();
+        let object = generation
+            .authenticate(
+                MediaObjectCoordinates {
+                    generation_id: 42,
+                    track: MediaTrack::AudioOpus,
+                    group_id: group.sequence,
+                    object_id: 0,
+                    flags: 0,
+                },
+                &payload,
+            )
+            .unwrap();
+        group.write_frame(object.into_bytes()).unwrap();
+        group.finish().unwrap();
+
+        let received = receiver.next().await.unwrap().unwrap();
+        assert_eq!(received.header.sequence, 7);
+        assert!(received.header.flags.contains(AudioFlags::DISCONTINUITY));
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -67,8 +67,8 @@ pub struct ControlHandler {
 
 #[derive(Clone, Debug)]
 pub struct ControlV2Handler {
-    pub config: HostConfig,
     pub sessions: Arc<SessionRegistry>,
+    pub generations: Arc<MediaGenerationManager>,
     pub authorization: AuthorizationPolicy,
     pub input_operations: Arc<InputOperations>,
     pub host_secret: [u8; 32],
@@ -267,8 +267,8 @@ impl ProtocolHandler for ControlV2Handler {
         let remote = connection.remote_id();
         if let Err(error) = serve_control_moq_v2(
             connection,
-            self.config.clone(),
             &self.sessions,
+            &self.generations,
             &self.authorization,
             &self.input_operations,
             self.host_secret,

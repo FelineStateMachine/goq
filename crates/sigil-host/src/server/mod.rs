@@ -36,7 +36,7 @@ use crate::clock::SessionClock;
 use crate::config::{GamescopeEncoderBackend, HostConfig, VaapiRateControl, VideoSource};
 use crate::cursor::{PointerPositionTracker, PointerState};
 use crate::input::{InputBackend, InputDisposition};
-use crate::moq_catalog::{publish_goq_catalog, publish_goq_catalog_v2};
+use crate::moq_catalog::publish_goq_catalog;
 use crate::source::{
     EncodedFrame, EncodedGop, EncodedSource, EncoderControl,
     spawn_gamescope_pipewire_after_static_preflight, spawn_test_pattern,
@@ -49,6 +49,7 @@ const SOURCE_REAP_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 const ENCODER_CONTROL_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 mod adaptive;
+mod generation;
 mod handlers;
 mod media_v3;
 mod moq;
@@ -57,6 +58,7 @@ mod startup;
 
 pub(crate) use adaptive::VideoDimensions;
 use adaptive::serve_media_feedback;
+pub(crate) use generation::MediaGenerationManager;
 pub use handlers::{
     AudioHandler, AuthorizedMoqHandler, ControlHandler, ControlV2Handler, InputHandler,
     InputOperations, InputV2Handler, MediaFeedbackHandler, MediaV3Handler,

@@ -17,7 +17,7 @@ enum MoqGroupDecision {
 /// Owns the single bounded live MoQ track. One configured H.264 GOP maps to
 /// one native MoQ group; its application frame sequence remains inside the
 /// encoded object envelope and is never reused as the transport group id.
-struct MoqGroupPublisher {
+pub(super) struct MoqGroupPublisher {
     track: TrackProducer,
     current_group: Option<GroupProducer>,
     cursor: MediaV3GroupCursor,
@@ -193,6 +193,279 @@ impl MoqGroupPublisher {
         self.abort_current();
         let _ = self.track.abort(MoqError::Cancel);
     }
+}
+
+const MOQ_AUDIO_PACKETS_PER_GROUP: usize = 5;
+const MAX_MOQ_AUDIO_GROUP_BYTES: usize =
+    MOQ_AUDIO_PACKETS_PER_GROUP * (AUDIO_HEADER_LEN + MAX_AUDIO_PAYLOAD_LEN + 256);
+
+struct MoqAudioPublisher {
+    track: TrackProducer,
+    current_group: Option<GroupProducer>,
+    object_count: usize,
+    object_bytes: usize,
+    generation_id: u64,
+    signing_key: MediaGenerationSigningKey,
+}
+
+impl MoqAudioPublisher {
+    fn new(
+        track: TrackProducer,
+        generation_id: u64,
+        signing_key: MediaGenerationSigningKey,
+    ) -> Self {
+        Self {
+            track,
+            current_group: None,
+            object_count: 0,
+            object_bytes: 0,
+            generation_id,
+            signing_key,
+        }
+    }
+
+    fn publish(&mut self, packet: crate::audio::EncodedAudioPacket) -> Result<()> {
+        let flags = if packet.discontinuity {
+            AudioFlags::DISCONTINUITY
+        } else {
+            AudioFlags::NONE
+        };
+        let payload = AudioPacket::new(
+            AudioPacketHeader::opus(
+                packet.payload.len(),
+                packet.sequence,
+                packet.capture_timestamp_us,
+                packet.pts_us,
+                flags,
+            )?,
+            packet.payload.as_ref().to_vec(),
+        )?
+        .encode_datagram()?;
+
+        if self.current_group.is_none()
+            || self.object_count >= MOQ_AUDIO_PACKETS_PER_GROUP
+            || packet.discontinuity
+        {
+            self.finish_group()?;
+            self.current_group = Some(
+                self.track
+                    .append_group()
+                    .context("creating bounded MoQ Opus group")?,
+            );
+        }
+        let group = self
+            .current_group
+            .as_mut()
+            .context("Opus packet has no active MoQ group")?;
+        let object_id = u32::try_from(self.object_count).context("audio object id overflowed")?;
+        let object = self.signing_key.authenticate(
+            MediaObjectCoordinates {
+                generation_id: self.generation_id,
+                track: MediaTrack::AudioOpus,
+                group_id: group.sequence,
+                object_id,
+                flags: u16::from(flags.bits()),
+            },
+            &payload,
+        )?;
+        let next_bytes = self
+            .object_bytes
+            .checked_add(object.as_bytes().len())
+            .filter(|bytes| *bytes <= MAX_MOQ_AUDIO_GROUP_BYTES)
+            .context("bounded MoQ Opus group exceeded its byte limit")?;
+        group
+            .write_frame(object.into_bytes())
+            .context("writing authenticated Opus object")?;
+        self.object_count += 1;
+        self.object_bytes = next_bytes;
+        if self.object_count == MOQ_AUDIO_PACKETS_PER_GROUP {
+            self.finish_group()?;
+        }
+        Ok(())
+    }
+
+    fn finish_group(&mut self) -> Result<()> {
+        if let Some(mut group) = self.current_group.take() {
+            group.finish().context("finishing bounded MoQ Opus group")?;
+        }
+        self.object_count = 0;
+        self.object_bytes = 0;
+        Ok(())
+    }
+
+    fn abort(mut self) {
+        if let Some(mut group) = self.current_group.take() {
+            let _ = group.abort(MoqError::Cancel);
+        }
+        let _ = self.track.abort(MoqError::Cancel);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_generation_video_publisher(
+    config: HostConfig,
+    mut current_gop_receiver: tokio::sync::watch::Receiver<Option<EncodedGop>>,
+    mut control_requests: tokio::sync::watch::Receiver<Option<MediaControlRequestV3>>,
+    track: TrackProducer,
+    generation_id: u64,
+    signing_key: MediaGenerationSigningKey,
+    encoder_control: Option<EncoderControl>,
+    telemetry: Arc<MediaV3Telemetry>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let maximum_replay_age = maximum_media_replay_age(config.framerate);
+    let mut replay_cursor = MediaReplayCursor::default();
+    let mut publisher = MoqGroupPublisher::authenticated(track, generation_id, signing_key);
+    let mut forced_idr = ForcedIdrCoordinator::new(encoder_control, Arc::clone(&telemetry));
+    let log_identity = iroh::SecretKey::from_bytes(&[1; 32]).public();
+
+    let result = async {
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        return Ok(());
+                    }
+                }
+                changed = control_requests.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                    let Some(request) = *control_requests.borrow_and_update() else {
+                        continue;
+                    };
+                    let through_sequence = current_gop_receiver
+                        .borrow()
+                        .as_ref()
+                        .and_then(|gop| gop.frames.last())
+                        .map(|frame| frame.sequence);
+                    let cancelled_group = apply_moq_keyframe_request(
+                        &mut publisher,
+                        &mut replay_cursor,
+                        through_sequence,
+                        request.reason,
+                    );
+                    if cancelled_group.is_some() {
+                        telemetry.scheduler_cancellations.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let disposition = forced_idr.request(request.reason);
+                    debug!(generation_id, request_id = request.request_id, ?disposition, ?cancelled_group, "shared generation accepted keyframe request");
+                }
+                acknowledgement = forced_idr.acknowledgements.join_next(),
+                    if forced_idr.pending_revision.is_some() =>
+                {
+                    forced_idr.complete(acknowledgement, log_identity, "shared-iroh-moq");
+                }
+                changed = current_gop_receiver.changed() => {
+                    changed.context("shared encoded video source stopped")?;
+                    let Some(current_gop) = current_gop_receiver.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    publish_generation_gop(
+                        &config,
+                        &mut publisher,
+                        &mut replay_cursor,
+                        current_gop,
+                        maximum_replay_age,
+                        &telemetry,
+                    )?;
+                }
+            }
+        }
+    }
+    .await;
+    forced_idr
+        .abort_and_drain(log_identity, "shared-iroh-moq")
+        .await;
+    publisher.abort();
+    result
+}
+
+fn publish_generation_gop(
+    config: &HostConfig,
+    publisher: &mut MoqGroupPublisher,
+    replay_cursor: &mut MediaReplayCursor,
+    current_gop: EncodedGop,
+    maximum_replay_age: Duration,
+    telemetry: &MediaV3Telemetry,
+) -> Result<()> {
+    let initial_replay_started_at = replay_cursor.last_sequence.is_none().then(Instant::now);
+    let replay_through_sequence = current_gop
+        .frames
+        .last()
+        .map(|frame| frame.sequence)
+        .context("shared current GOP snapshot is empty")?;
+    for frame in new_current_gop_frames(current_gop, replay_cursor.last_sequence) {
+        let replay_discontinuity = match replay_cursor.classify(
+            &frame,
+            replay_through_sequence,
+            initial_replay_started_at,
+            Instant::now(),
+            maximum_replay_age,
+        ) {
+            MediaReplayDecision::Send { discontinuity } => discontinuity,
+            MediaReplayDecision::SkipUntilKeyframe
+            | MediaReplayDecision::DiscardStaleSuffix { .. } => {
+                if publisher.request_keyframe().is_some() {
+                    telemetry
+                        .scheduler_cancellations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                replay_cursor.enter_resync_through(Some(replay_through_sequence));
+                break;
+            }
+        };
+        match publisher
+            .publish(config, &frame, replay_discontinuity)
+            .inspect_err(|_| {
+                telemetry.send_failures.fetch_add(1, Ordering::Relaxed);
+            })? {
+            MoqGroupDecision::Published {
+                cancelled_previous, ..
+            } => {
+                if cancelled_previous {
+                    telemetry
+                        .scheduler_cancellations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                replay_cursor.commit_sent(&frame);
+            }
+            MoqGroupDecision::SkipUntilKeyframe | MoqGroupDecision::EnterResync => {
+                replay_cursor.enter_resync_through(Some(replay_through_sequence));
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn run_generation_audio_publisher(
+    mut packets: tokio::sync::mpsc::Receiver<crate::audio::EncodedAudioPacket>,
+    track: TrackProducer,
+    generation_id: u64,
+    signing_key: MediaGenerationSigningKey,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let mut publisher = MoqAudioPublisher::new(track, generation_id, signing_key);
+    let result = async {
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        return Ok(());
+                    }
+                }
+                packet = packets.recv() => {
+                    let packet = packet.context("shared encoded Opus source stopped")?;
+                    publisher.publish(packet)?;
+                }
+            }
+        }
+    }
+    .await;
+    publisher.abort();
+    result
 }
 
 fn apply_moq_keyframe_request(
@@ -419,8 +692,8 @@ pub(super) async fn serve_control_moq(
 
 pub(super) async fn serve_control_moq_v2(
     connection: Connection,
-    config: HostConfig,
     sessions: &Arc<SessionRegistry>,
+    generations: &Arc<MediaGenerationManager>,
     authorization: &AuthorizationPolicy,
     input_operations: &Arc<InputOperations>,
     host_secret: [u8; 32],
@@ -468,56 +741,36 @@ pub(super) async fn serve_control_moq_v2(
         }
     };
 
-    let source = match config.source {
-        VideoSource::TestPattern => Ok(spawn_test_pattern(config.clone(), lease.session_clock)),
-        VideoSource::GamescopePipewire => {
-            let primary = spawn_gamescope_pipewire_after_static_preflight(
-                config.clone(),
-                lease.session_clock,
-            )
-            .await?;
-            select_gamescope_startup_source(config.clone(), lease.session_clock, primary).await
-        }
-    };
-    let EncodedSource {
-        frames: frame_receiver,
-        current_gop: mut current_gop_receiver,
-        task: source_task,
-        pointer_surface_dimensions,
-        encoder_control,
-    } = match source {
-        Ok(source) => source,
+    let generation = match generations.acquire().await {
+        Ok(generation) => generation,
         Err(error) => {
-            send_rejection_v2(&mut send, "video source is unavailable").await?;
+            send_rejection_v2(&mut send, "shared media generation is unavailable").await?;
             return Err(error);
         }
     };
-    let source_task = SourceTaskGuard::new(source_task);
-    sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
-
-    let mut generation_secret = [0_u8; 32];
-    getrandom::fill(&mut generation_secret)
-        .context("generating ephemeral media authentication key")?;
-    let generation_signing_key = MediaGenerationSigningKey::from_bytes(&generation_secret);
-    generation_secret.fill(0);
-    let issued_at_unix = unix_timestamp_now()?;
-    let certificate = generation_signing_key.certify(
-        *iroh::SecretKey::from_bytes(&host_secret)
-            .public()
-            .as_bytes(),
-        &host_secret,
+    let shared = Arc::clone(&generation.shared);
+    let initial_snapshot = sessions.bind_v2_generation(
+        remote,
         lease.session_id,
-        issued_at_unix,
-        issued_at_unix.saturating_add(60 * 60),
+        shared.generation_id,
+        shared.session_clock,
+        Arc::clone(&shared.telemetry),
+        shared.encoder_control.clone(),
     )?;
+    let issued_at_unix = unix_timestamp_now()?;
     let mut subscription_nonce = [0_u8; 32];
     getrandom::fill(&mut subscription_nonce).context("generating subscription capability nonce")?;
+    let subscription_tracks = if shared.audio_enabled {
+        SubscriptionTracks::ALL
+    } else {
+        SubscriptionTracks::VIDEO_H264
+    };
     let subscription_capability = SignedSubscriptionCapability::issue(
         SubscriptionClaims::new(
-            certificate.claims.host_node_id,
-            lease.session_id,
+            shared.certificate.claims.host_node_id,
+            shared.generation_id,
             *remote.as_bytes(),
-            SubscriptionTracks::VIDEO_H264,
+            subscription_tracks,
             lease.authorization_revision,
             issued_at_unix,
             issued_at_unix.saturating_add(15 * 60),
@@ -528,32 +781,27 @@ pub(super) async fn serve_control_moq_v2(
     )?;
     let subscription_token = subscription_capability.encode();
 
-    let mut broadcast = Broadcast::new().produce();
-    let track = broadcast
-        .create_track(Track {
-            name: MOQ_VIDEO_H264_TRACK.to_owned(),
-            priority: MOQ_VIDEO_TRACK_PRIORITY,
-        })
-        .context("creating static MoQ H.264 track for control v2")?;
-    let catalog = publish_goq_catalog_v2(&mut broadcast, lease.session_id, &certificate)?;
-    let broadcast_name = media_moq_broadcast_name(lease.session_id)?;
+    let broadcast_name = shared.broadcast_name.clone();
     let attachment = sessions.expect_moq_v2(
         remote,
         lease.session_id,
         broadcast_name.clone(),
-        broadcast.consume(),
+        shared.consumer()?,
         subscription_capability,
     )?;
 
-    let negotiated = MEDIA_CAPABILITIES
+    let mut supported = vec![Capability::VideoH264];
+    if shared.audio_enabled {
+        supported.push(Capability::AudioOpus);
+    }
+    let negotiated = supported
         .iter()
         .copied()
         .filter(|capability| hello.capabilities.contains(capability))
         .collect();
-    let mut control_hello =
-        HostHelloV2::accepted(lease.session_id, negotiated, lease.initial_snapshot.clone())
-            .with_media_subscription_capability(subscription_token);
-    if let Some(dimensions) = pointer_surface_dimensions {
+    let mut control_hello = HostHelloV2::accepted(lease.session_id, negotiated, initial_snapshot)
+        .with_media_subscription_capability(subscription_token);
+    if let Some(dimensions) = shared.pointer_surface_dimensions {
         control_hello = control_hello.with_pointer_surface_dimensions(dimensions);
     }
     write_host_hello_v2(&mut send, &control_hello).await?;
@@ -579,27 +827,18 @@ pub(super) async fn serve_control_moq_v2(
     .await
     .context("timed out waiting for authorized MoQ v2 attachment")??;
 
-    let session_result = run_control_moq_session(
+    let session_result = run_generation_control_session(
         &connection,
-        &config,
-        &mut current_gop_receiver,
-        MoqControlReader::V2 {
-            send,
-            recv,
-            sessions: Arc::clone(sessions),
-            input_operations: Arc::clone(input_operations),
-            session_id: lease.session_id,
-        },
+        send,
+        recv,
+        Arc::clone(sessions),
+        Arc::clone(input_operations),
         remote,
+        lease.session_id,
         closed,
-        track,
-        &mut broadcast,
-        encoder_control,
-        Arc::clone(&lease.media_v3_telemetry),
-        Some((lease.session_id, generation_signing_key)),
+        shared.keyframe_requests.clone(),
     )
     .await;
-    let catalog_result = catalog.finish();
 
     if sessions.invalidate_v2_focus(
         remote,
@@ -608,14 +847,43 @@ pub(super) async fn serve_control_moq_v2(
     )? {
         input_operations.reset()?;
     }
-    drop(current_gop_receiver);
-    drop(frame_receiver);
-    source_task.wait_or_abort(SOURCE_REAP_GRACE_TIMEOUT).await;
     drop(lease);
+    generation.release().await;
     info!(%remote, "MoQ control v2 client released");
-    match session_result {
-        Err(error) => Err(error),
-        Ok(()) => catalog_result,
+    session_result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_generation_control_session(
+    connection: &Connection,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    sessions: Arc<SessionRegistry>,
+    input_operations: Arc<InputOperations>,
+    remote: EndpointId,
+    session_id: u64,
+    mut moq_closed: tokio::sync::oneshot::Receiver<()>,
+    keyframes: tokio::sync::watch::Sender<Option<MediaControlRequestV3>>,
+) -> Result<()> {
+    let mut control = tokio::spawn(forward_control_v2_requests(
+        send,
+        recv,
+        sessions,
+        input_operations,
+        remote,
+        session_id,
+        keyframes,
+    ));
+    tokio::select! {
+        result = &mut control => result.context("shared-generation control task failed")?,
+        reason = connection.closed() => {
+            debug!(%remote, ?reason, "shared-generation control connection closed");
+            Ok(())
+        }
+        result = &mut moq_closed => {
+            debug!(%remote, ?result, "shared-generation MoQ attachment closed");
+            Ok(())
+        }
     }
 }
 

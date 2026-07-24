@@ -134,7 +134,7 @@ async fn negotiate_v2(
     nonce: [u8; 16],
     invitation: Option<&str>,
 ) -> Result<NegotiatedV2Stream, String> {
-    let capabilities = vec![Capability::VideoH264];
+    let capabilities = vec![Capability::VideoH264, Capability::AudioOpus];
     let mut hello = ClientHelloV2::new("portal/0.1.0", nonce, capabilities.clone());
     if let Some(invitation) = invitation {
         hello = hello.with_invitation(invitation);

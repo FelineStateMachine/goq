@@ -319,6 +319,12 @@ impl SignedMediaGenerationCertificate {
 
 pub struct MediaGenerationSigningKey(SigningKey);
 
+impl Clone for MediaGenerationSigningKey {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 impl std::fmt::Debug for MediaGenerationSigningKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("MediaGenerationSigningKey([REDACTED])")

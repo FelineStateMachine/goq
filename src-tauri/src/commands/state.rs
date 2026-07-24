@@ -1,5 +1,7 @@
 use serde::Serialize;
-use sigil_protocol::{KeyframeRequestReasonV3, MediaFeedbackReportV1};
+use sigil_protocol::{
+    ClientControlEnvelopeV2, KeyframeRequestReasonV3, MediaFeedbackReportV1, SessionSnapshotV2,
+};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -345,11 +347,16 @@ where
 pub struct AppState {
     pub enrollment: super::enrollment::EnrollmentState,
     pub input_send: TokioMutex<Option<tokio::sync::mpsc::Sender<sigil_protocol::InputEvent>>>,
+    pub input_connection: TokioMutex<Option<(u64, iroh::endpoint::Connection)>>,
+    pub v2_input_context: TokioMutex<Option<crate::media::input_delivery::V2InputContext>>,
     pub client_endpoint: TokioMutex<Option<iroh::Endpoint>>,
     pub media_connection: TokioMutex<Option<(u64, iroh::endpoint::Connection)>>,
     pub media_control: TokioMutex<Option<(u64, MediaControlRequestSender)>>,
+    pub session_control: TokioMutex<Option<(u64, SessionControlSender)>>,
+    pub session_snapshot: Arc<TokioMutex<Option<SessionSnapshotState>>>,
     pub media_feedback: TokioMutex<Option<(u64, iroh::endpoint::Connection, MediaFeedbackSender)>>,
     pub media_feedback_report_id: Arc<AtomicU64>,
+    pub control_request_id: Arc<AtomicU64>,
     pub frame_delivery: TokioMutex<Option<(u64, Arc<AtomicUsize>)>>,
     pub client_media_generation: Arc<AtomicU64>,
     pub audio_deliveries: Arc<StdMutex<AudioDeliveryState>>,
@@ -364,6 +371,8 @@ pub struct AppState {
 pub type MediaControlRequestSender =
     tokio::sync::mpsc::Sender<(KeyframeRequestReasonV3, Option<u64>)>;
 pub type MediaFeedbackSender = tokio::sync::watch::Sender<Option<AccumulatedMediaFeedback>>;
+pub type SessionControlSender = tokio::sync::mpsc::Sender<ClientControlEnvelopeV2>;
+pub type SessionSnapshotState = (u64, SessionSnapshotV2);
 
 const MAX_MEDIA_FEEDBACK_INTERVAL_MS: u64 = 5_000;
 
@@ -467,11 +476,16 @@ impl AppState {
         Self {
             enrollment: super::enrollment::EnrollmentState::default(),
             input_send: TokioMutex::new(None),
+            input_connection: TokioMutex::new(None),
+            v2_input_context: TokioMutex::new(None),
             client_endpoint: TokioMutex::new(None),
             media_connection: TokioMutex::new(None),
             media_control: TokioMutex::new(None),
+            session_control: TokioMutex::new(None),
+            session_snapshot: Arc::new(TokioMutex::new(None)),
             media_feedback: TokioMutex::new(None),
             media_feedback_report_id: Arc::new(AtomicU64::new(0)),
+            control_request_id: Arc::new(AtomicU64::new(0)),
             frame_delivery: TokioMutex::new(None),
             client_media_generation: Arc::new(AtomicU64::new(0)),
             audio_deliveries: Arc::new(StdMutex::new(AudioDeliveryState::default())),
@@ -697,8 +711,12 @@ mod tests {
         let state = AppState::default();
 
         assert!(state.client_endpoint.try_lock().unwrap().is_none());
+        assert!(state.input_connection.try_lock().unwrap().is_none());
+        assert!(state.v2_input_context.try_lock().unwrap().is_none());
         assert!(state.media_connection.try_lock().unwrap().is_none());
         assert!(state.media_control.try_lock().unwrap().is_none());
+        assert!(state.session_control.try_lock().unwrap().is_none());
+        assert!(state.session_snapshot.try_lock().unwrap().is_none());
         assert!(state.media_feedback.try_lock().unwrap().is_none());
         assert!(state.audio_connection.try_lock().unwrap().is_none());
     }

@@ -14,14 +14,19 @@ use iroh_moq::{Moq, MoqSession};
 use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
 use sigil_protocol::{
     AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1,
-    CONTROL_ALPN_V1, Capability, ClientHello, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN,
-    GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, INVITATION_CLOCK_SKEW_SECS, InputAck,
-    InputEvent, InvitationGrants, KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN,
+    CONTROL_ALPN_V1, CONTROL_ALPN_V2, Capability, ClientControlEnvelopeV2, ClientHello,
+    ClientHelloV2, ControllerSlot, FocusCommandActionV2, FocusCommandV2, FocusStateV2, FrameFlags,
+    GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN, GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1,
+    INPUT_ALPN_V2, INVITATION_CLOCK_SKEW_SECS, InputAck, InputClientHelloV2, InputEvent,
+    InputEventV2, InvitationGrants, KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN,
     MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1,
     MediaCodec, MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame,
-    MediaObjectV3, PointerPosition, PointerSurfaceDimensions, ProtocolError, SignedInvitation,
-    decode_media_frame_object, media_moq_broadcast_name, read_adaptive_bitrate_decision_v1,
-    read_host_hello, read_input_ack, read_media_object_v3, write_client_hello, write_input_event,
+    MediaObjectV3, PointerPosition, PointerSurfaceDimensions, ProtocolError,
+    ServerControlEnvelopeV2, SignedInvitation, decode_media_frame_object, media_moq_broadcast_name,
+    read_adaptive_bitrate_decision_v1, read_host_hello, read_host_hello_v2, read_input_ack,
+    read_input_ack_v2, read_input_host_hello_v2, read_media_object_v3, read_server_control_v2,
+    write_client_control_v2, write_client_hello, write_client_hello_v2,
+    write_input_client_hello_v2, write_input_event, write_input_event_v2,
     write_media_control_request_v3, write_media_feedback_report_v1,
 };
 
@@ -70,6 +75,9 @@ struct Args {
     /// for compatibility validation.
     #[arg(long)]
     media_v3: bool,
+    /// Exercise the explicit revisioned control/2 and focus-bound input/2 path.
+    #[arg(long, conflicts_with = "media_v3")]
+    control_v2: bool,
     /// Request a configured recovery keyframe after three accepted frames,
     /// then prove no delta history is delivered before the recovery barrier.
     #[arg(long)]
@@ -651,6 +659,243 @@ impl MoqProbeReceiver {
                 group_sequence: cursor.sequence,
                 recovery,
             }));
+        }
+    }
+}
+
+async fn run_control_v2_smoke(
+    endpoint: &Endpoint,
+    address: EndpointAddr,
+    nonce: [u8; 16],
+    invitation: Option<&str>,
+    frames: u32,
+    timeout_seconds: u64,
+    expected_size: Option<(u16, u16)>,
+) -> Result<()> {
+    let control_connection = endpoint
+        .connect(address.clone(), CONTROL_ALPN_V2)
+        .await
+        .context("connecting control v2 protocol")?;
+    let (mut control_send, mut control_recv) = control_connection
+        .open_bi()
+        .await
+        .context("opening control v2 stream")?;
+    let mut hello = ClientHelloV2::new("sigil-probe/0.1.0", nonce, vec![Capability::VideoH264]);
+    if let Some(invitation) = invitation {
+        hello = hello.with_invitation(invitation);
+    }
+    write_client_hello_v2(&mut control_send, &hello)
+        .await
+        .context("writing control v2 hello")?;
+    let host = tokio::time::timeout(
+        Duration::from_secs(timeout_seconds),
+        read_host_hello_v2(&mut control_recv),
+    )
+    .await
+    .context("timed out waiting for control v2 hello")??
+    .context("host closed during control v2 hello")?;
+    if !host.accepted {
+        bail!(
+            "host rejected control v2 stream: {}",
+            host.message.as_deref().unwrap_or("unspecified reason")
+        );
+    }
+    let session_id = host
+        .session_id
+        .context("host omitted control v2 session id")?;
+    let initial = host
+        .snapshot
+        .context("host omitted initial control v2 snapshot")?;
+    ensure!(
+        initial.revision > 0 && matches!(initial.focus, FocusStateV2::Vacant { .. }),
+        "initial control v2 snapshot was not a revisioned vacant slot"
+    );
+
+    let mut media = MoqProbeReceiver::connect(
+        endpoint,
+        address.clone(),
+        session_id,
+        Duration::from_secs(timeout_seconds),
+    )
+    .await?;
+    let focus_request = FocusCommandV2 {
+        request_id: 1,
+        action: FocusCommandActionV2::Request,
+        slot: ControllerSlot::ZERO,
+        expected_revision: initial.revision,
+        expected_focus_generation: None,
+    };
+    write_client_control_v2(
+        &mut control_send,
+        &ClientControlEnvelopeV2::Focus {
+            command: focus_request,
+        },
+    )
+    .await
+    .context("requesting control v2 focus")?;
+    let focused = read_v2_snapshot_after(
+        &mut control_recv,
+        initial.revision,
+        timeout_seconds,
+        |snapshot| snapshot.self_focus_generation().is_some(),
+    )
+    .await?;
+    let focus_generation = focused
+        .self_focus_generation()
+        .context("focus grant did not identify the requesting viewer")?;
+
+    let input_connection = endpoint
+        .connect(address, INPUT_ALPN_V2)
+        .await
+        .context("connecting input v2 protocol")?;
+    let (mut input_send, mut input_recv) = input_connection
+        .open_bi()
+        .await
+        .context("opening input v2 stream")?;
+    let input_hello = InputClientHelloV2::new(
+        "sigil-probe/0.1.0",
+        nonce,
+        session_id,
+        ControllerSlot::ZERO,
+        focus_generation,
+        vec![Capability::InputAck],
+    );
+    write_input_client_hello_v2(&mut input_send, &input_hello)
+        .await
+        .context("writing input v2 hello")?;
+    let input_host = tokio::time::timeout(
+        Duration::from_secs(timeout_seconds),
+        read_input_host_hello_v2(&mut input_recv),
+    )
+    .await
+    .context("timed out waiting for input v2 hello")??
+    .context("host closed during input v2 hello")?;
+    ensure!(input_host.accepted, "host rejected focused input v2 stream");
+    ensure!(
+        input_host.session_id == Some(session_id)
+            && input_host.slot == Some(ControllerSlot::ZERO)
+            && input_host.focus_generation == Some(focus_generation),
+        "input v2 host hello changed its focus binding"
+    );
+    write_input_event_v2(
+        &mut input_send,
+        &InputEventV2 {
+            session_id,
+            slot: ControllerSlot::ZERO,
+            focus_generation,
+            event: InputEvent::Probe,
+        },
+    )
+    .await
+    .context("writing slot-0 input v2 probe")?;
+    let input_ack = tokio::time::timeout(
+        Duration::from_secs(timeout_seconds.min(5)),
+        read_input_ack_v2(&mut input_recv),
+    )
+    .await
+    .context("timed out waiting for input v2 acknowledgement")??
+    .context("host closed before input v2 acknowledgement")?;
+    ensure!(
+        input_ack.session_id == session_id
+            && input_ack.slot == ControllerSlot::ZERO
+            && input_ack.focus_generation == focus_generation
+            && input_ack.ack.sequence == 1,
+        "input v2 acknowledgement changed its focus binding"
+    );
+
+    let mut accepted = 0_u32;
+    let mut last_sequence = None;
+    while accepted < frames {
+        let outcome = tokio::time::timeout(Duration::from_secs(timeout_seconds), media.next())
+            .await
+            .context("timed out waiting for control v2 media")??
+            .context("control v2 media ended before requested frames")?;
+        let MoqProbeOutcome::Frame { frame, .. } = outcome else {
+            continue;
+        };
+        if let Some((width, height)) = expected_size {
+            ensure!(
+                frame.header.width == width && frame.header.height == height,
+                "control v2 media dimensions did not match {width}x{height}"
+            );
+        }
+        if let Some(previous) = last_sequence {
+            ensure!(
+                frame.header.sequence > previous,
+                "control v2 media sequence regressed"
+            );
+        }
+        last_sequence = Some(frame.header.sequence);
+        accepted += 1;
+    }
+
+    let release = FocusCommandV2 {
+        request_id: 2,
+        action: FocusCommandActionV2::Release,
+        slot: ControllerSlot::ZERO,
+        expected_revision: focused.revision,
+        expected_focus_generation: Some(focus_generation),
+    };
+    write_client_control_v2(
+        &mut control_send,
+        &ClientControlEnvelopeV2::Focus { command: release },
+    )
+    .await
+    .context("releasing control v2 focus")?;
+    let released = read_v2_snapshot_after(
+        &mut control_recv,
+        focused.revision,
+        timeout_seconds,
+        |snapshot| matches!(snapshot.focus, FocusStateV2::Vacant { .. }),
+    )
+    .await?;
+    input_send.finish().context("finishing input v2 stream")?;
+    input_connection.close(0_u32.into(), b"focus released");
+    control_connection.close(0_u32.into(), b"probe complete");
+
+    println!("probe=ok");
+    println!("transport=iroh-moq");
+    println!("control_alpn=sigil/control/2");
+    println!("input_alpn=sigil/input/2");
+    println!("frames={accepted}");
+    println!("initial_snapshot_revision={}", initial.revision);
+    println!("focus_grant_revision={}", focused.revision);
+    println!("focus_generation={focus_generation}");
+    println!("slot_0_input=ok");
+    println!("focus_release_revision={}", released.revision);
+    println!("focus_release=ok");
+    Ok(())
+}
+
+async fn read_v2_snapshot_after(
+    recv: &mut iroh::endpoint::RecvStream,
+    previous_revision: u64,
+    timeout_seconds: u64,
+    predicate: impl Fn(&sigil_protocol::SessionSnapshotV2) -> bool,
+) -> Result<sigil_protocol::SessionSnapshotV2> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, read_server_control_v2(recv))
+            .await
+            .context("timed out waiting for control v2 state")??
+            .context("host closed before control v2 state arrived")?;
+        match envelope {
+            ServerControlEnvelopeV2::Snapshot { snapshot } => {
+                ensure!(
+                    snapshot.revision > previous_revision,
+                    "control v2 snapshot revision did not advance"
+                );
+                if predicate(&snapshot) {
+                    return Ok(snapshot);
+                }
+            }
+            ServerControlEnvelopeV2::FocusResult { result } => {
+                ensure!(
+                    result.accepted,
+                    "host rejected control v2 focus command: {}",
+                    result.message.as_deref().unwrap_or("unspecified reason")
+                );
+            }
         }
     }
 }
@@ -1243,6 +1488,18 @@ async fn main() -> Result<()> {
         .context("binding probe endpoint")?;
     let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
     let address = EndpointAddr::new(args.node_id);
+    if args.control_v2 {
+        return run_control_v2_smoke(
+            &endpoint,
+            address,
+            nonce,
+            invitation.as_deref(),
+            args.frames,
+            args.timeout_seconds,
+            args.expect_size,
+        )
+        .await;
+    }
     let media_transport = if args.media_v3 {
         MediaTransport::GroupedV3
     } else {

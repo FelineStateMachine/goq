@@ -1,4 +1,5 @@
-use super::session::InputLease;
+use std::sync::Mutex;
+
 use super::*;
 
 pub(super) const MEDIA_CAPABILITIES: &[Capability] = &[Capability::VideoH264];
@@ -8,19 +9,19 @@ const INPUT_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const REJECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[must_use = "the guard must remain armed for the lifetime of the input session"]
-struct InputSessionGuard<F>
+struct InputSessionGuard<L, F>
 where
     F: FnOnce() -> Result<()>,
 {
-    _lease: InputLease,
+    _lease: L,
     reset: Option<F>,
 }
 
-impl<F> InputSessionGuard<F>
+impl<L, F> InputSessionGuard<L, F>
 where
     F: FnOnce() -> Result<()>,
 {
-    fn new(lease: InputLease, reset: F) -> Self {
+    fn new(lease: L, reset: F) -> Self {
         Self {
             _lease: lease,
             reset: Some(reset),
@@ -39,7 +40,7 @@ where
     }
 }
 
-impl<F> Drop for InputSessionGuard<F>
+impl<L, F> Drop for InputSessionGuard<L, F>
 where
     F: FnOnce() -> Result<()>,
 {
@@ -62,6 +63,14 @@ pub struct ControlHandler {
     pub config: HostConfig,
     pub sessions: Arc<SessionRegistry>,
     pub authorization: AuthorizationPolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct ControlV2Handler {
+    pub config: HostConfig,
+    pub sessions: Arc<SessionRegistry>,
+    pub authorization: AuthorizationPolicy,
+    pub input_operations: Arc<InputOperations>,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +168,66 @@ pub struct InputHandler {
     pub sessions: Arc<SessionRegistry>,
 }
 
+#[derive(Debug)]
+pub struct InputOperations {
+    backend: InputBackend,
+    operation: Mutex<()>,
+}
+
+impl InputOperations {
+    pub fn new(backend: InputBackend) -> Self {
+        Self {
+            backend,
+            operation: Mutex::new(()),
+        }
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        self.backend.capabilities()
+    }
+
+    fn apply_v2(
+        &self,
+        sessions: &SessionRegistry,
+        remote: EndpointId,
+        binding: &InputEventV2,
+        negotiated: &[Capability],
+    ) -> Result<InputDisposition> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input operation lock poisoned"))?;
+        ensure!(
+            sessions.is_v2_focus_owner(
+                remote,
+                binding.session_id,
+                binding.slot,
+                binding.focus_generation,
+            ),
+            "input focus changed before backend application"
+        );
+        self.backend.apply(&binding.event, negotiated)
+    }
+
+    pub(super) fn reset(&self) -> Result<()> {
+        let _operation = match self.operation.lock() {
+            Ok(operation) => operation,
+            Err(poisoned) => {
+                warn!("recovering poisoned input operation lock for reset");
+                poisoned.into_inner()
+            }
+        };
+        self.backend.reset_session()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InputV2Handler {
+    pub operations: Arc<InputOperations>,
+    pub pointer_positions: Option<PointerPositionTracker>,
+    pub sessions: Arc<SessionRegistry>,
+}
+
 #[derive(Clone, Debug)]
 pub struct AudioHandler {
     pub config: HostConfig,
@@ -187,6 +256,41 @@ impl ProtocolHandler for InputHandler {
         .await
         {
             warn!(%remote, %error, "input connection ended");
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolHandler for ControlV2Handler {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let remote = connection.remote_id();
+        if let Err(error) = serve_control_moq_v2(
+            connection,
+            self.config.clone(),
+            &self.sessions,
+            &self.authorization,
+            &self.input_operations,
+        )
+        .await
+        {
+            warn!(%remote, %error, "MoQ control v2 connection ended");
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolHandler for InputV2Handler {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let remote = connection.remote_id();
+        if let Err(error) = serve_input_v2(
+            connection,
+            &self.operations,
+            self.pointer_positions.as_ref(),
+            &self.sessions,
+        )
+        .await
+        {
+            warn!(%remote, %error, "input v2 connection ended");
         }
         Ok(())
     }
@@ -366,6 +470,173 @@ async fn serve_input(
     result
 }
 
+async fn serve_input_v2(
+    connection: Connection,
+    operations: &InputOperations,
+    pointer_positions: Option<&PointerPositionTracker>,
+    sessions: &Arc<SessionRegistry>,
+) -> Result<()> {
+    let remote = connection.remote_id();
+    let handshake_permit = sessions
+        .pending_handshakes
+        .try_acquire()
+        .context("too many pending handshakes")?;
+    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
+        .await
+        .context("timed out accepting input v2 stream")?
+        .context("accepting input v2 stream")?;
+    let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_input_client_hello_v2(&mut recv))
+        .await
+        .context("timed out waiting for input v2 hello")??
+        .context("client closed before input v2 hello")?;
+    drop(handshake_permit);
+    debug!(%remote, agent = %hello.agent, session_id = hello.session_id, focus_generation = hello.focus_generation, "input v2 hello received");
+    let lease = match sessions.claim_input_v2(
+        remote,
+        hello.nonce,
+        hello.session_id,
+        hello.slot,
+        hello.focus_generation,
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            write_input_host_hello_v2(&mut send, &InputHostHelloV2::rejected(error.to_string()))
+                .await?;
+            send.finish()?;
+            return Err(error);
+        }
+    };
+    let supported =
+        supported_input_capabilities(operations.capabilities(), pointer_positions.is_some());
+    let negotiated = negotiated_input_capabilities_v2(&hello, &supported, lease.grants);
+    let ack_enabled = negotiated.contains(&Capability::InputAck);
+    let feedback_enabled = negotiated.contains(&Capability::PointerPositionFeedback);
+    let visibility_feedback_enabled = negotiated.contains(&Capability::PointerVisibilityFeedback);
+    let mut pointer_positions = pointer_positions
+        .filter(|_| feedback_enabled)
+        .map(PointerPositionTracker::subscribe);
+    write_input_host_hello_v2(
+        &mut send,
+        &InputHostHelloV2::accepted(
+            lease.session_id,
+            lease.slot,
+            lease.focus_generation,
+            negotiated.clone(),
+        ),
+    )
+    .await?;
+    info!(%remote, session_id = lease.session_id, focus_generation = lease.focus_generation, "input v2 client accepted");
+
+    let session_id = lease.session_id;
+    let slot = lease.slot;
+    let focus_generation = lease.focus_generation;
+    let guard = InputSessionGuard::new(lease, || operations.reset());
+    let session_result: Result<()> = async {
+        let mut received_events = 0_u64;
+        if let Some(pointer_positions) = pointer_positions.as_ref() {
+            let (pointer_position, pointer_visible) = pointer_feedback_fields(
+                Some(*pointer_positions.borrow()),
+                visibility_feedback_enabled,
+            );
+            write_input_ack_v2(
+                &mut send,
+                &InputAckV2 {
+                    session_id,
+                    slot,
+                    focus_generation,
+                    ack: InputAck {
+                        sequence: 0,
+                        pointer_position,
+                        pointer_visible,
+                    },
+                },
+            )
+            .await?;
+        }
+        loop {
+            if !sessions.is_v2_focus_owner(remote, session_id, slot, focus_generation) {
+                break;
+            }
+            tokio::select! {
+                _ = sessions.session_changed.notified() => continue,
+                changed = async {
+                    pointer_positions
+                        .as_mut()
+                        .expect("feedback branch is guarded")
+                        .changed()
+                        .await
+                }, if pointer_positions.is_some() => {
+                    changed.context("Xwayland pointer tracker stopped")?;
+                    let state = *pointer_positions
+                        .as_mut()
+                        .expect("feedback branch is guarded")
+                        .borrow_and_update();
+                    let (pointer_position, pointer_visible) =
+                        pointer_feedback_fields(Some(state), visibility_feedback_enabled);
+                    write_input_ack_v2(
+                        &mut send,
+                        &InputAckV2 {
+                            session_id,
+                            slot,
+                            focus_generation,
+                            ack: InputAck {
+                                sequence: received_events,
+                                pointer_position,
+                                pointer_visible,
+                            },
+                        },
+                    )
+                    .await?;
+                }
+                event = read_input_event_v2(&mut recv) => {
+                    let Some(event) = event? else { break; };
+                    ensure!(
+                        event.session_id == session_id
+                            && event.slot == slot
+                            && event.focus_generation == focus_generation,
+                        "input event changed its accepted focus binding"
+                    );
+                    let disposition = operations.apply_v2(sessions, remote, &event, &negotiated)?;
+                    match disposition {
+                        InputDisposition::Probed => debug!(%remote, "input v2 liveness probe acknowledged"),
+                        InputDisposition::Observed => info!(%remote, event_type = input_event_type(&event.event), "input v2 event observed"),
+                        InputDisposition::Disabled => debug!(%remote, event_type = input_event_type(&event.event), "input v2 event ignored because injection is disabled"),
+                        #[cfg(target_os = "linux")]
+                        InputDisposition::Injected => debug!(%remote, event_type = input_event_type(&event.event), "input v2 event injected"),
+                        InputDisposition::TextIgnored => debug!(%remote, "input v2 text event ignored"),
+                    }
+                    received_events = received_events.saturating_add(1);
+                    if ack_enabled {
+                        let pointer_state = pointer_positions.as_ref().map(|positions| *positions.borrow());
+                        let (pointer_position, pointer_visible) =
+                            pointer_feedback_fields(pointer_state, visibility_feedback_enabled);
+                        write_input_ack_v2(
+                            &mut send,
+                            &InputAckV2 {
+                                session_id,
+                                slot,
+                                focus_generation,
+                                ack: InputAck {
+                                    sequence: received_events,
+                                    pointer_position,
+                                    pointer_visible,
+                                },
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let reset_result = guard.finish().context("neutralizing input v2 session");
+    let result = session_result.and(reset_result);
+    info!(%remote, session_id, focus_generation, "input v2 client released");
+    result
+}
+
 async fn serve_audio(
     connection: Connection,
     config: HostConfig,
@@ -495,6 +766,21 @@ pub(super) async fn send_rejection(
     Ok(())
 }
 
+pub(super) async fn send_rejection_v2(
+    send: &mut iroh::endpoint::SendStream,
+    message: impl Into<String>,
+) -> Result<()> {
+    write_host_hello_v2(send, &HostHelloV2::rejected(message)).await?;
+    send.finish()?;
+    if tokio::time::timeout(REJECTION_DRAIN_TIMEOUT, send.stopped())
+        .await
+        .is_err()
+    {
+        debug!("timed out waiting for peer to acknowledge control v2 rejection");
+    }
+    Ok(())
+}
+
 pub(super) fn negotiated_capabilities(
     hello: &ClientHello,
     supported: &[Capability],
@@ -512,6 +798,23 @@ fn negotiated_input_capabilities(
     grants: InvitationGrants,
 ) -> Vec<Capability> {
     let mut negotiated = negotiated_capabilities(hello, supported);
+    negotiated.retain(|capability| input_capability_authorized(*capability, grants));
+    if !negotiated.contains(&Capability::PointerPositionFeedback) {
+        negotiated.retain(|capability| *capability != Capability::PointerVisibilityFeedback);
+    }
+    negotiated
+}
+
+fn negotiated_input_capabilities_v2(
+    hello: &InputClientHelloV2,
+    supported: &[Capability],
+    grants: InvitationGrants,
+) -> Vec<Capability> {
+    let mut negotiated = supported
+        .iter()
+        .copied()
+        .filter(|capability| hello.capabilities.contains(capability))
+        .collect::<Vec<_>>();
     negotiated.retain(|capability| input_capability_authorized(*capability, grants));
     if !negotiated.contains(&Capability::PointerPositionFeedback) {
         negotiated.retain(|capability| *capability != Capability::PointerVisibilityFeedback);

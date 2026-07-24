@@ -23,6 +23,8 @@ keyframe_recovery="ok"
 media_v3=false
 relay_only=false
 expected_path_mode=direct
+control_v2=false
+viewers=1
 
 usage() {
   cat <<'EOF'
@@ -43,6 +45,8 @@ Options:
                                 instead of upstream MoQ
   --relay-only                  Remove direct probe transports and require the
                                 control, media, and input paths to stay relayed
+  --control-v2                  Exercise explicit control/2 and input/2 focus
+  --viewers COUNT               Viewer count for control-v2 (Phase 1 requires 1)
   --help                        Show this help
 EOF
 }
@@ -105,6 +109,18 @@ while [[ $# -gt 0 ]]; do
       media_v3=true
       shift
       ;;
+    --control-v2)
+      control_v2=true
+      media_accept_log="MoQ control v2 client accepted"
+      media_release_log="MoQ control v2 client released"
+      session_gate_name="control v2"
+      shift
+      ;;
+    --viewers)
+      [[ $# -ge 2 ]] || die "--viewers requires a value"
+      viewers="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -128,6 +144,13 @@ require_positive_integer "--primary-frames" "$primary_frames"
 require_positive_integer "--reconnect-cycles" "$reconnect_cycles"
 require_positive_integer "--reconnect-frames" "$reconnect_frames"
 require_positive_integer "--probe-timeout-seconds" "$probe_timeout_seconds"
+require_positive_integer "--viewers" "$viewers"
+if [[ "$control_v2" == true && "$viewers" -ne 1 ]]; then
+  die "Phase 1 control-v2 proof supports exactly --viewers 1"
+fi
+if [[ "$control_v2" == true && "$media_v3" == true ]]; then
+  die "--control-v2 conflicts with --media-v3"
+fi
 [[ "$primary_frames" -ge 4 ]] \
   || die "--primary-frames must be at least 4 for keyframe recovery"
 [[ "$reconnect_frames" -ge 4 ]] \
@@ -503,6 +526,56 @@ host_watchdog_pid="$watchdog_pid"
 wait_for_log_line "$host_log" 'status=ready' "$host_pid" 'sigil' || die "host did not become ready"
 host_node_id="$(sed -n 's/^node_id=//p' "$host_log" | tail -n 1)"
 [[ "$host_node_id" == "$node_id" ]] || die "ready host node ID does not match its identity"
+
+if [[ "$control_v2" == true ]]; then
+  v2_log="$tmp_root/control-v2.log"
+  v1_log="$tmp_root/control-v1-compatibility.log"
+  if ! run_bounded "$command_timeout_seconds" "$v2_log" \
+    "$probe_bin" --control-v2 --node-id "$node_id" --frames "$primary_frames" \
+    --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800; then
+    sed -n '1,240p' "$v2_log" >&2 || true
+    die "control-v2 probe failed"
+  fi
+  grep -Fxq 'probe=ok' "$v2_log" || die "control-v2 probe did not complete"
+  grep -Fxq 'control_alpn=sigil/control/2' "$v2_log" || die "control-v2 ALPN evidence is missing"
+  grep -Fxq 'input_alpn=sigil/input/2' "$v2_log" || die "input-v2 ALPN evidence is missing"
+  grep -Fxq 'slot_0_input=ok' "$v2_log" || die "slot-0 input evidence is missing"
+  grep -Fxq 'focus_release=ok' "$v2_log" || die "focus release evidence is missing"
+  awk -F= '$1 == "initial_snapshot_revision" && $2 ~ /^[1-9][0-9]*$/ { found=1 } END { exit !found }' \
+    "$v2_log" || die "initial snapshot evidence is missing"
+  awk -F= '$1 == "focus_generation" && $2 ~ /^[1-9][0-9]*$/ { found=1 } END { exit !found }' \
+    "$v2_log" || die "focus generation evidence is missing"
+  wait_for_log_count "$host_log" 'MoQ control v2 client released' 1 "$host_pid" 'sigil' \
+    || die "control-v2 session was not released"
+  wait_for_log_count "$host_log" 'input v2 client released' 1 "$host_pid" 'sigil' \
+    || die "input-v2 session was not neutralized and released"
+
+  # The unchanged v1 path remains explicitly usable after a v2 generation.
+  if ! run_bounded "$command_timeout_seconds" "$v1_log" \
+    "$probe_bin" --node-id "$node_id" --frames 4 \
+    --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800; then
+    sed -n '1,160p' "$v1_log" >&2 || true
+    die "v1 compatibility probe failed after control-v2"
+  fi
+  grep -Fxq 'probe=ok' "$v1_log" || die "v1 compatibility probe did not complete"
+  grep -Fxq 'control_alpn=sigil/control/1' "$v1_log" || die "v1 compatibility ALPN evidence is missing"
+
+  kill -TERM "$host_pid" 2>/dev/null || true
+  if wait "$host_pid"; then host_status=0; else host_status=$?; fi
+  host_pid=""
+  wait "$host_watchdog_pid" 2>/dev/null || true
+  host_watchdog_pid=""
+  [[ "$host_status" -eq 0 ]] || die "host exited with status $host_status"
+  printf 'loopback_proof=ok\n'
+  printf 'control_v2=ok\n'
+  printf 'viewers=1\n'
+  printf 'initial_snapshot=ok\n'
+  printf 'slot_0_focus=grant-release\n'
+  printf 'input_v2=ok\n'
+  printf 'neutralization=reset-before-input-lease-release\n'
+  printf 'v1_compatibility=ok\n'
+  exit 0
+fi
 
 primary_probe_args=(
   --node-id "$node_id"

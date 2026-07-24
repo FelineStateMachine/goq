@@ -6,7 +6,11 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use moq_net::BroadcastConsumer;
-use sigil_protocol::{InvitationGrants, KeyframeRequestReasonV3};
+use sigil_protocol::{
+    ControllerSlot, FocusCommandActionV2, FocusCommandV2, FocusStateV2, FocusTransitionReasonV2,
+    InvitationGrants, KeyframeRequestReasonV3, MediaGenerationDescriptorV2, SessionSnapshotV2,
+    ViewerPresenceId, ViewerPresenceV2, media_moq_broadcast_name,
+};
 use tracing::{debug, warn};
 
 use super::{ENCODER_CONTROL_COMMIT_TIMEOUT, VideoDimensions};
@@ -20,6 +24,9 @@ pub struct SessionRegistry {
     active: Mutex<Option<ActiveSession>>,
     pending_moq: Mutex<Option<PendingMoqAttachment>>,
     next_session_id: AtomicU64,
+    next_focus_generation: AtomicU64,
+    v2_state: Mutex<Option<V2SessionState>>,
+    v2_snapshot: tokio::sync::watch::Sender<Option<SessionSnapshotV2>>,
     pub(super) session_changed: tokio::sync::Notify,
     pub(super) pending_handshakes: tokio::sync::Semaphore,
 }
@@ -72,6 +79,27 @@ struct ActiveSession {
     feedback_claimed: bool,
     media_v3_telemetry: Arc<MediaV3Telemetry>,
     encoder_control: Option<EncoderControl>,
+    mode: SessionMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionMode {
+    LegacyExclusive,
+    V2Single,
+}
+
+#[derive(Clone, Debug)]
+struct V2SessionState {
+    presence_id: ViewerPresenceId,
+    revision: u64,
+    focus: FocusStateV2,
+    transition_reason: FocusTransitionReasonV2,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct FocusCommandEffect {
+    pub(super) snapshot: SessionSnapshotV2,
+    pub(super) neutralize: bool,
 }
 
 #[derive(Debug, Default)]
@@ -316,10 +344,14 @@ impl MediaV3Telemetry {
 
 impl Default for SessionRegistry {
     fn default() -> Self {
+        let (v2_snapshot, _receiver) = tokio::sync::watch::channel(None);
         Self {
             active: Mutex::new(None),
             pending_moq: Mutex::new(None),
             next_session_id: AtomicU64::new(0),
+            next_focus_generation: AtomicU64::new(0),
+            v2_state: Mutex::new(None),
+            v2_snapshot,
             session_changed: tokio::sync::Notify::new(),
             pending_handshakes: tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES),
         }
@@ -359,6 +391,7 @@ impl SessionRegistry {
             feedback_claimed: false,
             media_v3_telemetry: Arc::clone(&media_v3_telemetry),
             encoder_control: None,
+            mode: SessionMode::LegacyExclusive,
         });
         Ok(SessionLease {
             registry: Arc::clone(self),
@@ -366,6 +399,59 @@ impl SessionRegistry {
             session_id,
             session_clock,
             media_v3_telemetry,
+        })
+    }
+
+    pub(super) fn claim_v2(
+        self: &Arc<Self>,
+        remote: EndpointId,
+        nonce: [u8; 16],
+        grants: InvitationGrants,
+    ) -> Result<V2SessionLease> {
+        let mut active = self.active.lock().expect("session registry poisoned");
+        if let Some(current) = active.as_ref() {
+            bail!("host already has active client {}", current.remote);
+        }
+        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let session_clock = SessionClock::start();
+        let media_v3_telemetry = Arc::new(MediaV3Telemetry::default());
+        let presence_id = ViewerPresenceId::new(format!("viewer-{session_id:016x}"))?;
+        let v2 = V2SessionState {
+            presence_id,
+            revision: 1,
+            focus: FocusStateV2::Vacant {
+                slot: ControllerSlot::ZERO,
+            },
+            transition_reason: FocusTransitionReasonV2::Initial,
+        };
+        let session = ActiveSession {
+            remote,
+            session_id,
+            nonce,
+            session_clock,
+            grants,
+            media_active: true,
+            input_claimed: false,
+            audio_claimed: false,
+            feedback_claimed: false,
+            media_v3_telemetry: Arc::clone(&media_v3_telemetry),
+            encoder_control: None,
+            mode: SessionMode::V2Single,
+        };
+        let snapshot = v2_snapshot_for(&session, &v2)?;
+        *active = Some(session);
+        self.v2_state
+            .lock()
+            .expect("v2 session state poisoned")
+            .replace(v2);
+        self.v2_snapshot.send_replace(Some(snapshot.clone()));
+        Ok(V2SessionLease {
+            registry: Arc::clone(self),
+            remote,
+            session_id,
+            session_clock,
+            media_v3_telemetry,
+            initial_snapshot: snapshot,
         })
     }
 
@@ -378,7 +464,10 @@ impl SessionRegistry {
         let session = active
             .as_mut()
             .filter(|session| {
-                session.media_active && session.remote == remote && session.nonce == nonce
+                session.mode == SessionMode::LegacyExclusive
+                    && session.media_active
+                    && session.remote == remote
+                    && session.nonce == nonce
             })
             .context("input connection does not match the active media session")?;
         ensure!(
@@ -391,6 +480,251 @@ impl SessionRegistry {
             remote,
             session_id: session.session_id,
             grants: session.grants,
+        })
+    }
+
+    pub(super) fn subscribe_v2_snapshots(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+    ) -> Result<tokio::sync::watch::Receiver<Option<SessionSnapshotV2>>> {
+        let active = self.active.lock().expect("session registry poisoned");
+        active
+            .as_ref()
+            .filter(|session| {
+                session.mode == SessionMode::V2Single
+                    && session.media_active
+                    && session.remote == remote
+                    && session.session_id == session_id
+            })
+            .context("snapshot subscription does not match the active v2 session")?;
+        Ok(self.v2_snapshot.subscribe())
+    }
+
+    pub(super) fn v2_revision(&self, remote: EndpointId, session_id: u64) -> Result<u64> {
+        let active = self.active.lock().expect("session registry poisoned");
+        active
+            .as_ref()
+            .filter(|session| {
+                session.mode == SessionMode::V2Single
+                    && session.media_active
+                    && session.remote == remote
+                    && session.session_id == session_id
+            })
+            .context("revision request does not match the active v2 session")?;
+        self.v2_state
+            .lock()
+            .expect("v2 session state poisoned")
+            .as_ref()
+            .map(|state| state.revision)
+            .context("active v2 session is missing revision state")
+    }
+
+    pub(super) fn apply_focus_command(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        command: &FocusCommandV2,
+    ) -> Result<FocusCommandEffect> {
+        command.validate()?;
+        let active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_ref()
+            .filter(|session| {
+                session.mode == SessionMode::V2Single
+                    && session.media_active
+                    && session.remote == remote
+                    && session.session_id == session_id
+            })
+            .context("focus command does not match the active v2 session")?;
+        let mut v2_state = self.v2_state.lock().expect("v2 session state poisoned");
+        let v2 = v2_state
+            .as_mut()
+            .context("active v2 session is missing focus state")?;
+        ensure!(
+            command.expected_revision == v2.revision,
+            "focus command expected stale revision {} instead of {}",
+            command.expected_revision,
+            v2.revision
+        );
+
+        let neutralize = match command.action {
+            FocusCommandActionV2::Request => {
+                ensure!(
+                    session.grants.contains(InvitationGrants::POINTER_KEYBOARD)
+                        || session.grants.contains(InvitationGrants::GAMEPAD),
+                    "viewer is not input-capable"
+                );
+                ensure!(
+                    matches!(v2.focus, FocusStateV2::Vacant { .. }),
+                    "controller slot 0 is already occupied"
+                );
+                let focus_generation =
+                    self.next_focus_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                v2.focus = FocusStateV2::Held {
+                    slot: command.slot,
+                    holder: v2.presence_id.clone(),
+                    session_id,
+                    focus_generation,
+                };
+                v2.transition_reason = FocusTransitionReasonV2::Requested;
+                false
+            }
+            FocusCommandActionV2::Release => {
+                let expected_focus_generation = command
+                    .expected_focus_generation
+                    .expect("validated focus release carries a generation");
+                ensure!(
+                    matches!(
+                        &v2.focus,
+                        FocusStateV2::Held {
+                            holder,
+                            session_id: holder_session_id,
+                            focus_generation,
+                            ..
+                        } if holder == &v2.presence_id
+                            && *holder_session_id == session_id
+                            && *focus_generation == expected_focus_generation
+                    ),
+                    "focus release does not match the current holder generation"
+                );
+                v2.focus = FocusStateV2::Vacant { slot: command.slot };
+                v2.transition_reason = FocusTransitionReasonV2::Released;
+                true
+            }
+        };
+        v2.revision = v2
+            .revision
+            .checked_add(1)
+            .context("v2 snapshot revision overflowed")?;
+        let snapshot = v2_snapshot_for(session, v2)?;
+        self.v2_snapshot.send_replace(Some(snapshot.clone()));
+        self.session_changed.notify_waiters();
+        Ok(FocusCommandEffect {
+            snapshot,
+            neutralize,
+        })
+    }
+
+    pub(super) fn invalidate_v2_focus(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        reason: FocusTransitionReasonV2,
+    ) -> Result<bool> {
+        let active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_ref()
+            .filter(|session| {
+                session.mode == SessionMode::V2Single
+                    && session.remote == remote
+                    && session.session_id == session_id
+            })
+            .context("focus invalidation does not match the active v2 session")?;
+        let mut v2_state = self.v2_state.lock().expect("v2 session state poisoned");
+        let v2 = v2_state
+            .as_mut()
+            .context("active v2 session is missing focus state")?;
+        if !matches!(v2.focus, FocusStateV2::Held { .. }) {
+            return Ok(false);
+        }
+        v2.focus = FocusStateV2::Vacant {
+            slot: ControllerSlot::ZERO,
+        };
+        v2.transition_reason = reason;
+        v2.revision = v2
+            .revision
+            .checked_add(1)
+            .context("v2 snapshot revision overflowed")?;
+        self.v2_snapshot
+            .send_replace(Some(v2_snapshot_for(session, v2)?));
+        self.session_changed.notify_waiters();
+        Ok(true)
+    }
+
+    pub(super) fn claim_input_v2(
+        self: &Arc<Self>,
+        remote: EndpointId,
+        nonce: [u8; 16],
+        session_id: u64,
+        slot: ControllerSlot,
+        focus_generation: u64,
+    ) -> Result<InputV2Lease> {
+        let mut active = self.active.lock().expect("session registry poisoned");
+        let session = active
+            .as_mut()
+            .filter(|session| {
+                session.mode == SessionMode::V2Single
+                    && session.media_active
+                    && session.remote == remote
+                    && session.nonce == nonce
+                    && session.session_id == session_id
+            })
+            .context("input v2 connection does not match the active session")?;
+        let v2_state = self.v2_state.lock().expect("v2 session state poisoned");
+        let v2 = v2_state
+            .as_ref()
+            .context("active v2 session is missing focus state")?;
+        ensure!(
+            matches!(
+                &v2.focus,
+                FocusStateV2::Held {
+                    holder,
+                    session_id: holder_session_id,
+                    slot: holder_slot,
+                    focus_generation: holder_generation,
+                } if holder == &v2.presence_id
+                    && *holder_session_id == session_id
+                    && *holder_slot == slot
+                    && *holder_generation == focus_generation
+            ),
+            "input v2 connection does not own the authoritative focus generation"
+        );
+        ensure!(
+            !session.input_claimed,
+            "active viewer already has an input stream"
+        );
+        session.input_claimed = true;
+        Ok(InputV2Lease {
+            registry: Arc::clone(self),
+            remote,
+            session_id,
+            slot,
+            focus_generation,
+            grants: session.grants,
+        })
+    }
+
+    pub(super) fn is_v2_focus_owner(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+        slot: ControllerSlot,
+        focus_generation: u64,
+    ) -> bool {
+        let active = self.active.lock().expect("session registry poisoned");
+        let Some(session) = active.as_ref().filter(|session| {
+            session.mode == SessionMode::V2Single
+                && session.media_active
+                && session.remote == remote
+                && session.session_id == session_id
+        }) else {
+            return false;
+        };
+        let v2_state = self.v2_state.lock().expect("v2 session state poisoned");
+        v2_state.as_ref().is_some_and(|v2| {
+            matches!(
+                &v2.focus,
+                FocusStateV2::Held {
+                    holder,
+                    session_id: holder_session_id,
+                    slot: holder_slot,
+                    focus_generation: holder_generation,
+                } if holder == &v2.presence_id
+                    && *holder_session_id == session.session_id
+                    && *holder_slot == slot
+                    && *holder_generation == focus_generation
+            )
         })
     }
 
@@ -606,6 +940,10 @@ impl SessionRegistry {
             // predecessor session.
             session.media_active = false;
             session.encoder_control = None;
+            if session.mode == SessionMode::V2Single {
+                *self.v2_state.lock().expect("v2 session state poisoned") = None;
+                self.v2_snapshot.send_replace(None);
+            }
             if !session.input_claimed && !session.audio_claimed && !session.feedback_claimed {
                 *active = None;
             }
@@ -664,6 +1002,30 @@ impl SessionRegistry {
     }
 }
 
+fn v2_snapshot_for(session: &ActiveSession, v2: &V2SessionState) -> Result<SessionSnapshotV2> {
+    debug_assert_eq!(session.mode, SessionMode::V2Single);
+    let input_capable = session.grants.contains(InvitationGrants::POINTER_KEYBOARD)
+        || session.grants.contains(InvitationGrants::GAMEPAD);
+    let snapshot = SessionSnapshotV2 {
+        revision: v2.revision,
+        self_presence_id: v2.presence_id.clone(),
+        viewers: vec![ViewerPresenceV2 {
+            presence_id: v2.presence_id.clone(),
+            session_id: session.session_id,
+            input_capable,
+            you: true,
+        }],
+        focus: v2.focus.clone(),
+        transition_reason: v2.transition_reason,
+        media: MediaGenerationDescriptorV2 {
+            generation_id: session.session_id,
+            broadcast_name: media_moq_broadcast_name(session.session_id)?,
+        },
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
 #[derive(Debug)]
 pub(super) struct SessionLease {
     registry: Arc<SessionRegistry>,
@@ -671,6 +1033,22 @@ pub(super) struct SessionLease {
     pub(super) session_id: u64,
     pub(super) session_clock: SessionClock,
     pub(super) media_v3_telemetry: Arc<MediaV3Telemetry>,
+}
+
+#[derive(Debug)]
+pub(super) struct V2SessionLease {
+    registry: Arc<SessionRegistry>,
+    remote: EndpointId,
+    pub(super) session_id: u64,
+    pub(super) session_clock: SessionClock,
+    pub(super) media_v3_telemetry: Arc<MediaV3Telemetry>,
+    pub(super) initial_snapshot: SessionSnapshotV2,
+}
+
+impl Drop for V2SessionLease {
+    fn drop(&mut self) {
+        self.registry.release(self.remote, self.session_id);
+    }
 }
 
 impl Drop for SessionLease {
@@ -684,6 +1062,16 @@ pub(super) struct InputLease {
     registry: Arc<SessionRegistry>,
     remote: EndpointId,
     pub(super) session_id: u64,
+    pub(super) grants: InvitationGrants,
+}
+
+#[derive(Debug)]
+pub(super) struct InputV2Lease {
+    registry: Arc<SessionRegistry>,
+    remote: EndpointId,
+    pub(super) session_id: u64,
+    pub(super) slot: ControllerSlot,
+    pub(super) focus_generation: u64,
     pub(super) grants: InvitationGrants,
 }
 
@@ -743,6 +1131,12 @@ impl Drop for SourceTaskGuard {
 }
 
 impl Drop for InputLease {
+    fn drop(&mut self) {
+        self.registry.release_input(self.remote, self.session_id);
+    }
+}
+
+impl Drop for InputV2Lease {
     fn drop(&mut self) {
         self.registry.release_input(self.remote, self.session_id);
     }
@@ -867,6 +1261,112 @@ mod tests {
         assert!(
             sessions
                 .claim(endpoint(2), nonce, InvitationGrants::ALL)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn v2_single_viewer_mode_excludes_legacy_and_publishes_revisioned_focus() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let nonce = [6; 16];
+        let media = sessions
+            .claim_v2(remote, nonce, InvitationGrants::ALL)
+            .unwrap();
+        assert_eq!(media.initial_snapshot.revision, 1);
+        assert!(matches!(
+            media.initial_snapshot.focus,
+            FocusStateV2::Vacant { .. }
+        ));
+        assert!(
+            sessions
+                .claim(endpoint(2), nonce, InvitationGrants::ALL)
+                .is_err()
+        );
+
+        let request = FocusCommandV2 {
+            request_id: 1,
+            action: FocusCommandActionV2::Request,
+            slot: ControllerSlot::ZERO,
+            expected_revision: 1,
+            expected_focus_generation: None,
+        };
+        let granted = sessions
+            .apply_focus_command(remote, media.session_id, &request)
+            .unwrap();
+        assert_eq!(granted.snapshot.revision, 2);
+        assert!(!granted.neutralize);
+        let focus_generation = granted.snapshot.self_focus_generation().unwrap();
+        assert!(sessions.is_v2_focus_owner(
+            remote,
+            media.session_id,
+            ControllerSlot::ZERO,
+            focus_generation
+        ));
+        assert!(
+            sessions
+                .claim_input_v2(
+                    remote,
+                    nonce,
+                    media.session_id,
+                    ControllerSlot::ZERO,
+                    focus_generation + 1,
+                )
+                .is_err()
+        );
+        let input = sessions
+            .claim_input_v2(
+                remote,
+                nonce,
+                media.session_id,
+                ControllerSlot::ZERO,
+                focus_generation,
+            )
+            .unwrap();
+
+        let release = FocusCommandV2 {
+            request_id: 2,
+            action: FocusCommandActionV2::Release,
+            slot: ControllerSlot::ZERO,
+            expected_revision: 2,
+            expected_focus_generation: Some(focus_generation),
+        };
+        let released = sessions
+            .apply_focus_command(remote, media.session_id, &release)
+            .unwrap();
+        assert_eq!(released.snapshot.revision, 3);
+        assert!(released.neutralize);
+        assert!(!sessions.is_v2_focus_owner(
+            remote,
+            media.session_id,
+            ControllerSlot::ZERO,
+            focus_generation
+        ));
+        assert!(
+            sessions
+                .apply_focus_command(remote, media.session_id, &release)
+                .is_err(),
+            "a stale release must not mutate the newer snapshot revision"
+        );
+        drop(input);
+        drop(media);
+    }
+
+    #[test]
+    fn legacy_mode_rejects_v2_coexistence() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let legacy = sessions
+            .claim(endpoint(1), [1; 16], InvitationGrants::ALL)
+            .unwrap();
+        assert!(
+            sessions
+                .claim_v2(endpoint(2), [2; 16], InvitationGrants::ALL)
+                .is_err()
+        );
+        drop(legacy);
+        assert!(
+            sessions
+                .claim_v2(endpoint(2), [2; 16], InvitationGrants::ALL)
                 .is_ok()
         );
     }

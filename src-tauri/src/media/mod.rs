@@ -9,5 +9,6 @@ pub(crate) mod moq_catalog;
 pub(crate) mod moq_receiver;
 pub(crate) mod network_diagnostics;
 pub(crate) mod object_receiver;
+pub(crate) mod session_control;
 pub(crate) mod transport;
 pub(crate) mod video_delivery;

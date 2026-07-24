@@ -324,7 +324,7 @@ pub(super) async fn serve_control_moq(
         &connection,
         &config,
         &mut current_gop_receiver,
-        recv,
+        MoqControlReader::V1(recv),
         remote,
         closed,
         track,
@@ -346,12 +346,258 @@ pub(super) async fn serve_control_moq(
     }
 }
 
+pub(super) async fn serve_control_moq_v2(
+    connection: Connection,
+    config: HostConfig,
+    sessions: &Arc<SessionRegistry>,
+    authorization: &AuthorizationPolicy,
+    input_operations: &Arc<InputOperations>,
+) -> Result<()> {
+    let remote = connection.remote_id();
+    let handshake_permit = sessions
+        .pending_handshakes
+        .try_acquire()
+        .context("too many pending handshakes")?;
+    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
+        .await
+        .context("timed out accepting MoQ control v2 stream")?
+        .context("accepting MoQ control v2 stream")?;
+    let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_client_hello_v2(&mut recv))
+        .await
+        .context("timed out waiting for control v2 hello")??
+        .context("client closed before control v2 hello")?;
+    drop(handshake_permit);
+    ensure!(
+        hello.capabilities.contains(&Capability::VideoH264),
+        "client did not offer required capability VideoH264"
+    );
+    debug!(%remote, agent = %hello.agent, "MoQ control v2 hello received");
+
+    let grants = match authorization.authorize_or_redeem(
+        remote,
+        hello.invitation.as_deref(),
+        unix_timestamp_now()?,
+    ) {
+        Ok(grants) => grants,
+        Err(error) => {
+            send_rejection_v2(&mut send, "Portal peer is not authorized").await?;
+            return Err(error.context("authorizing MoQ control v2 peer"));
+        }
+    };
+    ensure!(
+        grants.contains(InvitationGrants::VIEW),
+        "authorized MoQ control v2 peer lacks view permission"
+    );
+    let lease = match sessions.claim_v2(remote, hello.nonce, grants) {
+        Ok(lease) => lease,
+        Err(error) => {
+            send_rejection_v2(&mut send, "host already has an active client").await?;
+            return Err(error);
+        }
+    };
+
+    let source = match config.source {
+        VideoSource::TestPattern => Ok(spawn_test_pattern(config.clone(), lease.session_clock)),
+        VideoSource::GamescopePipewire => {
+            let primary = spawn_gamescope_pipewire_after_static_preflight(
+                config.clone(),
+                lease.session_clock,
+            )
+            .await?;
+            select_gamescope_startup_source(config.clone(), lease.session_clock, primary).await
+        }
+    };
+    let EncodedSource {
+        frames: frame_receiver,
+        current_gop: mut current_gop_receiver,
+        task: source_task,
+        pointer_surface_dimensions,
+        encoder_control,
+    } = match source {
+        Ok(source) => source,
+        Err(error) => {
+            send_rejection_v2(&mut send, "video source is unavailable").await?;
+            return Err(error);
+        }
+    };
+    let source_task = SourceTaskGuard::new(source_task);
+    sessions.install_encoder_control(remote, lease.session_id, encoder_control.clone())?;
+
+    let mut broadcast = Broadcast::new().produce();
+    let track = broadcast
+        .create_track(Track {
+            name: MOQ_VIDEO_H264_TRACK.to_owned(),
+            priority: MOQ_VIDEO_TRACK_PRIORITY,
+        })
+        .context("creating static MoQ H.264 track for control v2")?;
+    let catalog = publish_goq_catalog(&mut broadcast)?;
+    let broadcast_name = media_moq_broadcast_name(lease.session_id)?;
+    let attachment = sessions.expect_moq(
+        remote,
+        lease.session_id,
+        broadcast_name.clone(),
+        broadcast.consume(),
+    )?;
+
+    let negotiated = MEDIA_CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|capability| hello.capabilities.contains(capability))
+        .collect();
+    let mut control_hello =
+        HostHelloV2::accepted(lease.session_id, negotiated, lease.initial_snapshot.clone());
+    if let Some(dimensions) = pointer_surface_dimensions {
+        control_hello = control_hello.with_pointer_surface_dimensions(dimensions);
+    }
+    write_host_hello_v2(&mut send, &control_hello).await?;
+    info!(
+        %remote,
+        session_id = lease.session_id,
+        %broadcast_name,
+        "MoQ control v2 client accepted; awaiting authorized media attachment"
+    );
+
+    let MoqAttachmentWait {
+        mut attached,
+        closed,
+    } = attachment;
+    tokio::time::timeout(MOQ_ATTACHMENT_TIMEOUT, async {
+        tokio::select! {
+            result = &mut attached => result.context("authorized MoQ handler ended before v2 attachment"),
+            reason = connection.closed() => Err(anyhow::anyhow!("control v2 connection closed before MoQ attachment: {reason:?}")),
+        }
+    })
+    .await
+    .context("timed out waiting for authorized MoQ v2 attachment")??;
+
+    let session_result = run_control_moq_session(
+        &connection,
+        &config,
+        &mut current_gop_receiver,
+        MoqControlReader::V2 {
+            send,
+            recv,
+            sessions: Arc::clone(sessions),
+            input_operations: Arc::clone(input_operations),
+            session_id: lease.session_id,
+        },
+        remote,
+        closed,
+        track,
+        &mut broadcast,
+        encoder_control,
+        Arc::clone(&lease.media_v3_telemetry),
+    )
+    .await;
+    let catalog_result = catalog.finish();
+
+    if sessions.invalidate_v2_focus(
+        remote,
+        lease.session_id,
+        FocusTransitionReasonV2::Disconnected,
+    )? {
+        input_operations.reset()?;
+    }
+    drop(current_gop_receiver);
+    drop(frame_receiver);
+    source_task.wait_or_abort(SOURCE_REAP_GRACE_TIMEOUT).await;
+    drop(lease);
+    info!(%remote, "MoQ control v2 client released");
+    match session_result {
+        Err(error) => Err(error),
+        Ok(()) => catalog_result,
+    }
+}
+
+enum MoqControlReader {
+    V1(iroh::endpoint::RecvStream),
+    V2 {
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+        sessions: Arc<SessionRegistry>,
+        input_operations: Arc<InputOperations>,
+        session_id: u64,
+    },
+}
+
+async fn forward_control_v2_requests(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    sessions: Arc<SessionRegistry>,
+    input_operations: Arc<InputOperations>,
+    remote: EndpointId,
+    session_id: u64,
+    keyframes: tokio::sync::watch::Sender<Option<MediaControlRequestV3>>,
+) -> Result<()> {
+    let mut snapshots = sessions.subscribe_v2_snapshots(remote, session_id)?;
+    loop {
+        tokio::select! {
+            changed = snapshots.changed() => {
+                changed.context("v2 session snapshot publisher stopped")?;
+                let Some(snapshot) = snapshots.borrow_and_update().clone() else {
+                    break;
+                };
+                write_server_control_v2(
+                    &mut send,
+                    &ServerControlEnvelopeV2::Snapshot { snapshot },
+                )
+                .await?;
+            }
+            command = read_client_control_v2(&mut recv) => {
+                let Some(command) = command? else { break; };
+                match command {
+                    ClientControlEnvelopeV2::Focus { command } => {
+                        let request_id = command.request_id;
+                        let outcome = sessions.apply_focus_command(remote, session_id, &command);
+                        let result = match outcome {
+                            Ok(effect) => {
+                                if effect.neutralize {
+                                    input_operations.reset()?;
+                                }
+                                FocusCommandResultV2 {
+                                    request_id,
+                                    accepted: true,
+                                    revision: effect.snapshot.revision,
+                                    message: None,
+                                }
+                            }
+                            Err(error) => FocusCommandResultV2 {
+                                request_id,
+                                accepted: false,
+                                revision: sessions.v2_revision(remote, session_id)?,
+                                message: Some(error.to_string()),
+                            },
+                        };
+                        write_server_control_v2(
+                            &mut send,
+                            &ServerControlEnvelopeV2::FocusResult { result },
+                        )
+                        .await?;
+                    }
+                    ClientControlEnvelopeV2::Keyframe {
+                        request_id,
+                        last_sequence,
+                        reason,
+                    } => {
+                        keyframes.send_replace(Some(MediaControlRequestV3::request_keyframe(
+                            request_id,
+                            last_sequence,
+                            reason.into(),
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_control_moq_session(
     connection: &Connection,
     config: &HostConfig,
     current_gop_receiver: &mut tokio::sync::watch::Receiver<Option<EncodedGop>>,
-    control_recv: iroh::endpoint::RecvStream,
+    control_reader: MoqControlReader,
     remote: EndpointId,
     mut moq_closed: tokio::sync::oneshot::Receiver<()>,
     track: TrackProducer,
@@ -363,10 +609,27 @@ async fn run_control_moq_session(
     let mut replay_cursor = MediaReplayCursor::default();
     let mut publisher = MoqGroupPublisher::new(track);
     let (control_sender, mut control_requests) = tokio::sync::watch::channel(None);
-    let mut control_task = tokio::spawn(forward_media_v3_control_requests(
-        control_recv,
-        control_sender,
-    ));
+    let mut control_task = match control_reader {
+        MoqControlReader::V1(control_recv) => tokio::spawn(forward_media_v3_control_requests(
+            control_recv,
+            control_sender,
+        )),
+        MoqControlReader::V2 {
+            send,
+            recv,
+            sessions,
+            input_operations,
+            session_id,
+        } => tokio::spawn(forward_control_v2_requests(
+            send,
+            recv,
+            sessions,
+            input_operations,
+            remote,
+            session_id,
+            control_sender,
+        )),
+    };
     let mut control_task_finished = false;
     let mut control_receiver_open = true;
     let mut forced_idr = ForcedIdrCoordinator::new(encoder_control, Arc::clone(&telemetry));

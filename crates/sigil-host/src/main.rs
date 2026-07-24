@@ -29,8 +29,9 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId};
 use moq_net::Origin;
 use sigil_protocol::{
-    AUDIO_ALPN_V1, CONTROL_ALPN_V1, INPUT_ALPN_V1, InvitationGrants, MAX_INVITATION_TTL_SECS,
-    MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, SignedInvitation,
+    AUDIO_ALPN_V1, CONTROL_ALPN_V1, CONTROL_ALPN_V2, INPUT_ALPN_V1, INPUT_ALPN_V2,
+    InvitationGrants, MAX_INVITATION_TTL_SECS, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1,
+    SignedInvitation,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -42,8 +43,8 @@ use crate::config::{ConfigRevision, HostConfig, InputMode, VideoSource};
 use crate::cursor::PointerPositionTracker;
 use crate::input::InputBackend;
 use crate::server::{
-    AudioHandler, AuthorizedMoqHandler, ControlHandler, InputHandler, MediaFeedbackHandler,
-    MediaV3Handler, SessionRegistry,
+    AudioHandler, AuthorizedMoqHandler, ControlHandler, ControlV2Handler, InputHandler,
+    InputOperations, InputV2Handler, MediaFeedbackHandler, MediaV3Handler, SessionRegistry,
 };
 
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1001,7 +1002,17 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     }
 
     let moq_origin = Origin::random();
+    let input_operations = Arc::new(InputOperations::new(input_backend.clone()));
     let router = Router::builder(endpoint)
+        .accept(
+            CONTROL_ALPN_V2,
+            ControlV2Handler {
+                config: config.clone(),
+                sessions: Arc::clone(&sessions),
+                authorization: authorization.clone(),
+                input_operations: Arc::clone(&input_operations),
+            },
+        )
         .accept(
             CONTROL_ALPN_V1,
             ControlHandler {
@@ -1030,7 +1041,15 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
             MediaFeedbackHandler {
                 config: config.clone(),
                 sessions: Arc::clone(&sessions),
-                authorization,
+                authorization: authorization.clone(),
+            },
+        )
+        .accept(
+            INPUT_ALPN_V2,
+            InputV2Handler {
+                operations: input_operations,
+                pointer_positions: pointer_positions.clone(),
+                sessions: Arc::clone(&sessions),
             },
         )
         .accept(

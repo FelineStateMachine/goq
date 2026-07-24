@@ -6,17 +6,27 @@
 //! fail closed.
 
 mod audio;
+mod control_v2;
 mod error;
 mod feedback;
 mod framing;
 mod handshake;
 mod input;
+mod input_v2;
 mod invitation;
 mod media;
 mod media_v3;
 mod moq_catalog;
 
 pub use audio::{AUDIO_HEADER_LEN, AudioCodec, AudioFlags, AudioPacket, AudioPacketHeader};
+pub use control_v2::{
+    ClientControlEnvelopeV2, ClientHelloV2, ControlKeyframeReasonV2, FocusCommandActionV2,
+    FocusCommandResultV2, FocusCommandV2, FocusStateV2, FocusTransitionReasonV2, HostHelloV2,
+    MAX_CONTROL_V2_MESSAGE_LEN, MAX_SESSION_ROSTER_VIEWERS, MediaGenerationDescriptorV2,
+    ServerControlEnvelopeV2, SessionSnapshotV2, ViewerPresenceId, ViewerPresenceV2,
+    read_client_control_v2, read_client_hello_v2, read_host_hello_v2, read_server_control_v2,
+    write_client_control_v2, write_client_hello_v2, write_host_hello_v2, write_server_control_v2,
+};
 pub use error::{ProtocolError, Result};
 pub use feedback::{
     ADAPTIVE_BITRATE_DECISION_V1_LEN, AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1,
@@ -34,6 +44,12 @@ pub use input::{
     POINTER_POSITION_MAX, POINTER_POSITION_MIN, PointerPosition, RELATIVE_POINTER_DELTA_MAX,
     RELATIVE_POINTER_DELTA_MIN, read_input_ack, read_input_event, write_input_ack,
     write_input_event,
+};
+pub use input_v2::{
+    ControllerSlot, InputAckV2, InputClientHelloV2, InputEventV2, InputHostHelloV2,
+    read_input_ack_v2, read_input_client_hello_v2, read_input_event_v2, read_input_host_hello_v2,
+    write_input_ack_v2, write_input_client_hello_v2, write_input_event_v2,
+    write_input_host_hello_v2,
 };
 pub use invitation::{
     INVITATION_CLOCK_SKEW_SECS, INVITATION_TOKEN_PREFIX, InvitationClaims, InvitationGrants,
@@ -58,6 +74,8 @@ pub use moq_catalog::{
 
 /// Protocol version encoded in v1 messages.
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Protocol version encoded in v2 control and input messages.
+pub const PROTOCOL_VERSION_V2: u16 = 2;
 
 /// ALPN for custom MoQ-style grouped media objects and keyframe control.
 ///
@@ -67,8 +85,12 @@ pub const MEDIA_ALPN_V3: &[u8] = b"sigil/media/3";
 pub const MEDIA_FEEDBACK_ALPN_V1: &[u8] = b"sigil/media-feedback/1";
 /// ALPN for the v1 latency-independent input stream.
 pub const INPUT_ALPN_V1: &[u8] = b"sigil/input/1";
+/// ALPN for focus-generation-bound v2 input.
+pub const INPUT_ALPN_V2: &[u8] = b"sigil/input/2";
 /// ALPN for the v1 session-control stream.
 pub const CONTROL_ALPN_V1: &[u8] = b"sigil/control/1";
+/// ALPN for revisioned multi-viewer session control.
+pub const CONTROL_ALPN_V2: &[u8] = b"sigil/control/2";
 /// Static upstream MoQ track carrying bounded H.264 access-unit objects.
 pub const MOQ_VIDEO_H264_TRACK: &str = "video/h264";
 /// ALPN for the v1 low-latency Opus datagram connection.
@@ -114,7 +136,9 @@ mod tests {
         assert_eq!(MEDIA_ALPN_V3, b"sigil/media/3");
         assert_eq!(MEDIA_FEEDBACK_ALPN_V1, b"sigil/media-feedback/1");
         assert_eq!(INPUT_ALPN_V1, b"sigil/input/1");
+        assert_eq!(INPUT_ALPN_V2, b"sigil/input/2");
         assert_eq!(CONTROL_ALPN_V1, b"sigil/control/1");
+        assert_eq!(CONTROL_ALPN_V2, b"sigil/control/2");
         assert_eq!(AUDIO_ALPN_V1, b"sigil/audio/1");
     }
 

@@ -1,8 +1,10 @@
 use std::time::Duration;
 
 use sigil_protocol::{
-    KeyframeRequestReasonV3, MediaControlRequestV3, write_media_control_request_v3,
+    ClientControlEnvelopeV2, ControlKeyframeReasonV2, KeyframeRequestReasonV3,
+    MediaControlRequestV3, write_media_control_request_v3,
 };
+use std::sync::atomic::Ordering;
 
 use crate::commands::state::{AppState, MediaControlRequestSender};
 
@@ -70,17 +72,40 @@ pub(crate) async fn request_keyframe(
 ) -> Result<bool, String> {
     let reason = parse_keyframe_request_reason(&reason)?;
     let control = state.media_control.lock().await;
+    if let Some((current_generation, sender)) = control.as_ref() {
+        if *current_generation != generation {
+            return Ok(false);
+        }
+        return match sender.try_send((reason, None)) {
+            Ok(()) => Ok(true),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err("Media control channel closed".to_string())
+            }
+        };
+    }
+    drop(control);
+    let control = state.session_control.lock().await;
     let Some((current_generation, sender)) = control.as_ref() else {
         return Ok(false);
     };
     if *current_generation != generation {
         return Ok(false);
     }
-    match sender.try_send((reason, None)) {
+    let request_id = state
+        .control_request_id
+        .fetch_add(1, Ordering::Relaxed)
+        .checked_add(1)
+        .ok_or_else(|| "Control v2 request id overflowed".to_string())?;
+    match sender.try_send(ClientControlEnvelopeV2::Keyframe {
+        request_id,
+        last_sequence: None,
+        reason: ControlKeyframeReasonV2::from(reason),
+    }) {
         Ok(()) => Ok(true),
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            Err("Media control channel closed".to_string())
+            Err("Control v2 channel closed".to_string())
         }
     }
 }

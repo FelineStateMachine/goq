@@ -9,6 +9,8 @@ import {
 } from './input-state.mjs';
 import { createInputRuntime } from './input-runtime.mjs';
 import { createControlRuntime } from './control-runtime.mjs';
+import { createSessionState } from './session-state.mjs';
+import { createFocusRuntime } from './focus-runtime.mjs';
 import { formatVideoDiscardTelemetry } from './frame-stats.mjs';
 import { networkDiagnosticsPresentation } from './network-diagnostics.mjs';
 import {
@@ -50,6 +52,8 @@ let activePointerSession = null;
 let controllerActivationInProgress = false;
 let controlRuntime = null;
 let controllerRuntime = null;
+let sessionStateRuntime = null;
+let focusRuntime = null;
 
 const invoke = (...args) => window.__TAURI__.core.invoke(...args);
 const listen = (...args) => window.__TAURI__.event.listen(...args);
@@ -440,7 +444,7 @@ async function teardownConnectionAttempt(attempt) {
   await audioPipeline.teardown();
 }
 
-function updateAcceptedConnectionState({ attempt, state }) {
+function updateAcceptedConnectionState({ result, attempt, state }) {
   const session = attempt.pointerSession;
   if (!state.inputCapabilities.pointerPositionFeedback) {
     session.remotePosition = null;
@@ -449,6 +453,13 @@ function updateAcceptedConnectionState({ attempt, state }) {
     session.remotePosition = attempt.initialPointerFeedback.position;
     session.remoteVisible = attempt.initialPointerFeedback.pointer_visible;
   }
+  sessionStateRuntime.acceptConnection({
+    nativeGeneration: result.media_generation,
+    controlProtocol: connectionState.controlProtocol,
+    initialSnapshot: result.session_snapshot ?? null,
+    eligible: state.inputCapabilities.control,
+  });
+  focusRuntime.reset();
   controlRuntime.resetAcceptedConnection();
 }
 
@@ -492,6 +503,8 @@ async function teardownConnectedResources() {
 }
 
 async function showDisconnectedState() {
+  focusRuntime.reset();
+  sessionStateRuntime.reset();
   controlRuntime.resetDisconnected();
   updatePanelVisibility();
   setStatus('', 'idle');
@@ -599,7 +612,11 @@ controlRuntime = createControlRuntime({
   getConnection: () => ({
     connected: connectionState.connected,
     disconnecting: connectionState.disconnecting,
-    capabilities: connectionState.inputCapabilities,
+    capabilities: {
+      ...connectionState.inputCapabilities,
+      control: connectionState.inputCapabilities.control
+        && (connectionState.controlProtocol !== 'control-v2' || sessionStateRuntime?.focused === true),
+    },
   }),
   inputRuntime,
   invokeCursorGrab: (grab) => invoke('set_client_cursor_grab', { grab }),
@@ -619,8 +636,30 @@ controlRuntime = createControlRuntime({
   },
   publishController: () => controllerRuntime?.publishCurrentState(),
   resetControllerEscape: () => controllerRuntime?.resetEscape(),
-  onChange: () => updateControlUI(),
+  onChange: () => {
+    sessionStateRuntime?.setLocallyActive(controlRuntime.active);
+    updateControlUI();
+  },
+  onExit: () => {
+    if (connectionState.controlProtocol === 'control-v2') {
+      void focusRuntime?.release().catch((error) => console.error('focus release failed:', error));
+    }
+  },
   onReleaseFailure: () => setStatus('err', 'cursor release failed · quit app'),
+});
+sessionStateRuntime = createSessionState({
+  onFocusLoss: () => controlRuntime.exit({ releaseHostFocus: false, resetEscape: true }),
+  onChange: () => updateControlUI(),
+});
+focusRuntime = createFocusRuntime({
+  invokeCommand: invoke,
+  getSession: () => sessionStateRuntime.snapshot(),
+  startFocusedInput: async () => {
+    const capabilities = await invoke('iroh_client_start_focused_input');
+    connectionState.updateInputCapabilities(capabilities);
+  },
+  activateLocalControl: ({ controllerInitiated }) => controlRuntime.toggle({ controllerInitiated }),
+  onChange: () => updateControlUI(),
 });
 videoPipeline = createVideoPipelineSession({
   canvas,
@@ -788,6 +827,11 @@ listen('audio-stats', (event) => {
 async function toggleControl() {
   // Capture synchronous controller provenance before cursor acquisition yields.
   // The DOM click dispatcher does not await this async handler.
+  if (connectionState.controlProtocol === 'control-v2' && !sessionStateRuntime.focused) {
+    await focusRuntime.request({ controllerInitiated: controllerActivationInProgress });
+    updateControlUI();
+    return;
+  }
   await controlRuntime.toggle({ controllerInitiated: controllerActivationInProgress });
 }
 
@@ -838,10 +882,15 @@ function renderRemotePointer() {
 function updateControlUI() {
   const el = document.getElementById('control-toggle');
   const capabilities = connectionState.inputCapabilities;
-  const available = connectionState.connected && capabilities.control;
+  const available = connectionState.connected
+    && capabilities.control
+    && (connectionState.controlProtocol !== 'control-v2' || sessionStateRuntime.eligible);
   const controlling = controlRuntime.setInactiveIfUnavailable(available);
+  const controlAction = connectionState.controlProtocol === 'control-v2' && !sessionStateRuntime.focused
+    ? 'request control'
+    : controlling ? 'controlling' : 'activate control';
   el.textContent = available
-    ? `${controlling ? 'controlling' : 'take control'} · ${describeInputCapabilities()}${controlling && capabilities.relativePointer ? ' · Ctrl+Alt+Esc to exit' : controlling && capabilities.gamepad ? ' · hold Back+Start to exit' : ''}`
+    ? `${controlAction} · ${describeInputCapabilities()}${controlling && capabilities.relativePointer ? ' · Ctrl+Alt+Esc to exit' : controlling && capabilities.gamepad ? ' · hold Back+Start to exit' : ''}`
     : 'view only · input unavailable';
   el.classList.toggle('active', controlling);
   el.classList.toggle('disabled', !available);
@@ -1186,6 +1235,24 @@ listen('fido-done', () => {
 
 listen('dev-connect-routing', (event) => {
   console.warn('[development direct-node routing]', event.payload.warning, event.payload.host_node_id);
+});
+
+listen('session-state', (event) => {
+  try {
+    if (sessionStateRuntime.applyNativeSnapshot(event.payload)) {
+      void focusRuntime.observeSession().catch((error) => {
+        console.error('focused input activation failed:', error);
+        controlRuntime.exit();
+      });
+    }
+  } catch (error) {
+    console.error('invalid session-state payload:', error);
+    void disconnect();
+  }
+});
+
+listen('focus-command-result', (event) => {
+  focusRuntime.observeResult(event.payload);
 });
 
 listen('invitation-pending', (event) => {

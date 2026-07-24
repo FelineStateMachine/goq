@@ -12,6 +12,7 @@ export function createControlRuntime({
   publishController,
   resetControllerEscape,
   onChange,
+  onExit = () => {},
   onReleaseFailure,
   pointerLockTimeoutMs = BROWSER_POINTER_LOCK_TIMEOUT_MS,
   scheduleTimeout = globalThis.setTimeout,
@@ -44,6 +45,7 @@ export function createControlRuntime({
     throw new TypeError('resetControllerEscape must be a function');
   }
   if (typeof onChange !== 'function') throw new TypeError('onChange must be a function');
+  if (typeof onExit !== 'function') throw new TypeError('onExit must be a function');
   if (typeof onReleaseFailure !== 'function') {
     throw new TypeError('onReleaseFailure must be a function');
   }
@@ -134,7 +136,7 @@ export function createControlRuntime({
     try { pointerLock.exit(); } catch (_) {}
   }
 
-  function exit({ resetEscape = false } = {}) {
+  function exit({ resetEscape = false, releaseHostFocus = true } = {}) {
     controlTransitionGeneration += 1;
     controlTransitionInProgress = false;
     controllerActivationGate.reset();
@@ -144,6 +146,7 @@ export function createControlRuntime({
     controlMode = false;
     releasePointerLock();
     onChange();
+    if (releaseHostFocus) onExit();
   }
 
   function exitAfterBrowserPointerLockFailure() {

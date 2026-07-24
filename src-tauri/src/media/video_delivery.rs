@@ -32,9 +32,8 @@ const CLIENT_FRAME_STATS_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) struct VideoDeliveryRequest {
     pub(crate) app: AppHandle,
     pub(crate) endpoint: iroh::Endpoint,
-    pub(crate) frame_recv: iroh::endpoint::RecvStream,
     pub(crate) frame_connection: iroh::endpoint::Connection,
-    pub(crate) input_connection: iroh::endpoint::Connection,
+    pub(crate) input_connection: Option<iroh::endpoint::Connection>,
     pub(crate) audio_connection: Option<iroh::endpoint::Connection>,
     pub(crate) network_diagnostics: Arc<StdMutex<NetworkSessionDiagnostics>>,
     pub(crate) media_control_requests: Option<MediaControlRequestSender>,
@@ -50,9 +49,6 @@ pub(crate) async fn run_video_delivery(request: VideoDeliveryRequest) {
     let VideoDeliveryRequest {
         app,
         endpoint,
-        // The negotiated control/v3 handshake recv leg carries no media but
-        // must stay open for the session's lifetime.
-        frame_recv: _control_recv_keepalive,
         frame_connection: frame_connection_for_stats,
         input_connection,
         audio_connection: audio_connection_for_stats,
@@ -102,7 +98,9 @@ pub(crate) async fn run_video_delivery(request: VideoDeliveryRequest) {
                     if last_path_sample.elapsed() >= Duration::from_secs(1) {
                         let mut diagnostics = lock_network_diagnostics(&stats_network_diagnostics);
                         diagnostics.observe_connection(NetworkLeg::Media, &stats_connection);
-                        diagnostics.observe_connection(NetworkLeg::Input, &stats_input_connection);
+                        if let Some(input_connection) = stats_input_connection.as_ref() {
+                            diagnostics.observe_connection(NetworkLeg::Input, input_connection);
+                        }
                         if let Some(audio_connection) = stats_audio_connection.as_ref() {
                             diagnostics.observe_connection(NetworkLeg::Audio, audio_connection);
                         }

@@ -210,7 +210,7 @@ impl InputOperations {
         self.backend.apply(&binding.event, negotiated)
     }
 
-    pub(super) fn reset(&self) -> Result<()> {
+    pub(crate) fn reset(&self) -> Result<()> {
         let _operation = match self.operation.lock() {
             Ok(operation) => operation,
             Err(poisoned) => {
@@ -329,6 +329,7 @@ async fn serve_input(
     };
     let session_id = lease.session_id;
     let grants = lease.grants;
+    let authorization_revision = lease.authorization_revision;
     // Owning the lease guarantees cancellation or unwinding neutralizes the
     // virtual devices before another input stream can be admitted.
     let session_guard = InputSessionGuard::new(lease, || backend.reset_session());
@@ -347,7 +348,7 @@ async fn serve_input(
         &HostHello::accepted(session_id, negotiated.clone()),
     )
     .await?;
-    info!(%remote, session_id, "input client accepted");
+    info!(%remote, session_id, authorization_revision, "input client accepted");
 
     let session_result: Result<()> = async {
         let mut received_events = 0_u64;
@@ -527,7 +528,7 @@ async fn serve_input_v2(
         ),
     )
     .await?;
-    info!(%remote, session_id = lease.session_id, focus_generation = lease.focus_generation, "input v2 client accepted");
+    info!(%remote, session_id = lease.session_id, focus_generation = lease.focus_generation, authorization_revision = lease.authorization_revision, "input v2 client accepted");
 
     let session_id = lease.session_id;
     let slot = lease.slot;
@@ -703,7 +704,7 @@ async fn serve_audio(
     )
     .await?;
     send.finish()?;
-    info!(%remote, session_id = lease.session_id, "audio client accepted");
+    info!(%remote, session_id = lease.session_id, authorization_revision = lease.authorization_revision, "audio client accepted");
 
     let session_result: Result<()> = async {
         loop {

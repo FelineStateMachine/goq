@@ -55,6 +55,13 @@ PipeWire selectors, audio/input configuration, identity, and state paths are
 not editable through this contract. Operator comments and all non-managed TOML
 fields survive an update.
 
+Enrollment capacity is authorization state, not a host configuration field.
+Authorization v2 durably supports at most 32 enrolled viewers, while this
+implementation phase intentionally keeps the concurrent v2 runtime cap at one
+until shared media-generation ownership is available. A later configuration
+revision adds the independently bounded `max_viewers` setting; it does not
+change the durable enrollment ceiling.
+
 Requests are strict JSON and contain an optimistic-concurrency revision:
 
 ```json

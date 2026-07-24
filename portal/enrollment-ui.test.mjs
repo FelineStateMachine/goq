@@ -35,3 +35,8 @@ test('raw invitation bytes stay in native commands instead of the DOM', () => {
   assert.match(main, /portal_import_invitation_file/);
   assert.doesNotMatch(main, /readAsText|FileReader/);
 });
+
+test('invitation grants distinguish view-only and input-capable access', () => {
+  assert.match(main, /summary\.viewOnly \? 'view only' : 'input-capable'/);
+  assert.match(main, /summary\.grants\.map\(grantLabel\)/);
+});

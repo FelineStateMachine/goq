@@ -46,6 +46,8 @@ pub struct InvitationSummary {
     peer_node_id: String,
     expires_at_unix: u64,
     grants: Vec<&'static str>,
+    view_only: bool,
+    input_capable: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -54,6 +56,8 @@ pub struct EnrollmentStatus {
     host_node_id: Option<String>,
     peer_node_id: Option<String>,
     grants: Vec<&'static str>,
+    view_only: bool,
+    input_capable: bool,
     pending: Option<InvitationSummary>,
 }
 
@@ -96,11 +100,18 @@ fn public_key(bytes: [u8; 32], name: &str) -> Result<PublicKey, String> {
 }
 
 fn summary(invitation: &SignedInvitation) -> Result<InvitationSummary, String> {
+    let input_capable = invitation
+        .claims
+        .grants
+        .contains(InvitationGrants::POINTER_KEYBOARD)
+        || invitation.claims.grants.contains(InvitationGrants::GAMEPAD);
     Ok(InvitationSummary {
         host_node_id: public_key(invitation.claims.host_node_id, "host")?.to_string(),
         peer_node_id: public_key(invitation.claims.intended_peer_id, "Portal")?.to_string(),
         expires_at_unix: invitation.claims.expires_at_unix,
         grants: grant_names(invitation.claims.grants),
+        view_only: !input_capable,
+        input_capable,
     })
 }
 
@@ -364,15 +375,21 @@ pub fn portal_enrollment_status(
             host_node_id: None,
             peer_node_id: None,
             grants: Vec::new(),
+            view_only: false,
+            input_capable: false,
             pending,
         });
     };
     let grants = validate_profile(&profile)?;
+    let input_capable = grants.contains(InvitationGrants::POINTER_KEYBOARD)
+        || grants.contains(InvitationGrants::GAMEPAD);
     Ok(EnrollmentStatus {
         enrolled: true,
         host_node_id: Some(profile.host_node_id),
         peer_node_id: Some(profile.peer_node_id),
         grants: grant_names(grants),
+        view_only: !input_capable,
+        input_capable,
         pending,
     })
 }
@@ -552,7 +569,7 @@ mod tests {
 
     use super::*;
 
-    fn token(now: u64) -> String {
+    fn token_with_grants(now: u64, grants: InvitationGrants) -> String {
         let host = SigningKey::from_bytes(&[7; 32]);
         let peer = SigningKey::from_bytes(&[9; 32]);
         let claims = InvitationClaims::new(
@@ -562,10 +579,14 @@ mod tests {
             now + 300,
             1,
             [3; 32],
-            InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD),
+            grants,
         )
         .unwrap();
         SignedInvitation::issue(claims, &[7; 32]).unwrap().encode()
+    }
+
+    fn token(now: u64) -> String {
+        token_with_grants(now, InvitationGrants::VIEW.union(InvitationGrants::GAMEPAD))
     }
 
     #[test]
@@ -577,6 +598,18 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         assert!(!json.contains(&raw));
         assert!(json.contains("gamepad"));
+        assert!(json.contains("\"input_capable\":true"));
+        assert!(json.contains("\"view_only\":false"));
+    }
+
+    #[test]
+    fn view_only_invitation_is_reported_without_input_eligibility() {
+        let now = now_unix().unwrap();
+        let state = EnrollmentState::default();
+        let summary = stage_token(&state, token_with_grants(now, InvitationGrants::VIEW)).unwrap();
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"view_only\":true"));
+        assert!(json.contains("\"input_capable\":false"));
     }
 
     #[test]

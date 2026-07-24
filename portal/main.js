@@ -132,7 +132,8 @@ function showInvitationSummary(value) {
   document.getElementById('invitation-host').textContent = summary.hostFingerprint;
   document.getElementById('invitation-peer').textContent = summary.peerFingerprint;
   document.getElementById('invitation-expiry').textContent = formatInvitationExpiry(summary.expiresAtUnix);
-  document.getElementById('invitation-grants').textContent = summary.grants.map(grantLabel).join(' · ');
+  const access = summary.viewOnly ? 'view only' : 'input-capable';
+  document.getElementById('invitation-grants').textContent = `${access} · ${summary.grants.map(grantLabel).join(' · ')}`;
   document.getElementById('invitation-status').textContent = '';
   document.getElementById('invitation-overlay').classList.remove('hidden');
   setTimeout(() => setControllerFocus(document.getElementById('confirm-invitation')), 0);

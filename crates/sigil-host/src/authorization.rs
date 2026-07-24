@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,11 +16,16 @@ use sigil_protocol::{
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 
-const STATE_VERSION: u16 = 1;
-const STATE_FILE_NAME: &str = "authorization-v1.json";
+const STATE_VERSION: u16 = 2;
+const STATE_FILE_NAME: &str = "authorization-v2.json";
+const LEGACY_STATE_VERSION: u16 = 1;
+const LEGACY_STATE_FILE_NAME: &str = "authorization-v1.json";
 const LOCK_FILE_NAME: &str = "authorization-v1.lock";
 const MAX_STATE_FILE_LEN: u64 = 64 * 1024;
 const MAX_CONSUMED_INVITATIONS: usize = 64;
+pub const MAX_ENROLLED_VIEWERS: usize = 32;
+const MAX_SECURITY_AUDIT_ENTRIES: usize = 64;
+const VIEWER_HANDLE_RANDOM_BYTES: usize = 8;
 const WRITER_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const WRITER_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -55,15 +61,17 @@ pub enum AuthorizationPolicy {
     DevelopmentBypass,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizationSnapshot {
     pub epoch: u64,
     pub peer: Option<EndpointId>,
     pub grants: Option<InvitationGrants>,
     pub enrolled_at_unix: Option<u64>,
+    pub committed_revision: u64,
+    pub viewers: Vec<EnrolledViewer>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizationInspection {
     pub snapshot: AuthorizationSnapshot,
     pub storage_present: bool,
@@ -76,21 +84,49 @@ pub struct RevocationOutcome {
     pub current_epoch: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EnrolledViewer {
+    pub handle: String,
+    #[serde(skip_serializing)]
+    pub peer: EndpointId,
+    pub grants: InvitationGrants,
+    pub enrolled_at_unix: u64,
+    pub authorization_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedViewer {
+    pub handle: String,
+    pub grants: InvitationGrants,
+    pub authorization_revision: u64,
+    pub committed_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizationMutation {
+    pub handle: String,
+    pub peer: EndpointId,
+    pub previous_grants: InvitationGrants,
+    pub current_grants: Option<InvitationGrants>,
+    pub authorization_revision: u64,
+    pub committed_revision: u64,
+}
+
 impl AuthorizationSnapshot {
     fn from_state(state: &AuthorizationState) -> Result<Self> {
-        let (peer, grants, enrolled_at_unix) = match &state.enrollment {
-            Some(enrollment) => (
-                Some(enrollment.peer_node_id.parse::<EndpointId>()?),
-                Some(enrollment.grants),
-                Some(enrollment.enrolled_at_unix),
-            ),
-            None => (None, None, None),
-        };
+        let viewers = state
+            .enrollments
+            .iter()
+            .map(Enrollment::as_public)
+            .collect::<Result<Vec<_>>>()?;
+        let first = viewers.first();
         Ok(Self {
             epoch: state.enrollment_epoch,
-            peer,
-            grants,
-            enrolled_at_unix,
+            peer: first.map(|viewer| viewer.peer),
+            grants: first.map(|viewer| viewer.grants),
+            enrolled_at_unix: first.map(|viewer| viewer.enrolled_at_unix),
+            committed_revision: state.committed_revision,
+            viewers,
         })
     }
 }
@@ -101,13 +137,68 @@ struct AuthorizationState {
     version: u16,
     host_node_id: String,
     enrollment_epoch: u64,
-    enrollment: Option<Enrollment>,
+    committed_revision: u64,
+    enrollments: Vec<Enrollment>,
     consumed_invitations: Vec<ConsumedInvitation>,
+    security_audit: Vec<SecurityAuditEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Enrollment {
+    peer_node_id: String,
+    handle: String,
+    grants: InvitationGrants,
+    enrolled_at_unix: u64,
+    authorization_revision: u64,
+}
+
+impl Enrollment {
+    fn as_public(&self) -> Result<EnrolledViewer> {
+        Ok(EnrolledViewer {
+            handle: self.handle.clone(),
+            peer: self.peer_node_id.parse::<EndpointId>()?,
+            grants: self.grants,
+            enrolled_at_unix: self.enrolled_at_unix,
+            authorization_revision: self.authorization_revision,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecurityAuditEntry {
+    revision: u64,
+    occurred_at_unix: u64,
+    action: SecurityAuditAction,
+    handle: String,
+    previous_grants: Option<InvitationGrants>,
+    current_grants: Option<InvitationGrants>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SecurityAuditAction {
+    Enrolled,
+    GrantsReplaced,
+    Revoked,
+    ResetAll,
+    MigratedV1,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyAuthorizationState {
+    version: u16,
+    host_node_id: String,
+    enrollment_epoch: u64,
+    enrollment: Option<LegacyEnrollment>,
+    consumed_invitations: Vec<ConsumedInvitation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEnrollment {
     peer_node_id: String,
     grants: InvitationGrants,
     enrolled_at_unix: u64,
@@ -126,9 +217,62 @@ impl AuthorizationState {
             version: STATE_VERSION,
             host_node_id: host.to_string(),
             enrollment_epoch: 1,
-            enrollment: None,
+            committed_revision: 1,
+            enrollments: Vec::new(),
             consumed_invitations: Vec::new(),
+            security_audit: Vec::new(),
         }
+    }
+
+    fn from_legacy(legacy: LegacyAuthorizationState, expected_host: EndpointId) -> Result<Self> {
+        ensure!(
+            legacy.version == LEGACY_STATE_VERSION,
+            "unsupported legacy authorization state version"
+        );
+        ensure!(
+            legacy.host_node_id.parse::<EndpointId>().ok() == Some(expected_host),
+            "authorization state belongs to a different Sigil host"
+        );
+        ensure!(
+            legacy.enrollment_epoch != 0,
+            "authorization epoch must be non-zero"
+        );
+        ensure!(
+            legacy.consumed_invitations.len() <= MAX_CONSUMED_INVITATIONS,
+            "authorization replay ledger exceeds its fixed bound"
+        );
+        let mut state = Self::empty(expected_host);
+        state.enrollment_epoch = legacy.enrollment_epoch;
+        state.consumed_invitations = legacy.consumed_invitations;
+        if let Some(enrollment) = legacy.enrollment {
+            let peer = enrollment
+                .peer_node_id
+                .parse::<EndpointId>()
+                .context("legacy authorization enrollment contains an invalid peer node ID")?;
+            enrollment.grants.validate()?;
+            ensure!(
+                enrollment.grants.contains(InvitationGrants::VIEW),
+                "legacy authorization enrollment must include view permission"
+            );
+            let handle = random_viewer_handle(&[])?;
+            state.enrollments.push(Enrollment {
+                peer_node_id: peer.to_string(),
+                handle: handle.clone(),
+                grants: enrollment.grants,
+                enrolled_at_unix: enrollment.enrolled_at_unix,
+                authorization_revision: 1,
+            });
+            state.push_audit(SecurityAuditEntry {
+                revision: 1,
+                occurred_at_unix: enrollment.enrolled_at_unix,
+                action: SecurityAuditAction::MigratedV1,
+                handle,
+                previous_grants: Some(enrollment.grants),
+                current_grants: Some(enrollment.grants),
+            });
+        }
+        state.validate(expected_host)?;
+        Ok(state)
     }
 
     fn validate(&self, expected_host: EndpointId) -> Result<()> {
@@ -145,18 +289,46 @@ impl AuthorizationState {
             "authorization epoch must be non-zero"
         );
         ensure!(
+            self.committed_revision != 0,
+            "authorization committed revision must be non-zero"
+        );
+        ensure!(
+            self.enrollments.len() <= MAX_ENROLLED_VIEWERS,
+            "authorization enrollment map exceeds its fixed bound"
+        );
+        ensure!(
             self.consumed_invitations.len() <= MAX_CONSUMED_INVITATIONS,
             "authorization replay ledger exceeds its fixed bound"
         );
-        if let Some(enrollment) = &self.enrollment {
-            enrollment
+        ensure!(
+            self.security_audit.len() <= MAX_SECURITY_AUDIT_ENTRIES,
+            "authorization security audit exceeds its fixed bound"
+        );
+        let mut peers = HashSet::with_capacity(self.enrollments.len());
+        let mut handles = HashSet::with_capacity(self.enrollments.len());
+        for enrollment in &self.enrollments {
+            let peer = enrollment
                 .peer_node_id
                 .parse::<EndpointId>()
                 .context("authorization enrollment contains an invalid peer node ID")?;
+            ensure!(
+                peers.insert(peer),
+                "authorization contains a duplicate peer"
+            );
+            validate_viewer_handle(&enrollment.handle)?;
+            ensure!(
+                handles.insert(enrollment.handle.as_str()),
+                "authorization contains a duplicate viewer handle"
+            );
             enrollment.grants.validate()?;
             ensure!(
                 enrollment.grants.contains(InvitationGrants::VIEW),
                 "authorization enrollment must include view permission"
+            );
+            ensure!(
+                enrollment.authorization_revision != 0
+                    && enrollment.authorization_revision <= self.committed_revision,
+                "authorization enrollment revision is invalid"
             );
         }
         for (index, consumed) in self.consumed_invitations.iter().enumerate() {
@@ -171,6 +343,23 @@ impl AuthorizationState {
                 "authorization replay ledger contains a duplicate nonce"
             );
         }
+        let mut last_audit_revision = 0;
+        for audit in &self.security_audit {
+            ensure!(
+                audit.revision != 0
+                    && audit.revision <= self.committed_revision
+                    && audit.revision >= last_audit_revision,
+                "authorization security audit revision is invalid"
+            );
+            validate_viewer_handle(&audit.handle)?;
+            if let Some(grants) = audit.previous_grants {
+                grants.validate()?;
+            }
+            if let Some(grants) = audit.current_grants {
+                grants.validate()?;
+            }
+            last_audit_revision = audit.revision;
+        }
         Ok(())
     }
 
@@ -184,6 +373,43 @@ impl AuthorizationState {
         });
         before != self.consumed_invitations.len()
     }
+
+    fn next_revision(&self) -> Result<u64> {
+        self.committed_revision
+            .checked_add(1)
+            .context("authorization committed revision exhausted")
+    }
+
+    fn push_audit(&mut self, entry: SecurityAuditEntry) {
+        if self.security_audit.len() == MAX_SECURITY_AUDIT_ENTRIES {
+            self.security_audit.remove(0);
+        }
+        self.security_audit.push(entry);
+    }
+}
+
+fn validate_viewer_handle(handle: &str) -> Result<()> {
+    ensure!(
+        handle.len() == "viewer-".len() + VIEWER_HANDLE_RANDOM_BYTES * 2
+            && handle.starts_with("viewer-")
+            && handle["viewer-".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "authorization viewer handle is invalid"
+    );
+    Ok(())
+}
+
+fn random_viewer_handle(existing: &[Enrollment]) -> Result<String> {
+    for _ in 0..16 {
+        let mut random = [0_u8; VIEWER_HANDLE_RANDOM_BYTES];
+        getrandom::fill(&mut random).context("generating opaque viewer handle")?;
+        let handle = format!("viewer-{:016x}", u64::from_be_bytes(random));
+        if !existing.iter().any(|viewer| viewer.handle == handle) {
+            return Ok(handle);
+        }
+    }
+    anyhow::bail!("could not allocate a unique opaque viewer handle")
 }
 
 impl AuthorizationStore {
@@ -195,8 +421,12 @@ impl AuthorizationStore {
         location.ensure_state_directory()?;
         let lock = location.open_lock()?;
         location.lock_exclusive_bounded(&lock, WRITER_LOCK_TIMEOUT)?;
-        let state = location.load_state()?;
+        let (state, migrated) = location.load_state()?;
         state.validate(host)?;
+        if migrated {
+            location.write_state(&state)?;
+            location.remove_legacy_state()?;
+        }
         Ok(Self {
             location,
             writer: Arc::new(AuthorizationWriter {
@@ -249,8 +479,12 @@ impl AuthorizationStore {
             "invitation TTL must be between 1 and {MAX_INVITATION_TTL_SECS} seconds"
         );
         ensure!(
-            snapshot.peer.is_none() && snapshot.grants.is_none(),
-            "a Portal peer is already enrolled; revoke it before issuing another invitation"
+            snapshot.viewers.len() < MAX_ENROLLED_VIEWERS,
+            "authorization enrollment map is full"
+        );
+        ensure!(
+            !snapshot.viewers.iter().any(|viewer| viewer.peer == peer),
+            "Portal peer is already enrolled"
         );
         InvitationClaims::new(
             *host.as_bytes(),
@@ -265,12 +499,12 @@ impl AuthorizationStore {
         .map_err(Into::into)
     }
 
-    pub fn authorize_or_redeem(
+    pub fn authorize_or_redeem_viewer(
         &self,
         remote: EndpointId,
         invitation_token: Option<&str>,
         now: u64,
-    ) -> Result<InvitationGrants> {
+    ) -> Result<AuthorizedViewer> {
         // Admission never waits for another in-process authorization operation.
         // A concurrent redemption or durable write fails this handshake closed
         // and lets the client retry instead of growing accept-path latency.
@@ -282,19 +516,29 @@ impl AuthorizationStore {
         let result = match invitation_token {
             None => {
                 let enrollment = candidate
-                    .enrollment
-                    .as_ref()
+                    .enrollments
+                    .iter()
+                    .find(|enrollment| {
+                        enrollment.peer_node_id.parse::<EndpointId>().ok() == Some(remote)
+                    })
                     .context("Portal peer is not enrolled")?;
-                ensure!(
-                    enrollment.peer_node_id.parse::<EndpointId>()? == remote,
-                    "Portal peer is not enrolled"
-                );
-                enrollment.grants
+                AuthorizedViewer {
+                    handle: enrollment.handle.clone(),
+                    grants: enrollment.grants,
+                    authorization_revision: enrollment.authorization_revision,
+                    committed_revision: candidate.committed_revision,
+                }
             }
             Some(token) => {
                 ensure!(
-                    candidate.enrollment.is_none(),
-                    "an invitation cannot be used after enrollment"
+                    !candidate.enrollments.iter().any(|enrollment| {
+                        enrollment.peer_node_id.parse::<EndpointId>().ok() == Some(remote)
+                    }),
+                    "an invitation cannot be used after enrollment: Portal peer is already enrolled"
+                );
+                ensure!(
+                    candidate.enrollments.len() < MAX_ENROLLED_VIEWERS,
+                    "authorization enrollment map is full"
                 );
                 let invitation = SignedInvitation::decode(token)
                     .context("decoding and verifying enrollment invitation")?;
@@ -331,17 +575,35 @@ impl AuthorizationStore {
                     candidate.consumed_invitations.len() < MAX_CONSUMED_INVITATIONS,
                     "authorization replay ledger is full"
                 );
-                candidate.enrollment = Some(Enrollment {
+                let revision = candidate.next_revision()?;
+                let handle = random_viewer_handle(&candidate.enrollments)?;
+                candidate.enrollments.push(Enrollment {
                     peer_node_id: remote.to_string(),
+                    handle: handle.clone(),
                     grants: claims.grants,
                     enrolled_at_unix: now,
+                    authorization_revision: revision,
                 });
                 candidate.consumed_invitations.push(ConsumedInvitation {
                     nonce: claims.nonce,
                     expires_at_unix: claims.expires_at_unix,
                 });
+                candidate.committed_revision = revision;
+                candidate.push_audit(SecurityAuditEntry {
+                    revision,
+                    occurred_at_unix: now,
+                    action: SecurityAuditAction::Enrolled,
+                    handle: handle.clone(),
+                    previous_grants: None,
+                    current_grants: Some(claims.grants),
+                });
                 changed = true;
-                claims.grants
+                AuthorizedViewer {
+                    handle,
+                    grants: claims.grants,
+                    authorization_revision: revision,
+                    committed_revision: revision,
+                }
             }
         };
 
@@ -350,6 +612,16 @@ impl AuthorizationStore {
             *state = candidate;
         }
         Ok(result)
+    }
+
+    pub fn authorize_or_redeem(
+        &self,
+        remote: EndpointId,
+        invitation_token: Option<&str>,
+        now: u64,
+    ) -> Result<InvitationGrants> {
+        self.authorize_or_redeem_viewer(remote, invitation_token, now)
+            .map(|viewer| viewer.grants)
     }
 
     #[cfg(test)]
@@ -379,6 +651,8 @@ impl AuthorizationStore {
                         peer: None,
                         grants: None,
                         enrolled_at_unix: None,
+                        committed_revision: 1,
+                        viewers: Vec::new(),
                     },
                     storage_present: false,
                 });
@@ -405,7 +679,7 @@ impl AuthorizationStore {
             );
         }
 
-        let path = location.state_path();
+        let mut path = location.state_path();
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -413,15 +687,26 @@ impl AuthorizationStore {
         let mut file = match options.open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(AuthorizationInspection {
-                    snapshot: AuthorizationSnapshot {
-                        epoch: 1,
-                        peer: None,
-                        grants: None,
-                        enrolled_at_unix: None,
-                    },
-                    storage_present: false,
-                });
+                path = location.legacy_state_path();
+                match options.open(&path) {
+                    Ok(file) => file,
+                    Err(legacy_error) if legacy_error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(AuthorizationInspection {
+                            snapshot: AuthorizationSnapshot {
+                                epoch: 1,
+                                peer: None,
+                                grants: None,
+                                enrolled_at_unix: None,
+                                committed_revision: 1,
+                                viewers: Vec::new(),
+                            },
+                            storage_present: false,
+                        });
+                    }
+                    Err(legacy_error) => {
+                        return Err(legacy_error).context("opening legacy authorization state");
+                    }
+                }
             }
             Err(error) => return Err(error).context("opening authorization state"),
         };
@@ -440,8 +725,13 @@ impl AuthorizationStore {
             "authorization state exceeds its fixed size bound"
         );
         ensure!(!bytes.is_empty(), "authorization state is empty");
-        let state: AuthorizationState =
-            serde_json::from_slice(&bytes).context("parsing authorization state")?;
+        let state: AuthorizationState = if path == location.state_path() {
+            serde_json::from_slice(&bytes).context("parsing authorization state")?
+        } else {
+            let legacy: LegacyAuthorizationState =
+                serde_json::from_slice(&bytes).context("parsing legacy authorization state")?;
+            AuthorizationState::from_legacy(legacy, host)?
+        };
         state.validate(host)?;
         let snapshot = AuthorizationSnapshot::from_state(&state)?;
         Ok(AuthorizationInspection {
@@ -455,18 +745,130 @@ impl AuthorizationStore {
         state.validate(self.location.host)?;
         let mut candidate = state.clone();
         let previous_epoch = candidate.enrollment_epoch;
-        let had_enrollment = candidate.enrollment.take().is_some();
+        let had_enrollment = !candidate.enrollments.is_empty();
+        let removed = std::mem::take(&mut candidate.enrollments);
         candidate.enrollment_epoch = candidate
             .enrollment_epoch
             .checked_add(1)
             .context("authorization epoch exhausted")?;
         candidate.prune_expired(now);
+        candidate.committed_revision = candidate.next_revision()?;
+        for enrollment in removed {
+            candidate.push_audit(SecurityAuditEntry {
+                revision: candidate.committed_revision,
+                occurred_at_unix: now,
+                action: SecurityAuditAction::ResetAll,
+                handle: enrollment.handle,
+                previous_grants: Some(enrollment.grants),
+                current_grants: None,
+            });
+        }
         self.location.write_state(&candidate)?;
         *state = candidate;
         Ok(RevocationOutcome {
             had_enrollment,
             previous_epoch,
             current_epoch: state.enrollment_epoch,
+        })
+    }
+
+    pub fn list_viewers(&self) -> Result<AuthorizationSnapshot> {
+        let state = self.lock_state()?;
+        state.validate(self.location.host)?;
+        AuthorizationSnapshot::from_state(&state)
+    }
+
+    pub fn revoke_viewer(&self, handle: &str, now: u64) -> Result<AuthorizationMutation> {
+        validate_viewer_handle(handle)?;
+        let mut state = self.lock_state()?;
+        state.validate(self.location.host)?;
+        let mut candidate = state.clone();
+        let index = candidate
+            .enrollments
+            .iter()
+            .position(|viewer| viewer.handle == handle)
+            .context("viewer handle is not enrolled")?;
+        let removed = candidate.enrollments.remove(index);
+        let revision = candidate.next_revision()?;
+        candidate.committed_revision = revision;
+        candidate.prune_expired(now);
+        candidate.push_audit(SecurityAuditEntry {
+            revision,
+            occurred_at_unix: now,
+            action: SecurityAuditAction::Revoked,
+            handle: removed.handle.clone(),
+            previous_grants: Some(removed.grants),
+            current_grants: None,
+        });
+        self.location.write_state(&candidate)?;
+        *state = candidate;
+        Ok(AuthorizationMutation {
+            handle: removed.handle,
+            peer: removed.peer_node_id.parse()?,
+            previous_grants: removed.grants,
+            current_grants: None,
+            authorization_revision: revision,
+            committed_revision: revision,
+        })
+    }
+
+    pub fn replace_viewer_grants(
+        &self,
+        handle: &str,
+        grants: Option<InvitationGrants>,
+        now: u64,
+    ) -> Result<AuthorizationMutation> {
+        validate_viewer_handle(handle)?;
+        if let Some(grants) = grants {
+            grants.validate()?;
+            ensure!(
+                grants.contains(InvitationGrants::VIEW),
+                "a persisted viewer grant must include view permission"
+            );
+        }
+        let mut state = self.lock_state()?;
+        state.validate(self.location.host)?;
+        let mut candidate = state.clone();
+        let index = candidate
+            .enrollments
+            .iter()
+            .position(|viewer| viewer.handle == handle)
+            .context("viewer handle is not enrolled")?;
+        let previous = candidate.enrollments[index].clone();
+        ensure!(
+            grants != Some(previous.grants),
+            "viewer already has the requested grants"
+        );
+        let revision = candidate.next_revision()?;
+        if let Some(grants) = grants {
+            candidate.enrollments[index].grants = grants;
+            candidate.enrollments[index].authorization_revision = revision;
+        } else {
+            candidate.enrollments.remove(index);
+        }
+        candidate.committed_revision = revision;
+        candidate.prune_expired(now);
+        candidate.push_audit(SecurityAuditEntry {
+            revision,
+            occurred_at_unix: now,
+            action: if grants.is_some() {
+                SecurityAuditAction::GrantsReplaced
+            } else {
+                SecurityAuditAction::Revoked
+            },
+            handle: previous.handle.clone(),
+            previous_grants: Some(previous.grants),
+            current_grants: grants,
+        });
+        self.location.write_state(&candidate)?;
+        *state = candidate;
+        Ok(AuthorizationMutation {
+            handle: previous.handle,
+            peer: previous.peer_node_id.parse()?,
+            previous_grants: previous.grants,
+            current_grants: grants,
+            authorization_revision: revision,
+            committed_revision: revision,
         })
     }
 
@@ -486,6 +888,10 @@ impl AuthorizationStore {
 impl AuthorizationLocation {
     fn state_path(&self) -> PathBuf {
         self.state_directory.join(STATE_FILE_NAME)
+    }
+
+    fn legacy_state_path(&self) -> PathBuf {
+        self.state_directory.join(LEGACY_STATE_FILE_NAME)
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -572,8 +978,8 @@ impl AuthorizationLocation {
         Ok(())
     }
 
-    fn load_state(&self) -> Result<AuthorizationState> {
-        let path = self.state_path();
+    fn load_state(&self) -> Result<(AuthorizationState, bool)> {
+        let mut path = self.state_path();
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -581,7 +987,16 @@ impl AuthorizationLocation {
         let mut file = match options.open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(AuthorizationState::empty(self.host));
+                path = self.legacy_state_path();
+                match options.open(&path) {
+                    Ok(file) => file,
+                    Err(legacy_error) if legacy_error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok((AuthorizationState::empty(self.host), false));
+                    }
+                    Err(legacy_error) => {
+                        return Err(legacy_error).context("opening legacy authorization state");
+                    }
+                }
             }
             Err(error) => return Err(error).context("opening authorization state"),
         };
@@ -600,7 +1015,37 @@ impl AuthorizationLocation {
             "authorization state exceeds its fixed size bound"
         );
         ensure!(!bytes.is_empty(), "authorization state is empty");
-        serde_json::from_slice(&bytes).context("parsing authorization state")
+        if path == self.state_path() {
+            serde_json::from_slice(&bytes)
+                .context("parsing authorization state")
+                .map(|state| (state, false))
+        } else {
+            let legacy: LegacyAuthorizationState =
+                serde_json::from_slice(&bytes).context("parsing legacy authorization state")?;
+            Ok((AuthorizationState::from_legacy(legacy, self.host)?, true))
+        }
+    }
+
+    fn remove_legacy_state(&self) -> Result<()> {
+        let path = self.legacy_state_path();
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file() && !metadata.file_type().is_symlink(),
+                    "legacy authorization state is not a regular file"
+                );
+                #[cfg(unix)]
+                ensure!(
+                    metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
+                    "legacy authorization state has unsafe ownership or permissions"
+                );
+                fs::remove_file(&path)?;
+                File::open(&self.state_directory)?.sync_all()?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("inspecting legacy authorization state"),
+        }
     }
 
     fn write_state(&self, state: &AuthorizationState) -> Result<()> {
@@ -664,22 +1109,39 @@ impl AuthorizationLocation {
 }
 
 impl AuthorizationPolicy {
+    pub fn authorize_or_redeem_viewer(
+        &self,
+        remote: EndpointId,
+        invitation_token: Option<&str>,
+        now: u64,
+    ) -> Result<AuthorizedViewer> {
+        match self {
+            Self::Required(store) => {
+                store.authorize_or_redeem_viewer(remote, invitation_token, now)
+            }
+            Self::TestPatternProof | Self::DevelopmentBypass => {
+                ensure!(
+                    invitation_token.is_none(),
+                    "unrestricted development modes do not accept invitations"
+                );
+                Ok(AuthorizedViewer {
+                    handle: "viewer-0000000000000000".to_owned(),
+                    grants: InvitationGrants::ALL,
+                    authorization_revision: 1,
+                    committed_revision: 1,
+                })
+            }
+        }
+    }
+
     pub fn authorize_or_redeem(
         &self,
         remote: EndpointId,
         invitation_token: Option<&str>,
         now: u64,
     ) -> Result<InvitationGrants> {
-        match self {
-            Self::Required(store) => store.authorize_or_redeem(remote, invitation_token, now),
-            Self::TestPatternProof | Self::DevelopmentBypass => {
-                ensure!(
-                    invitation_token.is_none(),
-                    "unrestricted development modes do not accept invitations"
-                );
-                Ok(InvitationGrants::ALL)
-            }
-        }
+        self.authorize_or_redeem_viewer(remote, invitation_token, now)
+            .map(|viewer| viewer.grants)
     }
 }
 
@@ -770,6 +1232,92 @@ mod tests {
                 .unwrap(),
             grants
         );
+    }
+
+    #[test]
+    fn multiple_peers_enroll_with_unique_stable_handles() {
+        let (_directory, host, first_peer, store) = store();
+        let second_peer = SecretKey::from_bytes(&[19; 32]);
+        let first_token = token(
+            &store,
+            &host,
+            first_peer.public(),
+            1_000,
+            [21; 32],
+            InvitationGrants::ALL,
+        );
+        let first = store
+            .authorize_or_redeem_viewer(first_peer.public(), Some(&first_token), 1_001)
+            .unwrap();
+        let second_token = token(
+            &store,
+            &host,
+            second_peer.public(),
+            1_002,
+            [22; 32],
+            InvitationGrants::VIEW,
+        );
+        let second = store
+            .authorize_or_redeem_viewer(second_peer.public(), Some(&second_token), 1_003)
+            .unwrap();
+
+        assert_ne!(first.handle, second.handle);
+        validate_viewer_handle(&first.handle).unwrap();
+        validate_viewer_handle(&second.handle).unwrap();
+        assert!(second.committed_revision > first.committed_revision);
+        let snapshot = store.list_viewers().unwrap();
+        assert_eq!(snapshot.viewers.len(), 2);
+        assert_eq!(
+            store
+                .authorize_or_redeem_viewer(first_peer.public(), None, 1_004)
+                .unwrap()
+                .handle,
+            first.handle
+        );
+    }
+
+    #[test]
+    fn sole_writer_atomically_converts_v1_and_never_prefers_it_over_v2() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let host = SecretKey::from_bytes(&[27; 32]);
+        let peer = SecretKey::from_bytes(&[28; 32]);
+        let legacy = serde_json::json!({
+            "version": 1,
+            "host_node_id": host.public().to_string(),
+            "enrollment_epoch": 4,
+            "enrollment": {
+                "peer_node_id": peer.public().to_string(),
+                "grants": InvitationGrants::ALL.bits(),
+                "enrolled_at_unix": 1234
+            },
+            "consumed_invitations": [{
+                "nonce": vec![31_u8; 32],
+                "expires_at_unix": 2000
+            }]
+        });
+        let legacy_path = directory.path().join(LEGACY_STATE_FILE_NAME);
+        fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&legacy_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let store = AuthorizationStore::open(directory.path(), host.public()).unwrap();
+        let snapshot = store.list_viewers().unwrap();
+        assert_eq!(snapshot.epoch, 4);
+        assert_eq!(snapshot.viewers.len(), 1);
+        assert_eq!(snapshot.viewers[0].peer, peer.public());
+        assert!(directory.path().join(STATE_FILE_NAME).is_file());
+        assert!(!legacy_path.exists());
+
+        // A stale legacy file appearing after conversion is ignored; v2 is the
+        // only authority once its atomic replacement is present.
+        fs::write(&legacy_path, b"{not valid json").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&legacy_path, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(store);
+        let reopened = AuthorizationStore::open(directory.path(), host.public()).unwrap();
+        assert_eq!(reopened.list_viewers().unwrap().viewers.len(), 1);
     }
 
     #[test]

@@ -23,8 +23,9 @@ The public document includes only:
 
 - Sigil version and overall `ready`, `active`, `degraded`, or `unavailable`
   state.
-- Redacted host and enrolled-Portal fingerprints.
-- Canonically ordered enrollment grants, epoch, and enrollment time.
+- Redacted host fingerprint plus bounded enrollment count.
+- Stable opaque viewer handles, canonically ordered coarse grants, enrollment
+  times, per-viewer authorization revisions, and the global committed revision.
 - Runtime freshness, daemon state, uptime, session state, and a closed set of
   error codes.
 - The exact loaded configuration revision, fresh daemon instance ID, and sticky
@@ -34,6 +35,13 @@ The public document includes only:
 It never includes complete endpoint IDs, invitation material, replay-ledger
 entries, session nonces, addresses, PipeWire object names, filesystem paths, or
 free-form error text.
+
+Authorization status is read from the strict v2 document without taking the
+daemon's writer lease. Schema v2 reports the bounded viewer list and committed
+revision. Schema v1 removes those new fields and retains its original
+single-enrollment projection for compatibility. A valid development v1
+document can be inspected before migration, but only a sole writer converts it;
+once v2 exists, stale v1 bytes are ignored.
 
 ## Runtime authority
 

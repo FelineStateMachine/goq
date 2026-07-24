@@ -207,6 +207,17 @@ struct EnrollmentStatus {
     grants: Vec<&'static str>,
     epoch: u64,
     enrolled_at_unix: Option<u64>,
+    enrollment_count: usize,
+    authorization_revision: u64,
+    viewers: Vec<EnrollmentViewerStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct EnrollmentViewerStatus {
+    handle: String,
+    grants: Vec<&'static str>,
+    enrolled_at_unix: u64,
+    authorization_revision: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -533,6 +544,12 @@ pub fn status_json(status: &ApplianceStatusV2, schema_version: u16) -> Result<se
             runtime.remove("instance_id");
             runtime.remove("loaded_config_revision");
             runtime.remove("reached_ready");
+            let enrollment = value["enrollment"]
+                .as_object_mut()
+                .context("appliance enrollment status is not an object")?;
+            enrollment.remove("enrollment_count");
+            enrollment.remove("authorization_revision");
+            enrollment.remove("viewers");
         }
         2 => {}
         _ => anyhow::bail!("unsupported appliance status schema"),
@@ -586,7 +603,22 @@ fn assemble_status(
 ) -> ApplianceStatusV2 {
     let snapshot = authorization.snapshot;
     let grants = snapshot.grants.map(grant_list).unwrap_or_default();
-    let enrollment_active = snapshot.peer.is_some();
+    let enrollment_active = !snapshot.viewers.is_empty() || snapshot.peer.is_some();
+    let enrollment_count = if snapshot.viewers.is_empty() {
+        usize::from(snapshot.peer.is_some())
+    } else {
+        snapshot.viewers.len()
+    };
+    let viewers = snapshot
+        .viewers
+        .iter()
+        .map(|viewer| EnrollmentViewerStatus {
+            handle: viewer.handle.clone(),
+            grants: grant_list(viewer.grants),
+            enrolled_at_unix: viewer.enrolled_at_unix,
+            authorization_revision: viewer.authorization_revision,
+        })
+        .collect();
     let overall = match (runtime.daemon, runtime.session) {
         (DaemonState::Ready, SessionState::Active) => OverallState::Active,
         (DaemonState::Ready, _) => OverallState::Ready,
@@ -617,6 +649,9 @@ fn assemble_status(
             grants,
             epoch: snapshot.epoch,
             enrolled_at_unix: snapshot.enrolled_at_unix,
+            enrollment_count,
+            authorization_revision: snapshot.committed_revision,
+            viewers,
         },
         runtime,
     }
@@ -1212,6 +1247,8 @@ mod tests {
                     peer: Some(peer),
                     grants: Some(InvitationGrants::ALL),
                     enrolled_at_unix: Some(123),
+                    committed_revision: 1,
+                    viewers: Vec::new(),
                 },
                 storage_present: true,
             },
@@ -1249,6 +1286,8 @@ mod tests {
                     peer: None,
                     grants: None,
                     enrolled_at_unix: None,
+                    committed_revision: 1,
+                    viewers: Vec::new(),
                 },
                 storage_present: false,
             },

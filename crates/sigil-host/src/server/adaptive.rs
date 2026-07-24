@@ -1158,6 +1158,7 @@ pub(super) async fn serve_media_feedback(
     info!(
         %remote,
         session_id = lease.session_id,
+        authorization_revision = lease.authorization_revision,
         ceiling_kbps,
         applied = false,
         mode = if encoder_actuation_available { "active" } else { "shadow" },

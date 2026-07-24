@@ -445,22 +445,22 @@ pub(super) async fn serve_control_moq_v2(
     );
     debug!(%remote, agent = %hello.agent, "MoQ control v2 hello received");
 
-    let grants = match authorization.authorize_or_redeem(
+    let authorized = match authorization.authorize_or_redeem_viewer(
         remote,
         hello.invitation.as_deref(),
         unix_timestamp_now()?,
     ) {
-        Ok(grants) => grants,
+        Ok(authorized) => authorized,
         Err(error) => {
             send_rejection_v2(&mut send, "Portal peer is not authorized").await?;
             return Err(error.context("authorizing MoQ control v2 peer"));
         }
     };
     ensure!(
-        grants.contains(InvitationGrants::VIEW),
+        authorized.grants.contains(InvitationGrants::VIEW),
         "authorized MoQ control v2 peer lacks view permission"
     );
-    let lease = match sessions.claim_v2(remote, hello.nonce, grants) {
+    let lease = match sessions.claim_v2_authorized(remote, hello.nonce, authorized) {
         Ok(lease) => lease,
         Err(error) => {
             send_rejection_v2(&mut send, "host already has an active client").await?;
@@ -518,7 +518,7 @@ pub(super) async fn serve_control_moq_v2(
             lease.session_id,
             *remote.as_bytes(),
             SubscriptionTracks::VIDEO_H264,
-            1,
+            lease.authorization_revision,
             issued_at_unix,
             issued_at_unix.saturating_add(15 * 60),
             subscription_nonce,
@@ -560,6 +560,8 @@ pub(super) async fn serve_control_moq_v2(
     info!(
         %remote,
         session_id = lease.session_id,
+        authorization_revision = lease.authorization_revision,
+        authorization_committed_revision = lease.authorization_committed_revision,
         %broadcast_name,
         "MoQ control v2 client accepted; awaiting authorized media attachment"
     );
@@ -723,6 +725,7 @@ async fn run_control_moq_session(
         None => MoqGroupPublisher::new(track),
     };
     let (control_sender, mut control_requests) = tokio::sync::watch::channel(None);
+    let terminate_when_control_ends = matches!(&control_reader, MoqControlReader::V2 { .. });
     let mut control_task = match control_reader {
         MoqControlReader::V1(control_recv) => tokio::spawn(forward_media_v3_control_requests(
             control_recv,
@@ -757,6 +760,9 @@ async fn run_control_moq_session(
                     match control_result {
                         Ok(Ok(())) => {
                             debug!(%remote, "MoQ keyframe-control stream closed");
+                            if terminate_when_control_ends {
+                                return Ok(());
+                            }
                         }
                         Ok(Err(error)) => {
                             return Err(error).context("reading MoQ keyframe-control stream");

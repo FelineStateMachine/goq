@@ -599,6 +599,10 @@ pub(super) struct GenerationAdaptiveCoordinator {
     state: Mutex<GenerationAggregateState>,
     changed: tokio::sync::Notify,
     recovering_viewers: Arc<AtomicUsize>,
+    // Detaching is an action. In shadow mode the controller computes a lower
+    // bitrate and never applies it, so a pressured viewer cannot recover and
+    // would be detached for failing to do something it was never allowed to do.
+    encoder_actuation_available: bool,
 }
 
 impl std::fmt::Debug for GenerationAdaptiveCoordinator {
@@ -657,6 +661,8 @@ impl GenerationAdaptiveCoordinator {
         recovering_viewers: Arc<AtomicUsize>,
     ) -> Result<(Arc<Self>, tokio::task::JoinHandle<Result<()>>)> {
         let ceiling_kbps = adaptive_bitrate_ceiling_kbps(&config)?;
+        let encoder_actuation_available =
+            encoder_actuation_available(&config, encoder_control.as_ref());
         let coordinator = Arc::new(Self {
             generation_id,
             ceiling_kbps,
@@ -667,6 +673,7 @@ impl GenerationAdaptiveCoordinator {
             }),
             changed: tokio::sync::Notify::new(),
             recovering_viewers,
+            encoder_actuation_available,
         });
         let task_coordinator = Arc::clone(&coordinator);
         let task = tokio::spawn(async move {
@@ -849,7 +856,16 @@ impl GenerationAdaptiveCoordinator {
             match contributor.recovery.observe(&evaluation, now) {
                 RecoveryMutation::RequestRecovery => request_recovery = true,
                 RecoveryMutation::Detach => {
-                    contributor.detach.send_replace(true);
+                    if self.encoder_actuation_available {
+                        contributor.detach.send_replace(true);
+                    } else {
+                        warn!(
+                            generation_id = self.generation_id,
+                            "viewer stayed below the bitrate floor, but shadow mode never applied \
+                             a reduction; keeping it attached instead of detaching it for failing \
+                             to recover"
+                        );
+                    }
                 }
                 RecoveryMutation::None | RecoveryMutation::Recovered => {}
             }
@@ -1913,7 +1929,7 @@ pub(super) async fn serve_media_feedback(
         }
     };
     let encoder_actuation_available =
-        adaptive_bitrate_actuation_enabled(config) && lease.encoder_control.is_some();
+        encoder_actuation_available(config, lease.encoder_control.as_ref());
     // Shadow mode computes every decision and applies none. Say why, or a host
     // silently never adapts and nothing in the logs explains it.
     if !encoder_actuation_available {
@@ -2504,6 +2520,17 @@ fn adaptive_bitrate_ceiling_kbps(config: &HostConfig) -> Result<u32> {
     Ok(ceiling)
 }
 
+/// Whether adaptive decisions can actually be applied to the encoder. When this
+/// is false the controller runs in shadow: it computes every decision and
+/// applies none, so a pressured viewer has no path back and must not be
+/// detached for failing to take it.
+fn encoder_actuation_available(
+    config: &HostConfig,
+    encoder_control: Option<&EncoderControl>,
+) -> bool {
+    adaptive_bitrate_actuation_enabled(config) && encoder_control.is_some()
+}
+
 fn adaptive_bitrate_actuation_enabled(config: &HostConfig) -> bool {
     config.source == VideoSource::GamescopePipewire
         && config.gamescope_pipewire.as_ref().is_some_and(|gamescope| {
@@ -2752,6 +2779,36 @@ mod tests {
                 .contains(AdaptiveBitrateReasonFlagsV1::RTT_INFLATION)
         );
         assert_eq!(evaluation.pressure_severity, FeedbackSeverity::Clean);
+    }
+
+    // Regression: the shipped activation guide writes
+    // encoder_backend = "external-gst-launch", which puts adaptive in shadow.
+    // Detaching is an action, so shadow mode must not reach for it: the viewer
+    // is below floor precisely because no reduction was ever applied.
+    #[test]
+    fn shadow_mode_never_gains_permission_to_detach_a_viewer() {
+        let external = gamescope_feedback_test_config(VaapiRateControl::Cbr);
+        assert_eq!(
+            external
+                .gamescope_pipewire
+                .as_ref()
+                .unwrap()
+                .encoder_backend,
+            GamescopeEncoderBackend::ExternalGstLaunch,
+            "the activation guide's backend is the one that selects shadow mode"
+        );
+        assert!(!adaptive_bitrate_actuation_enabled(&external));
+        assert!(!encoder_actuation_available(&external, None));
+
+        let mut in_process = external.clone();
+        in_process
+            .gamescope_pipewire
+            .as_mut()
+            .unwrap()
+            .encoder_backend = GamescopeEncoderBackend::InProcessGstreamer;
+        assert!(adaptive_bitrate_actuation_enabled(&in_process));
+        // Still shadow without a live encoder handle: nothing to actuate.
+        assert!(!encoder_actuation_available(&in_process, None));
     }
 
     #[test]

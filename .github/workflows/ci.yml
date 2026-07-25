@@ -12,7 +12,409 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The complete demo gate used to be one serial 30-minute job. It is now the
+# same set of checks split into parallel legs that each restore a Cargo cache,
+# with `demo-gate` as the single required status check: it fails unless every
+# leg either succeeded or was a leg the audited docs-only scope may skip.
+#
+# Caches are restored everywhere but written only on a push to main. A cache
+# entry is scoped to the branch that wrote it, so saving on pull requests gave
+# every open pull request its own ~9GB set and the repository blew through the
+# 10GB ceiling, evicting the entries the legs depend on. Pull requests read
+# main's entries through restore-keys instead, so the repository holds one set.
+#
+# scripts/verify_ci_cross_build_policy.py enforces that structure, and
+# scripts/tests/demo-gate-stages.sh proves the legs still spend every check the
+# single job used to run. Adding a leg means adding it to `demo-gate.needs`;
+# the policy checker fails the build if you forget.
 jobs:
+  scope:
+    name: Change scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - name: Classify the change scope
+        id: classify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          PULL_NUMBER: ${{ github.event.number }}
+        run: |
+          # Fail closed. Only a pull request whose every changed path is
+          # documentation may skip the compile-heavy legs, and the lint and
+          # repository-test legs run unconditionally either way, so the
+          # website, docs, and README claim contracts keep their coverage.
+          if [[ "$EVENT_NAME" != 'pull_request' ]]; then
+            printf 'code=true\n' >>"$GITHUB_OUTPUT"
+            echo 'scope=full (event is not a pull request)'
+            exit 0
+          fi
+          if ! changed="$(gh api --paginate \
+            "repos/$REPOSITORY/pulls/$PULL_NUMBER/files" \
+            --jq '.[].filename')"; then
+            printf 'code=true\n' >>"$GITHUB_OUTPUT"
+            echo 'scope=full (could not enumerate the pull request diff)'
+            exit 0
+          fi
+          if [[ -z "$changed" ]]; then
+            printf 'code=true\n' >>"$GITHUB_OUTPUT"
+            echo 'scope=full (empty diff listing)'
+            exit 0
+          fi
+          code=false
+          while IFS= read -r changed_path; do
+            [[ -n "$changed_path" ]] || continue
+            case "$changed_path" in
+              docs/* | website/* | *.md | LICENSE) ;;
+              *)
+                code=true
+                printf 'code_path=%s\n' "$changed_path"
+                ;;
+            esac
+          done <<<"$changed"
+          printf 'code=%s\n' "$code" >>"$GITHUB_OUTPUT"
+          if [[ "$code" == true ]]; then
+            echo 'scope=full'
+          else
+            echo 'scope=docs-only'
+          fi
+
+  quick-checks:
+    name: Format, syntax, and lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Install Linux build dependencies
+        run: ./scripts/install-linux-build-deps.sh --profile lint
+
+      - name: Run the quick gate stage
+        run: ./scripts/verify-demo-build.sh --stage quick
+
+  repo-tests:
+    name: Repository and packaging tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Install Linux build dependencies
+        run: ./scripts/install-linux-build-deps.sh --profile full
+
+      - name: Restore the Cargo build cache
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-repo-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-repo-tests-${{ runner.os }}-
+
+      - name: Run the repository test stage
+        run: ./scripts/verify-demo-build.sh --stage repo-tests
+
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-repo-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+  native-tests:
+    name: Workspace tests and Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: scope
+    if: needs.scope.outputs.code == 'true'
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Install Linux build dependencies
+        run: ./scripts/install-linux-build-deps.sh --profile full
+
+      - name: Restore the Cargo build cache
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-native-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-native-${{ runner.os }}-
+
+      - name: Run the native gate stage
+        run: ./scripts/verify-demo-build.sh --stage native
+
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-native-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+  cross-build:
+    name: Linux glibc cross build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: scope
+    if: needs.scope.outputs.code == 'true'
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Install Linux build dependencies
+        run: ./scripts/install-linux-build-deps.sh --profile full
+
+      # A megabyte, and worth writing from every branch so a pull request never
+      # pays the cargo-zigbuild compile.
+      - name: Restore pinned cargo-zigbuild
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.0
+
+      - name: Restore the Cargo build cache
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-cross-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-cross-${{ runner.os }}-
+
+      - name: Install pinned cross-build tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig-venv"
+          printf '%s\n' \
+            'ziglang==0.16.0 --hash=sha256:9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b' \
+            | "$RUNNER_TEMP/zig-venv/bin/pip" install \
+                --disable-pip-version-check \
+                --only-binary=:all: \
+                --require-hashes \
+                --requirement /dev/stdin
+          install -d "$RUNNER_TEMP/ci-bin"
+          # Expand runner paths when the generated wrapper executes.
+          # shellcheck disable=SC2016
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'exec "$RUNNER_TEMP/zig-venv/bin/python" -m ziglang "$@"' \
+            >"$RUNNER_TEMP/ci-bin/zig"
+          chmod 0755 "$RUNNER_TEMP/ci-bin/zig"
+          echo "$RUNNER_TEMP/ci-bin" >>"$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/ci-bin:$PATH"
+          if ! cargo-zigbuild --version 2>/dev/null \
+            | grep -Fxq 'cargo-zigbuild 0.23.0'; then
+            cargo install cargo-zigbuild --locked --version 0.23.0
+          fi
+          test "$(zig version)" = 0.16.0
+          test "$(cargo-zigbuild --version)" = 'cargo-zigbuild 0.23.0'
+
+      - name: Run the Linux cross-build gate stage
+        env:
+          GOQ_VERIFY_IN_PROCESS_GSTREAMER: "1"
+          GOQ_REQUIRE_LINUX_CROSS_BUILD: "1"
+        run: ./scripts/verify-demo-build.sh --stage cross
+
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-cross-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+  gstreamer-gate:
+    name: In-process GStreamer gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: scope
+    if: needs.scope.outputs.code == 'true'
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Install Linux build dependencies
+        run: ./scripts/install-linux-build-deps.sh --profile full
+
+      - name: Restore the Cargo build cache
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-gstreamer-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-gstreamer-${{ runner.os }}-
+
+      - name: Run the in-process GStreamer gate stage
+        env:
+          GOQ_VERIFY_IN_PROCESS_GSTREAMER: "1"
+        run: ./scripts/verify-demo-build.sh --stage gstreamer
+
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-gstreamer-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+  loopback:
+    name: Loopback proof ${{ matrix.case }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: scope
+    if: needs.scope.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      # Cases 1-3 are all debug-profile builds of the same binaries, so they
+      # share one cache entry instead of storing three near-identical copies.
+      # One designated case per entry writes it, which also means no two
+      # concurrent matrix legs race to reserve the same key.
+      matrix:
+        include:
+          - case: 1
+            cache: debug
+            save: "true"
+          - case: 2
+            cache: debug
+            save: "false"
+          - case: 3
+            cache: debug
+            save: "false"
+          - case: 4
+            cache: release
+            save: "true"
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Install Linux build dependencies
+        run: ./scripts/install-linux-build-deps.sh --profile full
+
+      - name: Restore the Cargo build cache
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-loopback-${{ matrix.cache }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-loopback-${{ matrix.cache }}-${{ runner.os }}-
+
+      - name: Run the loopback proof
+        run: ./scripts/verify-demo-build.sh --stage loopback --loopback-case ${{ matrix.case }}
+
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' && matrix.save == 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-loopback-${{ matrix.cache }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+  release-containment:
+    name: Release-profile bypass containment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: scope
+    if: needs.scope.outputs.code == 'true'
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Install Linux build dependencies
+        run: ./scripts/install-linux-build-deps.sh --profile full
+
+      - name: Restore the Cargo build cache
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-containment-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-containment-${{ runner.os }}-
+
+      - name: Run the release containment stage
+        run: ./scripts/verify-demo-build.sh --stage containment
+
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-containment-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
   decky-gate:
     name: Decky plugin gate
     runs-on: ubuntu-24.04
@@ -54,6 +456,8 @@ jobs:
     name: Portal ${{ matrix.target }} compile guard
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    needs: scope
+    if: needs.scope.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -86,73 +490,62 @@ jobs:
   demo-gate:
     name: Complete demo gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 5
+    # Runs even when a leg fails, because this job is what reports that
+    # failure. It never passes on its own: the step below inspects every
+    # dependency result and exits non-zero unless each one is accounted for.
+    if: always()
+    needs:
+      - scope
+      - quick-checks
+      - repo-tests
+      - native-tests
+      - cross-build
+      - gstreamer-gate
+      - loopback
+      - release-containment
+      - decky-gate
+      - portal-target-matrix
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: "1"
     steps:
-      - name: Check out repository
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            build-essential \
-            file \
-            ffmpeg \
-            gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-bad \
-            gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-ugly \
-            gstreamer1.0-tools \
-            libayatana-appindicator3-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libgstreamer1.0-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libudev-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            pkg-config \
-            python3-venv \
-            shellcheck
-
-      - name: Restore pinned cargo-zigbuild
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
-        with:
-          path: ~/.cargo/bin/cargo-zigbuild
-          key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.0
-
-      - name: Install pinned cross-build tools
-        run: |
-          python3 -m venv "$RUNNER_TEMP/zig-venv"
-          printf '%s\n' \
-            'ziglang==0.16.0 --hash=sha256:9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b' \
-            | "$RUNNER_TEMP/zig-venv/bin/pip" install \
-                --disable-pip-version-check \
-                --only-binary=:all: \
-                --require-hashes \
-                --requirement /dev/stdin
-          install -d "$RUNNER_TEMP/ci-bin"
-          # Expand runner paths when the generated wrapper executes.
-          # shellcheck disable=SC2016
-          printf '%s\n' \
-            '#!/usr/bin/env bash' \
-            'exec "$RUNNER_TEMP/zig-venv/bin/python" -m ziglang "$@"' \
-            >"$RUNNER_TEMP/ci-bin/zig"
-          chmod 0755 "$RUNNER_TEMP/ci-bin/zig"
-          echo "$RUNNER_TEMP/ci-bin" >>"$GITHUB_PATH"
-          export PATH="$RUNNER_TEMP/ci-bin:$PATH"
-          if ! cargo-zigbuild --version 2>/dev/null \
-            | grep -Fxq 'cargo-zigbuild 0.23.0'; then
-            cargo install cargo-zigbuild --locked --version 0.23.0
-          fi
-          test "$(zig version)" = 0.16.0
-          test "$(cargo-zigbuild --version)" = 'cargo-zigbuild 0.23.0'
-
-      - name: Run complete demo gate
+      - name: Require every gate leg to have passed
         env:
-          GOQ_VERIFY_IN_PROCESS_GSTREAMER: "1"
-          GOQ_REQUIRE_LINUX_CROSS_BUILD: "1"
-        run: ./scripts/verify-demo-build.sh
+          LEG_RESULTS: ${{ toJSON(needs) }}
+          SCOPE_CODE: ${{ needs.scope.outputs.code }}
+        run: |
+          # A leg may only be missing when the audited docs-only scope skipped
+          # it. Every other non-success result, including cancelled, fails the
+          # required check.
+          skippable='native-tests cross-build gstreamer-gate loopback release-containment portal-target-matrix'
+          docs_only=false
+          if [[ "$SCOPE_CODE" == 'false' ]]; then
+            docs_only=true
+          fi
+          failed=false
+          while IFS=$'\t' read -r leg result; do
+            [[ -n "$leg" ]] || continue
+            case "$result" in
+              success)
+                printf 'leg_passed=%s\n' "$leg"
+                ;;
+              skipped)
+                if [[ "$docs_only" == true && " $skippable " == *" $leg "* ]]; then
+                  printf 'leg_skipped_docs_only=%s\n' "$leg"
+                else
+                  printf 'leg_must_not_be_skipped=%s\n' "$leg"
+                  failed=true
+                fi
+                ;;
+              *)
+                printf 'leg_failed=%s result=%s\n' "$leg" "$result"
+                failed=true
+                ;;
+            esac
+          done < <(jq -r 'to_entries[] | "\(.key)\t\(.value.result)"' <<<"$LEG_RESULTS")
+          if [[ "$failed" == true ]]; then
+            echo 'complete demo gate failed' >&2
+            exit 1
+          fi
+          echo 'complete_demo_gate=ok'

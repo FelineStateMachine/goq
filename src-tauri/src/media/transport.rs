@@ -22,6 +22,7 @@ pub(crate) struct NegotiatedV2Stream {
     pub(crate) pointer_surface_dimensions: Option<PointerSurfaceDimensions>,
     pub(crate) initial_snapshot: SessionSnapshotV2,
     pub(crate) media_subscription_capability: String,
+    pub(crate) media_authorization_revision: u64,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -177,6 +178,9 @@ async fn negotiate_v2(
         media_subscription_capability: response
             .media_subscription_capability
             .ok_or_else(|| "Host omitted control v2 media subscription capability".to_string())?,
+        media_authorization_revision: response
+            .media_authorization_revision
+            .ok_or_else(|| "Host omitted control v2 media authorization revision".to_string())?,
     })
 }
 

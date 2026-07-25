@@ -804,6 +804,7 @@ pub(super) async fn serve_control_moq_v2(
         broadcast_name.clone(),
         shared.consumer()?,
         subscription_capability,
+        shared.certificate.claims.host_node_id,
     )?;
 
     let mut supported = vec![Capability::VideoH264];
@@ -816,7 +817,7 @@ pub(super) async fn serve_control_moq_v2(
         .filter(|capability| hello.capabilities.contains(capability))
         .collect();
     let mut control_hello = HostHelloV2::accepted(lease.session_id, negotiated, initial_snapshot)
-        .with_media_subscription_capability(subscription_token);
+        .with_media_subscription_capability(subscription_token, lease.authorization_revision);
     if let Some(dimensions) = shared.pointer_surface_dimensions {
         control_hello = control_hello.with_pointer_surface_dimensions(dimensions);
     }

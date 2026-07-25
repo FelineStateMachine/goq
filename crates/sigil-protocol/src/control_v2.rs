@@ -564,6 +564,11 @@ pub struct HostHelloV2 {
     pub snapshot: Option<SessionSnapshotV2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_subscription_capability: Option<String>,
+    /// Authorization epoch the subscription capability was minted against.
+    /// A client cannot know its own enrollment revision, so the host states it
+    /// here and `validate` refuses a hello whose capability disagrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_authorization_revision: Option<u64>,
 }
 
 impl HostHelloV2 {
@@ -581,6 +586,7 @@ impl HostHelloV2 {
             pointer_surface_dimensions: None,
             snapshot: Some(snapshot),
             media_subscription_capability: None,
+            media_authorization_revision: None,
         }
     }
 
@@ -594,6 +600,7 @@ impl HostHelloV2 {
             pointer_surface_dimensions: None,
             snapshot: None,
             media_subscription_capability: None,
+            media_authorization_revision: None,
         }
     }
 
@@ -602,8 +609,13 @@ impl HostHelloV2 {
         self
     }
 
-    pub fn with_media_subscription_capability(mut self, capability: impl Into<String>) -> Self {
+    pub fn with_media_subscription_capability(
+        mut self,
+        capability: impl Into<String>,
+        authorization_revision: u64,
+    ) -> Self {
         self.media_subscription_capability = Some(capability.into());
+        self.media_authorization_revision = Some(authorization_revision);
         self
     }
 
@@ -635,18 +647,39 @@ impl HostHelloV2 {
                     "snapshot session does not match host hello",
                 );
             }
-            if let Some(capability) = &self.media_subscription_capability {
-                let capability = SignedSubscriptionCapability::decode(capability)?;
-                if capability.claims.media_generation_id != snapshot.media.generation_id {
+            match (
+                &self.media_subscription_capability,
+                self.media_authorization_revision,
+            ) {
+                (Some(capability), Some(authorization_revision)) => {
+                    let capability = SignedSubscriptionCapability::decode(capability)?;
+                    if capability.claims.media_generation_id != snapshot.media.generation_id {
+                        return invalid(
+                            "host hello v2",
+                            "subscription capability generation does not match the snapshot",
+                        );
+                    }
+                    if authorization_revision == 0
+                        || capability.claims.authorization_revision != authorization_revision
+                    {
+                        return invalid(
+                            "host hello v2",
+                            "subscription capability revision does not match the advertised authorization revision",
+                        );
+                    }
+                }
+                (None, None) => {}
+                _ => {
                     return invalid(
                         "host hello v2",
-                        "subscription capability generation does not match the snapshot",
+                        "a subscription capability and its authorization revision must be advertised together",
                     );
                 }
             }
         } else if self.session_id.is_some()
             || self.snapshot.is_some()
             || self.media_subscription_capability.is_some()
+            || self.media_authorization_revision.is_some()
             || self.message.as_ref().is_none_or(|message| {
                 message.is_empty() || message.len() > MAX_REJECTION_MESSAGE_LEN
             })
@@ -780,6 +813,74 @@ mod tests {
         duplicate.viewers.push(duplicate.viewers[0].clone());
         assert!(duplicate.validate().is_err());
         assert!(serde_json::from_str::<ControllerSlot>("1").is_err());
+    }
+
+    fn test_capability(
+        host: &ed25519_dalek::SigningKey,
+        generation_id: u64,
+        authorization_revision: u64,
+    ) -> String {
+        let subscriber = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
+        crate::SignedSubscriptionCapability::issue(
+            crate::SubscriptionClaims::new(
+                host.verifying_key().to_bytes(),
+                generation_id,
+                subscriber.verifying_key().to_bytes(),
+                crate::SubscriptionTracks::VIDEO_H264,
+                authorization_revision,
+                1_000,
+                1_600,
+                [5; 32],
+                1,
+            )
+            .unwrap(),
+            &host.to_bytes(),
+        )
+        .unwrap()
+        .encode()
+    }
+
+    // Regression: enrolled hosts mint capabilities at the viewer's enrollment
+    // revision, which is never 1 on a real appliance. The hello must carry that
+    // revision so a client never has to guess it.
+    #[test]
+    fn accepted_hello_binds_the_capability_to_the_advertised_authorization_revision() {
+        let host = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        for revision in [1_u64, 2, 9, u64::MAX] {
+            let token = test_capability(&host, 7, revision);
+            HostHelloV2::accepted(7, vec![Capability::VideoH264], snapshot(1))
+                .with_media_subscription_capability(token.clone(), revision)
+                .validate()
+                .expect("a hello whose revision matches its capability is valid");
+
+            let mismatched = HostHelloV2::accepted(7, vec![Capability::VideoH264], snapshot(1))
+                .with_media_subscription_capability(token, revision.wrapping_add(1).max(1));
+            assert!(
+                mismatched.validate().is_err(),
+                "revision {revision} must not validate against a mismatched advertisement"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_hello_rejects_a_capability_without_its_authorization_revision() {
+        let host = ed25519_dalek::SigningKey::from_bytes(&[12; 32]);
+        let mut orphaned = HostHelloV2::accepted(7, vec![Capability::VideoH264], snapshot(1));
+        orphaned.media_subscription_capability = Some(test_capability(&host, 7, 4));
+        assert!(orphaned.validate().is_err());
+
+        let mut revision_only = HostHelloV2::accepted(7, vec![Capability::VideoH264], snapshot(1));
+        revision_only.media_authorization_revision = Some(4);
+        assert!(revision_only.validate().is_err());
+
+        let mut zero = HostHelloV2::accepted(7, vec![Capability::VideoH264], snapshot(1))
+            .with_media_subscription_capability(test_capability(&host, 7, 4), 4);
+        zero.media_authorization_revision = Some(0);
+        assert!(zero.validate().is_err());
+
+        let mut rejected = HostHelloV2::rejected("nope");
+        rejected.media_authorization_revision = Some(4);
+        assert!(rejected.validate().is_err());
     }
 
     #[test]

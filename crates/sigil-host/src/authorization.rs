@@ -1246,6 +1246,179 @@ mod tests {
         );
     }
 
+    // Regression: every automated proof runs under TestPatternProof or
+    // DevelopmentBypass, which pin `authorization_revision` to 1. A real
+    // `Required` host mints enrollment revisions starting at 2 and rising with
+    // every grant change, so any client that assumes 1 rejects its own
+    // authenticated media. Compose the exact host issuance path with the exact
+    // client verification path across several enrollments and mutations.
+    #[test]
+    fn enrolled_viewers_verify_their_capability_at_the_advertised_revision() {
+        use sigil_protocol::{
+            Capability, HostHelloV2, SignedSubscriptionCapability, SubscriptionClaims,
+            SubscriptionTracks,
+        };
+
+        let (_directory, host, first_peer, store) = store();
+        let second_peer = SecretKey::from_bytes(&[23; 32]);
+        let generation_id = 11_u64;
+        let now = 5_000_u64;
+
+        let first_token = token(
+            &store,
+            &host,
+            first_peer.public(),
+            1_000,
+            [41; 32],
+            InvitationGrants::ALL,
+        );
+        let second_token = token(
+            &store,
+            &host,
+            second_peer.public(),
+            1_002,
+            [42; 32],
+            InvitationGrants::ALL,
+        );
+        let mut admissions = vec![
+            store
+                .authorize_or_redeem_viewer(first_peer.public(), Some(&first_token), 1_001)
+                .unwrap(),
+            store
+                .authorize_or_redeem_viewer(second_peer.public(), Some(&second_token), 1_003)
+                .unwrap(),
+        ];
+        // A grant change bumps the revision again; re-admit to pick it up.
+        let handle = admissions[0].handle.clone();
+        store
+            .replace_viewer_grants(&handle, Some(InvitationGrants::VIEW), 1_004)
+            .unwrap();
+        admissions.push(
+            store
+                .authorize_or_redeem_viewer(first_peer.public(), None, 1_005)
+                .unwrap(),
+        );
+
+        // No enrolled viewer lands on revision 1, which is exactly why the
+        // client cannot assume it.
+        assert!(
+            admissions
+                .iter()
+                .all(|viewer| viewer.authorization_revision > 1),
+            "enrolled revisions must not collide with the development-bypass constant"
+        );
+
+        for (index, authorized) in admissions.iter().enumerate() {
+            let peer = if index == 1 {
+                second_peer.public()
+            } else {
+                first_peer.public()
+            };
+
+            // Host: server/moq.rs mints the capability at the lease revision
+            // and advertises that revision in the same accepted hello.
+            let capability = SignedSubscriptionCapability::issue(
+                SubscriptionClaims::new(
+                    *host.public().as_bytes(),
+                    generation_id,
+                    *peer.as_bytes(),
+                    SubscriptionTracks::VIDEO_H264,
+                    authorized.authorization_revision,
+                    now,
+                    now + 900,
+                    [u8::try_from(index + 1).unwrap(); 32],
+                    1,
+                )
+                .unwrap(),
+                &host.to_bytes(),
+            )
+            .unwrap();
+            let hello = HostHelloV2::accepted(
+                7,
+                vec![Capability::VideoH264],
+                control_v2_snapshot(generation_id),
+            )
+            .with_media_subscription_capability(
+                capability.encode(),
+                authorized.authorization_revision,
+            );
+            hello
+                .validate()
+                .expect("host hello must bind its capability to the advertised revision");
+
+            // Client: Portal and sigil-probe take the revision from the hello.
+            let advertised = hello
+                .media_authorization_revision
+                .expect("accepted hello advertises its authorization revision");
+            SignedSubscriptionCapability::decode(
+                hello
+                    .media_subscription_capability
+                    .as_deref()
+                    .expect("accepted hello carries a capability"),
+            )
+            .unwrap()
+            .verify_binding(
+                *host.public().as_bytes(),
+                generation_id,
+                *peer.as_bytes(),
+                SubscriptionTracks::VIDEO_H264,
+                advertised,
+                now + 1,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "enrolled viewer at revision {} must verify its own capability: {error}",
+                    authorized.authorization_revision
+                )
+            });
+
+            // The shipped defect, pinned: a client that assumes the
+            // development-bypass constant rejects a real enrolled viewer.
+            assert!(
+                capability
+                    .verify_binding(
+                        *host.public().as_bytes(),
+                        generation_id,
+                        *peer.as_bytes(),
+                        SubscriptionTracks::VIDEO_H264,
+                        1,
+                        now + 1,
+                    )
+                    .is_err(),
+                "a hardcoded revision must not accept an enrolled viewer's capability"
+            );
+        }
+    }
+
+    fn control_v2_snapshot(generation_id: u64) -> sigil_protocol::SessionSnapshotV2 {
+        use sigil_protocol::{
+            ControllerSlot, FocusStateV2, FocusTransitionReasonV2, MediaGenerationDescriptorV2,
+            SessionSnapshotV2, ViewerPresenceId, ViewerPresenceV2,
+        };
+        let presence = ViewerPresenceId::new("viewer-0001").unwrap();
+        SessionSnapshotV2 {
+            revision: 1,
+            self_presence_id: presence.clone(),
+            viewers: vec![ViewerPresenceV2 {
+                presence_id: presence,
+                session_id: 7,
+                input_capable: true,
+                you: true,
+            }],
+            focus: FocusStateV2::Vacant {
+                slot: ControllerSlot::ZERO,
+            },
+            focus_proposal: None,
+            self_is_focus_owner: false,
+            transition_reason: FocusTransitionReasonV2::Initial,
+            media: MediaGenerationDescriptorV2 {
+                generation_id,
+                broadcast_name: sigil_protocol::media_generation_moq_broadcast_name(generation_id)
+                    .unwrap(),
+            },
+        }
+    }
+
     #[test]
     fn multiple_peers_enroll_with_unique_stable_handles() {
         let (_directory, host, first_peer, store) = store();

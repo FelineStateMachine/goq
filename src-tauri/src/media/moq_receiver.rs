@@ -759,7 +759,7 @@ pub(crate) async fn open_upstream_moq_media(
                 generation_id,
                 *endpoint.id().as_bytes(),
                 SubscriptionTracks::VIDEO_H264,
-                1,
+                authentication.authorization_revision,
                 authentication.now_unix,
             )
             .map_err(|error| format!("Subscription capability rejected: {error}"))?;
@@ -806,6 +806,7 @@ fn record_verification_failure(counter: &Option<Arc<AtomicU64>>) {
 pub(crate) struct MoqAuthenticationExpectation {
     pub(crate) expected_host: [u8; 32],
     pub(crate) subscription_capability: String,
+    pub(crate) authorization_revision: u64,
     pub(crate) now_unix: u64,
 }
 

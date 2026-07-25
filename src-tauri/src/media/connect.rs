@@ -227,6 +227,7 @@ pub(crate) async fn connect_client(
         NegotiatedMediaStream::V2(negotiation) => Some(MoqAuthenticationExpectation {
             expected_host: *host_node_id.as_bytes(),
             subscription_capability: negotiation.media_subscription_capability.clone(),
+            authorization_revision: negotiation.media_authorization_revision,
             now_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| "System clock is before the Unix epoch".to_string())?

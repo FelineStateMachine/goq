@@ -539,6 +539,7 @@ struct MoqProbeReceiver {
 struct MoqProbeAuthentication {
     expected_host: [u8; 32],
     subscription_capability: String,
+    authorization_revision: u64,
     now_unix: u64,
 }
 
@@ -581,7 +582,7 @@ impl MoqProbeReceiver {
                     generation_id,
                     *endpoint.id().as_bytes(),
                     SubscriptionTracks::VIDEO_H264,
-                    1,
+                    authentication.authorization_revision,
                     authentication.now_unix,
                 )?;
             subscribe_authenticated_goq_video_track(
@@ -830,6 +831,9 @@ async fn run_control_v2_smoke(
     let subscription_capability = host
         .media_subscription_capability
         .context("host omitted control v2 media subscription capability")?;
+    let media_authorization_revision = host
+        .media_authorization_revision
+        .context("host omitted control v2 media authorization revision")?;
     let initial = host
         .snapshot
         .context("host omitted initial control v2 snapshot")?;
@@ -856,6 +860,7 @@ async fn run_control_v2_smoke(
         Some(MoqProbeAuthentication {
             expected_host: *address.id.as_bytes(),
             subscription_capability,
+            authorization_revision: media_authorization_revision,
             now_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .context("system clock is before the Unix epoch")?
@@ -871,6 +876,7 @@ async fn run_control_v2_smoke(
             media,
             initial,
             focus_handoffs,
+            frames,
             timeout_seconds,
         )
         .await;
@@ -954,11 +960,37 @@ async fn run_control_v2_smoke(
         }
         let mut accepted = 0_u32;
         let mut last_sequence = None;
+        // The roster at hello time is one instantaneous sample: a peer that has
+        // not finished attaching yet, or one that has already left, makes it
+        // disagree with the configured viewer count for reasons that say
+        // nothing about admission. Track the maximum across the snapshot
+        // stream, exactly as the focus participant does, so the cardinality
+        // assertion is about what the host actually admitted.
+        let mut maximum_roster_viewers = initial.viewers.len();
+        let mut roster_revision = initial.revision;
         while accepted < frames {
-            let outcome = tokio::time::timeout(Duration::from_secs(timeout_seconds), media.next())
-                .await
-                .context("timed out waiting for spectator media")??
-                .context("spectator media ended before requested frames")?;
+            let outcome = tokio::select! {
+                envelope = read_server_control_v2(&mut control_recv) => {
+                    match envelope?.context("host closed during spectator proof")? {
+                        ServerControlEnvelopeV2::Snapshot { snapshot: next } => {
+                            ensure!(
+                                next.revision >= roster_revision,
+                                "spectator snapshot revision regressed"
+                            );
+                            roster_revision = next.revision;
+                            maximum_roster_viewers =
+                                maximum_roster_viewers.max(next.viewers.len());
+                            continue;
+                        }
+                        _ => continue,
+                    }
+                }
+                outcome = tokio::time::timeout(Duration::from_secs(timeout_seconds), media.next()) => {
+                    outcome
+                        .context("timed out waiting for spectator media")??
+                        .context("spectator media ended before requested frames")?
+                }
+            };
             let MoqProbeOutcome::Frame { frame, .. } = outcome else {
                 continue;
             };
@@ -983,11 +1015,11 @@ async fn run_control_v2_smoke(
         println!("control_alpn=sigil/control/2");
         println!("media_generation_id={generation_id}");
         println!("media_broadcast_name={broadcast_name}");
-        println!("roster_viewers={}", initial.viewers.len());
+        println!("roster_viewers={maximum_roster_viewers}");
         println!("frames={accepted}");
         println!("spectator=ok");
         println!("resource_summary_version=1");
-        println!("maximum_roster_viewers={}", initial.viewers.len());
+        println!("maximum_roster_viewers={maximum_roster_viewers}");
         println!("media_progress=monotonic");
         println!("probe_media_object_capacity={MEDIA_OBJECT_CAPACITY}");
         return Ok(());
@@ -1225,6 +1257,7 @@ fn next_handoff_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_focus_handoff_participant(
     control_connection: iroh::endpoint::Connection,
     mut control_send: iroh::endpoint::SendStream,
@@ -1232,6 +1265,7 @@ async fn run_focus_handoff_participant(
     mut media: MoqProbeReceiver,
     mut snapshot: sigil_protocol::SessionSnapshotV2,
     required_handoffs: u32,
+    frames: u32,
     timeout_seconds: u64,
 ) -> Result<()> {
     let mut request_id = 1_u64;
@@ -1241,15 +1275,24 @@ async fn run_focus_handoff_participant(
     let mut maximum_roster_viewers = snapshot.viewers.len();
     let mut last_holder = focus_holder_identity(&snapshot);
     let mut next_command_at = tokio::time::Instant::now();
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(timeout_seconds.max(1).saturating_mul(2));
+    // Two timeout windows for the handoff exchange, plus the wall time the
+    // frame budget itself needs at a conservative 30fps floor.
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(timeout_seconds.max(1).saturating_mul(2))
+        + Duration::from_secs(u64::from(frames) / 30 + 1);
 
-    while observed_handoffs < required_handoffs {
+    // Leaving as soon as the handoffs land would shrink the roster underneath
+    // any concurrent same-peer replacement cycle, which then fails on viewer
+    // cardinality for reasons that have nothing to do with admission. Hold the
+    // session for the full frame budget, exactly like a spectator.
+    while observed_handoffs < required_handoffs || accepted_frames < frames {
         ensure!(
             tokio::time::Instant::now() < deadline,
-            "timed out after observing {observed_handoffs} of {required_handoffs} focus handoffs"
+            "timed out after observing {observed_handoffs} of {required_handoffs} focus handoffs \
+             and {accepted_frames} of {frames} frames"
         );
-        if !command_in_flight
+        if observed_handoffs < required_handoffs
+            && !command_in_flight
             && tokio::time::Instant::now() >= next_command_at
             && let Some(command) = next_handoff_command(&snapshot, request_id)
         {
@@ -1303,7 +1346,10 @@ async fn run_focus_handoff_participant(
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
-                bail!("timed out after observing {observed_handoffs} of {required_handoffs} focus handoffs");
+                bail!(
+                    "timed out after observing {observed_handoffs} of {required_handoffs} focus \
+                     handoffs and {accepted_frames} of {frames} frames"
+                );
             }
         }
     }

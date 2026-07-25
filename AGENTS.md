@@ -202,6 +202,17 @@ Sigil host.
   frontend syntax/tests, ShellCheck, package tests, loopback transport
   including three-viewer admission and slot-0 focus handoff, legacy
   second-client rejection, and release-profile containment of `--dev-connect`.
+- The gate is the union of ordered stages, and `--stage` runs one of them:
+  `quick` `cross` `native` `gstreamer` `repo-tests` `loopback` `containment`.
+  Start with `./scripts/verify-demo-build.sh --stage quick`; it is a few
+  seconds and catches format, frontend syntax, ShellCheck, and whitespace
+  damage before you spend a compile on them. `--stage loopback
+  --loopback-case N` runs one of the four loopback proofs. Passing no argument
+  still runs every stage, so a release or hardware-UAT invocation is unchanged.
+  CI runs the same stages as parallel legs behind the required
+  `Complete demo gate` check; `scripts/verify_ci_cross_build_policy.py` and
+  `scripts/tests/demo-gate-stages.sh` are what keep those legs equivalent to
+  the complete gate, so run the repository shell tests after touching either.
 - Run `./scripts/verify-website.sh` for every website or public installer
   change. Exercise interactive website changes in a real browser.
 - Treat `docs/fresh-bazzite-host.md`, `docs/public-release-delivery.md`, and

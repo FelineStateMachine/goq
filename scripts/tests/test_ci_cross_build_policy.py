@@ -7,9 +7,7 @@ from scripts.verify_ci_cross_build_policy import PolicyError, verify, verify_gat
 
 
 REPO_DIR = Path(__file__).resolve().parents[2]
-WORKFLOW = (REPO_DIR / ".github" / "workflows" / "ci.yml").read_text(
-    encoding="utf-8"
-)
+WORKFLOW = (REPO_DIR / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 GATE_SCRIPT = (REPO_DIR / "scripts" / "verify-demo-build.sh").read_text(
     encoding="utf-8"
 )
@@ -21,377 +19,487 @@ def replace_once(source: str, old: str, new: str) -> str:
     return source.replace(old, new, 1)
 
 
-def remove_named_step(source: str, name: str, next_name: str) -> tuple[str, str]:
-    marker = f"      - name: {name}\n"
-    next_marker = f"      - name: {next_name}\n"
-    start = source.index(marker)
-    end = source.index(next_marker, start)
-    return source[:start] + source[end:], source[start:end]
+def job_marker(name: str) -> str:
+    return f"  {name}:\n"
 
 
-def replace_once_in_demo_gate(source: str, old: str, new: str) -> str:
-    prefix, marker, demo_gate = source.partition("  demo-gate:\n")
-    if not marker:
-        raise AssertionError("fixture source must contain the demo-gate job")
-    return prefix + marker + replace_once(demo_gate, old, new)
+def add_job_field(source: str, job: str, field: str) -> str:
+    """Insert a field as the first entry of the named job."""
+    return replace_once(source, job_marker(job), f"{job_marker(job)}    {field}\n")
 
 
-class CiCrossBuildPolicyTests(unittest.TestCase):
-    def test_repository_workflow_passes(self) -> None:
+def in_job(source: str, job: str, old: str, new: str) -> str:
+    """Replace the first occurrence of `old` at or after the named job."""
+    start = source.index(job_marker(job))
+    offset = source.index(old, start)
+    return source[:offset] + new + source[offset + len(old) :]
+
+
+class WorkflowStructureTests(unittest.TestCase):
+    def test_repository_workflow_and_gate_script_pass(self) -> None:
         verify(WORKFLOW)
         verify_gate_script(GATE_SCRIPT)
 
-    def test_rejects_cross_build_helper_inside_false_branch(self) -> None:
-        mutated = replace_once(
-            GATE_SCRIPT,
-            "./scripts/run-linux-cross-build-gate.sh",
-            "if false; then\n./scripts/run-linux-cross-build-gate.sh\nfi",
-        )
-        with self.assertRaisesRegex(
-            PolicyError, "executable prefix changed"
-        ):
-            verify_gate_script(mutated)
-
-    def test_rejects_successful_early_exit_before_cross_build_helper(self) -> None:
-        mutated = replace_once(
-            GATE_SCRIPT,
-            "./scripts/run-linux-cross-build-gate.sh",
-            "if true; then\n  exit 0\nfi\n"
-            "./scripts/run-linux-cross-build-gate.sh",
-        )
-        with self.assertRaisesRegex(PolicyError, "executable prefix changed"):
-            verify_gate_script(mutated)
-
-    def test_rejects_failure_control_changes_before_cross_build_helper(self) -> None:
-        prefixes = [
-            "exit 0",
-            "return 0",
-            "trap 'exit 0' EXIT",
-            "exec true",
-            "set +e",
-        ]
-        for prefix in prefixes:
-            with self.subTest(prefix=prefix):
-                mutated = replace_once(
-                    GATE_SCRIPT,
-                    "./scripts/run-linux-cross-build-gate.sh",
-                    f"{prefix}\n./scripts/run-linux-cross-build-gate.sh",
-                )
-                with self.assertRaisesRegex(
-                    PolicyError, "executable prefix changed"
-                ):
-                    verify_gate_script(mutated)
-
-    def test_rejects_failure_masked_cross_build_helper(self) -> None:
-        mutated = replace_once(
-            GATE_SCRIPT,
-            "./scripts/run-linux-cross-build-gate.sh",
-            "./scripts/run-linux-cross-build-gate.sh || true",
-        )
-        with self.assertRaisesRegex(PolicyError, "executable prefix changed"):
-            verify_gate_script(mutated)
-
-    def test_rejects_demo_gate_run_bypass_even_with_decoy_comment(self) -> None:
-        mutated = replace_once(
-            WORKFLOW,
-            "        run: ./scripts/verify-demo-build.sh",
-            "        run: echo bypassed",
-        )
-        mutated += "\n# run: ./scripts/verify-demo-build.sh\n"
-        with self.assertRaisesRegex(
-            PolicyError, "does not execute the repository gate"
-        ):
+    def test_rejects_extra_top_level_field(self) -> None:
+        mutated = replace_once(WORKFLOW, "name: CI\n", "name: CI\nenv:\n  X: '1'\n")
+        with self.assertRaisesRegex(PolicyError, "top-level fields changed"):
             verify(mutated)
-
-    def test_rejects_conditionally_disabled_cross_install(self) -> None:
-        mutated = replace_once(
-            WORKFLOW,
-            "      - name: Install pinned cross-build tools\n        run: |",
-            "      - name: Install pinned cross-build tools\n"
-            "        if: false\n"
-            "        run: |",
-        )
-        with self.assertRaisesRegex(PolicyError, "unexpected or missing fields"):
-            verify(mutated)
-
-    def test_rejects_checkout_ref_override(self) -> None:
-        mutated = replace_once_in_demo_gate(
-            WORKFLOW,
-            "        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1",
-            "        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1\n"
-            "        with:\n"
-            "          ref: main",
-        )
-        with self.assertRaisesRegex(
-            PolicyError, "checkout step has unexpected or missing fields"
-        ):
-            verify(mutated)
-
-    def test_rejects_checkout_action_change(self) -> None:
-        mutated = replace_once_in_demo_gate(
-            WORKFLOW,
-            "actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1",
-            "actions/checkout@main",
-        )
-        with self.assertRaisesRegex(PolicyError, "checkout action is not digest-pinned"):
-            verify(mutated)
-
-    def test_rejects_step_poisoning_cargo_environment(self) -> None:
-        mutated = replace_once(
-            WORKFLOW,
-            "      - name: Install Linux build dependencies\n",
-            "      - name: Poison Cargo environment\n"
-            "        run: printf '%s\\n' 'export RUSTC_WRAPPER=true' >> ~/.cargo/env\n\n"
-            "      - name: Install Linux build dependencies\n",
-        )
-        with self.assertRaisesRegex(
-            PolicyError, "step list or order changed from the CI policy contract"
-        ):
-            verify(mutated)
-
-    def test_rejects_step_replacing_cargo_zigbuild(self) -> None:
-        mutated = replace_once(
-            WORKFLOW,
-            "      - name: Run complete demo gate\n",
-            "      - name: Replace cargo-zigbuild\n"
-            "        run: |\n"
-            "          printf '%s\\n' '#!/usr/bin/env bash' 'exit 0' "
-            "> ~/.cargo/bin/cargo-zigbuild\n"
-            "          chmod 0755 ~/.cargo/bin/cargo-zigbuild\n\n"
-            "      - name: Run complete demo gate\n",
-        )
-        with self.assertRaisesRegex(
-            PolicyError, "step list or order changed from the CI policy contract"
-        ):
-            verify(mutated)
-
-    def test_rejects_extra_steps_at_every_boundary(self) -> None:
-        markers = [
-            "      - name: Check out repository\n",
-            "      - name: Install Linux build dependencies\n",
-            "      - name: Restore pinned cargo-zigbuild\n",
-            "      - name: Install pinned cross-build tools\n",
-            "      - name: Run complete demo gate\n",
-        ]
-        for position, marker in enumerate(markers):
-            with self.subTest(position=position):
-                mutated = replace_once_in_demo_gate(
-                    WORKFLOW,
-                    marker,
-                    f"      - name: Extra step {position}\n"
-                    "        run: echo unexpected\n\n"
-                    f"{marker}",
-                )
-                with self.assertRaisesRegex(
-                    PolicyError, "step list or order changed from the CI policy contract"
-                ):
-                    verify(mutated)
-
-        mutated = WORKFLOW + (
-            "\n"
-            "      - name: Extra trailing step\n"
-            "        run: echo unexpected\n"
-        )
-        with self.assertRaisesRegex(
-            PolicyError, "step list or order changed from the CI policy contract"
-        ):
-            verify(mutated)
-
-    def test_rejects_required_step_reordering(self) -> None:
-        cache_marker = "      - name: Restore pinned cargo-zigbuild\n"
-        install_marker = "      - name: Install pinned cross-build tools\n"
-        gate_marker = "      - name: Run complete demo gate\n"
-        cache_start = WORKFLOW.index(cache_marker)
-        install_start = WORKFLOW.index(install_marker, cache_start)
-        gate_start = WORKFLOW.index(gate_marker, install_start)
-        cache_step = WORKFLOW[cache_start:install_start]
-        install_step = WORKFLOW[install_start:gate_start]
-        mutated = (
-            WORKFLOW[:cache_start]
-            + install_step
-            + cache_step
-            + WORKFLOW[gate_start:]
-        )
-        with self.assertRaisesRegex(
-            PolicyError, "step list or order changed from the CI policy contract"
-        ):
-            verify(mutated)
-
-    def test_rejects_partial_linux_dependency_body_mutations(self) -> None:
-        mutations = [
-            (
-                "            ffmpeg \\\n",
-                "",
-            ),
-            (
-                "            shellcheck\n",
-                "            shellcheck \\\n"
-                "            unzip\n",
-            ),
-            (
-                "          sudo apt-get update\n",
-                "          sudo apt-get update --quiet\n",
-            ),
-        ]
-        for old, new in mutations:
-            with self.subTest(replacement=new):
-                mutated = replace_once(WORKFLOW, old, new)
-                with self.assertRaisesRegex(
-                    PolicyError, "Linux dependency step body changed"
-                ):
-                    verify(mutated)
-
-    def test_rejects_linux_dependency_step_field_changes(self) -> None:
-        mutated = replace_once(
-            WORKFLOW,
-            "      - name: Install Linux build dependencies\n        run: |",
-            "      - name: Install Linux build dependencies\n"
-            "        env:\n"
-            "          BASH_ENV: ~/.cargo/env\n"
-            "        run: |",
-        )
-        with self.assertRaisesRegex(
-            PolicyError, "Linux dependency step has unexpected or missing fields"
-        ):
-            verify(mutated)
-
-    def test_rejects_conditionally_disabled_demo_job(self) -> None:
-        mutated = replace_once(
-            WORKFLOW,
-            "  demo-gate:\n    name: Complete demo gate",
-            "  demo-gate:\n    if: false\n    name: Complete demo gate",
-        )
-        with self.assertRaisesRegex(PolicyError, "must not be conditionally disabled"):
-            verify(mutated)
-
-    def test_rejects_quoted_conditionally_disabled_demo_job(self) -> None:
-        mutated = replace_once(
-            WORKFLOW,
-            "  demo-gate:\n    name: Complete demo gate",
-            '  demo-gate:\n    "if": false\n    name: Complete demo gate',
-        )
-        with self.assertRaisesRegex(PolicyError, "must not be conditionally disabled"):
-            verify(mutated)
-
-    def test_rejects_demo_job_continue_on_error(self) -> None:
-        mutated = replace_once(
-            WORKFLOW,
-            "  demo-gate:\n    name: Complete demo gate",
-            "  demo-gate:\n    continue-on-error: true\n"
-            "    name: Complete demo gate",
-        )
-        with self.assertRaisesRegex(PolicyError, "must not suppress failures"):
-            verify(mutated)
-
-    def test_rejects_missing_pull_request_trigger(self) -> None:
-        mutated = replace_once(WORKFLOW, "  pull_request:\n", "")
-        with self.assertRaisesRegex(
-            PolicyError, "empty pull_request trigger"
-        ):
-            verify(mutated)
-
-    def test_rejects_filtered_pull_request_trigger(self) -> None:
-        filters = [
-            "    branches: [main]",
-            "    paths: ['crates/**']",
-            "    types: [opened]",
-        ]
-        for filter_line in filters:
-            with self.subTest(filter_line=filter_line):
-                mutated = replace_once(
-                    WORKFLOW,
-                    "  pull_request:\n",
-                    f"  pull_request:\n{filter_line}\n",
-                )
-                with self.assertRaisesRegex(
-                    PolicyError, "exactly empty and unfiltered"
-                ):
-                    verify(mutated)
-
-    def test_rejects_inline_pull_request_mapping(self) -> None:
-        mutated = replace_once(WORKFLOW, "  pull_request:", "  pull_request: {}")
-        with self.assertRaisesRegex(PolicyError, "must be exactly empty"):
-            verify(mutated)
-
-    def test_rejects_changed_demo_job_identity_and_execution_limits(self) -> None:
-        changes = [
-            ("    name: Complete demo gate", "    name: Optional demo gate", "required name"),
-            (
-                "  demo-gate:\n    name: Complete demo gate\n"
-                "    runs-on: ubuntu-24.04",
-                "  demo-gate:\n    name: Complete demo gate\n"
-                "    runs-on: ubuntu-latest",
-                "ubuntu-24.04",
-            ),
-            ("    timeout-minutes: 45", "    timeout-minutes: 5", "45 minutes"),
-        ]
-        for old, new, error in changes:
-            with self.subTest(field=old):
-                mutated = replace_once(WORKFLOW, old, new)
-                with self.assertRaisesRegex(PolicyError, error):
-                    verify(mutated)
-
-    def test_rejects_changed_demo_job_environment(self) -> None:
-        changes = [
-            ('      CARGO_TERM_COLOR: always', '      CARGO_TERM_COLOR: never'),
-            ('      RUST_BACKTRACE: "1"\n', ""),
-            (
-                '      RUST_BACKTRACE: "1"',
-                '      RUST_BACKTRACE: "1"\n      CI_FAILURES_OPTIONAL: "1"',
-            ),
-        ]
-        for old, new in changes:
-            with self.subTest(replacement=new):
-                mutated = replace_once(WORKFLOW, old, new)
-                with self.assertRaisesRegex(
-                    PolicyError, "env changed from the CI policy contract"
-                ):
-                    verify(mutated)
 
     def test_rejects_failure_suppressing_workflow_shell_default(self) -> None:
         mutated = replace_once(
             WORKFLOW,
             "name: CI\n\non:",
-            "name: CI\n\ndefaults:\n"
-            "  run:\n"
-            "    shell: 'bash {0} || true'\n\n"
-            "on:",
+            "name: CI\n\ndefaults:\n  run:\n    shell: 'bash {0} || true'\n\non:",
         )
         with self.assertRaisesRegex(PolicyError, "workflow-level defaults are forbidden"):
             verify(mutated)
 
-    def test_ignores_tokens_in_comments_and_later_jobs(self) -> None:
-        mutated, removed = remove_named_step(
-            WORKFLOW,
-            "Install pinned cross-build tools",
-            "Run complete demo gate",
+    def test_rejects_missing_pull_request_trigger(self) -> None:
+        mutated = replace_once(WORKFLOW, "  pull_request:\n", "")
+        with self.assertRaisesRegex(PolicyError, "empty pull_request trigger"):
+            verify(mutated)
+
+    def test_rejects_filtered_pull_request_trigger(self) -> None:
+        for filter_line in (
+            "    branches: [main]",
+            "    paths: ['crates/**']",
+            "    types: [opened]",
+        ):
+            with self.subTest(filter_line=filter_line):
+                mutated = replace_once(
+                    WORKFLOW, "  pull_request:\n", f"  pull_request:\n{filter_line}\n"
+                )
+                with self.assertRaisesRegex(PolicyError, "exactly empty and unfiltered"):
+                    verify(mutated)
+
+    def test_rejects_inline_pull_request_mapping(self) -> None:
+        mutated = replace_once(WORKFLOW, "  pull_request:", "  pull_request: {}")
+        with self.assertRaisesRegex(PolicyError, "exactly empty and unfiltered"):
+            verify(mutated)
+
+    def test_rejects_widened_push_trigger(self) -> None:
+        mutated = replace_once(
+            WORKFLOW, "    branches: [main]", "    branches: [main, release]"
         )
-        decoy = (
-            "\n# Install pinned cross-build tools\n"
-            "# GOQ_REQUIRE_LINUX_CROSS_BUILD: \"1\"\n"
-            "  later-decoy:\n"
+        with self.assertRaisesRegex(PolicyError, "limited to main"):
+            verify(mutated)
+
+    def test_rejects_unparseable_workflow(self) -> None:
+        mutated = replace_once(WORKFLOW, "permissions:\n", "permissions:\n\t- bogus\n")
+        with self.assertRaises(PolicyError):
+            verify(mutated)
+
+
+class JobInventoryTests(unittest.TestCase):
+    def test_rejects_job_added_outside_the_gate(self) -> None:
+        mutated = WORKFLOW + (
+            "\n  sneaky:\n"
             "    runs-on: ubuntu-24.04\n"
             "    steps:\n"
-            f"{removed}"
+            "      - name: Do something unreviewed\n"
+            "        run: echo unexpected\n"
         )
-        with self.assertRaisesRegex(PolicyError, "must exist exactly once"):
-            verify(mutated + decoy)
+        with self.assertRaisesRegex(PolicyError, "jobs changed from the CI policy"):
+            verify(mutated)
 
-    def test_rejects_wrong_install_body_even_with_tokens_in_later_job(self) -> None:
+    def test_rejects_removed_gate_leg(self) -> None:
+        start = WORKFLOW.index(job_marker("release-containment"))
+        end = WORKFLOW.index(job_marker("decky-gate"))
+        mutated = WORKFLOW[:start] + WORKFLOW[end:]
+        with self.assertRaisesRegex(PolicyError, "jobs changed from the CI policy"):
+            verify(mutated)
+
+    def test_rejects_summary_job_missing_a_dependency(self) -> None:
+        mutated = replace_once(WORKFLOW, "      - release-containment\n", "")
+        with self.assertRaisesRegex(PolicyError, "must depend on every other job"):
+            verify(mutated)
+
+    def test_rejects_duplicate_summary_dependency(self) -> None:
         mutated = replace_once(
             WORKFLOW,
-            "          cargo install cargo-zigbuild --locked --version 0.23.0",
-            "          echo skipped cargo install",
+            "      - release-containment\n",
+            "      - release-containment\n      - release-containment\n",
         )
-        mutated += (
-            "\n  later-decoy:\n"
-            "    runs-on: ubuntu-24.04\n"
-            "    steps:\n"
-            "      - name: Decoy\n"
-            "        run: cargo install cargo-zigbuild --locked --version 0.23.0\n"
-        )
-        with self.assertRaisesRegex(PolicyError, "install step body changed"):
+        with self.assertRaisesRegex(PolicyError, "duplicate"):
             verify(mutated)
+
+
+class SummaryJobTests(unittest.TestCase):
+    def test_rejects_renamed_summary_job(self) -> None:
+        mutated = replace_once(
+            WORKFLOW, "    name: Complete demo gate", "    name: Optional demo gate"
+        )
+        with self.assertRaisesRegex(PolicyError, "required name"):
+            verify(mutated)
+
+    def test_rejects_summary_job_off_the_pinned_runner(self) -> None:
+        mutated = in_job(WORKFLOW, "demo-gate", "runs-on: ubuntu-24.04", "runs-on: ubuntu-latest")
+        with self.assertRaisesRegex(PolicyError, "must run on ubuntu-24.04"):
+            verify(mutated)
+
+    def test_rejects_summary_job_that_cannot_report_failures(self) -> None:
+        for condition in ("if: false", "if: success()", "if: github.ref == 'x'"):
+            with self.subTest(condition=condition):
+                mutated = in_job(WORKFLOW, "demo-gate", "if: always()", condition)
+                with self.assertRaisesRegex(PolicyError, "if: always\\(\\)"):
+                    verify(mutated)
+
+    def test_rejects_summary_job_that_never_fails(self) -> None:
+        mutated = replace_once(
+            WORKFLOW,
+            "            echo 'complete demo gate failed' >&2\n            exit 1\n",
+            "            echo 'complete demo gate failed' >&2\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "must fail when a leg did not pass"):
+            verify(mutated)
+
+    def test_rejects_widened_skippable_leg_list(self) -> None:
+        mutated = replace_once(
+            WORKFLOW,
+            "skippable='native-tests cross-build",
+            "skippable='quick-checks repo-tests native-tests cross-build",
+        )
+        with self.assertRaisesRegex(PolicyError, "skippable legs changed"):
+            verify(mutated)
+
+    def test_rejects_skip_tolerated_without_the_scope_decision(self) -> None:
+        mutated = replace_once(
+            WORKFLOW,
+            "          if [[ \"$SCOPE_CODE\" == 'false' ]]; then\n            docs_only=true\n          fi",
+            "          docs_only=true",
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "only tolerate a skip the docs-only scope made"
+        ):
+            verify(mutated)
+
+
+class LegConditionTests(unittest.TestCase):
+    def test_rejects_conditionally_disabled_always_run_leg(self) -> None:
+        for leg in ("quick-checks", "repo-tests", "decky-gate", "scope"):
+            with self.subTest(leg=leg):
+                mutated = add_job_field(WORKFLOW, leg, "if: false")
+                with self.assertRaises(PolicyError):
+                    verify(mutated)
+
+    def test_rejects_quoted_conditionally_disabled_leg(self) -> None:
+        mutated = add_job_field(WORKFLOW, "quick-checks", '"if": false')
+        with self.assertRaises(PolicyError):
+            verify(mutated)
+
+    def test_rejects_skippable_leg_with_a_different_condition(self) -> None:
+        for condition in (
+            "if: false",
+            "if: github.actor != 'nobody'",
+            "if: needs.scope.outputs.code != 'true'",
+        ):
+            with self.subTest(condition=condition):
+                mutated = in_job(
+                    WORKFLOW,
+                    "native-tests",
+                    "if: needs.scope.outputs.code == 'true'",
+                    condition,
+                )
+                with self.assertRaisesRegex(PolicyError, "audited docs-only scope"):
+                    verify(mutated)
+
+    def test_rejects_leg_continue_on_error(self) -> None:
+        for leg in ("cross-build", "release-containment", "demo-gate"):
+            with self.subTest(leg=leg):
+                mutated = add_job_field(WORKFLOW, leg, "continue-on-error: true")
+                with self.assertRaisesRegex(PolicyError, "must not suppress failures"):
+                    verify(mutated)
+
+    def test_rejects_leg_run_defaults_override(self) -> None:
+        mutated = add_job_field(
+            WORKFLOW, "cross-build", "defaults:\n      run:\n        shell: 'bash {0} || true'"
+        )
+        with self.assertRaisesRegex(PolicyError, "must not override run defaults"):
+            verify(mutated)
+
+
+class StepIntegrityTests(unittest.TestCase):
+    def test_rejects_step_that_masks_failure(self) -> None:
+        for token in ("|| true", "set +e", "trap 'exit 0' EXIT", "exec true"):
+            with self.subTest(token=token):
+                mutated = in_job(
+                    WORKFLOW,
+                    "native-tests",
+                    "run: ./scripts/verify-demo-build.sh --stage native",
+                    f"run: ./scripts/verify-demo-build.sh --stage native {token}",
+                )
+                with self.assertRaisesRegex(PolicyError, "forbidden token"):
+                    verify(mutated)
+
+    def test_rejects_step_poisoning_the_cargo_toolchain(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "native-tests",
+            "      - name: Run the native gate stage\n",
+            "      - name: Poison Cargo environment\n"
+            "        run: printf 'x\\n' 'export RUSTC_WRAPPER=true' >>~/.cargo/env\n\n"
+            "      - name: Run the native gate stage\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "forbidden token"):
+            verify(mutated)
+
+    def test_rejects_conditionally_disabled_step(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "cross-build",
+            "      - name: Install pinned cross-build tools\n",
+            "      - name: Install pinned cross-build tools\n        if: false\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "conditionally disabled step"):
+            verify(mutated)
+
+    def test_rejects_step_continue_on_error(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "cross-build",
+            "      - name: Install pinned cross-build tools\n",
+            "      - name: Install pinned cross-build tools\n"
+            "        continue-on-error: true\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "step that suppresses failures"):
+            verify(mutated)
+
+    def test_rejects_action_that_is_not_digest_pinned(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "quick-checks",
+            "uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1",
+            "uses: actions/checkout@v6",
+        )
+        with self.assertRaisesRegex(PolicyError, "not digest-pinned"):
+            verify(mutated)
+
+    def test_rejects_checkout_ref_override(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "cross-build",
+            "uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1",
+            "uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1\n"
+            "        with:\n          ref: main",
+        )
+        with self.assertRaisesRegex(PolicyError, "overrides the checked-out ref"):
+            verify(mutated)
+
+    def test_rejects_swapped_checkout_digest(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "quick-checks",
+            "actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8",
+            "actions/checkout@" + "b" * 40,
+        )
+        with self.assertRaisesRegex(PolicyError, "not digest-pinned to the policy"):
+            verify(mutated)
+
+
+class GateLegTests(unittest.TestCase):
+    def test_rejects_leg_running_the_wrong_stage(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "release-containment",
+            "run: ./scripts/verify-demo-build.sh --stage containment",
+            "run: ./scripts/verify-demo-build.sh --stage quick",
+        )
+        with self.assertRaisesRegex(PolicyError, "must run the repository gate stage"):
+            verify(mutated)
+
+    def test_rejects_leg_that_does_not_run_the_gate(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "native-tests",
+            "run: ./scripts/verify-demo-build.sh --stage native",
+            "run: echo bypassed",
+        )
+        mutated += "\n# run: ./scripts/verify-demo-build.sh --stage native\n"
+        with self.assertRaisesRegex(PolicyError, "must invoke the repository gate"):
+            verify(mutated)
+
+    def test_rejects_cross_build_leg_without_the_required_cross_build(self) -> None:
+        mutated = in_job(
+            WORKFLOW, "cross-build", 'GOQ_REQUIRE_LINUX_CROSS_BUILD: "1"', 'GOQ_REQUIRE_LINUX_CROSS_BUILD: "0"'
+        )
+        with self.assertRaisesRegex(PolicyError, "does not require the Linux cross build"):
+            verify(mutated)
+
+    def test_rejects_cross_build_leg_without_the_gstreamer_backend(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "cross-build",
+            '          GOQ_VERIFY_IN_PROCESS_GSTREAMER: "1"\n',
+            "",
+        )
+        with self.assertRaisesRegex(PolicyError, "in-process GStreamer backend"):
+            verify(mutated)
+
+    def test_rejects_gstreamer_leg_without_its_gate(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "gstreamer-gate",
+            '          GOQ_VERIFY_IN_PROCESS_GSTREAMER: "1"\n',
+            "",
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "does not require the in-process GStreamer gate"
+        ):
+            verify(mutated)
+
+    def test_rejects_leg_that_skips_dependency_installation(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "loopback",
+            "        run: ./scripts/install-linux-build-deps.sh --profile full\n",
+            "        run: echo skipped\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "install the Linux build dependencies"):
+            verify(mutated)
+
+    def test_rejects_leg_off_the_pinned_runner(self) -> None:
+        mutated = in_job(
+            WORKFLOW, "loopback", "runs-on: ubuntu-24.04", "runs-on: ubuntu-latest"
+        )
+        with self.assertRaisesRegex(PolicyError, "must run on ubuntu-24.04"):
+            verify(mutated)
+
+
+class ScopeJobTests(unittest.TestCase):
+    def test_rejects_missing_fail_closed_branch(self) -> None:
+        for branch in (
+            "            echo 'scope=full (event is not a pull request)'\n",
+            "            echo 'scope=full (could not enumerate the pull request diff)'\n",
+            "            echo 'scope=full (empty diff listing)'\n",
+        ):
+            with self.subTest(branch=branch):
+                mutated = replace_once(WORKFLOW, branch, "")
+                with self.assertRaisesRegex(PolicyError, "fail-closed branch"):
+                    verify(mutated)
+
+    def test_rejects_widened_documentation_allowlist(self) -> None:
+        for arm in (
+            "docs/* | website/* | *.md | LICENSE | crates/*) ;;",
+            "docs/* | website/* | *.md | LICENSE | src-tauri/*) ;;",
+            "*) ;;",
+        ):
+            with self.subTest(arm=arm):
+                mutated = replace_once(
+                    WORKFLOW, "docs/* | website/* | *.md | LICENSE) ;;", arm
+                )
+                with self.assertRaisesRegex(PolicyError, "allowlist changed"):
+                    verify(mutated)
+
+    def test_rejects_extra_allowlist_arm(self) -> None:
+        mutated = replace_once(
+            WORKFLOW,
+            "              docs/* | website/* | *.md | LICENSE) ;;\n",
+            "              docs/* | website/* | *.md | LICENSE) ;;\n"
+            "              crates/*) ;;\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "allowlist changed"):
+            verify(mutated)
+
+    def test_rejects_scope_job_that_cannot_be_trusted(self) -> None:
+        mutated = add_job_field(WORKFLOW, "scope", "if: false")
+        with self.assertRaisesRegex(PolicyError, "must carry no if condition"):
+            verify(mutated)
+
+    def test_rejects_extra_scope_output(self) -> None:
+        mutated = replace_once(
+            WORKFLOW,
+            "      code: ${{ steps.classify.outputs.code }}\n",
+            "      code: ${{ steps.classify.outputs.code }}\n"
+            "      other: ${{ steps.classify.outputs.other }}\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "exactly the code output"):
+            verify(mutated)
+
+
+class GateScriptTests(unittest.TestCase):
+    def test_rejects_changed_executable_prefix(self) -> None:
+        for mutation in ("set -eu\n", "set -euo pipefail\nexit 0\n"):
+            with self.subTest(mutation=mutation):
+                mutated = replace_once(GATE_SCRIPT, "set -euo pipefail\n", mutation)
+                with self.assertRaisesRegex(PolicyError, "executable prefix changed"):
+                    verify_gate_script(mutated)
+
+    def test_rejects_failure_masked_cross_build_helper(self) -> None:
+        mutated = replace_once(
+            GATE_SCRIPT,
+            "  ./scripts/run-linux-cross-build-gate.sh\n",
+            "  ./scripts/run-linux-cross-build-gate.sh || true\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "forbidden token"):
+            verify_gate_script(mutated)
+
+    def test_rejects_conditionally_wrapped_cross_build_helper(self) -> None:
+        mutated = replace_once(
+            GATE_SCRIPT,
+            "  ./scripts/run-linux-cross-build-gate.sh\n",
+            "  if false; then\n    ./scripts/run-linux-cross-build-gate.sh\n  fi\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "invoked unconditionally"):
+            verify_gate_script(mutated)
+
+    def test_rejects_duplicated_or_removed_cross_build_helper(self) -> None:
+        removed = replace_once(
+            GATE_SCRIPT, "  ./scripts/run-linux-cross-build-gate.sh\n", ""
+        )
+        with self.assertRaisesRegex(PolicyError, "exactly once"):
+            verify_gate_script(removed)
+
+        duplicated = replace_once(
+            GATE_SCRIPT,
+            "  ./scripts/run-linux-cross-build-gate.sh\n",
+            "  ./scripts/run-linux-cross-build-gate.sh\n"
+            "  ./scripts/run-linux-cross-build-gate.sh\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "exactly once"):
+            verify_gate_script(duplicated)
+
+    def test_rejects_failure_control_tokens_anywhere(self) -> None:
+        for token in ("set +e", "trap 'exit 0' EXIT", "exec true"):
+            with self.subTest(token=token):
+                mutated = replace_once(
+                    GATE_SCRIPT,
+                    "run_stage_quick() {\n",
+                    f"run_stage_quick() {{\n  {token}\n",
+                )
+                with self.assertRaisesRegex(PolicyError, "forbidden token"):
+                    verify_gate_script(mutated)
+
+    def test_rejects_dropped_stage(self) -> None:
+        mutated = replace_once(
+            GATE_SCRIPT,
+            "readonly ALL_STAGES=(quick cross native gstreamer repo-tests loopback containment)",
+            "readonly ALL_STAGES=(quick native gstreamer repo-tests loopback containment)",
+        )
+        with self.assertRaisesRegex(PolicyError, "stages changed"):
+            verify_gate_script(mutated)
+
+    def test_rejects_undispatched_stage(self) -> None:
+        mutated = replace_once(
+            GATE_SCRIPT, "    cross) run_stage_cross ;;\n", ""
+        )
+        with self.assertRaisesRegex(PolicyError, "does not dispatch"):
+            verify_gate_script(mutated)
+
+    def test_rejects_missing_stage_function(self) -> None:
+        mutated = replace_once(
+            GATE_SCRIPT, "run_stage_containment() {", "run_stage_containment_disabled() {"
+        )
+        with self.assertRaises(PolicyError):
+            verify_gate_script(mutated)
+
+    def test_rejects_default_run_that_skips_stages(self) -> None:
+        mutated = replace_once(
+            GATE_SCRIPT,
+            '  for current_stage in "${ALL_STAGES[@]}"; do',
+            "  for current_stage in quick; do",
+        )
+        with self.assertRaisesRegex(PolicyError, "must run every stage"):
+            verify_gate_script(mutated)
 
 
 if __name__ == "__main__":

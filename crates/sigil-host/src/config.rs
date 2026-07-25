@@ -95,12 +95,22 @@ pub enum VaapiRateControl {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum GamescopeEncoderBackend {
-    /// Preserve the proven child-process pipeline and its natural-IDR control
-    /// limitation for existing configurations.
-    #[default]
+    /// The child-process pipeline. It cannot change encoder properties while
+    /// playing, so adaptive bitrate and motion-sensitive resolution can only
+    /// run in shadow. Retained for CQP and as an explicit escape hatch, and it
+    /// is the default on builds that cannot run the in-process backend.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "in-process-gstreamer")),
+        default
+    )]
     ExternalGstLaunch,
     /// Run the video pipeline in-process so Sigil can apply bounded encoder
-    /// controls. This remains an explicit opt-in until hardware acceptance.
+    /// controls. This is the only backend where adaptive bitrate and
+    /// resolution actuation are live, so it is the default wherever it can
+    /// actually run. The default deliberately tracks build capability: a
+    /// binary without this feature would otherwise reject its own default
+    /// configuration.
+    #[cfg_attr(all(target_os = "linux", feature = "in-process-gstreamer"), default)]
     InProcessGstreamer,
 }
 
@@ -144,8 +154,9 @@ pub struct GamescopePipewireConfig {
     pub pw_dump_path: PathBuf,
     pub gst_launch_path: PathBuf,
     pub gst_inspect_path: PathBuf,
-    /// External gst-launch remains the compatibility default. The in-process
-    /// backend is accepted only by Linux builds that contain its feature.
+    /// Defaults to the in-process backend on builds that contain its feature,
+    /// because that is the only backend where adaptive bitrate and resolution
+    /// actuation are live. Other builds default to external gst-launch.
     #[serde(default)]
     pub encoder_backend: GamescopeEncoderBackend,
     /// Exact dynamically registered VA encoder factory, such as `vah264enc`.
@@ -268,10 +279,19 @@ impl GamescopePipewireConfig {
                 || cfg!(all(target_os = "linux", feature = "in-process-gstreamer")),
             "gamescope_pipewire.encoder_backend=in-process-gstreamer requires a Linux Sigil build with the in-process-gstreamer feature"
         );
+        // Not a temporary gap: the in-process pipeline is built around a
+        // mutable encoder `bitrate` property, which constant-quantizer mode
+        // does not have. The two are contradictory rather than unfinished.
         ensure!(
             self.encoder_backend != GamescopeEncoderBackend::InProcessGstreamer
                 || self.rate_control == VaapiRateControl::Cbr,
-            "gamescope_pipewire.encoder_backend=in-process-gstreamer currently requires CBR"
+            "gamescope_pipewire.encoder_backend=in-process-gstreamer requires \
+             rate_control=\"cbr\", because adaptive bitrate changes a live \
+             encoder bitrate that constant-quantizer mode does not expose. \
+             Either set rate_control=\"cbr\" to keep adaptive bitrate and \
+             motion-sensitive resolution, or set \
+             encoder_backend=\"external-gst-launch\" to keep CQP and accept \
+             that both adapt in shadow only."
         );
         ensure!(
             self.vaapi_render_node
@@ -608,6 +628,16 @@ fn validate_file_security(path: &Path, metadata: &fs::Metadata) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The compiled default tracks build capability, so tests must expect the
+    /// backend this binary can actually run rather than a fixed variant.
+    fn default_encoder_backend() -> GamescopeEncoderBackend {
+        if cfg!(all(target_os = "linux", feature = "in-process-gstreamer")) {
+            GamescopeEncoderBackend::InProcessGstreamer
+        } else {
+            GamescopeEncoderBackend::ExternalGstLaunch
+        }
+    }
+
     #[test]
     fn config_revision_is_exact_bounded_and_strict() {
         let first = ConfigRevision::from_bytes(b"a = 1\n");
@@ -837,7 +867,7 @@ source = "gamescope-pipewire"
     }
 
     #[test]
-    fn gamescope_encoder_backend_defaults_external() {
+    fn gamescope_encoder_backend_defaults_to_build_capability() {
         let config: HostConfig = toml::from_str(
             r#"
 identity_path = "/tmp/host.key"
@@ -860,7 +890,7 @@ bitrate_kbps = 12000
 
         assert_eq!(
             config.gamescope_pipewire.unwrap().encoder_backend,
-            GamescopeEncoderBackend::ExternalGstLaunch
+            default_encoder_backend()
         );
     }
 

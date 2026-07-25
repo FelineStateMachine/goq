@@ -18,6 +18,10 @@ ffmpeg="$(command -v ffmpeg || true)"
 
 temp_parent="${TMPDIR:-/tmp}"
 temp_parent="${temp_parent%/}"
+# Keep the owner-only authorization socket below Darwin's sockaddr_un limit.
+if [[ "$(uname -s)" == Darwin ]]; then
+  temp_parent=/tmp
+fi
 temp_root="$(mktemp -d "$temp_parent/sigil-appliance-status.XXXXXX")"
 host_pid=''
 

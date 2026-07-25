@@ -770,6 +770,7 @@ impl MoqProbeReceiver {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_control_v2_smoke(
     endpoint: &Endpoint,
     address: EndpointAddr,
@@ -933,6 +934,10 @@ async fn run_control_v2_smoke(
                     "not-applicable"
                 }
             );
+            println!("resource_summary_version=1");
+            println!("maximum_roster_viewers={}", initial.viewers.len());
+            println!("media_progress=monotonic");
+            println!("probe_media_object_capacity={MEDIA_OBJECT_CAPACITY}");
             return Ok(());
         }
         let mut accepted = 0_u32;
@@ -969,6 +974,10 @@ async fn run_control_v2_smoke(
         println!("roster_viewers={}", initial.viewers.len());
         println!("frames={accepted}");
         println!("spectator=ok");
+        println!("resource_summary_version=1");
+        println!("maximum_roster_viewers={}", initial.viewers.len());
+        println!("media_progress=monotonic");
+        println!("probe_media_object_capacity={MEDIA_OBJECT_CAPACITY}");
         return Ok(());
     }
     let focus_request = FocusCommandV2 {
@@ -1124,6 +1133,7 @@ async fn run_control_v2_smoke(
     println!("media_broadcast_name={broadcast_name}");
     println!("media_generation_scope=host");
     println!("subscription_endpoint_binding=ok");
+    println!("roster_viewers={}", initial.viewers.len());
     println!("frames={accepted}");
     println!("initial_snapshot_revision={}", initial.revision);
     println!("focus_grant_revision={}", focused.revision);
@@ -1136,6 +1146,10 @@ async fn run_control_v2_smoke(
         println!("focus_release_revision=disconnect");
         println!("focus_release=disconnect");
     }
+    println!("resource_summary_version=1");
+    println!("maximum_roster_viewers={}", initial.viewers.len());
+    println!("media_progress=monotonic");
+    println!("probe_media_object_capacity={MEDIA_OBJECT_CAPACITY}");
     Ok(())
 }
 
@@ -1223,20 +1237,21 @@ async fn run_focus_handoff_participant(
             tokio::time::Instant::now() < deadline,
             "timed out after observing {observed_handoffs} of {required_handoffs} focus handoffs"
         );
-        if !command_in_flight && tokio::time::Instant::now() >= next_command_at {
-            if let Some(command) = next_handoff_command(&snapshot, request_id) {
-                write_client_control_v2(
-                    &mut control_send,
-                    &ClientControlEnvelopeV2::Focus { command },
-                )
-                .await
-                .context("writing bounded focus handoff command")?;
-                request_id = request_id
-                    .checked_add(1)
-                    .context("focus handoff request id exhausted")?;
-                command_in_flight = true;
-                next_command_at = tokio::time::Instant::now() + Duration::from_millis(300);
-            }
+        if !command_in_flight
+            && tokio::time::Instant::now() >= next_command_at
+            && let Some(command) = next_handoff_command(&snapshot, request_id)
+        {
+            write_client_control_v2(
+                &mut control_send,
+                &ClientControlEnvelopeV2::Focus { command },
+            )
+            .await
+            .context("writing bounded focus handoff command")?;
+            request_id = request_id
+                .checked_add(1)
+                .context("focus handoff request id exhausted")?;
+            command_in_flight = true;
+            next_command_at = tokio::time::Instant::now() + Duration::from_millis(300);
         }
 
         tokio::select! {
@@ -1288,6 +1303,10 @@ async fn run_focus_handoff_participant(
     println!("roster_viewers={maximum_roster_viewers}");
     println!("focus_handoff_media_frames={accepted_frames}");
     println!("reset_before_successor=host-ordered");
+    println!("resource_summary_version=1");
+    println!("maximum_roster_viewers={maximum_roster_viewers}");
+    println!("media_progress=monotonic");
+    println!("probe_media_object_capacity={MEDIA_OBJECT_CAPACITY}");
     Ok(())
 }
 

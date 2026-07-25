@@ -611,12 +611,13 @@ impl HostHelloV2 {
         validate_version(self.version)?;
         validate_capabilities(&self.capabilities)?;
         if self.accepted {
-            let session_id = self.session_id.filter(|id| *id != 0).ok_or_else(|| {
-                ProtocolError::InvalidMessage {
-                    message_type: "host hello v2",
-                    reason: "accepted responses require a non-zero session id",
-                }
-            })?;
+            let session_id =
+                self.session_id
+                    .filter(|id| *id != 0)
+                    .ok_or(ProtocolError::InvalidMessage {
+                        message_type: "host hello v2",
+                        reason: "accepted responses require a non-zero session id",
+                    })?;
             if self.message.is_some() {
                 return invalid("host hello v2", "accepted responses forbid a message");
             }

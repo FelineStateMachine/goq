@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ use sigil_protocol::{
     SignedSubscriptionCapability, SubscriptionTracks, ViewerPresenceId, ViewerPresenceV2,
     media_generation_moq_broadcast_name, media_moq_broadcast_name,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::focus::{FocusArbiter, FocusCandidate, FocusNeutralization};
 use super::{ENCODER_CONTROL_COMMIT_TIMEOUT, VideoDimensions};
@@ -23,6 +23,18 @@ use crate::clock::SessionClock;
 use crate::source::EncoderControl;
 
 const MAX_PENDING_HANDSHAKES: usize = 4;
+// The hard eight-viewer ceiling gives each admitted viewer four independent
+// handshake slots (control, MoQ, input, and feedback). The semaphore therefore
+// grows linearly with configured concurrency and never with connection churn.
+const MAX_TRACKED_ADMISSION_PEERS: usize = crate::config::MAX_VIEWERS as usize * 4;
+const ADMISSION_RATE_WINDOW: Duration = Duration::from_secs(10);
+const MAX_ADMISSIONS_PER_WINDOW: usize = 12;
+const ATTACHMENT_RATE_WINDOW: Duration = Duration::from_secs(5);
+const MAX_ATTACHMENTS_PER_WINDOW: usize = 4;
+const KEYFRAME_RATE_WINDOW: Duration = Duration::from_secs(2);
+const MAX_KEYFRAME_REQUESTS_PER_WINDOW: usize = 8;
+const FEEDBACK_CLAIM_RATE_WINDOW: Duration = Duration::from_secs(10);
+const MAX_FEEDBACK_CLAIMS_PER_WINDOW: usize = 4;
 
 #[derive(Debug)]
 pub struct SessionRegistry {
@@ -31,6 +43,7 @@ pub struct SessionRegistry {
     max_viewers: usize,
     next_session_id: AtomicU64,
     authorization_committed_revision: AtomicU64,
+    admission_rates: Mutex<HashMap<EndpointId, RateWindow>>,
     v2_state: Mutex<V2SessionState>,
     pub(super) session_changed: tokio::sync::Notify,
     pub(super) pending_handshakes: tokio::sync::Semaphore,
@@ -126,6 +139,58 @@ struct V2ViewerSession {
     presence_id: ViewerPresenceId,
     authorization_neutralizing: bool,
     snapshots: tokio::sync::watch::Sender<Option<SessionSnapshotV2>>,
+    rates: ViewerRateLimits,
+}
+
+#[derive(Debug, Default)]
+struct ViewerRateLimits {
+    attachments: RateWindow,
+    keyframes: RateWindow,
+    feedback_claims: RateWindow,
+}
+
+#[derive(Debug, Default)]
+struct RateWindow {
+    events: VecDeque<Instant>,
+    last_seen: Option<Instant>,
+}
+
+impl RateWindow {
+    fn check(
+        &mut self,
+        now: Instant,
+        window: Duration,
+        maximum: usize,
+        label: &'static str,
+    ) -> Result<()> {
+        while self
+            .events
+            .front()
+            .is_some_and(|event| now.saturating_duration_since(*event) >= window)
+        {
+            self.events.pop_front();
+        }
+        self.last_seen = Some(now);
+        ensure!(self.events.len() < maximum, "{label} rate limit exceeded");
+        self.events.push_back(now);
+        Ok(())
+    }
+
+    fn expired(&self, now: Instant, window: Duration) -> bool {
+        self.last_seen
+            .is_none_or(|seen| now.saturating_duration_since(seen) >= window)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SessionRuntimeStatus {
+    pub(crate) mode: &'static str,
+    pub(crate) active_viewers: usize,
+    pub(crate) media_generation_id: Option<u64>,
+    pub(crate) roster_revision: Option<u64>,
+    pub(crate) focus_occupied: Option<bool>,
+    pub(crate) configured_capacity: usize,
+    pub(crate) authorization_revision: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -408,6 +473,7 @@ impl SessionRegistry {
             max_viewers: usize::from(max_viewers),
             next_session_id: AtomicU64::new(0),
             authorization_committed_revision: AtomicU64::new(1),
+            admission_rates: Mutex::new(HashMap::with_capacity(MAX_TRACKED_ADMISSION_PEERS)),
             v2_state: Mutex::new(V2SessionState::new(focus_owner)),
             session_changed: tokio::sync::Notify::new(),
             pending_handshakes: tokio::sync::Semaphore::new(
@@ -416,6 +482,7 @@ impl SessionRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub fn has_session(&self) -> bool {
         if self
             .active
@@ -431,6 +498,61 @@ impl SessionRegistry {
             .expect("v2 session state poisoned")
             .viewers
             .is_empty()
+    }
+
+    pub(crate) fn runtime_status(&self) -> SessionRuntimeStatus {
+        if let Some(active) = self
+            .active
+            .lock()
+            .expect("session registry poisoned")
+            .as_ref()
+            .filter(|session| session.media_active)
+        {
+            return SessionRuntimeStatus {
+                mode: "legacy_exclusive",
+                active_viewers: 1,
+                media_generation_id: Some(active.media_generation_id),
+                roster_revision: None,
+                focus_occupied: None,
+                configured_capacity: self.max_viewers,
+                authorization_revision: self
+                    .authorization_committed_revision
+                    .load(Ordering::SeqCst),
+            };
+        }
+        let state = self.v2_state.lock().expect("v2 session state poisoned");
+        SessionRuntimeStatus {
+            mode: if state.viewers.is_empty() {
+                "inactive"
+            } else {
+                "moq_multi_viewer"
+            },
+            active_viewers: state.viewers.len(),
+            media_generation_id: state.media.as_ref().map(|media| media.generation_id),
+            roster_revision: (!state.viewers.is_empty()).then_some(state.revision),
+            focus_occupied: (!state.viewers.is_empty())
+                .then_some(matches!(state.focus.state(), FocusStateV2::Held { .. })),
+            configured_capacity: self.max_viewers,
+            authorization_revision: self.authorization_committed_revision.load(Ordering::SeqCst),
+        }
+    }
+
+    fn check_admission_rate(&self, remote: EndpointId, now: Instant) -> Result<()> {
+        let mut rates = self
+            .admission_rates
+            .lock()
+            .expect("viewer admission rate state poisoned");
+        rates.retain(|_, rate| !rate.expired(now, ADMISSION_RATE_WINDOW));
+        ensure!(
+            rates.contains_key(&remote) || rates.len() < MAX_TRACKED_ADMISSION_PEERS,
+            "viewer admission rate table is full"
+        );
+        rates.entry(remote).or_default().check(
+            now,
+            ADMISSION_RATE_WINDOW,
+            MAX_ADMISSIONS_PER_WINDOW,
+            "viewer reconnect",
+        )
     }
 
     pub(super) fn claim(
@@ -482,6 +604,7 @@ impl SessionRegistry {
         })
     }
 
+    #[allow(dead_code)]
     pub(super) fn claim_v2(
         self: &Arc<Self>,
         remote: EndpointId,
@@ -515,6 +638,7 @@ impl SessionRegistry {
             authorized.authorization_revision != 0 && authorized.committed_revision != 0,
             "viewer authorization revision is invalid"
         );
+        self.check_admission_rate(remote, Instant::now())?;
         self.authorization_committed_revision
             .fetch_max(authorized.committed_revision, Ordering::SeqCst);
         ensure!(
@@ -548,19 +672,22 @@ impl SessionRegistry {
             "viewer presence id is already active for another peer"
         );
         let replaced = state.viewers.remove(&remote);
-        let replacement_transition = replaced
+        let replaced_candidate = replaced.as_ref().map(|viewer| FocusCandidate {
+            presence_id: viewer.presence_id.clone(),
+            session_id: viewer.session.session_id,
+        });
+        let replacement_transition = replaced_candidate
             .as_ref()
-            .map(|viewer| FocusCandidate {
-                presence_id: viewer.presence_id.clone(),
-                session_id: viewer.session.session_id,
-            })
             .map(|candidate| {
                 state
                     .focus
-                    .begin_invalidation(&candidate, FocusTransitionReasonV2::Replaced)
+                    .begin_invalidation(candidate, FocusTransitionReasonV2::Replaced)
             })
             .transpose()?
             .and_then(|mutation| mutation.neutralization);
+        if let Some(candidate) = &replaced_candidate {
+            state.focus.retire_candidate(candidate);
+        }
         let media = state.media.clone().unwrap_or(MediaGenerationDescriptorV2 {
             generation_id: session_id,
             broadcast_name: media_generation_moq_broadcast_name(session_id)?,
@@ -574,7 +701,7 @@ impl SessionRegistry {
             media_generation_id: media.generation_id,
             media_broadcast_name: media.broadcast_name,
             grants: authorized.grants,
-            viewer_handle: Some(authorized.handle),
+            viewer_handle: Some(authorized.handle.clone()),
             authorization_revision: authorized.authorization_revision,
             authorization_committed_revision: authorized.committed_revision,
             media_active: true,
@@ -592,6 +719,7 @@ impl SessionRegistry {
                 presence_id,
                 authorization_neutralizing: false,
                 snapshots,
+                rates: ViewerRateLimits::default(),
             },
         );
         state.live_control_leases = state
@@ -601,6 +729,8 @@ impl SessionRegistry {
         advance_v2_revision(&mut state)?;
         publish_v2_snapshots(&state)?;
         let snapshot = v2_snapshot_for(&state, remote)?;
+        let active_viewers = state.viewers.len();
+        let viewer_handle = authorized.handle.clone();
         let replaced_snapshots = replaced.map(|viewer| viewer.snapshots);
         let lease = V2SessionLease {
             registry: Arc::clone(self),
@@ -616,6 +746,17 @@ impl SessionRegistry {
         };
         drop(state);
         self.session_changed.notify_waiters();
+        info!(
+            viewer_handle,
+            session_id,
+            active_viewers,
+            reason = if replacing {
+                "replacement"
+            } else {
+                "connected"
+            },
+            "multi-viewer session membership changed"
+        );
         Ok(lease)
     }
 
@@ -742,6 +883,7 @@ impl SessionRegistry {
             presence_id,
             session_id,
         };
+        let audit_handle = candidate.presence_id.clone();
         state.focus.check_rate_limit(&candidate, Instant::now())?;
         let mutation = match command.action {
             FocusCommandActionV2::Request => {
@@ -803,6 +945,16 @@ impl SessionRegistry {
             publish_v2_snapshots(&state)?;
         }
         let snapshot = v2_snapshot_for(&state, remote)?;
+        if mutation.changed {
+            info!(
+                viewer_handle = audit_handle.as_str(),
+                session_id,
+                action = ?command.action,
+                roster_revision = snapshot.revision,
+                transition_reason = ?snapshot.transition_reason,
+                "slot-0 focus state changed"
+            );
+        }
         self.session_changed.notify_waiters();
         Ok(FocusCommandEffect {
             snapshot,
@@ -950,6 +1102,13 @@ impl SessionRegistry {
         }
         advance_v2_revision(&mut state)?;
         publish_v2_snapshots(&state)?;
+        info!(
+            viewer_handle = %mutation.handle,
+            authorization_revision = mutation.authorization_revision,
+            committed_revision = mutation.committed_revision,
+            reason = if disconnected { "view_revoked" } else if input_reduced { "input_reduced" } else { "grants_changed" },
+            "live viewer authorization changed"
+        );
         drop(state);
         self.session_changed.notify_waiters();
         Ok(AuthorizationSessionEffect {
@@ -1227,6 +1386,12 @@ impl SessionRegistry {
             .get_mut(&remote)
             .filter(|viewer| viewer.session.media_active && viewer.session.nonce == nonce)
             .context("feedback connection does not match the active media session")?;
+        viewer.rates.feedback_claims.check(
+            Instant::now(),
+            FEEDBACK_CLAIM_RATE_WINDOW,
+            MAX_FEEDBACK_CLAIMS_PER_WINDOW,
+            "media feedback claim",
+        )?;
         let session = &mut viewer.session;
         ensure!(
             session.grants.contains(InvitationGrants::VIEW),
@@ -1394,14 +1559,23 @@ impl SessionRegistry {
             .as_ref()
             .filter(|session| session.media_active && session.remote == remote)
             .cloned();
-        let v2 = self
-            .v2_state
-            .lock()
-            .expect("v2 session state poisoned")
-            .viewers
-            .get(&remote)
-            .filter(|viewer| viewer.session.media_active)
-            .map(|viewer| viewer.session.clone());
+        let v2 = {
+            let mut state = self.v2_state.lock().expect("v2 session state poisoned");
+            state
+                .viewers
+                .get_mut(&remote)
+                .filter(|viewer| viewer.session.media_active)
+                .map(|viewer| {
+                    viewer.rates.attachments.check(
+                        Instant::now(),
+                        ATTACHMENT_RATE_WINDOW,
+                        MAX_ATTACHMENTS_PER_WINDOW,
+                        "MoQ attachment",
+                    )?;
+                    Ok::<ActiveSession, anyhow::Error>(viewer.session.clone())
+                })
+                .transpose()?
+        };
         let session = legacy
             .or(v2)
             .context("MoQ connection does not match an active control session")?;
@@ -1444,6 +1618,25 @@ impl SessionRegistry {
         })
     }
 
+    pub(super) fn admit_v2_keyframe_request(
+        &self,
+        remote: EndpointId,
+        session_id: u64,
+    ) -> Result<()> {
+        let mut state = self.v2_state.lock().expect("v2 session state poisoned");
+        let viewer = state
+            .viewers
+            .get_mut(&remote)
+            .filter(|viewer| viewer.session.media_active && viewer.session.session_id == session_id)
+            .context("keyframe request does not match the active viewer generation")?;
+        viewer.rates.keyframes.check(
+            Instant::now(),
+            KEYFRAME_RATE_WINDOW,
+            MAX_KEYFRAME_REQUESTS_PER_WINDOW,
+            "keyframe request",
+        )
+    }
+
     fn release(&self, remote: EndpointId, session_id: u64) {
         let mut active = self.active.lock().expect("session registry poisoned");
         if let Some(session) = active.as_mut()
@@ -1477,6 +1670,11 @@ impl SessionRegistry {
             return;
         };
         let presence_id = viewer.presence_id.clone();
+        let viewer_handle = viewer
+            .session
+            .viewer_handle
+            .clone()
+            .unwrap_or_else(|| presence_id.as_str().to_owned());
         let focus_mutation = state.focus.begin_invalidation(
             &FocusCandidate {
                 presence_id: presence_id.clone(),
@@ -1496,6 +1694,11 @@ impl SessionRegistry {
         if let Err(error) = focus_mutation {
             warn!(%error, session_id, "failed to invalidate focus during viewer release");
         }
+        state.focus.retire_candidate(&FocusCandidate {
+            presence_id,
+            session_id,
+        });
+        let active_viewers = state.viewers.len();
         if state.viewers.is_empty() {
             state.media = None;
         }
@@ -1504,6 +1707,13 @@ impl SessionRegistry {
         }
         drop(state);
         self.session_changed.notify_waiters();
+        info!(
+            viewer_handle,
+            session_id,
+            active_viewers,
+            reason = "disconnected",
+            "multi-viewer session membership changed"
+        );
     }
 
     pub(crate) fn is_active(&self, remote: EndpointId, session_id: u64) -> bool {
@@ -1537,6 +1747,11 @@ impl SessionRegistry {
         else {
             return Ok(false);
         };
+        let viewer_handle = viewer
+            .session
+            .viewer_handle
+            .clone()
+            .unwrap_or_else(|| viewer.presence_id.as_str().to_owned());
         ensure!(
             !matches!(
                 state.focus.state(),
@@ -1560,6 +1775,13 @@ impl SessionRegistry {
             .expect("MoQ registry poisoned")
             .remove(&(remote, session_id));
         self.session_changed.notify_waiters();
+        info!(
+            viewer_handle,
+            session_id,
+            active_viewers = self.runtime_status().active_viewers,
+            reason = "adaptive_recovery_detach",
+            "multi-viewer session membership changed"
+        );
         Ok(true)
     }
 
@@ -1709,8 +1931,11 @@ pub(crate) struct V2SessionLease {
     registry: Arc<SessionRegistry>,
     remote: EndpointId,
     pub(crate) session_id: u64,
+    #[allow(dead_code)]
     pub(super) session_clock: SessionClock,
+    #[allow(dead_code)]
     pub(super) media_v3_telemetry: Arc<MediaV3Telemetry>,
+    #[allow(dead_code)]
     pub(super) initial_snapshot: SessionSnapshotV2,
     pub(super) authorization_revision: u64,
     pub(super) authorization_committed_revision: u64,
@@ -2608,6 +2833,98 @@ mod tests {
         assert!(sessions.pending_handshakes.try_acquire().is_err());
         drop(permits);
         assert!(sessions.pending_handshakes.try_acquire().is_ok());
+    }
+
+    #[test]
+    fn per_viewer_reconnect_keyframe_and_feedback_rates_are_bounded() {
+        let sessions = Arc::new(SessionRegistry::new(1));
+        let remote = endpoint(1);
+        let mut lease = sessions
+            .claim_v2_authorized(
+                remote,
+                [1; 16],
+                authorized_viewer("viewer-one", InvitationGrants::ALL),
+            )
+            .unwrap();
+        for nonce in 2..=MAX_ADMISSIONS_PER_WINDOW {
+            lease = sessions
+                .claim_v2_authorized(
+                    remote,
+                    [u8::try_from(nonce).unwrap(); 16],
+                    authorized_viewer("viewer-one", InvitationGrants::ALL),
+                )
+                .unwrap();
+        }
+        assert!(
+            sessions
+                .claim_v2_authorized(
+                    remote,
+                    [99; 16],
+                    authorized_viewer("viewer-one", InvitationGrants::ALL),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("reconnect rate limit")
+        );
+
+        for _ in 0..MAX_KEYFRAME_REQUESTS_PER_WINDOW {
+            sessions
+                .admit_v2_keyframe_request(remote, lease.session_id)
+                .unwrap();
+        }
+        assert!(
+            sessions
+                .admit_v2_keyframe_request(remote, lease.session_id)
+                .unwrap_err()
+                .to_string()
+                .contains("keyframe request rate limit")
+        );
+
+        let active_nonce = [12; 16];
+        for _ in 0..MAX_FEEDBACK_CLAIMS_PER_WINDOW {
+            let feedback = sessions.claim_feedback(remote, active_nonce).unwrap();
+            drop(feedback);
+        }
+        assert!(sessions.claim_feedback(remote, active_nonce).is_err());
+    }
+
+    #[test]
+    fn runtime_status_reports_bounded_multi_viewer_focus_without_peer_keys() {
+        let sessions = Arc::new(SessionRegistry::new(3));
+        let first = sessions
+            .claim_v2_authorized(
+                endpoint(1),
+                [1; 16],
+                authorized_viewer("viewer-one", InvitationGrants::ALL),
+            )
+            .unwrap();
+        let second = sessions
+            .claim_v2_authorized(
+                endpoint(2),
+                [2; 16],
+                authorized_viewer("viewer-two", InvitationGrants::VIEW),
+            )
+            .unwrap();
+        let status = sessions.runtime_status();
+        assert_eq!(status.mode, "moq_multi_viewer");
+        assert_eq!(status.active_viewers, 2);
+        assert_eq!(status.configured_capacity, 3);
+        assert_eq!(status.focus_occupied, Some(false));
+        sessions
+            .apply_focus_command(
+                endpoint(1),
+                first.session_id,
+                &FocusCommandV2 {
+                    request_id: 1,
+                    action: FocusCommandActionV2::Request,
+                    slot: ControllerSlot::ZERO,
+                    expected_revision: second.initial_snapshot.revision,
+                    expected_focus_generation: None,
+                    expected_proposal_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(sessions.runtime_status().focus_occupied, Some(true));
     }
 
     #[test]

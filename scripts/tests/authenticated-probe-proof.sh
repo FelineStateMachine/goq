@@ -6,6 +6,12 @@ script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_dir="$(CDPATH='' cd -- "$script_dir/../.." && pwd -P)"
 temp_parent="${TMPDIR:-/tmp}"
 temp_parent="${temp_parent%/}"
+# Darwin's per-user TMPDIR is long enough to overflow sockaddr_un once the
+# owner-only authorization socket is appended. Use the same private mktemp
+# directory under the short system alias; the generated child remains mode 0700.
+if [[ "$(uname -s)" == Darwin ]]; then
+  temp_parent=/tmp
+fi
 temp_root="$(mktemp -d "$temp_parent/sigil-auth-probe.XXXXXX")"
 
 host_pid=""
@@ -169,10 +175,12 @@ grep -Fq 'host rejected control stream: Portal peer is not authorized' "$replay_
   }
 enrollment="$($host_bin enrollment show --config "$host_config")"
 grep -Fxq 'enrollment=active' <<<"$enrollment" || die 'probe enrollment is not active'
-grep -Fxq "peer_node_id=$probe_node_id" <<<"$enrollment" \
-  || die 'enrollment belongs to the wrong peer'
-grep -Fxq 'grants=view,pointer-keyboard' <<<"$enrollment" \
-  || die 'enrollment grants changed'
+grep -Fxq 'viewer_count=1' <<<"$enrollment" || die 'probe enrollment count changed'
+grep -Eq '^viewer=viewer-[0-9a-f]{16} grants=view,pointer-keyboard authorization_revision=[1-9][0-9]* enrolled_at_unix=[0-9]+$' \
+  <<<"$enrollment" || die 'opaque enrollment handle or grants changed'
+if grep -Fq "$probe_node_id" <<<"$enrollment"; then
+  die 'enrollment inspection exposed the raw peer identity'
+fi
 
 printf 'authenticated_probe_proof=ok\n'
 printf 'invitation_redemption=ok\n'

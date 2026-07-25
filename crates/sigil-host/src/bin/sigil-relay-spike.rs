@@ -208,11 +208,12 @@ fn main() -> Result<()> {
         - 1;
     let verify_p95_us = evidence.verification_micros[p95_index];
     let host_direct_bytes = evidence.host_bytes.saturating_mul(2);
-    let savings_percent = if host_direct_bytes == 0 {
-        0
-    } else {
-        100_u64.saturating_sub(evidence.host_bytes.saturating_mul(100) / host_direct_bytes)
-    };
+    let host_share_percent = evidence
+        .host_bytes
+        .saturating_mul(100)
+        .checked_div(host_direct_bytes)
+        .unwrap_or(0);
+    let savings_percent = 100_u64.saturating_sub(host_share_percent);
     let sign_cpu_percent =
         evidence.sign_nanos as f64 / (args.duration_seconds as f64 * 1_000_000_000_f64) * 100.0;
     let verify_cpu_percent = evidence.verification_nanos as f64

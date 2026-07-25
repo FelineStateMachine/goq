@@ -9,6 +9,9 @@ use sigil_protocol::{
 const FOCUS_PROPOSAL_TTL: Duration = Duration::from_secs(15);
 const FOCUS_ACTIVATION_TTL: Duration = Duration::from_secs(10);
 const FOCUS_COMMAND_RATE_WINDOW: Duration = Duration::from_secs(2);
+// Eight commands per two-second window permits one complete request/approve/
+// activate/release exchange with retry headroom for each of the hard maximum
+// eight viewers, while each viewer retains only its own bounded timestamps.
 const MAX_FOCUS_COMMANDS_PER_WINDOW: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +114,11 @@ impl FocusArbiter {
         );
         entries.push_back(now);
         Ok(())
+    }
+
+    pub(super) fn retire_candidate(&mut self, candidate: &FocusCandidate) {
+        self.command_times
+            .remove(&(candidate.presence_id.clone(), candidate.session_id));
     }
 
     pub(super) fn expire_proposal(&mut self, now: Instant) -> bool {

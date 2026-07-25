@@ -427,6 +427,7 @@ pub(crate) async fn open_input_session(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_input_session_v2(
     endpoint: &Endpoint,
     address: &iroh::EndpointAddr,

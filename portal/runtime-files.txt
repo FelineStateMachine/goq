@@ -27,6 +27,7 @@ main.js
 network-diagnostics.mjs
 pointer-feedback.mjs
 roster-ui.mjs
+session-diagnostics.mjs
 session-state.mjs
 stream-metrics.mjs
 stream-runtime.mjs

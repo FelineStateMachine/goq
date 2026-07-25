@@ -907,6 +907,7 @@ async fn run_generation_control_session(
     }
 }
 
+#[allow(dead_code)]
 enum MoqControlReader {
     V1(iroh::endpoint::RecvStream),
     V2 {
@@ -992,6 +993,7 @@ async fn forward_control_v2_requests(
                         last_sequence,
                         reason,
                     } => {
+                        sessions.admit_v2_keyframe_request(remote, session_id)?;
                         keyframes.send_replace(Some(MediaControlRequestV3::request_keyframe(
                             request_id,
                             last_sequence,

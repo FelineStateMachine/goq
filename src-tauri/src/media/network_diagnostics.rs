@@ -9,12 +9,13 @@ use std::{
 use iroh::endpoint::{Connection, PathId};
 use serde::Serialize;
 use sigil_protocol::{
-    AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1,
-    MediaFeedbackFlags, MediaFeedbackReportV1,
+    AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1, FocusStateV2,
+    MediaFeedbackFlags, MediaFeedbackReportV1, SessionSnapshotV2,
 };
 
 const LATENCY_BUCKETS_MS: usize = 5_001;
 pub(crate) const INPUT_ACK_PENDING_CAPACITY: usize = 1_024;
+const MAX_DIAGNOSTIC_VIEWERS: usize = 8;
 
 pub(crate) fn lock_network_diagnostics(
     diagnostics: &StdMutex<NetworkSessionDiagnostics>,
@@ -57,6 +58,7 @@ pub(crate) enum NetworkLeg {
 pub(crate) enum MediaDeliveryRole {
     #[default]
     DirectHost,
+    #[allow(dead_code)]
     ViewerRelay,
 }
 
@@ -66,6 +68,118 @@ struct MediaAuthenticationDiagnostics {
     generation_certified: bool,
     delivery_role: MediaDeliveryRole,
     verification_failures: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug)]
+struct SessionProtocolDiagnostics {
+    mode: &'static str,
+    local_handle: Option<String>,
+    focus_generation: Option<u64>,
+    roster_revision: Option<u64>,
+    roster_updated_at: Option<Instant>,
+    subscription_expires_at_unix: Option<u64>,
+    stale_snapshot_total: u64,
+    invalid_snapshot_total: u64,
+}
+
+impl Default for SessionProtocolDiagnostics {
+    fn default() -> Self {
+        Self {
+            mode: "legacy_exclusive_v1",
+            local_handle: None,
+            focus_generation: None,
+            roster_revision: None,
+            roster_updated_at: None,
+            subscription_expires_at_unix: None,
+            stale_snapshot_total: 0,
+            invalid_snapshot_total: 0,
+        }
+    }
+}
+
+impl SessionProtocolDiagnostics {
+    fn configure_v2(
+        &mut self,
+        snapshot: &SessionSnapshotV2,
+        subscription_expires_at_unix: u64,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.mode = "moq_multi_viewer_v2";
+        self.subscription_expires_at_unix = Some(subscription_expires_at_unix);
+        self.observe_snapshot(snapshot, now, true)
+    }
+
+    fn observe_snapshot(
+        &mut self,
+        snapshot: &SessionSnapshotV2,
+        now: Instant,
+        initial: bool,
+    ) -> Result<(), String> {
+        if let Err(error) = snapshot.validate() {
+            self.invalid_snapshot_total = self.invalid_snapshot_total.saturating_add(1);
+            return Err(format!("Invalid session diagnostics snapshot: {error}"));
+        }
+        if snapshot.viewers.len() > MAX_DIAGNOSTIC_VIEWERS {
+            self.invalid_snapshot_total = self.invalid_snapshot_total.saturating_add(1);
+            return Err("Session diagnostics roster exceeds the hard viewer bound".to_string());
+        }
+        if !initial
+            && self
+                .roster_revision
+                .is_some_and(|revision| snapshot.revision <= revision)
+        {
+            self.stale_snapshot_total = self.stale_snapshot_total.saturating_add(1);
+            return Ok(());
+        }
+        let local = snapshot.self_viewer();
+        self.local_handle = Some(local.presence_id.as_str().to_owned());
+        self.focus_generation = match &snapshot.focus {
+            FocusStateV2::Held {
+                holder,
+                session_id,
+                focus_generation,
+                ..
+            } if holder == &local.presence_id && *session_id == local.session_id => {
+                Some(*focus_generation)
+            }
+            _ => None,
+        };
+        self.roster_revision = Some(snapshot.revision);
+        self.roster_updated_at = Some(now);
+        Ok(())
+    }
+
+    fn snapshot(&self, now: Instant, now_unix: u64) -> SessionProtocolSnapshot {
+        SessionProtocolSnapshot {
+            mode: self.mode,
+            local_handle: self.local_handle.clone(),
+            focus_generation: self.focus_generation,
+            roster_revision: self.roster_revision,
+            roster_age_ms: self.roster_updated_at.map(|updated| {
+                u64::try_from(now.saturating_duration_since(updated).as_millis())
+                    .unwrap_or(u64::MAX)
+            }),
+            subscription_expires_at_unix: self.subscription_expires_at_unix,
+            subscription_seconds_remaining: self
+                .subscription_expires_at_unix
+                .map(|expiry| expiry.saturating_sub(now_unix)),
+            stale_snapshot_total: self.stale_snapshot_total,
+            invalid_snapshot_total: self.invalid_snapshot_total,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SessionProtocolSnapshot {
+    mode: &'static str,
+    local_handle: Option<String>,
+    focus_generation: Option<u64>,
+    roster_revision: Option<u64>,
+    roster_age_ms: Option<u64>,
+    subscription_expires_at_unix: Option<u64>,
+    subscription_seconds_remaining: Option<u64>,
+    stale_snapshot_total: u64,
+    invalid_snapshot_total: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -612,6 +726,7 @@ pub(crate) struct NetworkSessionDiagnostics {
     input_ack: InputAckDiagnostics,
     media_authentication: MediaAuthenticationDiagnostics,
     adaptive: AdaptiveViewerSnapshot,
+    session: SessionProtocolDiagnostics,
 }
 
 impl NetworkSessionDiagnostics {
@@ -624,7 +739,30 @@ impl NetworkSessionDiagnostics {
             input_ack: InputAckDiagnostics::new(input_ack_negotiated),
             media_authentication: MediaAuthenticationDiagnostics::default(),
             adaptive: AdaptiveViewerSnapshot::default(),
+            session: SessionProtocolDiagnostics::default(),
         }
+    }
+
+    pub(crate) fn configure_v2_session(
+        &mut self,
+        snapshot: &SessionSnapshotV2,
+        subscription_expires_at_unix: u64,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.session
+            .configure_v2(snapshot, subscription_expires_at_unix, now)
+    }
+
+    pub(crate) fn observe_session_snapshot(
+        &mut self,
+        snapshot: &SessionSnapshotV2,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.session.observe_snapshot(snapshot, now, false)
+    }
+
+    pub(crate) fn mark_session_snapshot_invalid(&mut self) {
+        self.session.invalid_snapshot_total = self.session.invalid_snapshot_total.saturating_add(1);
     }
 
     pub(crate) fn configure_authenticated_media(&mut self, delivery_role: MediaDeliveryRole) {
@@ -684,8 +822,11 @@ impl NetworkSessionDiagnostics {
     }
 
     pub(crate) fn snapshot(&self, now: Instant) -> NetworkDiagnosticsSnapshot {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
         NetworkDiagnosticsSnapshot {
-            version: 1,
+            version: 2,
             session_elapsed_ms: u64::try_from(
                 now.saturating_duration_since(self.started_at).as_millis(),
             )
@@ -696,6 +837,7 @@ impl NetworkSessionDiagnostics {
             input_ack: self.input_ack.snapshot(),
             media_authentication: self.media_authentication.snapshot(),
             adaptive: self.adaptive.clone(),
+            session: self.session.snapshot(now, now_unix),
         }
     }
 }
@@ -710,6 +852,7 @@ pub(crate) struct NetworkDiagnosticsSnapshot {
     input_ack: InputAckSnapshot,
     media_authentication: MediaAuthenticationSnapshot,
     adaptive: AdaptiveViewerSnapshot,
+    session: SessionProtocolSnapshot,
 }
 
 #[cfg(test)]

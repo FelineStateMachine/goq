@@ -78,7 +78,7 @@ Every input is a mode `0600` regular file at an absolute path. It begins with
 these fields, copied from `manifest.tsv` where applicable:
 
 ```text
-uat_schema=goq-public-alpha-evidence-v2
+uat_schema=goq-public-alpha-evidence-v3
 evidence_kind=controller
 observed_at_unix=1760000000
 git_commit=0123456789abcdef0123456789abcdef01234567
@@ -107,8 +107,10 @@ chmod 600 /absolute/path/to/controller.evidence
 ```
 
 Supported kinds are `cold-boot`, `controller`, `mouse`, `soak`,
-`network-direct`, `network-relay`, `reconnect`, `second-client`, and the
-optional `loopback-preflight`.
+`network-direct`, `network-relay`, `reconnect`, `multi-viewer`,
+`second-client`, and the optional `loopback-preflight`. `second-client` is the
+legacy-exclusive check; native-MoQ v2 must admit the bounded three-viewer
+contract instead of rejecting viewer two.
 
 ## 3. Required hardware exercises
 
@@ -249,7 +251,7 @@ Both records reject packet loss over 5%. The relay run must be forced or
 observed under the documented difficult-NAT setup and confirmed as relayed by
 Portal diagnostics.
 
-### Reconnect and second-client admission
+### Reconnect and multi-viewer admission
 
 Perform at least ten reconnects with the exact candidates. Each must restore
 the intended session state and resume from a keyframe:
@@ -264,14 +266,48 @@ keyframe_recovery_p95_ms=900
 
 Keyframe recovery p95 must not exceed 2000 ms.
 
-While the authorized primary session remains playable, attempt a second client
-at least three times:
+Connect three exact-candidate Portals concurrently over native MoQ control v2.
+Exercise controller focus transfer, one constrained viewer, same-peer
+replacement, and live grant revocation while collecting shared-resource and
+cleanup evidence:
 
 ```text
+protocol_mode=native-moq-v2
+configured_viewer_capacity=3
+concurrent_viewers=3
+shared_media_generation=pass
+shared_video_sources=1
+shared_video_encoders=1
+shared_audio_sources=1
+shared_audio_encoders=1
+shared_publishers=1
+shared_adaptive_actuators=1
+viewer_progress=pass
+slot_0_holders_max=1
+focus_handoff_p95_ms=250
+slow_viewer_isolation=pass
+same_peer_replacement=pass
+live_view_revocation=pass
+survivors_uninterrupted=pass
+final_cleanup=pass
+ordinary_service_restored=pass
+```
+
+The configured capacity must be 3 through 8, at least three viewers must be
+simultaneous, and focus handoff p95 must not exceed 1000 ms. Shared resource
+counts and the maximum slot-0 holder count must each be exactly one. Revoking
+one viewer or detaching a constrained viewer must not change survivor media
+generation or interrupt their A/V/input diagnostics.
+
+Run a separate legacy-exclusive session. While its authorized primary remains
+playable, attempt a second legacy client at least three times:
+
+```text
+protocol_mode=legacy-exclusive-v1
 second_client_attempts=3
 second_client_rejections=3
 authorized_primary_uninterrupted=pass
-rejection_reason=active-client
+rejection_reason=legacy-active-client
 ```
 
 ## 4. Optional loopback preflight
@@ -282,7 +318,8 @@ mode. Its output includes an operationally sensitive `node_id`, so remove that
 line before ingestion and add the common envelope:
 
 ```bash
-./scripts/loopback-proof.sh --profile release \
+./scripts/loopback-proof.sh --profile release --control-v2 --viewers 3 \
+  --primary-frames 600 --reconnect-cycles 3 \
   | sed '/^node_id=/d' \
   >> /absolute/path/to/loopback-preflight.evidence
 chmod 600 /absolute/path/to/loopback-preflight.evidence
@@ -294,9 +331,14 @@ The normalized record requires:
 loopback_proof=ok
 profile=release
 host_sha256=<same value as sigil_sha256>
-active_client_rejection=ok
+control_v2=ok
+viewers=3
 reconnect_cycles=3
-cleanup=ok
+same_peer_replacement=ok
+shared_generation=ok
+slot_0_single_holder=ok
+bounded_queues=ok
+final_cleanup=ok
 ```
 
 The harness ingests the output by value and never mutates the Bazzite host.

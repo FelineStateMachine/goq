@@ -6,6 +6,7 @@ use iroh::{Endpoint, SecretKey, endpoint::presets};
 use serde::Serialize;
 use sigil_protocol::{
     InputEvent, InvitationGrants, KeyframeRequestReasonV3, PointerSurfaceDimensions,
+    SignedSubscriptionCapability,
 };
 use tauri::{
     AppHandle, Emitter,
@@ -233,14 +234,31 @@ pub(crate) async fn connect_client(
         }),
         NegotiatedMediaStream::V1(_) => None,
     };
+    let subscription_expires_at_unix = match &media_negotiation {
+        NegotiatedMediaStream::V2(negotiation) => Some(
+            SignedSubscriptionCapability::decode(&negotiation.media_subscription_capability)
+                .map_err(|error| format!("Invalid media subscription capability: {error}"))?
+                .claims
+                .expires_at_unix,
+        ),
+        NegotiatedMediaStream::V1(_) => None,
+    };
     let media_generation = next_media_generation(&state.client_media_generation)?;
     let network_diagnostics = Arc::new(StdMutex::new(NetworkSessionDiagnostics::new(
         Instant::now(),
         false,
     )));
     if moq_authentication.is_some() {
-        lock_network_diagnostics(&network_diagnostics)
-            .configure_authenticated_media(MediaDeliveryRole::DirectHost);
+        let mut diagnostics = lock_network_diagnostics(&network_diagnostics);
+        diagnostics.configure_authenticated_media(MediaDeliveryRole::DirectHost);
+        diagnostics.configure_v2_session(
+            initial_session_snapshot
+                .as_ref()
+                .ok_or_else(|| "Control v2 omitted its diagnostics snapshot".to_string())?,
+            subscription_expires_at_unix
+                .ok_or_else(|| "Control v2 omitted its subscription expiry".to_string())?,
+            Instant::now(),
+        )?;
     }
     let media_verification_failures =
         lock_network_diagnostics(&network_diagnostics).media_verification_failure_counter();
@@ -455,6 +473,7 @@ pub(crate) async fn connect_client(
             frame_recv,
             control_rx,
             Arc::clone(&state.session_snapshot),
+            Arc::clone(&network_diagnostics),
         ));
         None
     };

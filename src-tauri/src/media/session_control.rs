@@ -8,6 +8,7 @@ use sigil_protocol::{
 use tauri::{AppHandle, Emitter};
 
 use crate::commands::state::{SessionControlSender, SessionSnapshotState};
+use crate::media::network_diagnostics::{NetworkSessionDiagnostics, lock_network_diagnostics};
 
 pub(crate) const SESSION_CONTROL_COMMAND_CAPACITY: usize = 4;
 
@@ -44,6 +45,7 @@ pub(crate) async fn install_initial_snapshot(
         .map_err(|error| format!("Failed to publish initial session snapshot: {error}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_session_control(
     app: AppHandle,
     native_generation: u64,
@@ -52,6 +54,7 @@ pub(crate) async fn run_session_control(
     mut recv: iroh::endpoint::RecvStream,
     mut commands: tokio::sync::mpsc::Receiver<ClientControlEnvelopeV2>,
     state: Arc<tokio::sync::Mutex<Option<SessionSnapshotState>>>,
+    diagnostics: Arc<std::sync::Mutex<NetworkSessionDiagnostics>>,
 ) {
     loop {
         tokio::select! {
@@ -81,7 +84,15 @@ pub(crate) async fn run_session_control(
                             .map(|(_, snapshot)| snapshot.revision)
                             .unwrap_or(0);
                         if snapshot.revision <= current_revision {
+                            let _ = lock_network_diagnostics(&diagnostics)
+                                .observe_session_snapshot(&snapshot, std::time::Instant::now());
                             continue;
+                        }
+                        if let Err(error) = lock_network_diagnostics(&diagnostics)
+                            .observe_session_snapshot(&snapshot, std::time::Instant::now())
+                        {
+                            eprintln!("[client] invalid session diagnostics snapshot: {error}");
+                            break;
                         }
                         *guard = Some((native_generation, snapshot.clone()));
                         drop(guard);
@@ -104,6 +115,7 @@ pub(crate) async fn run_session_control(
                     }
                     Ok(None) => break,
                     Err(error) => {
+                        lock_network_diagnostics(&diagnostics).mark_session_snapshot_invalid();
                         eprintln!("[client] invalid control v2 message: {error}");
                         break;
                     }
@@ -151,6 +163,7 @@ pub(crate) async fn send_focus_command(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn latest_snapshot(
     state: &tokio::sync::Mutex<Option<SessionSnapshotState>>,
     native_generation: u64,

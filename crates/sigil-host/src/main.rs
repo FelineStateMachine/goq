@@ -348,6 +348,14 @@ struct ServeArgs {
     height: u32,
     #[arg(long, default_value_t = 60)]
     framerate: u32,
+    /// Concurrent native-MoQ viewers in direct proof mode.
+    #[arg(
+        long,
+        default_value_t = config::DEFAULT_MAX_VIEWERS,
+        value_parser = clap::value_parser!(u8).range(1..=8),
+        requires = "identity"
+    )]
+    max_viewers: u8,
     #[arg(long, default_value = "ffmpeg")]
     ffmpeg: PathBuf,
     /// Exit after this many seconds; intended for bounded automation.
@@ -985,9 +993,11 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         config.max_viewers,
         config.focus_owner.clone(),
     ));
+    let media_generations = MediaGenerationManager::new(config.clone(), host_secret);
     let publisher = appliance::RuntimePublisher::start(
         secret.public(),
         Arc::clone(&sessions),
+        Arc::clone(&media_generations),
         configured_service,
         loaded_config_revision,
     )?;
@@ -1117,7 +1127,6 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
 
     let moq_origin = Origin::random();
     let input_operations = Arc::new(InputOperations::new(input_backend.clone()));
-    let media_generations = MediaGenerationManager::new(config.clone(), host_secret);
     let authorization_admin = match &authorization {
         AuthorizationPolicy::Required(store) => Some(
             authorization_admin::AuthorizationAdminServer::start(
@@ -1338,7 +1347,7 @@ fn load_serve_config(args: &ServeArgs) -> Result<LoadedServeConfig> {
         config: HostConfig {
             identity_path,
             state_path,
-            max_viewers: config::DEFAULT_MAX_VIEWERS,
+            max_viewers: args.max_viewers,
             focus_owner: None,
             source: source.into(),
             width: Some(args.width),

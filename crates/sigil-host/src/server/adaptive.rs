@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::session::{
     AdaptiveEncoderProposal, FeedbackLease, FeedbackScope, MediaV3TelemetrySnapshot,
@@ -34,6 +35,9 @@ const ISOLATED_RECOVERY_CLEAN_WINDOWS: u8 = 3;
 const ISOLATED_RECOVERY_PRESSURE_WINDOWS: u8 = 3;
 const ISOLATED_RECOVERY_MAX_ATTEMPTS: u8 = 2;
 const ISOLATED_RECOVERY_BACKOFF: Duration = Duration::from_secs(2);
+// All policy state is one fixed record per hard-bounded viewer. Reports use a
+// latest cumulative ingress slot and the generation owns one actuator/queued
+// plan, so eight viewers cannot multiply encoder work or queue history.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FeedbackSeverity {
@@ -594,6 +598,7 @@ pub(super) struct GenerationAdaptiveCoordinator {
     ceiling_kbps: u32,
     state: Mutex<GenerationAggregateState>,
     changed: tokio::sync::Notify,
+    recovering_viewers: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for GenerationAdaptiveCoordinator {
@@ -649,6 +654,7 @@ impl GenerationAdaptiveCoordinator {
         producer_telemetry: Arc<super::session::MediaV3Telemetry>,
         keyframe_requests: tokio::sync::watch::Sender<Option<MediaControlRequestV3>>,
         shutdown: tokio::sync::watch::Receiver<bool>,
+        recovering_viewers: Arc<AtomicUsize>,
     ) -> Result<(Arc<Self>, tokio::task::JoinHandle<Result<()>>)> {
         let ceiling_kbps = adaptive_bitrate_ceiling_kbps(&config)?;
         let coordinator = Arc::new(Self {
@@ -660,6 +666,7 @@ impl GenerationAdaptiveCoordinator {
                 target_kbps: ceiling_kbps,
             }),
             changed: tokio::sync::Notify::new(),
+            recovering_viewers,
         });
         let task_coordinator = Arc::clone(&coordinator);
         let task = tokio::spawn(async move {
@@ -720,6 +727,7 @@ impl GenerationAdaptiveCoordinator {
                 detach,
             },
         );
+        self.update_recovering_count(&state);
         drop(state);
         self.changed.notify_one();
         Ok(GenerationFeedbackRegistration {
@@ -741,6 +749,7 @@ impl GenerationAdaptiveCoordinator {
             .is_some_and(|contributor| contributor.authorization_revision == authorization_revision)
         {
             state.contributors.remove(&key);
+            self.update_recovering_count(&state);
             drop(state);
             self.changed.notify_one();
         }
@@ -849,6 +858,7 @@ impl GenerationAdaptiveCoordinator {
             contributor.last_received_at = Some(now);
             changed_keys.push(*key);
         }
+        self.update_recovering_count(&state);
 
         let active = state
             .contributors
@@ -950,6 +960,21 @@ impl GenerationAdaptiveCoordinator {
             decision_id: plan_decision_id,
             last_sequence: aggregate_report.and_then(|report| report.last_sequence),
         }))
+    }
+
+    fn update_recovering_count(&self, state: &GenerationAggregateState) {
+        let count = state
+            .contributors
+            .values()
+            .filter(|contributor| {
+                !matches!(
+                    contributor.recovery,
+                    ContributorRecoveryState::Active { .. }
+                )
+            })
+            .count();
+        debug_assert!(count <= usize::from(crate::config::MAX_VIEWERS));
+        self.recovering_viewers.store(count, Ordering::Relaxed);
     }
 }
 
@@ -1540,11 +1565,9 @@ impl GenerationAdaptiveActuator {
             None
         };
         let resolution_target = plan.resolution_decision.map(|decision| decision.target);
-        let resolution_revision = if resolution_target.is_some()
-            && (resolution_target != self.requested_resolution
-                || resolution_target != self.committed_resolution)
-        {
-            let target = resolution_target.expect("resolution target was checked");
+        let resolution_revision = if let Some(target) = resolution_target.filter(|target| {
+            Some(*target) != self.requested_resolution || Some(*target) != self.committed_resolution
+        }) {
             match control.request_resolution(target.width, target.height) {
                 Ok(revision) => {
                     self.requested_resolution = Some(target);

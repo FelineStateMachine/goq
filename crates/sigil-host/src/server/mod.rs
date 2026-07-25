@@ -74,6 +74,7 @@ use media_v3::{
 use moq::{MOQ_REJECT_CODE, serve_authorized_moq, serve_control_moq, serve_control_moq_v2};
 
 pub use session::SessionRegistry;
+pub(crate) use session::SessionRuntimeStatus;
 use session::{
     ClaimedMoqAttachment, ForcedIdrCoordinator, ForcedIdrDisposition, MediaV3Telemetry,
     MoqAttachmentWait, SourceTaskGuard,
@@ -191,7 +192,7 @@ fn endpoint(byte: u8) -> EndpointId {
 }
 
 #[cfg(test)]
-fn moq_test_config() -> HostConfig {
+pub(crate) fn moq_test_config() -> HostConfig {
     HostConfig {
         identity_path: "identity".into(),
         state_path: "state".into(),

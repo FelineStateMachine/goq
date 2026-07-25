@@ -615,6 +615,7 @@ impl AuthorizationStore {
         Ok(result)
     }
 
+    #[allow(dead_code)]
     pub fn authorize_or_redeem(
         &self,
         remote: EndpointId,

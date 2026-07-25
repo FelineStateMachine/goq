@@ -122,6 +122,10 @@ if grep -Eiq '(^|[[:space:]├└│─])(moq-media|moq-mux)([[:space:]-]|$)' <<
 fi
 
 ./scripts/loopback-proof.sh
+./scripts/loopback-proof.sh --profile debug --control-v2 --viewers 3 \
+  --primary-frames 600 --reconnect-cycles 3
+./scripts/loopback-proof.sh --profile release --legacy-exclusive --viewers 2 \
+  --expect-second-rejected
 
 cargo test --locked -p portal --release \
   commands::state::tests::rejects_direct_node_when_debug_mode_is_disabled \

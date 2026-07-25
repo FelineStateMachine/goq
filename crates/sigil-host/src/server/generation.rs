@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -26,6 +26,9 @@ use crate::source::{
 };
 
 const GENERATION_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+// Producer resources are generation-global. Viewer growth is represented only
+// by at most MAX_VIEWERS leases and consumers; no capture, encoder, publisher,
+// actuator, frame watch, or retained GOP allocation scales with viewer count.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MediaGenerationLifecycle {
@@ -61,6 +64,7 @@ pub(crate) struct MediaGenerationManager {
     state_changed: Notify,
     starts: AtomicU64,
     stops: AtomicU64,
+    recovering_viewers: Arc<AtomicUsize>,
 }
 
 impl MediaGenerationManager {
@@ -73,6 +77,7 @@ impl MediaGenerationManager {
             state_changed: Notify::new(),
             starts: AtomicU64::new(0),
             stops: AtomicU64::new(0),
+            recovering_viewers: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -101,8 +106,13 @@ impl MediaGenerationManager {
                         .fetch_add(1, Ordering::Relaxed)
                         .checked_add(1)
                         .context("media generation id overflowed")?;
-                    match ActiveGeneration::start(&self.config, self.host_secret, generation_id)
-                        .await
+                    match ActiveGeneration::start(
+                        &self.config,
+                        self.host_secret,
+                        generation_id,
+                        Arc::clone(&self.recovering_viewers),
+                    )
+                    .await
                     {
                         Ok(active) => {
                             let shared = active.shared.clone();
@@ -154,6 +164,7 @@ impl MediaGenerationManager {
             active.stop().await;
             self.stops.fetch_add(1, Ordering::Relaxed);
         }
+        self.recovering_viewers.store(0, Ordering::Relaxed);
         let mut state = self.state.lock().await;
         state.lifecycle = MediaGenerationLifecycle::Idle;
         self.state_changed.notify_waiters();
@@ -173,6 +184,10 @@ impl MediaGenerationManager {
             })
             .map(|active| Arc::clone(&active.shared.adaptive))
             .context("feedback does not match the active media generation")
+    }
+
+    pub(crate) fn recovering_viewer_count(&self) -> usize {
+        self.recovering_viewers.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -284,7 +299,12 @@ impl std::fmt::Debug for ActiveGeneration {
 }
 
 impl ActiveGeneration {
-    async fn start(config: &HostConfig, host_secret: [u8; 32], generation_id: u64) -> Result<Self> {
+    async fn start(
+        config: &HostConfig,
+        host_secret: [u8; 32],
+        generation_id: u64,
+        recovering_viewers: Arc<AtomicUsize>,
+    ) -> Result<Self> {
         let session_clock = SessionClock::start();
         let source = match config.source {
             VideoSource::TestPattern => Ok(spawn_test_pattern(config.clone(), session_clock)),
@@ -354,6 +374,7 @@ impl ActiveGeneration {
             Arc::clone(&telemetry),
             keyframe_requests.clone(),
             shutdown_rx.clone(),
+            recovering_viewers,
         )?;
         let video_publisher = tokio::spawn(run_generation_video_publisher(
             config.clone(),
@@ -411,6 +432,7 @@ impl ActiveGeneration {
             audio_sources = usize::from(audio_enabled),
             audio_encoders = usize::from(audio_enabled),
             publishers = 1,
+            adaptive_actuators = 1,
             "shared media generation started"
         );
         Ok(Self {

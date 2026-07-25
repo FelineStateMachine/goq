@@ -24,6 +24,7 @@ pub(crate) struct NegotiatedV2Stream {
     pub(crate) media_subscription_capability: String,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum NegotiatedMediaStream {
     V2(NegotiatedV2Stream),
     V1(NegotiatedV1Stream),

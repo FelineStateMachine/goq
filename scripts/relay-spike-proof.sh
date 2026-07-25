@@ -49,7 +49,7 @@ done
   exit 2
 }
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/goq-relay-spike.XXXXXX")
 trap 'rm -rf "$tmp_root"' EXIT
 log="$tmp_root/relay-spike.log"
@@ -58,6 +58,7 @@ log="$tmp_root/relay-spike.log"
 # Exact direct/relay-fallback Iroh path measurements remain the manual gate.
 (
   cd "$repo_root"
+  # shellcheck source=/dev/null
   source "${HOME}/.cargo/env"
   cargo run --quiet --release -p sigil-host --bin sigil-relay-spike -- \
     --video "$video" \

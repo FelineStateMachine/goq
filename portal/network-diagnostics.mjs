@@ -1,4 +1,9 @@
-const NETWORK_DIAGNOSTICS_VERSION = 1;
+import {
+  normalizeSessionDiagnostics,
+  sessionDiagnosticsPresentation,
+} from './session-diagnostics.mjs';
+
+const NETWORK_DIAGNOSTICS_VERSION = 2;
 const PATH_MODES = new Set(['direct', 'relay', 'custom', 'unknown']);
 
 function record(value, label) {
@@ -251,6 +256,7 @@ export function normalizeNetworkDiagnostics(value) {
       : normalizeLeg(diagnostics.audio, 'network_diagnostics.audio'),
     inputAck: normalizeInputAck(diagnostics.input_ack),
     adaptive: normalizeAdaptive(diagnostics.adaptive),
+    session: normalizeSessionDiagnostics(diagnostics.session),
   };
 }
 
@@ -301,7 +307,7 @@ export function networkDiagnosticsPresentation(diagnostics) {
     };
   }
   return {
-    session: `v${diagnostics.version} · ${(diagnostics.sessionElapsedMs / 1000).toFixed(1)} s`,
+    session: `v${diagnostics.version} · ${(diagnostics.sessionElapsedMs / 1000).toFixed(1)} s · ${sessionDiagnosticsPresentation(diagnostics.session)}`,
     media: formatNetworkLeg(diagnostics.media),
     input: formatNetworkLeg(diagnostics.input),
     audio: formatNetworkLeg(diagnostics.audio),

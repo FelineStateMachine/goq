@@ -13,7 +13,7 @@ use crate::authorization::{AuthorizationInspection, AuthorizationStore};
 use crate::config::{ConfigRevision, HostConfig};
 use crate::config_management::ConfigTransactionSummaryV1;
 use crate::secure_state;
-use crate::server::SessionRegistry;
+use crate::server::{MediaGenerationManager, SessionRegistry};
 
 const LIFECYCLE_LOCK_FILE: &str = "daemon-v1.lock";
 const GLOBAL_LIFECYCLE_LOCK_FILE: &str = "daemon-global-v1.lock";
@@ -21,7 +21,7 @@ const RUNTIME_STATUS_FILE: &str = "daemon-status-v1.json";
 // Frozen local-management ABI consumed by Sigil commands and the Decky
 // plugin. A successor needs an explicit migration; never rename this in place.
 const RUNTIME_DIRECTORY_COMPONENT: &str = "sigil-spark";
-const RUNTIME_STATUS_VERSION: u16 = 2;
+const RUNTIME_STATUS_VERSION: u16 = 3;
 const MAX_RUNTIME_STATUS_BYTES: u64 = 16 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const STALE_AFTER: Duration = Duration::from_secs(10);
@@ -164,6 +164,29 @@ struct RuntimeStatusV2 {
     last_error: Option<RuntimeErrorV1>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeStatusV3 {
+    version: u16,
+    instance_id: String,
+    host_node_id: String,
+    loaded_config_revision: Option<ConfigRevision>,
+    reached_ready: bool,
+    updated_at_unix_ms: u64,
+    uptime_ms: u64,
+    daemon: DaemonState,
+    session_active: bool,
+    session_mode: String,
+    active_viewer_count: usize,
+    media_generation_id: Option<u64>,
+    roster_revision: Option<u64>,
+    focus_occupied: Option<bool>,
+    recovering_viewer_count: usize,
+    configured_viewer_capacity: usize,
+    authorization_revision: u64,
+    last_error: Option<RuntimeErrorV1>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApplianceStatusV2 {
     schema_version: u16,
@@ -230,6 +253,14 @@ struct RuntimeStatus {
     instance_id: Option<String>,
     loaded_config_revision: Option<ConfigRevision>,
     reached_ready: bool,
+    mode: Option<String>,
+    active_viewer_count: Option<usize>,
+    media_generation_id: Option<u64>,
+    roster_revision: Option<u64>,
+    focus_occupied: Option<bool>,
+    recovering_viewer_count: Option<usize>,
+    configured_viewer_capacity: Option<usize>,
+    authorization_revision: Option<u64>,
     last_error: Option<RuntimeErrorV1>,
 }
 
@@ -243,6 +274,7 @@ pub struct RuntimePublisher {
     reached_ready: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<RuntimeErrorV1>>>,
     sessions: Arc<SessionRegistry>,
+    generations: Arc<MediaGenerationManager>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -251,6 +283,7 @@ impl RuntimePublisher {
     pub fn start(
         host: EndpointId,
         sessions: Arc<SessionRegistry>,
+        generations: Arc<MediaGenerationManager>,
         require_runtime: bool,
         loaded_config_revision: Option<ConfigRevision>,
     ) -> Result<Option<Self>> {
@@ -267,13 +300,21 @@ impl RuntimePublisher {
             !require_runtime || loaded_config_revision.is_some(),
             "configured Sigil service requires a loaded config revision"
         );
-        Self::start_at(&state_directory, host, sessions, loaded_config_revision).map(Some)
+        Self::start_at(
+            &state_directory,
+            host,
+            sessions,
+            generations,
+            loaded_config_revision,
+        )
+        .map(Some)
     }
 
     fn start_at(
         state_directory: &Path,
         host: EndpointId,
         sessions: Arc<SessionRegistry>,
+        generations: Arc<MediaGenerationManager>,
         loaded_config_revision: Option<ConfigRevision>,
     ) -> Result<Self> {
         let instance_id = random_instance_id()?;
@@ -291,6 +332,7 @@ impl RuntimePublisher {
             reached_ready,
             last_error,
             sessions,
+            generations,
             write_lock,
             task: None,
         };
@@ -305,6 +347,7 @@ impl RuntimePublisher {
         let reached_ready = Arc::clone(&publisher.reached_ready);
         let last_error = Arc::clone(&publisher.last_error);
         let sessions = Arc::clone(&publisher.sessions);
+        let generations = Arc::clone(&publisher.generations);
         let write_lock = Arc::clone(&publisher.write_lock);
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -318,7 +361,8 @@ impl RuntimePublisher {
                 let loaded_config_revision = loaded_config_revision.clone();
                 let daemon = decode_daemon_state(daemon_state.load(Ordering::Relaxed));
                 let reached_ready = reached_ready.load(Ordering::Relaxed);
-                let session_active = sessions.has_session();
+                let session = sessions.runtime_status();
+                let recovering_viewer_count = generations.recovering_viewer_count();
                 let last_error = last_error
                     .lock()
                     .expect("runtime status error state poisoned")
@@ -332,7 +376,8 @@ impl RuntimePublisher {
                         started,
                         daemon,
                         reached_ready,
-                        session_active,
+                        session,
+                        recovering_viewer_count,
                         last_error,
                     })
                 })
@@ -390,7 +435,8 @@ impl RuntimePublisher {
         let loaded_config_revision = self.loaded_config_revision.clone();
         let started = self.started;
         let reached_ready = self.reached_ready.load(Ordering::Relaxed);
-        let session_active = self.sessions.has_session();
+        let session = self.sessions.runtime_status();
+        let recovering_viewer_count = self.generations.recovering_viewer_count();
         let last_error = self
             .last_error
             .lock()
@@ -405,7 +451,8 @@ impl RuntimePublisher {
                 started,
                 daemon: DaemonState::Stopped,
                 reached_ready,
-                session_active,
+                session,
+                recovering_viewer_count,
                 last_error,
             })
         })
@@ -422,7 +469,8 @@ impl RuntimePublisher {
             started: self.started,
             daemon: decode_daemon_state(self.daemon_state.load(Ordering::Relaxed)),
             reached_ready: self.reached_ready.load(Ordering::Relaxed),
-            session_active: self.sessions.has_session(),
+            session: self.sessions.runtime_status(),
+            recovering_viewer_count: self.generations.recovering_viewer_count(),
             last_error: self
                 .last_error
                 .lock()
@@ -441,7 +489,8 @@ impl RuntimePublisher {
         let started = self.started;
         let daemon = decode_daemon_state(self.daemon_state.load(Ordering::Relaxed));
         let reached_ready = self.reached_ready.load(Ordering::Relaxed);
-        let session_active = self.sessions.has_session();
+        let session = self.sessions.runtime_status();
+        let recovering_viewer_count = self.generations.recovering_viewer_count();
         let last_error = self
             .last_error
             .lock()
@@ -456,7 +505,8 @@ impl RuntimePublisher {
                 started,
                 daemon,
                 reached_ready,
-                session_active,
+                session,
+                recovering_viewer_count,
                 last_error,
             })
         })
@@ -544,6 +594,14 @@ pub fn status_json(status: &ApplianceStatusV2, schema_version: u16) -> Result<se
             runtime.remove("instance_id");
             runtime.remove("loaded_config_revision");
             runtime.remove("reached_ready");
+            runtime.remove("mode");
+            runtime.remove("active_viewer_count");
+            runtime.remove("media_generation_id");
+            runtime.remove("roster_revision");
+            runtime.remove("focus_occupied");
+            runtime.remove("recovering_viewer_count");
+            runtime.remove("configured_viewer_capacity");
+            runtime.remove("authorization_revision");
             let enrollment = value["enrollment"]
                 .as_object_mut()
                 .context("appliance enrollment status is not an object")?;
@@ -728,11 +786,19 @@ fn read_runtime_status(
         instance_id: Some(persisted.instance_id),
         loaded_config_revision: persisted.loaded_config_revision,
         reached_ready: persisted.reached_ready,
+        mode: Some(persisted.session_mode),
+        active_viewer_count: Some(persisted.active_viewer_count),
+        media_generation_id: persisted.media_generation_id,
+        roster_revision: persisted.roster_revision,
+        focus_occupied: persisted.focus_occupied,
+        recovering_viewer_count: Some(persisted.recovering_viewer_count),
+        configured_viewer_capacity: Some(persisted.configured_viewer_capacity),
+        authorization_revision: Some(persisted.authorization_revision),
         last_error: persisted.last_error,
     })
 }
 
-fn read_persisted_runtime(state_directory: &Path) -> Result<Option<RuntimeStatusV2>> {
+fn read_persisted_runtime(state_directory: &Path) -> Result<Option<RuntimeStatusV3>> {
     let Some(bytes) = secure_state::read_bounded(
         state_directory,
         RUNTIME_STATUS_FILE,
@@ -751,8 +817,8 @@ fn read_persisted_runtime(state_directory: &Path) -> Result<Option<RuntimeStatus
         1 => {
             let legacy: RuntimeStatusV1 =
                 serde_json::from_value(value).context("parsing legacy Sigil runtime status")?;
-            Ok(Some(RuntimeStatusV2 {
-                version: legacy.version,
+            Ok(Some(RuntimeStatusV3 {
+                version: RUNTIME_STATUS_VERSION,
                 instance_id: legacy.instance_id,
                 host_node_id: legacy.host_node_id,
                 loaded_config_revision: None,
@@ -761,20 +827,108 @@ fn read_persisted_runtime(state_directory: &Path) -> Result<Option<RuntimeStatus
                 uptime_ms: legacy.uptime_ms,
                 daemon: legacy.daemon,
                 session_active: legacy.session_active,
+                session_mode: if legacy.session_active {
+                    "legacy_exclusive".to_owned()
+                } else {
+                    "inactive".to_owned()
+                },
+                active_viewer_count: usize::from(legacy.session_active),
+                media_generation_id: None,
+                roster_revision: None,
+                focus_occupied: None,
+                recovering_viewer_count: 0,
+                configured_viewer_capacity: usize::from(crate::config::DEFAULT_MAX_VIEWERS),
+                authorization_revision: 1,
                 last_error: legacy.last_error,
             }))
         }
         2 => {
-            let current: RuntimeStatusV2 =
+            let legacy: RuntimeStatusV2 =
                 serde_json::from_value(value).context("parsing Sigil runtime status v2")?;
-            ensure!(
-                current.version == RUNTIME_STATUS_VERSION,
-                "unsupported Sigil runtime status version"
-            );
+            Ok(Some(RuntimeStatusV3 {
+                version: RUNTIME_STATUS_VERSION,
+                instance_id: legacy.instance_id,
+                host_node_id: legacy.host_node_id,
+                loaded_config_revision: legacy.loaded_config_revision,
+                reached_ready: legacy.reached_ready,
+                updated_at_unix_ms: legacy.updated_at_unix_ms,
+                uptime_ms: legacy.uptime_ms,
+                daemon: legacy.daemon,
+                session_active: legacy.session_active,
+                session_mode: if legacy.session_active {
+                    "legacy_exclusive".to_owned()
+                } else {
+                    "inactive".to_owned()
+                },
+                active_viewer_count: usize::from(legacy.session_active),
+                media_generation_id: None,
+                roster_revision: None,
+                focus_occupied: None,
+                recovering_viewer_count: 0,
+                configured_viewer_capacity: usize::from(crate::config::DEFAULT_MAX_VIEWERS),
+                authorization_revision: 1,
+                last_error: legacy.last_error,
+            }))
+        }
+        3 => {
+            let current: RuntimeStatusV3 =
+                serde_json::from_value(value).context("parsing Sigil runtime status v3")?;
+            validate_runtime_session(&current)?;
             Ok(Some(current))
         }
         _ => anyhow::bail!("unsupported Sigil runtime status version"),
     }
+}
+
+fn validate_runtime_session(status: &RuntimeStatusV3) -> Result<()> {
+    ensure!(
+        (1..=usize::from(crate::config::MAX_VIEWERS)).contains(&status.configured_viewer_capacity),
+        "runtime viewer capacity is out of bounds"
+    );
+    ensure!(
+        status.active_viewer_count <= status.configured_viewer_capacity,
+        "runtime active viewer count exceeds configured capacity"
+    );
+    ensure!(
+        status.recovering_viewer_count <= status.active_viewer_count,
+        "runtime recovering viewer count exceeds active viewers"
+    );
+    ensure!(
+        status.authorization_revision != 0,
+        "runtime authorization revision must be non-zero"
+    );
+    ensure!(
+        status.media_generation_id.is_none_or(|value| value != 0)
+            && status.roster_revision.is_none_or(|value| value != 0),
+        "runtime generation and roster revisions must be non-zero when present"
+    );
+    match status.session_mode.as_str() {
+        "inactive" => ensure!(
+            !status.session_active
+                && status.active_viewer_count == 0
+                && status.media_generation_id.is_none()
+                && status.roster_revision.is_none()
+                && status.focus_occupied.is_none(),
+            "inactive runtime session fields are inconsistent"
+        ),
+        "legacy_exclusive" => ensure!(
+            status.session_active
+                && status.active_viewer_count == 1
+                && status.roster_revision.is_none()
+                && status.focus_occupied.is_none(),
+            "legacy runtime session fields are inconsistent"
+        ),
+        "moq_multi_viewer" => ensure!(
+            status.session_active
+                && status.active_viewer_count > 0
+                && status.media_generation_id.is_some()
+                && status.roster_revision.is_some()
+                && status.focus_occupied.is_some(),
+            "multi-viewer runtime session fields are inconsistent"
+        ),
+        _ => anyhow::bail!("runtime session mode is unsupported"),
+    }
+    Ok(())
 }
 
 pub(crate) fn latest_runtime_instance(
@@ -804,7 +958,7 @@ pub(crate) fn latest_runtime_instance(
     Ok(Some(persisted.instance_id))
 }
 
-fn stale_runtime(persisted: RuntimeStatusV2, heartbeat_age_ms: Option<u64>) -> RuntimeStatus {
+fn stale_runtime(persisted: RuntimeStatusV3, heartbeat_age_ms: Option<u64>) -> RuntimeStatus {
     let stopped = persisted.daemon == DaemonState::Stopped;
     RuntimeStatus {
         state: RuntimeState::Stale,
@@ -823,6 +977,14 @@ fn stale_runtime(persisted: RuntimeStatusV2, heartbeat_age_ms: Option<u64>) -> R
         instance_id: None,
         loaded_config_revision: None,
         reached_ready: false,
+        mode: None,
+        active_viewer_count: None,
+        media_generation_id: None,
+        roster_revision: None,
+        focus_occupied: None,
+        recovering_viewer_count: None,
+        configured_viewer_capacity: None,
+        authorization_revision: None,
         last_error: persisted.last_error,
     }
 }
@@ -837,6 +999,14 @@ fn absent_runtime() -> RuntimeStatus {
         instance_id: None,
         loaded_config_revision: None,
         reached_ready: false,
+        mode: None,
+        active_viewer_count: None,
+        media_generation_id: None,
+        roster_revision: None,
+        focus_occupied: None,
+        recovering_viewer_count: None,
+        configured_viewer_capacity: None,
+        authorization_revision: None,
         last_error: None,
     }
 }
@@ -851,6 +1021,14 @@ fn unavailable_runtime() -> RuntimeStatus {
         instance_id: None,
         loaded_config_revision: None,
         reached_ready: false,
+        mode: None,
+        active_viewer_count: None,
+        media_generation_id: None,
+        roster_revision: None,
+        focus_occupied: None,
+        recovering_viewer_count: None,
+        configured_viewer_capacity: None,
+        authorization_revision: None,
         last_error: None,
     }
 }
@@ -910,12 +1088,14 @@ struct RuntimeSnapshotInput {
     started: Instant,
     daemon: DaemonState,
     reached_ready: bool,
-    session_active: bool,
+    session: crate::server::SessionRuntimeStatus,
+    recovering_viewer_count: usize,
     last_error: Option<RuntimeErrorV1>,
 }
 
 fn write_runtime_snapshot(input: RuntimeSnapshotInput) -> Result<()> {
-    let status = RuntimeStatusV2 {
+    let session_active = input.session.active_viewers != 0;
+    let status = RuntimeStatusV3 {
         version: RUNTIME_STATUS_VERSION,
         instance_id: input.instance_id,
         host_node_id: input.host.to_string(),
@@ -924,9 +1104,20 @@ fn write_runtime_snapshot(input: RuntimeSnapshotInput) -> Result<()> {
         updated_at_unix_ms: unix_timestamp_millis()?,
         uptime_ms: u64::try_from(input.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         daemon: input.daemon,
-        session_active: input.session_active,
+        session_active,
+        session_mode: input.session.mode.to_owned(),
+        active_viewer_count: input.session.active_viewers,
+        media_generation_id: input.session.media_generation_id,
+        roster_revision: input.session.roster_revision,
+        focus_occupied: input.session.focus_occupied,
+        recovering_viewer_count: input
+            .recovering_viewer_count
+            .min(input.session.active_viewers),
+        configured_viewer_capacity: input.session.configured_capacity,
+        authorization_revision: input.session.authorization_revision,
         last_error: input.last_error,
     };
+    validate_runtime_session(&status)?;
     let bytes = serde_json::to_vec(&status)?;
     secure_state::atomic_write(
         &input.state_directory,
@@ -1016,9 +1207,9 @@ mod tests {
     fn current_runtime_document(
         updated_at_unix_ms: u64,
         revision: ConfigRevision,
-    ) -> RuntimeStatusV2 {
+    ) -> RuntimeStatusV3 {
         let host = SecretKey::from_bytes(&[7; 32]).public();
-        RuntimeStatusV2 {
+        RuntimeStatusV3 {
             version: RUNTIME_STATUS_VERSION,
             instance_id: "0123456789abcdef0123456789abcdef".to_owned(),
             host_node_id: host.to_string(),
@@ -1028,6 +1219,14 @@ mod tests {
             uptime_ms: 1_000,
             daemon: DaemonState::Stopped,
             session_active: false,
+            session_mode: "inactive".to_owned(),
+            active_viewer_count: 0,
+            media_generation_id: None,
+            roster_revision: None,
+            focus_occupied: None,
+            recovering_viewer_count: 0,
+            configured_viewer_capacity: usize::from(crate::config::DEFAULT_MAX_VIEWERS),
+            authorization_revision: 1,
             last_error: None,
         }
     }
@@ -1049,8 +1248,9 @@ mod tests {
         let second_state = private_directory();
         let first = LifecycleGuard::acquire_at(first_state.path(), None).unwrap();
         assert!(LifecycleGuard::acquire_at(first_state.path(), None).is_err());
-        LifecycleGuard::acquire_at(second_state.path(), None).unwrap();
+        let second = LifecycleGuard::acquire_at(second_state.path(), None).unwrap();
         drop(first);
+        drop(second);
         LifecycleGuard::acquire_at(first_state.path(), None).unwrap();
     }
 
@@ -1180,7 +1380,7 @@ mod tests {
         let revision = ConfigRevision::from_bytes(b"candidate");
         let instance = "0123456789abcdef0123456789abcdef";
         let valid = current_runtime_document(20_000, revision.clone());
-        let write = |document: &RuntimeStatusV2| {
+        let write = |document: &RuntimeStatusV3| {
             secure_state::atomic_write(
                 directory.path(),
                 RUNTIME_STATUS_FILE,
@@ -1261,6 +1461,14 @@ mod tests {
                 instance_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
                 loaded_config_revision: Some(ConfigRevision::from_bytes(b"config")),
                 reached_ready: true,
+                mode: Some("moq_multi_viewer".to_owned()),
+                active_viewer_count: Some(3),
+                media_generation_id: Some(7),
+                roster_revision: Some(9),
+                focus_occupied: Some(true),
+                recovering_viewer_count: Some(1),
+                configured_viewer_capacity: Some(3),
+                authorization_revision: Some(4),
                 last_error: None,
             },
             ConfigRevision::from_bytes(b"config"),
@@ -1307,17 +1515,24 @@ mod tests {
         assert_eq!(current["schema_version"], 2);
         assert!(current["config"].get("revision").is_some());
         assert!(current["runtime"].get("reached_ready").is_some());
+        assert!(current["runtime"].get("active_viewer_count").is_some());
     }
 
     #[tokio::test]
     async fn publisher_writes_transitions_and_retains_an_explicit_stopped_state() {
         let directory = private_directory();
         let sessions = Arc::new(SessionRegistry::default());
+        let generations = MediaGenerationManager::new(crate::server::moq_test_config(), [7; 32]);
         let host = SecretKey::from_bytes(&[7; 32]).public();
         let revision = ConfigRevision::from_bytes(b"config");
-        let publisher =
-            RuntimePublisher::start_at(directory.path(), host, sessions, Some(revision.clone()))
-                .unwrap();
+        let publisher = RuntimePublisher::start_at(
+            directory.path(),
+            host,
+            sessions,
+            generations,
+            Some(revision.clone()),
+        )
+        .unwrap();
         publisher.mark_ready().await.unwrap();
         publisher.write_snapshot().unwrap();
         let status =

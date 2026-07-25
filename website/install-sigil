@@ -4,8 +4,8 @@ set -euo pipefail
 umask 077
 
 readonly repository="FelineStateMachine/goq"
-readonly publisher_key="unconfigured"
-readonly release_tag="unconfigured"
+readonly publisher_key="RWS0Lc9GR1BHMg1qTBKX3mQTxSkIEafny6ueBDQ0p04N2XWagpE8fV6f"
+readonly release_tag="v0.1.0"
 readonly minisign_version="0.12"
 readonly minisign_url="https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz"
 readonly minisign_sha256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"

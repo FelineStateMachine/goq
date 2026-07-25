@@ -305,7 +305,13 @@ fi
 command -v cargo >/dev/null 2>&1 || die "cargo is required"
 ffmpeg_bin="$(command -v ffmpeg || true)"
 [[ -n "$ffmpeg_bin" ]] || die "ffmpeg is required"
-if ! "$ffmpeg_bin" -hide_banner -encoders 2>/dev/null | grep -q '[[:space:]]libx264[[:space:]]'; then
+# Capture the encoder list before matching. Piping it straight into `grep -q`
+# lets grep exit on the first hit, which hands ffmpeg a SIGPIPE, and `pipefail`
+# then reports the whole probe as failed. A full ffmpeg build emits enough
+# encoders to lose that race every time, so the check rejected exactly the
+# builds that do provide libx264.
+ffmpeg_encoders="$("$ffmpeg_bin" -hide_banner -encoders 2>/dev/null || true)"
+if ! grep -q '[[:space:]]libx264[[:space:]]' <<<"$ffmpeg_encoders"; then
   die "ffmpeg does not provide the required libx264 encoder"
 fi
 

@@ -10,8 +10,10 @@ sitting at the machine, not the latency of a screen-sharing tool.
 goq is not a multi-tenant streaming service and not a desktop-sharing tool.
 It streams a private [Gamescope](https://github.com/ValveSoftware/gamescope)
 session that exists only for your games: the host needs no monitor, no
-desktop environment, and no interactive login. Exactly one client is admitted
-to exactly one session at a time, authenticated by a hardware security key.
+desktop environment, and no interactive login. Native MoQ admits three viewers
+by default, up to a hard ceiling of eight. Every viewer may watch according to
+its grants, while exactly one viewer at a time may hold slot-0 input focus.
+Legacy control/media clients remain strictly exclusive.
 
 ## The two programs
 
@@ -40,13 +42,14 @@ Sigil · bare-metal Linux host          Portal · installed desktop client
   buffered, so a slow receiver never accumulates a playable backlog. Media
   travels as bounded MoQ groups: one GOP is one group, and a newer
   independently decodable group cancels its predecessor.
-- **Input is independent.** Controller, keyboard, and relative mouse travel
+- **Input is independent and focused.** Controller, keyboard, and relative mouse travel
   on their own iroh connection, unaffected by media backpressure. Session
-  teardown always releases held keys and emits a neutral gamepad state, even
-  after an error or disconnect.
+  focus is a revocable token rather than a viewing right. Every handoff first
+  invalidates the former focus generation, then releases held keys and emits a
+  neutral gamepad state before a successor can inject.
 - **Fail closed.** Portal derives its stable iroh identity from a FIDO2 key
   with `hmac-secret`. A signed, short-lived, peer-bound invitation from Sigil
-  enrolls that one client once, with independently granted view,
+  enrolls each bounded viewer once, with independently granted view,
   pointer/keyboard, and gamepad permissions and durable replay protection.
   Every ordinary launch after that is **PIN -> tap -> play**.
 - **Strict product boundary.** Sigil never depends on Tauri or a webview.
@@ -64,9 +67,10 @@ Working today:
 - The pure Rust Sigil daemon: Gamescope PipeWire capture at the display's
   native mode, AMD GstVA H.264 encoding, and bounded PipeWire/Opus audio.
 - Authenticated session admission over a control connection, then a
-  session-scoped upstream `iroh-moq` broadcast with a strictly validated
-  catalog, with earlier custom media protocols kept as explicit compatibility
-  fallbacks.
+  shared, authenticated upstream `iroh-moq` generation with a strictly
+  validated catalog. Multiple viewers share one video/audio producer and one
+  adaptive actuator; earlier custom media protocols remain exclusive
+  compatibility fallbacks.
 - Adaptive bitrate and motion-sensitive resolution on the opt-in in-process
   encoder backend: session-authenticated receiver feedback, hysteresis, and
   changes that commit only on exact encoder readback or a target-size IDR.
@@ -75,7 +79,8 @@ Working today:
 - Linux `uinput` keyboard, relative mouse, and an Xbox-style virtual gamepad,
   with strict device preflight and end-of-session neutralization.
 - One-time FIDO-bound enrollment, replay protection, and controller-usable
-  onboarding in Portal.
+  onboarding in Portal, with bounded multi-peer authorization and live view or
+  input revocation.
 - A deterministic, checksum-bound Bazzite runtime package with serialized
   install/upgrade and tamper-checked rollback, plus the foundation of a
   controller-first Decky Loader management plugin over a redacted local
@@ -137,7 +142,7 @@ hardware report; add `--smoke` to exercise a bounded 1280x800/60 VA-API
 encode, or `--cold-boot` on the first login after a physically headless boot
 for a strict readiness gate.
 
-### Enroll one Portal
+### Enroll a Portal
 
 On Portal's first launch, enter the security-key PIN and choose **show portal
 id**. On the Sigil host, create an invitation for that exact peer:
@@ -152,7 +157,10 @@ sigil invitation create \
 ```
 
 Move the owner-only invitation file to the client and open it with Portal.
-Sigil consumes it once; every later launch is **PIN -> tap -> play**. To move
+Sigil consumes it once; every later launch is **PIN -> tap -> play**. Repeat
+with a distinct invitation for each viewer. A view-only invitation creates a
+spectator with no focus action; pointer/keyboard or gamepad grants make a
+viewer eligible to request slot-0 focus but do not grant possession. To move
 Portal to a different Sigil host, revoke the enrollment on the old host and
 use **client -> reset enrollment**. A new invitation never silently replaces
 a working enrollment.
@@ -166,8 +174,10 @@ Run the complete repository gate before sharing work:
 ```
 
 It covers Rust format, tests, and clippy, the Linux cross-build when
-available, frontend syntax and tests, ShellCheck, package tests, and loopback
-transport proof. Website and installer changes go through
+available, frontend syntax and tests, ShellCheck, package tests, a three-viewer
+native-MoQ loopback proof, and a separate legacy-exclusive proof. The explicit
+eight-viewer release stress gate remains a local resource test, and neither
+loopback mode substitutes for exact-candidate hardware UAT. Website and installer changes go through
 `./scripts/verify-website.sh`. Hardware acceptance evidence lives under
 [`docs/hardware-uat/`](docs/hardware-uat/README.md), separate from local
 tests.
@@ -181,10 +191,16 @@ assets carry a single frozen build-target suffix, `linux-glibc2.17-x86_64`,
 pinned by `release/sigil-target-contract.txt`; that name describes the binary
 ABI (glibc 2.17, x86-64), not a distribution, so one build runs across the
 supported AMD hosts. Portal is a compiled, signed desktop application, never a
-shell install; the first public target is macOS arm64. The packaging, signing,
-and publication ceremonies are documented in
+shell install; the only published target is macOS arm64, which is ad-hoc signed
+rather than Apple-notarized, so macOS blocks its first launch until you allow it
+under System Settings, Privacy and Security. macOS x86_64,
+Linux x86_64, and Windows x86_64 are built and attested every release as
+unpublished preview artifacts. The packaging, signing, and publication
+ceremonies are documented in
 [public release delivery](docs/public-release-delivery.md) and the
-[Portal release runbook](docs/portal-release.md).
+[Portal release runbook](docs/portal-release.md). The operator path from the
+committed `unconfigured` trust pins to a first published release is
+[release credential bring-up](docs/release-credentials.md).
 
 ## License
 

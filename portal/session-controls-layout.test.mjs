@@ -41,3 +41,16 @@ test('stream diagnostics remain exclusive to the Info panel', () => {
   assert.doesNotMatch(html, /🔊|🔇|🔈/);
   assert.match(css, /#audio-toggle\s*\{[^}]*min-width:\s*80px;[^}]*min-height:\s*36px;/s);
 });
+
+test('multi-viewer roster stays in the Info drawer and outside the stream surface', () => {
+  const mainStart = html.indexOf('<main class="main">');
+  const mainEnd = html.indexOf('</main>', mainStart);
+  const panelStart = html.indexOf('<aside class="panel" id="panel"');
+  const panelEnd = html.indexOf('</aside>', panelStart);
+  const roster = html.indexOf('id="roster-section"');
+
+  assert.ok(roster > panelStart && roster < panelEnd);
+  assert.ok(roster < mainStart || roster > mainEnd);
+  assert.match(css, /\.roster-section\.hidden\s*\{\s*display:\s*none;/);
+  assert.match(css, /@media \(max-width: 480px\)[\s\S]*\.viewer-status/);
+});

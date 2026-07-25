@@ -31,6 +31,12 @@ Portal preserves the package builder's versioned macOS contract:
 Do not advertise x86_64, universal, or Linux Portal downloads until those exact
 artifacts pass an equivalent signed packaging gate.
 
+macOS x86_64, Linux x86_64, and Windows x86_64 are built and attested on every
+release as unpublished preview artifacts, retained only as short-lived Actions
+artifacts. They are unsigned, are not release assets, and are not a download
+channel. The published Portal contract remains exactly the three macOS arm64
+files above.
+
 ## Sigil bootstrap trust boundary
 
 `website/install-sigil` is the public bootstrap source. Before the release
@@ -100,8 +106,8 @@ scripts/sign-bazzite-release.sh \
 ```
 
 Before promotion, run the **Portal release** workflow for the same tag. It
-requires the untouched two-asset Sigil draft, attaches exactly the signed and
-notarized Portal DMG, checksum, and manifest, verifies the five-asset combined
+requires the untouched two-asset Sigil draft, attaches exactly the ad-hoc
+signed Portal DMG, checksum, and manifest, verifies the five-asset combined
 draft, and leaves it unpublished. Transfer only the resulting Sigil `.minisig`
 back to the online release operator and attach it to that draft. Do not use
 `--clobber` for any asset.
@@ -111,8 +117,8 @@ six-asset public-alpha set, verifies the detached Sigil signature with the
 committed public key, checks the outer digest, inspects the archive without
 extraction, binds both products to the same tag and commit, re-verifies the
 Portal digest and release manifest, then mounts the downloaded DMG on a native
-arm64 macOS runner and repeats Developer ID, hardened-runtime, Gatekeeper,
-stapling, architecture, identifier, and payload checks. Only then does it
+arm64 macOS runner and repeats the ad-hoc signature, architecture, identifier,
+and payload checks, including proof that no notarization ticket is present. Only then does it
 replace the incomplete draft notes and publish the prerelease. The workflow has
 no input, environment, or secret capable of
 receiving the offline secret key.
@@ -152,18 +158,38 @@ distinct signed candidates. Record, without node IDs or credentials:
 
 ## Portal signing boundary
 
-The existing macOS package gate requires a Developer ID Application identity,
-hardened runtime, notarization, stapling, strict Gatekeeper assessment, and a
-release build without `demo-direct-node`. Store the certificate and
-notarization credentials only in the protected GitHub `main` environment with
-required reviewers. The release workflow uses those secrets only in its macOS
-arm64 publication job.
+Portal is **not** signed with an Apple Developer ID and is **not** notarized.
+The project has no Apple Developer Program membership, and there is no free
+path to notarization. This is a deliberate, recorded decision rather than an
+unfinished step.
 
-Pin the public Apple TeamIdentifier in `release/portal-apple-team-id.txt` before
-the first tag. The protected secret, produced app signature, promotion verifier,
-and UAT verifier must all equal that committed value. The Portal tag-ref build
-also emits GitHub artifact attestations; promotion requires each of the three
-Portal assets to verify against the exact workflow, tag ref, and source commit.
+The DMG carries only the ad-hoc signature that arm64 macOS requires in order to
+execute a binary at all. An ad-hoc signature asserts nothing about origin, so
+the packaging gate additionally proves that no certificate authority chain, no
+Apple TeamIdentifier, and no notarization ticket crept into a build that claims
+to be ad-hoc.
+
+Trust therefore comes from provenance, not from Apple:
+
+- a GitHub/Sigstore build-provenance attestation bound to the exact workflow,
+  tag ref, and source commit;
+- the published SHA-256 beside the DMG;
+- the release manifest, which records `signing: "adhoc"` and `notarized: false`
+  rather than claiming verification the artifact does not have.
+
+Promotion requires each of the three Portal assets to verify against the exact
+workflow, tag ref, and source commit. Users are expected to check the digest
+and, ideally, `gh attestation verify`.
+
+The consequence for users is real and must never be hidden: macOS blocks the
+first launch, and the user has to allow Portal under System Settings, Privacy
+and Security. The website says so, and the release notes say so.
+
+`scripts/package-macos-client.sh --signing developer-id` still implements the
+full Developer ID, notarization, stapling, and Gatekeeper gate for the day a
+membership exists. It is not exercised by CI and must be re-validated end to
+end before it is trusted; enabling it also means restoring the
+`release/portal-apple-team-id.txt` pin.
 
 The first release automation must verify that the git tag, every Cargo package
 version, Tauri version, artifact filenames, and manifests agree before it

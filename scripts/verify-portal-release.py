@@ -21,7 +21,12 @@ PRODUCT = "portal-client"
 BUNDLE_IDENTIFIER = "sh.goq.portal"
 PLATFORM = "macos"
 ARCHITECTURE = "arm64"
-VERIFICATION = "developer-id+hardened-runtime+notarized+stapled+gatekeeper"
+# Portal is distributed without an Apple Developer ID. arm64 macOS refuses to
+# execute a wholly unsigned binary, so the release carries the linker's ad-hoc
+# signature and anchors trust in GitHub/Sigstore build provenance plus the
+# published digest instead of in Gatekeeper.
+SIGNING = "adhoc"
+VERIFICATION = "adhoc-signed+github-attested+sha256"
 NON_RELEASE_FEATURES = (
     "demo-direct-node",
     "experimental-non-macos-pointer-capture",
@@ -167,17 +172,18 @@ def expected_release_manifest(
         "bundle_identifier": BUNDLE_IDENTIFIER,
         "checksum_asset": checksum_asset,
         "demo_direct_node": False,
-        "developer_id_signed": True,
-        "format": 1,
-        "gatekeeper_verified": True,
+        "developer_id_signed": False,
+        "format": 2,
+        "gatekeeper_verified": False,
         "git_commit": git_commit,
-        "hardened_runtime": True,
-        "notarized": True,
+        "hardened_runtime": False,
+        "notarized": False,
         "platform": PLATFORM,
         "product": PRODUCT,
         "release_tag": release_tag,
         "sha256": digest,
-        "stapled": True,
+        "signing": SIGNING,
+        "stapled": False,
         "version": release_version(release_tag),
     }
 

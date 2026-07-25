@@ -37,8 +37,163 @@ jobs:
           ./scripts/tests/portal-release.sh
           ./scripts/verify-website.sh
 
+  preview:
+    name: Build unpublished ${{ matrix.target }} preview
+    needs: policy
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            target: x86_64-apple-darwin
+            platform: macos
+            bundles: app,dmg
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            bundles: deb,rpm,appimage
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            bundles: msi,nsis
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Require workflow execution from the exact tag
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libudev-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config
+
+      - name: Install pinned Tauri CLI
+        shell: bash
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo install tauri-cli --version 2.11.3 --locked
+
+      # No optional features: a preview build must differ from the published
+      # macOS arm64 release only by target and by the absence of signing.
+      - name: Build unsigned preview bundles
+        shell: bash
+        run: |
+          cargo tauri build --locked --ci \
+            --target "${{ matrix.target }}" \
+            --bundles "${{ matrix.bundles }}"
+
+      - name: Collect preview artifacts and digests
+        id: collect
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          digest() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{ print $1 }'
+            else
+              shasum -a 256 "$1" | awk '{ print $1 }'
+            fi
+          }
+
+          version="${RELEASE_TAG#v}"
+          staging="$RUNNER_TEMP/portal-preview"
+          mkdir -p "$staging"
+          bundle_root="target/$TARGET/release/bundle"
+          test -d "$bundle_root" || {
+            echo "the bundler produced no output at $bundle_root" >&2
+            exit 1
+          }
+
+          entries=""
+          count=0
+          while IFS= read -r artifact; do
+            name="$(basename "$artifact")"
+            # The manifest is assembled textually, so refuse any name that
+            # could alter its structure rather than escaping after the fact.
+            printf '%s' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || {
+              echo "unsafe preview artifact name: $name" >&2
+              exit 1
+            }
+            test ! -e "$staging/$name" || {
+              echo "duplicate preview artifact name: $name" >&2
+              exit 1
+            }
+            cp "$artifact" "$staging/$name"
+            sha256="$(digest "$staging/$name")"
+            printf '%s  %s\n' "$sha256" "$name" >"$staging/$name.sha256"
+            test "$count" -eq 0 || entries="$entries,"
+            entries="$entries{\"name\":\"$name\",\"sha256\":\"$sha256\"}"
+            count=$((count + 1))
+          done < <(find "$bundle_root" -type f \
+            \( -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' \
+               -o -name '*.AppImage' -o -name '*.msi' -o -name '*.exe' \) \
+            | sort)
+
+          test "$count" -gt 0 || {
+            echo "the bundler produced no recognised preview artifact" >&2
+            exit 1
+          }
+
+          cat >"$staging/preview-manifest.json" <<EOF
+          {
+            "artifacts": [$entries
+            ],
+            "format": 1,
+            "git_commit": "$(git rev-parse HEAD)",
+            "platform": "$PLATFORM",
+            "product": "portal-client-preview",
+            "published": false,
+            "release_tag": "$RELEASE_TAG",
+            "signed": false,
+            "target": "$TARGET",
+            "version": "$version"
+          }
+          EOF
+          echo "staging=$staging" >>"$GITHUB_OUTPUT"
+
+      - name: Attest preview build provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.1.0
+        with:
+          subject-path: ${{ steps.collect.outputs.staging }}/*
+
+      # Deliberately an Actions artifact, never a release asset. The published
+      # release contract stays exactly the macOS arm64 DMG set.
+      - name: Retain unpublished preview build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: portal-preview-${{ inputs.tag }}-${{ matrix.target }}
+          path: ${{ steps.collect.outputs.staging }}
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
-    name: Sign, notarize, and publish macOS arm64
+    name: Build and publish ad-hoc macOS arm64
     needs: policy
     runs-on: macos-26
     timeout-minutes: 90
@@ -72,53 +227,16 @@ jobs:
       - name: Install pinned Tauri CLI
         run: cargo install tauri-cli --version 2.11.3 --locked
 
-      - name: Import Developer ID certificate
-        env:
-          APPLE_CERTIFICATE_BASE64: ${{ secrets.PORTAL_APPLE_CERTIFICATE_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.PORTAL_APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          certificate_path="$RUNNER_TEMP/portal-developer-id.p12"
-          keychain_path="$RUNNER_TEMP/portal-signing.keychain-db"
-          keychain_password="$(openssl rand -hex 32)"
-          echo "::add-mask::$keychain_password"
-          python3 - "$certificate_path" <<'PY'
-          import base64
-          import os
-          import pathlib
-          import sys
-
-          encoded = os.environ.get("APPLE_CERTIFICATE_BASE64", "")
-          if not encoded:
-              raise SystemExit("PORTAL_APPLE_CERTIFICATE_BASE64 is not configured")
-          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(encoded, validate=True))
-          PY
-          chmod 0600 "$certificate_path"
-          security create-keychain -p "$keychain_password" "$keychain_path"
-          security set-keychain-settings -lut 21600 "$keychain_path"
-          security unlock-keychain -p "$keychain_password" "$keychain_path"
-          security default-keychain -s "$keychain_path"
-          security import "$certificate_path" \
-            -k "$keychain_path" \
-            -P "$APPLE_CERTIFICATE_PASSWORD" \
-            -T /usr/bin/codesign \
-            -T /usr/bin/security
-          security set-key-partition-list \
-            -S apple-tool:,apple: \
-            -s \
-            -k "$keychain_password" \
-            "$keychain_path" >/dev/null
-
-      - name: Build and verify signed release assets
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.PORTAL_APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.PORTAL_APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.PORTAL_APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.PORTAL_APPLE_TEAM_ID }}
+      # Portal has no Apple Developer ID. The packaging gate refuses to run in
+      # ad-hoc mode if any Apple credential is present in the environment, so
+      # this job deliberately provides none.
+      - name: Build and verify ad-hoc release assets
         run: |
           release_dir="$RUNNER_TEMP/portal-release"
           mkdir -m 0700 "$release_dir"
           ./scripts/package-macos-client.sh \
             --release-tag "$RELEASE_TAG" \
+            --signing adhoc \
             --output-dir "$release_dir"
 
       - name: Attest exact Portal build provenance
@@ -186,16 +304,3 @@ jobs:
             --release-tag "$RELEASE_TAG" \
             --names-json "$asset_names"
 
-      - name: Remove signing keychain
-        if: always()
-        run: |
-          security delete-keychain "$RUNNER_TEMP/portal-signing.keychain-db" 2>/dev/null || true
-          python3 - "$RUNNER_TEMP/portal-developer-id.p12" <<'PY'
-          import pathlib
-          import sys
-
-          path = pathlib.Path(sys.argv[1])
-          if path.exists():
-              path.write_bytes(b"\0" * path.stat().st_size)
-              path.unlink()
-          PY

@@ -12,6 +12,7 @@ export function createControlRuntime({
   publishController,
   resetControllerEscape,
   onChange,
+  onExit = () => {},
   onReleaseFailure,
   pointerLockTimeoutMs = BROWSER_POINTER_LOCK_TIMEOUT_MS,
   scheduleTimeout = globalThis.setTimeout,
@@ -44,6 +45,7 @@ export function createControlRuntime({
     throw new TypeError('resetControllerEscape must be a function');
   }
   if (typeof onChange !== 'function') throw new TypeError('onChange must be a function');
+  if (typeof onExit !== 'function') throw new TypeError('onExit must be a function');
   if (typeof onReleaseFailure !== 'function') {
     throw new TypeError('onReleaseFailure must be a function');
   }
@@ -53,6 +55,7 @@ export function createControlRuntime({
   let controlTransitionInProgress = false;
   let controlTransitionGeneration = 0;
   let nativeCursorCommand = Promise.resolve();
+  let hostReleaseCommand = Promise.resolve();
   let browserPointerLockRequired = true;
 
   function connection() {
@@ -134,7 +137,8 @@ export function createControlRuntime({
     try { pointerLock.exit(); } catch (_) {}
   }
 
-  function exit({ resetEscape = false } = {}) {
+  function exit({ resetEscape = false, releaseHostFocus = true } = {}) {
+    if (!controlMode && !controlTransitionInProgress) return false;
     controlTransitionGeneration += 1;
     controlTransitionInProgress = false;
     controllerActivationGate.reset();
@@ -144,6 +148,19 @@ export function createControlRuntime({
     controlMode = false;
     releasePointerLock();
     onChange();
+    if (releaseHostFocus) {
+      const releaseGeneration = controlTransitionGeneration;
+      hostReleaseCommand = Promise.resolve(inputRuntime.drain(250))
+        .then(() => {
+          if (releaseGeneration !== controlTransitionGeneration || controlMode) return false;
+          return onExit();
+        })
+        .catch((error) => {
+          logger.error('host focus release failed after local neutralization:', error);
+          return false;
+        });
+    }
+    return true;
   }
 
   function exitAfterBrowserPointerLockFailure() {
@@ -248,6 +265,7 @@ export function createControlRuntime({
 
   async function prepareDisconnect(timeoutMs = 250) {
     exit();
+    await hostReleaseCommand;
     await inputRuntime.drain(timeoutMs);
   }
 

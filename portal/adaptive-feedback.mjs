@@ -237,6 +237,12 @@ export function normalizeAdaptiveDecisionEnvelope(payload, generation) {
   }
   const decision = payload.decision;
   if (!decision || typeof decision !== 'object') throw new TypeError('adaptive decision body is required');
+  const contribution = ['steady', 'clean', 'limiting', 'stale'].includes(decision.contribution)
+    ? decision.contribution
+    : 'unknown';
+  const recoveryState = ['active', 'floor-limited', 'detached'].includes(decision.recovery_state)
+    ? decision.recovery_state
+    : 'unknown';
   return {
     decision_id: boundedInteger(decision.decision_id, Number.MAX_SAFE_INTEGER, 'decision ID'),
     report_id: boundedInteger(decision.report_id, Number.MAX_SAFE_INTEGER, 'report ID'),
@@ -248,6 +254,9 @@ export function normalizeAdaptiveDecisionEnvelope(payload, generation) {
       ? decision.reasons.filter((reason) => typeof reason === 'string').slice(0, 8)
       : [],
     applied: decision.applied === true,
+    contribution,
+    recovery_state: recoveryState,
+    scope: decision.scope === 'local-viewer' ? 'local-viewer' : 'unknown',
   };
 }
 
@@ -256,5 +265,5 @@ export function formatAdaptiveDecision(decision, available) {
   if (!decision) return 'awaiting report · advisory only';
   const reasons = decision.reasons.length ? decision.reasons.join(', ') : 'no pressure signals';
   const disposition = decision.applied ? 'host reports applied' : 'advisory only (not applied)';
-  return `${decision.target_kbps} kbps · ${decision.state} · ${reasons} · ${disposition}`;
+  return `${decision.target_kbps} kbps global · ${decision.state} · local ${decision.contribution} · recovery ${decision.recovery_state} · ${reasons} · ${disposition}`;
 }

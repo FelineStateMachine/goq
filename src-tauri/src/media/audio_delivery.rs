@@ -12,6 +12,7 @@ use tauri::{
 
 use super::transport::negotiate_v1;
 use crate::commands::state::{AUDIO_DELIVERY_CAPACITY, AppState, AudioDeliveryState};
+use crate::media::moq_receiver::MoqAudioReceiver;
 
 // Three 20 ms Opus packets cap the Rust→webview handoff at 60 ms. The
 // AudioWorklet owns a separate fixed ring and never feeds back into transport.
@@ -366,6 +367,184 @@ pub(crate) async fn try_start_audio(
         }
     });
     Ok(audio_connection)
+}
+
+pub(crate) struct MoqAudioStartRequest {
+    pub(crate) audio_supported: bool,
+    pub(crate) audio_channel: Channel<Response>,
+    pub(crate) audio_deliveries: Arc<StdMutex<AudioDeliveryState>>,
+    pub(crate) connection_generation: Arc<AtomicU64>,
+    pub(crate) generation: u64,
+}
+
+pub(crate) fn try_start_moq_audio(
+    app: AppHandle,
+    mut receiver: MoqAudioReceiver,
+    request: MoqAudioStartRequest,
+) -> Result<(), String> {
+    if !request.audio_supported {
+        return Err("WebCodecs Opus AudioDecoder is unavailable".to_string());
+    }
+    tokio::spawn(async move {
+        let mut reorder = AudioReorderBuffer::default();
+        let mut transport_received_total = 0_u64;
+        let mut sequence_dropped_total = 0_u64;
+        let mut frontend_dropped_total = 0_u64;
+        let mut frontend_sent_total = 0_u64;
+        let mut pending_discontinuity = false;
+        let mut last_stats = Instant::now();
+
+        loop {
+            let packet = match receiver.next().await {
+                Ok(Some(packet)) => packet,
+                Ok(None) => {
+                    emit_audio_event_if_current(
+                        &app,
+                        "audio-state",
+                        &request.connection_generation,
+                        &request.audio_deliveries,
+                        request.generation,
+                        |_| {
+                            serde_json::json!({
+                                "generation": request.generation,
+                                "available": false,
+                                "error": "Authenticated MoQ audio track ended"
+                            })
+                        },
+                    );
+                    break;
+                }
+                Err(error) => {
+                    emit_audio_event_if_current(
+                        &app,
+                        "audio-state",
+                        &request.connection_generation,
+                        &request.audio_deliveries,
+                        request.generation,
+                        |_| {
+                            serde_json::json!({
+                                "generation": request.generation,
+                                "available": false,
+                                "error": error
+                            })
+                        },
+                    );
+                    break;
+                }
+            };
+            if !audio_generation_is_current(&request.connection_generation, request.generation) {
+                break;
+            }
+            transport_received_total = transport_received_total.saturating_add(1);
+            let (packets, dropped) = match reorder.insert(packet) {
+                Ok(result) => result,
+                Err(error) => {
+                    emit_audio_event_if_current(
+                        &app,
+                        "audio-state",
+                        &request.connection_generation,
+                        &request.audio_deliveries,
+                        request.generation,
+                        |_| {
+                            serde_json::json!({
+                                "generation": request.generation,
+                                "available": false,
+                                "error": error
+                            })
+                        },
+                    );
+                    break;
+                }
+            };
+            sequence_dropped_total = sequence_dropped_total.saturating_add(dropped);
+            pending_discontinuity |= dropped > 0;
+            for ordered in packets {
+                let delivery_id = match lock_audio_deliveries(&request.audio_deliveries)
+                    .reserve(request.generation)
+                {
+                    Ok(Some(delivery_id)) => delivery_id,
+                    Ok(None) => {
+                        frontend_dropped_total = frontend_dropped_total.saturating_add(1);
+                        pending_discontinuity = true;
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                let envelope = match encode_audio_channel_packet(
+                    request.generation,
+                    delivery_id,
+                    ordered.packet,
+                    ordered.discontinuity || pending_discontinuity,
+                ) {
+                    Ok(envelope) => envelope,
+                    Err(error) => {
+                        lock_audio_deliveries(&request.audio_deliveries)
+                            .release_failed_delivery(request.generation, delivery_id);
+                        emit_audio_event_if_current(
+                            &app,
+                            "audio-state",
+                            &request.connection_generation,
+                            &request.audio_deliveries,
+                            request.generation,
+                            |_| {
+                                serde_json::json!({
+                                    "generation": request.generation,
+                                    "available": false,
+                                    "error": error
+                                })
+                            },
+                        );
+                        return;
+                    }
+                };
+                if request.audio_channel.send(Response::new(envelope)).is_err() {
+                    lock_audio_deliveries(&request.audio_deliveries)
+                        .release_failed_delivery(request.generation, delivery_id);
+                    emit_audio_event_if_current(
+                        &app,
+                        "audio-state",
+                        &request.connection_generation,
+                        &request.audio_deliveries,
+                        request.generation,
+                        |_| {
+                            serde_json::json!({
+                                "generation": request.generation,
+                                "available": false,
+                                "error": "Audio webview channel closed"
+                            })
+                        },
+                    );
+                    return;
+                }
+                frontend_sent_total = frontend_sent_total.saturating_add(1);
+                pending_discontinuity = false;
+            }
+            if last_stats.elapsed() >= Duration::from_millis(250) {
+                if !emit_audio_event_if_current(
+                    &app,
+                    "audio-stats",
+                    &request.connection_generation,
+                    &request.audio_deliveries,
+                    request.generation,
+                    |deliveries| {
+                        serde_json::json!({
+                            "generation": request.generation,
+                            "transport_received_total": transport_received_total,
+                            "sequence_dropped_total": sequence_dropped_total,
+                            "frontend_dropped_total": frontend_dropped_total,
+                            "frontend_sent_total": frontend_sent_total,
+                            "frontend_queue_depth": deliveries.depth(request.generation).unwrap_or(0),
+                            "frontend_queue_capacity": AUDIO_DELIVERY_CAPACITY,
+                        })
+                    },
+                ) {
+                    return;
+                }
+                last_stats = Instant::now();
+            }
+        }
+    });
+    Ok(())
 }
 
 pub(crate) fn iroh_client_ack_audio(

@@ -6,6 +6,8 @@ use anyhow::{Context, Result, ensure};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 pub fn ensure_private_directory(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
@@ -271,6 +273,61 @@ pub fn remove_file_if_exists(directory: &Path, file_name: &str) -> Result<bool> 
             Err(error).with_context(|| format!("inspecting private state {}", path.display()))
         }
     }
+}
+
+#[cfg(unix)]
+pub fn prepare_private_unix_socket(
+    directory: &Path,
+    file_name: &str,
+) -> Result<std::path::PathBuf> {
+    validate_private_directory(directory)?;
+    let path = directory.join(file_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_socket() && !metadata.file_type().is_symlink(),
+                "private administration socket path is not a Unix socket"
+            );
+            ensure!(
+                metadata.uid() == unsafe { libc::geteuid() },
+                "private administration socket has the wrong owner"
+            );
+            ensure!(
+                metadata.mode() & 0o077 == 0,
+                "private administration socket is accessible by group or others"
+            );
+            fs::remove_file(&path).with_context(|| {
+                format!("removing stale administration socket {}", path.display())
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspecting administration socket {}", path.display()));
+        }
+    }
+    Ok(path)
+}
+
+#[cfg(unix)]
+pub fn secure_private_unix_socket(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("securing administration socket {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting administration socket {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_socket() && !metadata.file_type().is_symlink(),
+        "private administration socket path is not a Unix socket"
+    );
+    ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "private administration socket has the wrong owner"
+    );
+    ensure!(
+        metadata.mode() & 0o777 == 0o600,
+        "private administration socket must have mode 0600"
+    );
+    Ok(())
 }
 
 fn validate_private_file(file: &File, path: &Path) -> Result<()> {

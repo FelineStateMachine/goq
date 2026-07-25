@@ -50,6 +50,39 @@ jobs:
           python3 scripts/package-decky-plugin.py "$RUNNER_TEMP/decky-artifacts"
           python3 -m unittest scripts.tests.test_decky_package -v
 
+  portal-target-matrix:
+    name: Portal ${{ matrix.target }} compile guard
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            target: x86_64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Add the release matrix target
+        run: rustup target add ${{ matrix.target }}
+
+      # These targets are built and attested for every release but are never
+      # published, so nothing else in CI would notice them breaking. This job
+      # keeps them compiling under both documented pointer policies.
+      - name: Compile Portal under both pointer policies
+        # Windows runners default to PowerShell, which reads the backslash
+        # continuation as an incomplete unary operator and fails to parse the
+        # step before compiling anything. Pin bash so both matrix legs run the
+        # same commands.
+        shell: bash
+        run: |
+          cargo check --locked -p portal --all-targets --target ${{ matrix.target }}
+          cargo check --locked -p portal --all-targets --target ${{ matrix.target }} \
+            --features experimental-non-macos-pointer-capture
+
   demo-gate:
     name: Complete demo gate
     runs-on: ubuntu-24.04

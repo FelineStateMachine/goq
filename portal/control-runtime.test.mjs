@@ -82,12 +82,14 @@ function newHarness({
     change: 0,
     releaseFailures: [],
     exits: 0,
+    hostReleases: 0,
+    exitOrder: [],
   };
   const inputRuntime = {
     send: (event) => { sent.push(event); return true; },
     clear: () => { calls.clear += 1; },
-    releaseHeld: () => { calls.releaseHeld += 1; },
-    drain: async (timeoutMs) => { calls.drains.push(timeoutMs); },
+    releaseHeld: () => { calls.releaseHeld += 1; calls.exitOrder.push('neutral'); },
+    drain: async (timeoutMs) => { calls.drains.push(timeoutMs); calls.exitOrder.push('drain'); },
   };
   const pointerLock = {
     target,
@@ -113,6 +115,7 @@ function newHarness({
     publishController: () => { calls.publish += 1; },
     resetControllerEscape: () => { calls.resetEscape += 1; },
     onChange: () => { calls.change += 1; },
+    onExit: async () => { calls.hostReleases += 1; calls.exitOrder.push('host-release'); },
     onReleaseFailure: (error) => calls.releaseFailures.push(error),
     pointerLockTimeoutMs,
     scheduleTimeout,
@@ -272,6 +275,8 @@ test('losing a browser-owned lock exits active control exactly once', async () =
   assert.equal(harness.calls.resetEscape, 1);
   assert.equal(harness.calls.releaseHeld, 1);
   assert.equal(harness.runtime.handleBrowserPointerLockChange(), false);
+  await eventually(() => assert.equal(harness.calls.hostReleases, 1));
+  assert.deepEqual(harness.calls.exitOrder.slice(0, 3), ['neutral', 'drain', 'host-release']);
 });
 
 test('a native-only session ignores browser ownership changes', async () => {
@@ -341,7 +346,7 @@ test('disconnect exits control and awaits the requested finite input drain', asy
 
   assert.equal(harness.runtime.active, false);
   assert.equal(harness.calls.releaseHeld, 1);
-  assert.deepEqual(harness.calls.drains, [250]);
+  assert.deepEqual(harness.calls.drains, [250, 250]);
   assert.equal(harness.calls.change, 2);
 });
 

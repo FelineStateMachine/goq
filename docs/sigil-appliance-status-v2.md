@@ -23,10 +23,13 @@ The public document includes only:
 
 - Sigil version and overall `ready`, `active`, `degraded`, or `unavailable`
   state.
-- Redacted host and enrolled-Portal fingerprints.
-- Canonically ordered enrollment grants, epoch, and enrollment time.
-- Runtime freshness, daemon state, uptime, session state, and a closed set of
-  error codes.
+- Redacted host fingerprint plus bounded enrollment count.
+- Stable opaque viewer handles, canonically ordered coarse grants, enrollment
+  times, per-viewer authorization revisions, and the global committed revision.
+- Runtime freshness, daemon state, uptime, session mode, bounded active-viewer
+  count, configured capacity, media generation, roster revision, focus
+  occupancy, recovering-viewer count, authorization revision, and a closed set
+  of error codes.
 - The exact loaded configuration revision, fresh daemon instance ID, and sticky
   `reached_ready` evidence used by the transactional configuration gate.
 - The current configuration revision and any pending transaction summary.
@@ -34,6 +37,13 @@ The public document includes only:
 It never includes complete endpoint IDs, invitation material, replay-ledger
 entries, session nonces, addresses, PipeWire object names, filesystem paths, or
 free-form error text.
+
+Authorization status is read from the strict v2 document without taking the
+daemon's writer lease. Schema v2 reports the bounded viewer list and committed
+revision. Schema v1 removes those new fields and retains its original
+single-enrollment projection for compatibility. A valid development v1
+document can be inspected before migration, but only a sole writer converts it;
+once v2 exists, stale v1 bytes are ignored.
 
 ## Runtime authority
 
@@ -65,6 +75,14 @@ must be regular, owner-only objects. Reads and writes are bounded, refuse
 symlinks, and use no-follow opens. Heartbeat I/O runs outside Tokio's async
 worker threads.
 
+The runtime publisher writes strict heartbeat version 3. Its multi-viewer
+fields are internally bounded: active count cannot exceed configured capacity
+or the hard ceiling of eight, recovering count cannot exceed active count, and
+generation/roster revisions are nonzero when present. `inactive`,
+`legacy_exclusive`, and `moq_multi_viewer` have distinct fail-closed field
+shapes. Schema-v1 appliance output removes these fields; it never invents a
+roster or focus generation for a legacy heartbeat.
+
 The status command treats a missing runtime document as `offline`. A heartbeat
 older than ten seconds is `stale`; stale data never claims a live session or
 live uptime. Clean shutdown writes `stopping`, shuts down the Iroh router, and
@@ -73,10 +91,11 @@ stale, while the runtime directory itself is discarded at reboot. Every
 runtime document is bound to the current host identity before its state is
 combined with durable enrollment data.
 
-Runtime status v2 remains able to read a version-1 heartbeat after an upgrade,
-but legacy heartbeats carry no configuration revision and never satisfy the
+Runtime status v3 remains able to read version-1 and version-2 heartbeats after
+an upgrade, but those legacy heartbeats cannot report multi-viewer details;
+version 1 also carries no configuration revision and never satisfies the
 configuration health gate. Stale or absent heartbeats do not expose an instance
-ID, loaded revision, or ready claim.
+ID, loaded revision, ready claim, active count, focus, or generation state.
 
 The Decky backend merges this document with `systemctl --user` unit state.
 Service control, enrollment reset, and identity factory reset remain separate

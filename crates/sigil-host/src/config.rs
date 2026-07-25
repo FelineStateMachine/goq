@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+pub const DEFAULT_MAX_VIEWERS: u8 = 3;
+pub const MAX_VIEWERS: u8 = 8;
 const REVISION_PREFIX: &str = "sha256:";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -95,12 +97,22 @@ pub enum VaapiRateControl {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum GamescopeEncoderBackend {
-    /// Preserve the proven child-process pipeline and its natural-IDR control
-    /// limitation for existing configurations.
-    #[default]
+    /// The child-process pipeline. It cannot change encoder properties while
+    /// playing, so adaptive bitrate and motion-sensitive resolution can only
+    /// run in shadow. Retained for CQP and as an explicit escape hatch, and it
+    /// is the default on builds that cannot run the in-process backend.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "in-process-gstreamer")),
+        default
+    )]
     ExternalGstLaunch,
     /// Run the video pipeline in-process so Sigil can apply bounded encoder
-    /// controls. This remains an explicit opt-in until hardware acceptance.
+    /// controls. This is the only backend where adaptive bitrate and
+    /// resolution actuation are live, so it is the default wherever it can
+    /// actually run. The default deliberately tracks build capability: a
+    /// binary without this feature would otherwise reject its own default
+    /// configuration.
+    #[cfg_attr(all(target_os = "linux", feature = "in-process-gstreamer"), default)]
     InProcessGstreamer,
 }
 
@@ -118,6 +130,10 @@ fn default_source() -> VideoSource {
 
 fn default_input_mode() -> InputMode {
     InputMode::Disabled
+}
+
+const fn default_max_viewers() -> u8 {
+    DEFAULT_MAX_VIEWERS
 }
 
 fn default_ffmpeg() -> PathBuf {
@@ -144,8 +160,9 @@ pub struct GamescopePipewireConfig {
     pub pw_dump_path: PathBuf,
     pub gst_launch_path: PathBuf,
     pub gst_inspect_path: PathBuf,
-    /// External gst-launch remains the compatibility default. The in-process
-    /// backend is accepted only by Linux builds that contain its feature.
+    /// Defaults to the in-process backend on builds that contain its feature,
+    /// because that is the only backend where adaptive bitrate and resolution
+    /// actuation are live. Other builds default to external gst-launch.
     #[serde(default)]
     pub encoder_backend: GamescopeEncoderBackend,
     /// Exact dynamically registered VA encoder factory, such as `vah264enc`.
@@ -268,10 +285,19 @@ impl GamescopePipewireConfig {
                 || cfg!(all(target_os = "linux", feature = "in-process-gstreamer")),
             "gamescope_pipewire.encoder_backend=in-process-gstreamer requires a Linux Sigil build with the in-process-gstreamer feature"
         );
+        // Not a temporary gap: the in-process pipeline is built around a
+        // mutable encoder `bitrate` property, which constant-quantizer mode
+        // does not have. The two are contradictory rather than unfinished.
         ensure!(
             self.encoder_backend != GamescopeEncoderBackend::InProcessGstreamer
                 || self.rate_control == VaapiRateControl::Cbr,
-            "gamescope_pipewire.encoder_backend=in-process-gstreamer currently requires CBR"
+            "gamescope_pipewire.encoder_backend=in-process-gstreamer requires \
+             rate_control=\"cbr\", because adaptive bitrate changes a live \
+             encoder bitrate that constant-quantizer mode does not expose. \
+             Either set rate_control=\"cbr\" to keep adaptive bitrate and \
+             motion-sensitive resolution, or set \
+             encoder_backend=\"external-gst-launch\" to keep CQP and accept \
+             that both adapt in shadow only."
         );
         ensure!(
             self.vaapi_render_node
@@ -363,6 +389,14 @@ fn validate_pipewire_property(name: &str, value: &str) -> Result<()> {
 pub struct HostConfig {
     pub identity_path: PathBuf,
     pub state_path: PathBuf,
+    /// Concurrent native-MoQ v2 viewers. Durable enrollment has a separate
+    /// fixed bound and legacy transports remain exclusive.
+    #[serde(default = "default_max_viewers")]
+    pub max_viewers: u8,
+    /// Optional stable opaque authorization handle allowed to preempt slot 0.
+    /// Other viewers can request a holder-approved handoff but cannot preempt.
+    #[serde(default)]
+    pub focus_owner: Option<String>,
     #[serde(default = "default_source")]
     pub source: VideoSource,
     /// Optional encoded-size override. Gamescope uses its advertised native
@@ -468,6 +502,20 @@ impl HostConfig {
             !self.state_path.as_os_str().is_empty(),
             "state_path is required"
         );
+        ensure!(
+            (1..=MAX_VIEWERS).contains(&self.max_viewers),
+            "max_viewers must be between 1 and {MAX_VIEWERS}"
+        );
+        if let Some(handle) = &self.focus_owner {
+            ensure!(
+                handle.len() == 23
+                    && handle.starts_with("viewer-")
+                    && handle["viewer-".len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "focus_owner must be a stable opaque viewer- followed by 16 lowercase hexadecimal digits"
+            );
+        }
         match (self.width, self.height) {
             (Some(width), Some(height)) => validate_video_dimensions(width, height)?,
             (None, None) => {}
@@ -608,6 +656,16 @@ fn validate_file_security(path: &Path, metadata: &fs::Metadata) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The compiled default tracks build capability, so tests must expect the
+    /// backend this binary can actually run rather than a fixed variant.
+    fn default_encoder_backend() -> GamescopeEncoderBackend {
+        if cfg!(all(target_os = "linux", feature = "in-process-gstreamer")) {
+            GamescopeEncoderBackend::InProcessGstreamer
+        } else {
+            GamescopeEncoderBackend::ExternalGstLaunch
+        }
+    }
+
     #[test]
     fn config_revision_is_exact_bounded_and_strict() {
         let first = ConfigRevision::from_bytes(b"a = 1\n");
@@ -695,8 +753,49 @@ state_path = "/tmp/state"
         )
         .unwrap();
         config.validate().unwrap();
+        assert_eq!(config.max_viewers, DEFAULT_MAX_VIEWERS);
         assert_eq!(config.configured_dimensions(), None);
         assert_eq!(config.test_pattern_dimensions().unwrap(), (1_280, 800));
+    }
+
+    #[test]
+    fn max_viewers_defaults_to_three_and_rejects_values_outside_one_through_eight() {
+        let mut config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.max_viewers, 3);
+        config.validate().unwrap();
+
+        config.max_viewers = 1;
+        config.validate().unwrap();
+        config.max_viewers = 8;
+        config.validate().unwrap();
+        config.max_viewers = 0;
+        assert!(config.validate().is_err());
+        config.max_viewers = 9;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn focus_owner_accepts_only_stable_opaque_authorization_handles() {
+        let mut config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+focus_owner = "viewer-0123456789abcdef"
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+
+        config.focus_owner = Some("viewer-owner".into());
+        assert!(config.validate().is_err());
+        config.focus_owner = Some("viewer-0123456789ABCDEF".into());
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -837,7 +936,7 @@ source = "gamescope-pipewire"
     }
 
     #[test]
-    fn gamescope_encoder_backend_defaults_external() {
+    fn gamescope_encoder_backend_defaults_to_build_capability() {
         let config: HostConfig = toml::from_str(
             r#"
 identity_path = "/tmp/host.key"
@@ -860,7 +959,7 @@ bitrate_kbps = 12000
 
         assert_eq!(
             config.gamescope_pipewire.unwrap().encoder_backend,
-            GamescopeEncoderBackend::ExternalGstLaunch
+            default_encoder_backend()
         );
     }
 

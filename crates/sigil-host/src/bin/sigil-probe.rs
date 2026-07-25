@@ -8,20 +8,27 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::presets};
 use iroh_moq::{Moq, MoqSession};
 use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
 use sigil_protocol::{
     AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1,
-    CONTROL_ALPN_V1, Capability, ClientHello, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN,
-    GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, INVITATION_CLOCK_SKEW_SECS, InputAck,
-    InputEvent, InvitationGrants, KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN,
-    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1,
-    MediaCodec, MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame,
-    MediaObjectV3, PointerPosition, PointerSurfaceDimensions, ProtocolError, SignedInvitation,
-    decode_media_frame_object, media_moq_broadcast_name, read_adaptive_bitrate_decision_v1,
-    read_host_hello, read_input_ack, read_media_object_v3, write_client_hello, write_input_event,
+    AuthenticatedMediaObject, CONTROL_ALPN_V1, CONTROL_ALPN_V2, Capability,
+    ClientControlEnvelopeV2, ClientHello, ClientHelloV2, ControllerSlot, FocusCommandActionV2,
+    FocusCommandV2, FocusStateV2, FrameFlags, GAMEPAD_AXIS_MAX, GAMEPAD_AXIS_MIN,
+    GAMEPAD_TRIGGER_MAX, GamepadState, INPUT_ALPN_V1, INPUT_ALPN_V2, INVITATION_CLOCK_SKEW_SECS,
+    InputAck, InputClientHelloV2, InputEvent, InputEventV2, InvitationGrants,
+    KeyframeRequestReasonV3, MAX_INVITATION_TOKEN_LEN, MAX_MEDIA_GROUP_BYTES_V3,
+    MAX_MEDIA_OBJECT_ID_V3, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, MediaCodec,
+    MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame,
+    MediaObjectCoordinates, MediaObjectV3, MediaTrack, PointerPosition, PointerSurfaceDimensions,
+    ProtocolError, ServerControlEnvelopeV2, SignedInvitation, SignedMediaGenerationCertificate,
+    SignedSubscriptionCapability, SubscriptionTracks, decode_media_frame_object,
+    media_moq_broadcast_name, read_adaptive_bitrate_decision_v1, read_host_hello,
+    read_host_hello_v2, read_input_ack, read_input_ack_v2, read_input_host_hello_v2,
+    read_media_object_v3, read_server_control_v2, write_client_control_v2, write_client_hello,
+    write_client_hello_v2, write_input_client_hello_v2, write_input_event, write_input_event_v2,
     write_media_control_request_v3, write_media_feedback_report_v1,
 };
 
@@ -34,9 +41,18 @@ mod identity;
 
 mod moq_catalog;
 
-use moq_catalog::{MoqCatalogMode, subscribe_goq_video_track};
+use moq_catalog::{
+    MoqCatalogMode, subscribe_authenticated_goq_video_track, subscribe_goq_video_track,
+};
 
 const MEDIA_OBJECT_CAPACITY: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum AdaptiveProfile {
+    Clean,
+    FloorBreach,
+    Stale,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "sigil-probe", version, about = "Bounded Sigil transport probe")]
@@ -70,6 +86,29 @@ struct Args {
     /// for compatibility validation.
     #[arg(long)]
     media_v3: bool,
+    /// Exercise the explicit revisioned control/2 and focus-bound input/2 path.
+    #[arg(long, conflicts_with = "media_v3")]
+    control_v2: bool,
+    /// Join control/2 as a view-only exercise without requesting slot-0 focus.
+    #[arg(long, requires = "control_v2")]
+    spectator: bool,
+    /// End focused v2 proof by disconnecting instead of issuing a release
+    /// against a roster revision that may advance while spectators join.
+    #[arg(long, requires = "control_v2", conflicts_with = "spectator")]
+    disconnect_with_focus: bool,
+    /// Participate in bounded holder-approved slot-0 handoffs and stop after
+    /// observing this many successor generations.
+    #[arg(long, default_value_t = 0, requires = "control_v2")]
+    focus_handoffs: u32,
+    /// Drive a bounded per-viewer adaptive profile on control/2. Clean viewers
+    /// prove survivor recovery; floor-breach viewers prove isolated detach.
+    #[arg(
+        long,
+        value_enum,
+        requires = "control_v2",
+        conflicts_with = "focus_handoffs"
+    )]
+    adaptive_profile: Option<AdaptiveProfile>,
     /// Request a configured recovery keyframe after three accepted frames,
     /// then prove no delta history is delivered before the recovery barrier.
     #[arg(long)]
@@ -120,6 +159,18 @@ struct Args {
         ]
     )]
     resolution_stall_smoke: Option<PathBuf>,
+    /// After the stall is released, submit this many clean, sequence-advancing
+    /// feedback windows and require the controller to climb back out of the
+    /// pressure trough. The host needs CLEAN_WINDOWS plus COOLDOWN_WINDOWS of
+    /// clean evidence, so fewer than about twelve cannot observe an increase.
+    /// 0 keeps the historical behaviour of ending at the resume barrier.
+    #[arg(
+        long,
+        value_name = "WINDOWS",
+        default_value_t = 0,
+        requires = "resolution_stall_smoke"
+    )]
+    resolution_recovery_windows: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -482,6 +533,14 @@ struct MoqProbeReceiver {
     maximum_group_objects: usize,
     maximum_group_bytes: usize,
     historical_suffix_frames: u64,
+    certificate: Option<SignedMediaGenerationCertificate>,
+}
+
+struct MoqProbeAuthentication {
+    expected_host: [u8; 32],
+    subscription_capability: String,
+    authorization_revision: u64,
+    now_unix: u64,
 }
 
 impl MoqProbeReceiver {
@@ -489,10 +548,16 @@ impl MoqProbeReceiver {
         endpoint: &Endpoint,
         address: EndpointAddr,
         session_id: u64,
+        generation_id: u64,
+        advertised_broadcast_name: Option<&str>,
         timeout: Duration,
+        authentication: Option<MoqProbeAuthentication>,
     ) -> Result<Self> {
-        let broadcast_name = media_moq_broadcast_name(session_id)
-            .context("deriving session-scoped MoQ broadcast name")?;
+        let broadcast_name = match advertised_broadcast_name {
+            Some(name) => name.to_owned(),
+            None => media_moq_broadcast_name(session_id)
+                .context("deriving session-scoped MoQ broadcast name")?,
+        };
         let moq = Moq::new(endpoint.clone());
         let mut session = tokio::time::timeout(timeout, moq.connect(address.clone()))
             .await
@@ -510,9 +575,30 @@ impl MoqProbeReceiver {
                 format!("timed out subscribing to upstream MoQ broadcast {broadcast_name}")
             })?
             .with_context(|| format!("subscribing to upstream MoQ broadcast {broadcast_name}"))?;
-        let catalog = subscribe_goq_video_track(&broadcast, timeout)
+        let catalog = if let Some(authentication) = authentication {
+            SignedSubscriptionCapability::decode(&authentication.subscription_capability)?
+                .verify_binding(
+                    authentication.expected_host,
+                    generation_id,
+                    *endpoint.id().as_bytes(),
+                    SubscriptionTracks::VIDEO_H264,
+                    authentication.authorization_revision,
+                    authentication.now_unix,
+                )?;
+            subscribe_authenticated_goq_video_track(
+                &broadcast,
+                timeout,
+                authentication.expected_host,
+                generation_id,
+                authentication.now_unix,
+            )
             .await
-            .context("resolving Goq MoQ catalog")?;
+            .context("resolving authenticated Goq MoQ catalog")?
+        } else {
+            subscribe_goq_video_track(&broadcast, timeout)
+                .await
+                .context("resolving Goq MoQ catalog")?
+        };
         Ok(Self {
             lifetime: MoqProbeLifetime {
                 _moq: moq,
@@ -531,6 +617,7 @@ impl MoqProbeReceiver {
             maximum_group_objects: 0,
             maximum_group_bytes: 0,
             historical_suffix_frames: 0,
+            certificate: catalog.certificate,
         })
     }
 
@@ -617,12 +704,53 @@ impl MoqProbeReceiver {
                 cursor.object_bytes,
                 object.len(),
             )?;
-            let frame = decode_media_frame_object(&object).with_context(|| {
+            let authenticated_coordinates = self
+                .certificate
+                .as_ref()
+                .map(|_| AuthenticatedMediaObject::coordinates(&object))
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "decoding authenticated upstream MoQ group {} object {}",
+                        cursor.sequence, cursor.object_count
+                    )
+                })?;
+            let payload = if let (Some(certificate), Some(coordinates)) =
+                (&self.certificate, authenticated_coordinates)
+            {
+                AuthenticatedMediaObject::verify(
+                    &object,
+                    certificate,
+                    MediaObjectCoordinates {
+                        generation_id: certificate.claims.generation_id,
+                        track: MediaTrack::VideoH264,
+                        group_id: cursor.sequence,
+                        object_id: u32::try_from(cursor.object_count)
+                            .context("authenticated MoQ object index overflow")?,
+                        flags: coordinates.flags,
+                    },
+                )
+                .with_context(|| {
+                    format!(
+                        "verifying authenticated upstream MoQ group {} object {}",
+                        cursor.sequence, cursor.object_count
+                    )
+                })?
+            } else {
+                object.as_ref()
+            };
+            let frame = decode_media_frame_object(payload).with_context(|| {
                 format!(
                     "decoding upstream MoQ group {} object {}",
                     cursor.sequence, cursor.object_count
                 )
             })?;
+            ensure!(
+                authenticated_coordinates.is_none_or(|coordinates| {
+                    coordinates.flags == u16::from(frame.header.flags.bits())
+                }),
+                "authenticated media flags do not match the decoded media envelope"
+            );
             let first_object = cursor.object_count == 0;
             let contiguous = validate_moq_probe_frame(
                 cursor.sequence,
@@ -651,6 +779,624 @@ impl MoqProbeReceiver {
                 group_sequence: cursor.sequence,
                 recovery,
             }));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_control_v2_smoke(
+    endpoint: &Endpoint,
+    address: EndpointAddr,
+    nonce: [u8; 16],
+    invitation: Option<&str>,
+    frames: u32,
+    timeout_seconds: u64,
+    expected_size: Option<(u16, u16)>,
+    spectator: bool,
+    disconnect_with_focus: bool,
+    focus_handoffs: u32,
+    adaptive_profile: Option<AdaptiveProfile>,
+) -> Result<()> {
+    let control_connection = endpoint
+        .connect(address.clone(), CONTROL_ALPN_V2)
+        .await
+        .context("connecting control v2 protocol")?;
+    let (mut control_send, mut control_recv) = control_connection
+        .open_bi()
+        .await
+        .context("opening control v2 stream")?;
+    let mut hello = ClientHelloV2::new("sigil-probe/0.1.0", nonce, vec![Capability::VideoH264]);
+    if let Some(invitation) = invitation {
+        hello = hello.with_invitation(invitation);
+    }
+    write_client_hello_v2(&mut control_send, &hello)
+        .await
+        .context("writing control v2 hello")?;
+    let host = tokio::time::timeout(
+        Duration::from_secs(timeout_seconds),
+        read_host_hello_v2(&mut control_recv),
+    )
+    .await
+    .context("timed out waiting for control v2 hello")??
+    .context("host closed during control v2 hello")?;
+    if !host.accepted {
+        bail!(
+            "host rejected control v2 stream: {}",
+            host.message.as_deref().unwrap_or("unspecified reason")
+        );
+    }
+    let session_id = host
+        .session_id
+        .context("host omitted control v2 session id")?;
+    let subscription_capability = host
+        .media_subscription_capability
+        .context("host omitted control v2 media subscription capability")?;
+    let media_authorization_revision = host
+        .media_authorization_revision
+        .context("host omitted control v2 media authorization revision")?;
+    let initial = host
+        .snapshot
+        .context("host omitted initial control v2 snapshot")?;
+    ensure!(
+        initial.revision > 0,
+        "initial control v2 snapshot was not revisioned"
+    );
+    if !spectator && focus_handoffs == 0 {
+        ensure!(
+            matches!(initial.focus, FocusStateV2::Vacant { .. }),
+            "initial control v2 snapshot did not advertise a vacant slot"
+        );
+    }
+    let generation_id = initial.media.generation_id;
+    let broadcast_name = initial.media.broadcast_name.clone();
+
+    let mut media = MoqProbeReceiver::connect(
+        endpoint,
+        address.clone(),
+        session_id,
+        generation_id,
+        Some(&broadcast_name),
+        Duration::from_secs(timeout_seconds),
+        Some(MoqProbeAuthentication {
+            expected_host: *address.id.as_bytes(),
+            subscription_capability,
+            authorization_revision: media_authorization_revision,
+            now_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before the Unix epoch")?
+                .as_secs(),
+        }),
+    )
+    .await?;
+    if focus_handoffs > 0 {
+        return run_focus_handoff_participant(
+            control_connection,
+            control_send,
+            control_recv,
+            media,
+            initial,
+            focus_handoffs,
+            frames,
+            timeout_seconds,
+        )
+        .await;
+    }
+    if spectator {
+        if let Some(profile) = adaptive_profile {
+            let mut accepted = 0_u32;
+            let mut last_sequence = None;
+            let feedback =
+                run_v2_adaptive_profile(endpoint, address.clone(), nonce, session_id, profile);
+            tokio::pin!(feedback);
+            let mut media_open = true;
+            let evidence = loop {
+                tokio::select! {
+                    evidence = &mut feedback => break evidence?,
+                    outcome = media.next(), if media_open => {
+                        let Some(outcome) = outcome? else {
+                            if profile == AdaptiveProfile::FloorBreach {
+                                media_open = false;
+                                continue;
+                            }
+                            bail!("adaptive-profile spectator media ended early");
+                        };
+                    let MoqProbeOutcome::Frame { frame, .. } = outcome else {
+                        continue;
+                    };
+                    if let Some((width, height)) = expected_size {
+                        ensure!(
+                            frame.header.width == width && frame.header.height == height,
+                            "adaptive-profile media dimensions did not match {width}x{height}"
+                        );
+                    }
+                    if let Some(previous) = last_sequence {
+                        ensure!(
+                            frame.header.sequence > previous,
+                            "adaptive-profile media sequence regressed"
+                        );
+                    }
+                    last_sequence = Some(frame.header.sequence);
+                    accepted += 1;
+                    }
+                }
+            };
+            ensure!(
+                accepted >= frames.min(60),
+                "adaptive profile did not preserve media progress"
+            );
+            control_connection.close(0_u32.into(), b"adaptive profile complete");
+            println!("probe=ok");
+            println!("transport=iroh-moq");
+            println!("control_alpn=sigil/control/2");
+            println!("media_generation_id={generation_id}");
+            println!("media_broadcast_name={broadcast_name}");
+            println!("roster_viewers={}", initial.viewers.len());
+            println!("frames={accepted}");
+            println!("spectator=ok");
+            println!("adaptive_profile={}", profile.label());
+            println!("adaptive_minimum_kbps={}", evidence.minimum_kbps);
+            println!("adaptive_final_kbps={}", evidence.final_kbps);
+            println!(
+                "adaptive_survivor_recovery={}",
+                if evidence.survivor_recovery {
+                    "ok"
+                } else {
+                    "not-applicable"
+                }
+            );
+            println!(
+                "adaptive_floor_detach={}",
+                if evidence.floor_detach {
+                    "ok"
+                } else {
+                    "not-applicable"
+                }
+            );
+            println!("resource_summary_version=1");
+            println!("maximum_roster_viewers={}", initial.viewers.len());
+            println!("media_progress=monotonic");
+            println!("probe_media_object_capacity={MEDIA_OBJECT_CAPACITY}");
+            return Ok(());
+        }
+        let mut accepted = 0_u32;
+        let mut last_sequence = None;
+        // The roster at hello time is one instantaneous sample: a peer that has
+        // not finished attaching yet, or one that has already left, makes it
+        // disagree with the configured viewer count for reasons that say
+        // nothing about admission. Track the maximum across the snapshot
+        // stream, exactly as the focus participant does, so the cardinality
+        // assertion is about what the host actually admitted.
+        let mut maximum_roster_viewers = initial.viewers.len();
+        let mut roster_revision = initial.revision;
+        while accepted < frames {
+            let outcome = tokio::select! {
+                envelope = read_server_control_v2(&mut control_recv) => {
+                    match envelope?.context("host closed during spectator proof")? {
+                        ServerControlEnvelopeV2::Snapshot { snapshot: next } => {
+                            ensure!(
+                                next.revision >= roster_revision,
+                                "spectator snapshot revision regressed"
+                            );
+                            roster_revision = next.revision;
+                            maximum_roster_viewers =
+                                maximum_roster_viewers.max(next.viewers.len());
+                            continue;
+                        }
+                        _ => continue,
+                    }
+                }
+                outcome = tokio::time::timeout(Duration::from_secs(timeout_seconds), media.next()) => {
+                    outcome
+                        .context("timed out waiting for spectator media")??
+                        .context("spectator media ended before requested frames")?
+                }
+            };
+            let MoqProbeOutcome::Frame { frame, .. } = outcome else {
+                continue;
+            };
+            if let Some((width, height)) = expected_size {
+                ensure!(
+                    frame.header.width == width && frame.header.height == height,
+                    "spectator media dimensions did not match {width}x{height}"
+                );
+            }
+            if let Some(previous) = last_sequence {
+                ensure!(
+                    frame.header.sequence > previous,
+                    "spectator media sequence regressed"
+                );
+            }
+            last_sequence = Some(frame.header.sequence);
+            accepted += 1;
+        }
+        control_connection.close(0_u32.into(), b"spectator probe complete");
+        println!("probe=ok");
+        println!("transport=iroh-moq");
+        println!("control_alpn=sigil/control/2");
+        println!("media_generation_id={generation_id}");
+        println!("media_broadcast_name={broadcast_name}");
+        println!("roster_viewers={maximum_roster_viewers}");
+        println!("frames={accepted}");
+        println!("spectator=ok");
+        println!("resource_summary_version=1");
+        println!("maximum_roster_viewers={maximum_roster_viewers}");
+        println!("media_progress=monotonic");
+        println!("probe_media_object_capacity={MEDIA_OBJECT_CAPACITY}");
+        return Ok(());
+    }
+    let focus_request = FocusCommandV2 {
+        request_id: 1,
+        action: FocusCommandActionV2::Request,
+        slot: ControllerSlot::ZERO,
+        expected_revision: initial.revision,
+        expected_focus_generation: None,
+        expected_proposal_id: None,
+    };
+    write_client_control_v2(
+        &mut control_send,
+        &ClientControlEnvelopeV2::Focus {
+            command: focus_request,
+        },
+    )
+    .await
+    .context("requesting control v2 focus")?;
+    let focused = read_v2_snapshot_after(
+        &mut control_recv,
+        initial.revision,
+        timeout_seconds,
+        |snapshot| snapshot.self_focus_generation().is_some(),
+    )
+    .await?;
+    let focus_generation = focused
+        .self_focus_generation()
+        .context("focus grant did not identify the requesting viewer")?;
+
+    let input_connection = endpoint
+        .connect(address, INPUT_ALPN_V2)
+        .await
+        .context("connecting input v2 protocol")?;
+    let (mut input_send, mut input_recv) = input_connection
+        .open_bi()
+        .await
+        .context("opening input v2 stream")?;
+    let input_hello = InputClientHelloV2::new(
+        "sigil-probe/0.1.0",
+        nonce,
+        session_id,
+        ControllerSlot::ZERO,
+        focus_generation,
+        vec![Capability::InputAck],
+    );
+    write_input_client_hello_v2(&mut input_send, &input_hello)
+        .await
+        .context("writing input v2 hello")?;
+    let input_host = tokio::time::timeout(
+        Duration::from_secs(timeout_seconds),
+        read_input_host_hello_v2(&mut input_recv),
+    )
+    .await
+    .context("timed out waiting for input v2 hello")??
+    .context("host closed during input v2 hello")?;
+    ensure!(input_host.accepted, "host rejected focused input v2 stream");
+    ensure!(
+        input_host.session_id == Some(session_id)
+            && input_host.slot == Some(ControllerSlot::ZERO)
+            && input_host.focus_generation == Some(focus_generation),
+        "input v2 host hello changed its focus binding"
+    );
+    write_input_event_v2(
+        &mut input_send,
+        &InputEventV2 {
+            session_id,
+            slot: ControllerSlot::ZERO,
+            focus_generation,
+            event: InputEvent::Probe,
+        },
+    )
+    .await
+    .context("writing slot-0 input v2 probe")?;
+    let input_ack = tokio::time::timeout(
+        Duration::from_secs(timeout_seconds.min(5)),
+        read_input_ack_v2(&mut input_recv),
+    )
+    .await
+    .context("timed out waiting for input v2 acknowledgement")??
+    .context("host closed before input v2 acknowledgement")?;
+    ensure!(
+        input_ack.session_id == session_id
+            && input_ack.slot == ControllerSlot::ZERO
+            && input_ack.focus_generation == focus_generation
+            && input_ack.ack.sequence == 1,
+        "input v2 acknowledgement changed its focus binding"
+    );
+
+    let mut accepted = 0_u32;
+    let mut last_sequence = None;
+    while accepted < frames {
+        let outcome = tokio::time::timeout(Duration::from_secs(timeout_seconds), media.next())
+            .await
+            .context("timed out waiting for control v2 media")??
+            .context("control v2 media ended before requested frames")?;
+        let MoqProbeOutcome::Frame { frame, .. } = outcome else {
+            continue;
+        };
+        if let Some((width, height)) = expected_size {
+            ensure!(
+                frame.header.width == width && frame.header.height == height,
+                "control v2 media dimensions did not match {width}x{height}"
+            );
+        }
+        if let Some(previous) = last_sequence {
+            ensure!(
+                frame.header.sequence > previous,
+                "control v2 media sequence regressed"
+            );
+        }
+        last_sequence = Some(frame.header.sequence);
+        accepted += 1;
+    }
+
+    let released = if disconnect_with_focus {
+        None
+    } else {
+        let release = FocusCommandV2 {
+            request_id: 2,
+            action: FocusCommandActionV2::Release,
+            slot: ControllerSlot::ZERO,
+            expected_revision: focused.revision,
+            expected_focus_generation: Some(focus_generation),
+            expected_proposal_id: None,
+        };
+        write_client_control_v2(
+            &mut control_send,
+            &ClientControlEnvelopeV2::Focus { command: release },
+        )
+        .await
+        .context("releasing control v2 focus")?;
+        Some(
+            read_v2_snapshot_after(
+                &mut control_recv,
+                focused.revision,
+                timeout_seconds,
+                |snapshot| matches!(snapshot.focus, FocusStateV2::Vacant { .. }),
+            )
+            .await?,
+        )
+    };
+    input_send.finish().context("finishing input v2 stream")?;
+    input_connection.close(0_u32.into(), b"focus released");
+    control_connection.close(0_u32.into(), b"probe complete");
+
+    println!("probe=ok");
+    println!("transport=iroh-moq");
+    println!("control_alpn=sigil/control/2");
+    println!("input_alpn=sigil/input/2");
+    println!("media_authentication=ed25519-v1");
+    println!("media_generation_certified=ok");
+    println!("media_generation_id={generation_id}");
+    println!("media_broadcast_name={broadcast_name}");
+    println!("media_generation_scope=host");
+    println!("subscription_endpoint_binding=ok");
+    println!("roster_viewers={}", initial.viewers.len());
+    println!("frames={accepted}");
+    println!("initial_snapshot_revision={}", initial.revision);
+    println!("focus_grant_revision={}", focused.revision);
+    println!("focus_generation={focus_generation}");
+    println!("slot_0_input=ok");
+    if let Some(released) = released {
+        println!("focus_release_revision={}", released.revision);
+        println!("focus_release=ok");
+    } else {
+        println!("focus_release_revision=disconnect");
+        println!("focus_release=disconnect");
+    }
+    println!("resource_summary_version=1");
+    println!("maximum_roster_viewers={}", initial.viewers.len());
+    println!("media_progress=monotonic");
+    println!("probe_media_object_capacity={MEDIA_OBJECT_CAPACITY}");
+    Ok(())
+}
+
+fn focus_holder_identity(
+    snapshot: &sigil_protocol::SessionSnapshotV2,
+) -> Option<(String, u64, u64)> {
+    match &snapshot.focus {
+        FocusStateV2::Held {
+            holder,
+            session_id,
+            focus_generation,
+            ..
+        } => Some((holder.as_str().to_owned(), *session_id, *focus_generation)),
+        FocusStateV2::Vacant { .. } | FocusStateV2::Neutralizing { .. } => None,
+    }
+}
+
+fn next_handoff_command(
+    snapshot: &sigil_protocol::SessionSnapshotV2,
+    request_id: u64,
+) -> Option<FocusCommandV2> {
+    let self_viewer = snapshot.self_viewer();
+    match &snapshot.focus {
+        FocusStateV2::Vacant { slot } => Some(FocusCommandV2 {
+            request_id,
+            action: FocusCommandActionV2::Request,
+            slot: *slot,
+            expected_revision: snapshot.revision,
+            expected_focus_generation: None,
+            expected_proposal_id: None,
+        }),
+        FocusStateV2::Held {
+            slot,
+            holder,
+            session_id,
+            focus_generation,
+        } if holder == &snapshot.self_presence_id && *session_id == self_viewer.session_id => {
+            snapshot
+                .focus_proposal
+                .as_ref()
+                .map(|proposal| FocusCommandV2 {
+                    request_id,
+                    action: FocusCommandActionV2::Approve,
+                    slot: *slot,
+                    expected_revision: snapshot.revision,
+                    expected_focus_generation: Some(*focus_generation),
+                    expected_proposal_id: Some(proposal.proposal_id),
+                })
+        }
+        FocusStateV2::Held { slot, .. } if snapshot.focus_proposal.is_none() => {
+            Some(FocusCommandV2 {
+                request_id,
+                action: FocusCommandActionV2::Request,
+                slot: *slot,
+                expected_revision: snapshot.revision,
+                expected_focus_generation: None,
+                expected_proposal_id: None,
+            })
+        }
+        FocusStateV2::Held { .. } | FocusStateV2::Neutralizing { .. } => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_focus_handoff_participant(
+    control_connection: iroh::endpoint::Connection,
+    mut control_send: iroh::endpoint::SendStream,
+    mut control_recv: iroh::endpoint::RecvStream,
+    mut media: MoqProbeReceiver,
+    mut snapshot: sigil_protocol::SessionSnapshotV2,
+    required_handoffs: u32,
+    frames: u32,
+    timeout_seconds: u64,
+) -> Result<()> {
+    let mut request_id = 1_u64;
+    let mut command_in_flight = false;
+    let mut observed_handoffs = 0_u32;
+    let mut accepted_frames = 0_u32;
+    let mut maximum_roster_viewers = snapshot.viewers.len();
+    let mut last_holder = focus_holder_identity(&snapshot);
+    let mut next_command_at = tokio::time::Instant::now();
+    // Two timeout windows for the handoff exchange, plus the wall time the
+    // frame budget itself needs at a conservative 30fps floor.
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(timeout_seconds.max(1).saturating_mul(2))
+        + Duration::from_secs(u64::from(frames) / 30 + 1);
+
+    // Leaving as soon as the handoffs land would shrink the roster underneath
+    // any concurrent same-peer replacement cycle, which then fails on viewer
+    // cardinality for reasons that have nothing to do with admission. Hold the
+    // session for the full frame budget, exactly like a spectator.
+    while observed_handoffs < required_handoffs || accepted_frames < frames {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out after observing {observed_handoffs} of {required_handoffs} focus handoffs \
+             and {accepted_frames} of {frames} frames"
+        );
+        if observed_handoffs < required_handoffs
+            && !command_in_flight
+            && tokio::time::Instant::now() >= next_command_at
+            && let Some(command) = next_handoff_command(&snapshot, request_id)
+        {
+            write_client_control_v2(
+                &mut control_send,
+                &ClientControlEnvelopeV2::Focus { command },
+            )
+            .await
+            .context("writing bounded focus handoff command")?;
+            request_id = request_id
+                .checked_add(1)
+                .context("focus handoff request id exhausted")?;
+            command_in_flight = true;
+            next_command_at = tokio::time::Instant::now() + Duration::from_millis(300);
+        }
+
+        tokio::select! {
+            envelope = read_server_control_v2(&mut control_recv) => {
+                let envelope = envelope?
+                    .context("host closed during bounded focus handoff proof")?;
+                match envelope {
+                    ServerControlEnvelopeV2::Snapshot { snapshot: next } => {
+                        ensure!(
+                            next.revision >= snapshot.revision,
+                            "focus handoff snapshot revision regressed"
+                        );
+                        if next.revision == snapshot.revision {
+                            continue;
+                        }
+                        if let Some(holder) = focus_holder_identity(&next) {
+                            if last_holder.as_ref().is_some_and(|previous| previous != &holder) {
+                                observed_handoffs = observed_handoffs.saturating_add(1);
+                            }
+                            last_holder = Some(holder);
+                        }
+                        maximum_roster_viewers = maximum_roster_viewers.max(next.viewers.len());
+                        snapshot = next;
+                        command_in_flight = false;
+                    }
+                    ServerControlEnvelopeV2::FocusResult { result } => {
+                        if !result.accepted {
+                            command_in_flight = false;
+                            next_command_at = tokio::time::Instant::now() + Duration::from_millis(300);
+                        }
+                    }
+                }
+            }
+            outcome = media.next() => {
+                if matches!(outcome?, Some(MoqProbeOutcome::Frame { .. })) {
+                    accepted_frames = accepted_frames.saturating_add(1);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                bail!(
+                    "timed out after observing {observed_handoffs} of {required_handoffs} focus \
+                     handoffs and {accepted_frames} of {frames} frames"
+                );
+            }
+        }
+    }
+
+    control_connection.close(0_u32.into(), b"focus handoff proof complete");
+    println!("probe=ok");
+    println!("control_alpn=sigil/control/2");
+    println!("focus_handoffs_observed={observed_handoffs}");
+    println!("roster_viewers={maximum_roster_viewers}");
+    println!("focus_handoff_media_frames={accepted_frames}");
+    println!("reset_before_successor=host-ordered");
+    println!("resource_summary_version=1");
+    println!("maximum_roster_viewers={maximum_roster_viewers}");
+    println!("media_progress=monotonic");
+    println!("probe_media_object_capacity={MEDIA_OBJECT_CAPACITY}");
+    Ok(())
+}
+
+async fn read_v2_snapshot_after(
+    recv: &mut iroh::endpoint::RecvStream,
+    previous_revision: u64,
+    timeout_seconds: u64,
+    predicate: impl Fn(&sigil_protocol::SessionSnapshotV2) -> bool,
+) -> Result<sigil_protocol::SessionSnapshotV2> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, read_server_control_v2(recv))
+            .await
+            .context("timed out waiting for control v2 state")??
+            .context("host closed before control v2 state arrived")?;
+        match envelope {
+            ServerControlEnvelopeV2::Snapshot { snapshot } => {
+                ensure!(
+                    snapshot.revision > previous_revision,
+                    "control v2 snapshot revision did not advance"
+                );
+                if predicate(&snapshot) {
+                    return Ok(snapshot);
+                }
+            }
+            ServerControlEnvelopeV2::FocusResult { result } => {
+                ensure!(
+                    result.accepted,
+                    "host rejected control v2 focus command: {}",
+                    result.message.as_deref().unwrap_or("unspecified reason")
+                );
+            }
         }
     }
 }
@@ -764,6 +1510,17 @@ struct ResolutionStallEvidence {
     resume_input_ack_micros: u64,
     resume_media_micros: u64,
     resume_sequence_advance: u64,
+    recovery: Option<ResolutionRecoveryEvidence>,
+}
+
+#[derive(Debug)]
+struct ResolutionRecoveryEvidence {
+    windows: u64,
+    trough_kbps: u32,
+    final_kbps: u32,
+    increase_observed: bool,
+    final_dimensions: (u16, u16),
+    restored_native: bool,
 }
 
 struct ResolutionStallGate {
@@ -913,6 +1670,134 @@ async fn run_feedback_smoke(
     Ok((decision, path_mode, path_rtt_ms))
 }
 
+impl AdaptiveProfile {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::FloorBreach => "floor-breach",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+struct AdaptiveProfileEvidence {
+    minimum_kbps: u32,
+    final_kbps: u32,
+    survivor_recovery: bool,
+    floor_detach: bool,
+}
+
+async fn run_v2_adaptive_profile(
+    endpoint: &Endpoint,
+    address: EndpointAddr,
+    nonce: [u8; 16],
+    session_id: u64,
+    profile: AdaptiveProfile,
+) -> Result<AdaptiveProfileEvidence> {
+    let connection = endpoint
+        .connect(address, MEDIA_FEEDBACK_ALPN_V1)
+        .await
+        .context("connecting control-v2 adaptive feedback profile")?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("opening control-v2 adaptive feedback stream")?;
+    let negotiation = negotiate(
+        &mut send,
+        &mut recv,
+        nonce,
+        vec![Capability::VideoH264],
+        Capability::VideoH264,
+        "control-v2 adaptive feedback",
+        None,
+    )
+    .await?;
+    ensure!(
+        negotiation.session_id == session_id,
+        "control-v2 media and adaptive feedback session IDs differ"
+    );
+
+    let report_count = match profile {
+        AdaptiveProfile::Clean => 36,
+        AdaptiveProfile::FloorBreach => 32,
+        AdaptiveProfile::Stale => 5,
+    };
+    let mut minimum_kbps = u32::MAX;
+    let mut maximum_kbps = 0_u32;
+    let mut final_kbps = 0_u32;
+    let mut saw_stale = false;
+    let mut floor_detach = false;
+    let mut final_reason_bits = 0_u16;
+    for report_id in 1..=report_count {
+        let mut report = complete_feedback_report(report_id, MediaFeedbackFlags::NONE, report_id);
+        match profile {
+            AdaptiveProfile::Clean => {}
+            AdaptiveProfile::FloorBreach => {
+                report.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+                report.transport_dropped_delta = 8;
+                report.frontend_dropped_delta = 8;
+                report.decoder_dropped_delta = 8;
+                report.presenter_dropped_delta = 8;
+                report.frontend_queue_depth = report.frontend_queue_capacity;
+                report.decode_queue_depth = report.decode_queue_capacity;
+                report.presenter_queue_depth = report.presenter_queue_capacity;
+                report.transport_delivery_p95_ms = Some(250);
+                report.decode_p95_ms = Some(125);
+                report.presentation_p95_ms = Some(125);
+            }
+            AdaptiveProfile::Stale => {
+                report.interval_ms = 5_000;
+            }
+        }
+        let decision = match exchange_feedback_report(&mut send, &mut recv, &report).await {
+            Ok(decision) => decision,
+            Err(error) if profile == AdaptiveProfile::FloorBreach && minimum_kbps <= 1_000 => {
+                floor_detach = true;
+                eprintln!("[probe] floor-breach feedback stream detached as expected: {error}");
+                break;
+            }
+            Err(error) => return Err(error).context("running control-v2 adaptive profile"),
+        };
+        minimum_kbps = minimum_kbps.min(decision.target_kbps);
+        maximum_kbps = maximum_kbps.max(decision.target_kbps);
+        final_kbps = decision.target_kbps;
+        final_reason_bits = decision.reasons.bits();
+        saw_stale |= decision
+            .reasons
+            .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+    }
+    ensure!(
+        minimum_kbps != u32::MAX,
+        "adaptive profile received no decisions"
+    );
+    let survivor_recovery = profile == AdaptiveProfile::Clean
+        && minimum_kbps < maximum_kbps
+        && final_kbps > minimum_kbps;
+    match profile {
+        AdaptiveProfile::Clean => ensure!(
+            survivor_recovery,
+            "clean survivor did not observe aggregate downshift and recovery: min={minimum_kbps}, max={maximum_kbps}, final={final_kbps}, reasons={final_reason_bits}"
+        ),
+        AdaptiveProfile::FloorBreach => ensure!(
+            floor_detach && minimum_kbps <= 1_000,
+            "floor-breach viewer was not detached after bounded recovery"
+        ),
+        AdaptiveProfile::Stale => ensure!(saw_stale, "stale profile was not classified stale"),
+    }
+    if profile != AdaptiveProfile::FloorBreach {
+        send.finish()
+            .context("finishing control-v2 adaptive feedback profile")?;
+        connection.close(0_u32.into(), b"adaptive profile complete");
+    }
+    Ok(AdaptiveProfileEvidence {
+        minimum_kbps,
+        final_kbps,
+        survivor_recovery,
+        floor_detach,
+    })
+}
+
 async fn next_resolution_stall_moq_frame(receiver: &mut MoqProbeReceiver) -> Result<AcceptedMedia> {
     loop {
         match receiver.next().await? {
@@ -1016,6 +1901,7 @@ async fn run_resolution_stall_smoke(
     expected_ack: &mut u64,
     expected_native: Option<(u16, u16)>,
     timeout: Duration,
+    recovery_windows: u64,
 ) -> Result<ResolutionStallEvidence> {
     let gate = ResolutionStallGate::new(gate_directory)?;
     let initial = tokio::time::timeout(timeout, next_resolution_stall_moq_frame(receiver))
@@ -1052,6 +1938,7 @@ async fn run_resolution_stall_smoke(
     );
     let pressure_decision =
         exchange_feedback_report(feedback_send, feedback_recv, &pressure).await?;
+    let mut trough_kbps = pressure_decision.target_kbps;
     ensure!(
         pressure_decision
             .reasons
@@ -1119,6 +2006,7 @@ async fn run_resolution_stall_smoke(
         let sent_at = Instant::now();
         fresh_started.get_or_insert(sent_at);
         let decision = exchange_feedback_report(feedback_send, feedback_recv, &report).await?;
+        trough_kbps = trough_kbps.min(decision.target_kbps);
         ensure!(
             decision.state != AdaptiveBitrateStateV1::Increase,
             "no-progress feedback unexpectedly increased adaptive bitrate"
@@ -1186,6 +2074,72 @@ async fn run_resolution_stall_smoke(
     let resume_media_micros =
         u64::try_from(media_resumed_at.elapsed().as_micros()).unwrap_or(u64::MAX);
 
+    // Proving the descent is only half of the contract. Feed clean, genuinely
+    // advancing evidence for long enough to clear the clean-window and
+    // cooldown counters, then require the controller to climb back out.
+    let recovery = if recovery_windows > 0 {
+        let mut latest_sequence = resumed.sequence;
+        let mut latest_dimensions = (resumed.width, resumed.height);
+        let mut final_kbps = trough_kbps;
+        let mut increase_observed = false;
+        let mut last_feedback_at = Instant::now();
+        for _ in 0..recovery_windows {
+            // Drain as fast as frames arrive until the next feedback deadline.
+            // Consuming a single frame per window would starve the receiver and
+            // manufacture exactly the cancellation backpressure this loop
+            // exists to prove has cleared, so the controller would correctly
+            // refuse to climb and the test would be measuring its own harness.
+            let deadline = last_feedback_at + RESOLUTION_STALL_FEEDBACK_INTERVAL;
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match tokio::time::timeout(
+                    deadline - now,
+                    next_resolution_stall_moq_frame(receiver),
+                )
+                .await
+                {
+                    Ok(Ok(frame)) => {
+                        latest_sequence = frame.sequence;
+                        latest_dimensions = (frame.width, frame.height);
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => break,
+                }
+            }
+            report_id += 1;
+            let report =
+                complete_feedback_report(report_id, MediaFeedbackFlags::NONE, latest_sequence);
+            let sent_at = Instant::now();
+            let decision = exchange_feedback_report(feedback_send, feedback_recv, &report).await?;
+            last_feedback_at = sent_at;
+            final_kbps = decision.target_kbps;
+            if decision.state == AdaptiveBitrateStateV1::Increase {
+                increase_observed = true;
+            }
+        }
+        ensure!(
+            increase_observed,
+            "adaptive bitrate never increased across {recovery_windows} clean recovery windows              (trough {trough_kbps} kbps, final {final_kbps} kbps)"
+        );
+        ensure!(
+            final_kbps > trough_kbps,
+            "adaptive bitrate recovered no ground: trough {trough_kbps} kbps, final {final_kbps} kbps"
+        );
+        Some(ResolutionRecoveryEvidence {
+            windows: recovery_windows,
+            trough_kbps,
+            final_kbps,
+            increase_observed,
+            final_dimensions: latest_dimensions,
+            restored_native: latest_dimensions == native_dimensions,
+        })
+    } else {
+        None
+    };
+
     Ok(ResolutionStallEvidence {
         native_dimensions,
         reduced_dimensions,
@@ -1196,6 +2150,7 @@ async fn run_resolution_stall_smoke(
         resume_input_ack_micros,
         resume_media_micros,
         resume_sequence_advance,
+        recovery,
     })
 }
 
@@ -1243,6 +2198,22 @@ async fn main() -> Result<()> {
         .context("binding probe endpoint")?;
     let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
     let address = EndpointAddr::new(args.node_id);
+    if args.control_v2 {
+        return run_control_v2_smoke(
+            &endpoint,
+            address,
+            nonce,
+            invitation.as_deref(),
+            args.frames,
+            args.timeout_seconds,
+            args.expect_size,
+            args.spectator,
+            args.disconnect_with_focus,
+            args.focus_handoffs,
+            args.adaptive_profile,
+        )
+        .await;
+    }
     let media_transport = if args.media_v3 {
         MediaTransport::GroupedV3
     } else {
@@ -1283,7 +2254,10 @@ async fn main() -> Result<()> {
                 &endpoint,
                 address.clone(),
                 session_id,
+                session_id,
+                None,
                 Duration::from_secs(args.timeout_seconds),
+                None,
             )
             .await?,
         )
@@ -1491,6 +2465,7 @@ async fn main() -> Result<()> {
             &mut expected_ack,
             args.expect_size,
             Duration::from_secs(args.timeout_seconds),
+            args.resolution_recovery_windows,
         )
         .await?;
 
@@ -1534,6 +2509,33 @@ async fn main() -> Result<()> {
             "resolution_stall_input_ack_micros={}",
             evidence.stall_input_ack_micros
         );
+        match evidence.recovery.as_ref() {
+            Some(recovery) => {
+                println!("resolution_recovery_windows={}", recovery.windows);
+                println!("resolution_recovery_trough_kbps={}", recovery.trough_kbps);
+                println!("resolution_recovery_final_kbps={}", recovery.final_kbps);
+                println!(
+                    "resolution_recovery_increase_observed={}",
+                    recovery.increase_observed
+                );
+                println!(
+                    "resolution_recovery_final_dimensions={}x{}",
+                    recovery.final_dimensions.0, recovery.final_dimensions.1
+                );
+                println!(
+                    "resolution_recovery_restored_native={}",
+                    recovery.restored_native
+                );
+            }
+            None => {
+                println!("resolution_recovery_windows=not-requested");
+                println!("resolution_recovery_trough_kbps=not-requested");
+                println!("resolution_recovery_final_kbps=not-requested");
+                println!("resolution_recovery_increase_observed=not-requested");
+                println!("resolution_recovery_final_dimensions=not-requested");
+                println!("resolution_recovery_restored_native=not-requested");
+            }
+        }
         println!(
             "resolution_resume_input_ack_micros={}",
             evidence.resume_input_ack_micros

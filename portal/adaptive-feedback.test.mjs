@@ -235,8 +235,13 @@ test('decision diagnostics reject stale generations and say advisory not applied
       state: 'hold',
       reasons: ['clean-recovery'],
       applied: false,
+      contribution: 'clean',
+      recovery_state: 'active',
+      scope: 'local-viewer',
     },
   }, 7);
   assert.match(formatAdaptiveDecision(decision, true), /advisory only \(not applied\)/);
+  assert.match(formatAdaptiveDecision(decision, true), /local clean · recovery active/);
+  assert.equal(decision.scope, 'local-viewer');
   assert.equal(formatAdaptiveDecision(null, false), 'unavailable');
 });

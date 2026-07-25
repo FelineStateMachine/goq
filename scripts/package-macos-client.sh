@@ -6,21 +6,32 @@ umask 077
 usage() {
   cat <<'EOF'
 Usage: scripts/package-macos-client.sh --release-tag vVERSION
-       --output-dir /absolute/path
+       --output-dir /absolute/path --signing adhoc|developer-id
 
-Build and verify a distributable macOS DMG. This gate requires:
+Build and verify a distributable macOS DMG. Both modes require:
 
   - a clean worktree;
   - a release tag resolving exactly to HEAD and matching every package version;
   - an Apple Silicon runner and the aarch64-apple-darwin Rust target;
-  - APPLE_SIGNING_IDENTITY naming a Developer ID Application identity;
-  - Tauri notarization credentials (App Store Connect API or Apple ID);
-  - strict code-signing, hardened runtime, Gatekeeper, and stapling checks.
+  - an arm64-only executable, the pinned bundle identifier, a verified DMG,
+    and no host or credential artifact inside the client bundle.
+
+--signing adhoc is the published release mode. Portal has no Apple Developer
+ID, so the DMG is not notarized and Gatekeeper will not accept it silently.
+arm64 macOS refuses to execute a wholly unsigned binary, so this mode requires
+the linker's ad-hoc signature to be present and rejects any Developer ID
+signature that appeared unintentionally. Trust is anchored in GitHub/Sigstore
+build provenance and the published SHA-256, not in Apple.
+
+--signing developer-id additionally requires APPLE_SIGNING_IDENTITY, the
+committed team-identifier pin, notarization credentials, hardened runtime,
+stapling, and Gatekeeper acceptance. It is preserved for the day an Apple
+Developer Program membership exists and is NOT exercised by CI, so re-validate
+it end to end before trusting it.
 
 The normal release is built without optional Cargo features. Development
 features, including demo-direct-node and
-experimental-non-macos-pointer-capture, and ad-hoc signatures are
-intentionally not accepted by this command.
+experimental-non-macos-pointer-capture, are intentionally not accepted.
 EOF
 }
 
@@ -33,9 +44,15 @@ script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
 repo_dir="$(CDPATH='' cd -- "$script_dir/.." && pwd -P)"
 output_dir=""
 release_tag=""
+signing_mode=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --signing)
+      [[ $# -ge 2 ]] || die "--signing requires a mode"
+      signing_mode="$2"
+      shift 2
+      ;;
     --output-dir)
       [[ $# -ge 2 ]] || die "--output-dir requires a path"
       output_dir="$2"
@@ -58,6 +75,11 @@ done
 [[ "$(uname -m)" == arm64 ]] || die "the first public Portal release is macOS arm64 only"
 [[ -n "$output_dir" && "$output_dir" == /* ]] || die "--output-dir must be absolute"
 [[ -n "$release_tag" ]] || die "--release-tag is required"
+case "$signing_mode" in
+  adhoc|developer-id) ;;
+  "") die "--signing adhoc|developer-id is required; there is no default" ;;
+  *) die "unknown signing mode: $signing_mode" ;;
+esac
 [[ -d "$output_dir" ]] || die "output directory does not exist"
 output_dir="$(CDPATH='' cd -- "$output_dir" && pwd -P)"
 case "$output_dir/" in
@@ -77,32 +99,43 @@ python3 "$verifier" source --repo-dir "$repo_dir" --release-tag "$release_tag" >
 rustup target list --installed | grep -Fxq aarch64-apple-darwin \
   || die "the aarch64-apple-darwin Rust target is required"
 
-signing_identity="${APPLE_SIGNING_IDENTITY:-}"
-[[ "$signing_identity" == Developer\ ID\ Application:* ]] \
-  || die "APPLE_SIGNING_IDENTITY must name a Developer ID Application identity"
-security find-identity -v -p codesigning | grep -Fq "\"$signing_identity\"" \
-  || die "APPLE_SIGNING_IDENTITY is not available in the keychain"
-expected_team_id_file="$repo_dir/release/portal-apple-team-id.txt"
-[[ -f "$expected_team_id_file" && ! -L "$expected_team_id_file" ]] \
-  || die "committed Portal Apple team identifier is missing or unsafe"
-expected_team_id="$(<"$expected_team_id_file")"
-[[ "$expected_team_id" =~ ^[A-Z0-9]{10}$ ]] \
-  || die "release/portal-apple-team-id.txt must contain one Apple TeamIdentifier"
-[[ "${APPLE_TEAM_ID:-}" == "$expected_team_id" ]] \
-  || die "APPLE_TEAM_ID does not match the committed Portal signer"
+signing_identity=""
+if [[ "$signing_mode" == developer-id ]]; then
+  signing_identity="${APPLE_SIGNING_IDENTITY:-}"
+  [[ "$signing_identity" == Developer\ ID\ Application:* ]] \
+    || die "APPLE_SIGNING_IDENTITY must name a Developer ID Application identity"
+  security find-identity -v -p codesigning | grep -Fq "\"$signing_identity\"" \
+    || die "APPLE_SIGNING_IDENTITY is not available in the keychain"
+  expected_team_id_file="$repo_dir/release/portal-apple-team-id.txt"
+  [[ -f "$expected_team_id_file" && ! -L "$expected_team_id_file" ]] \
+    || die "committed Portal Apple team identifier is missing or unsafe"
+  expected_team_id="$(<"$expected_team_id_file")"
+  [[ "$expected_team_id" =~ ^[A-Z0-9]{10}$ ]] \
+    || die "release/portal-apple-team-id.txt must contain one Apple TeamIdentifier"
+  [[ "${APPLE_TEAM_ID:-}" == "$expected_team_id" ]] \
+    || die "APPLE_TEAM_ID does not match the committed Portal signer"
 
-api_credentials=false
-apple_id_credentials=false
-if [[ -n "${APPLE_API_ISSUER:-}" && -n "${APPLE_API_KEY:-}" && -n "${APPLE_API_KEY_PATH:-}" ]]; then
-  [[ "$APPLE_API_KEY_PATH" == /* && -f "$APPLE_API_KEY_PATH" ]] \
-    || die "APPLE_API_KEY_PATH must name an absolute private-key file"
-  api_credentials=true
+  api_credentials=false
+  apple_id_credentials=false
+  if [[ -n "${APPLE_API_ISSUER:-}" && -n "${APPLE_API_KEY:-}" && -n "${APPLE_API_KEY_PATH:-}" ]]; then
+    [[ "$APPLE_API_KEY_PATH" == /* && -f "$APPLE_API_KEY_PATH" ]] \
+      || die "APPLE_API_KEY_PATH must name an absolute private-key file"
+    api_credentials=true
+  fi
+  if [[ -n "${APPLE_ID:-}" && -n "${APPLE_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
+    apple_id_credentials=true
+  fi
+  $api_credentials || $apple_id_credentials \
+    || die "set complete App Store Connect API or Apple ID notarization credentials"
+else
+  # Refuse to silently produce a half-signed artifact: in ad-hoc mode Tauri
+  # must not find any Apple credential in the environment.
+  for leaked in APPLE_SIGNING_IDENTITY APPLE_CERTIFICATE APPLE_API_KEY \
+    APPLE_API_ISSUER APPLE_API_KEY_PATH APPLE_ID APPLE_PASSWORD; do
+    [[ -z "${!leaked:-}" ]] \
+      || die "$leaked is set but --signing adhoc was requested"
+  done
 fi
-if [[ -n "${APPLE_ID:-}" && -n "${APPLE_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
-  apple_id_credentials=true
-fi
-$api_credentials || $apple_id_credentials \
-  || die "set complete App Store Connect API or Apple ID notarization credentials"
 
 # shellcheck source=/dev/null
 source "$HOME/.cargo/env"
@@ -121,17 +154,33 @@ dmg_path="$(find "$bundle_root/dmg" -maxdepth 1 -type f -name '*.dmg' -print)"
 hdiutil verify "$dmg_path"
 codesign --verify --deep --strict --verbose=2 "$app_path"
 signature_details="$(codesign -d --verbose=4 "$app_path" 2>&1)"
-grep -Fq "Authority=$signing_identity" <<<"$signature_details" \
-  || die "application is not signed by the configured Developer ID identity"
-team_identifier="$(sed -n 's/^TeamIdentifier=//p' <<<"$signature_details")"
-[[ "$team_identifier" == "$expected_team_id" ]] \
-  || die "application TeamIdentifier does not match the committed Portal signer"
-grep -Eq '^flags=.*runtime' <<<"$signature_details" \
-  || die "application signature does not enable hardened runtime"
-spctl --assess --type execute --verbose=4 "$app_path"
-xcrun stapler validate "$app_path"
-xcrun stapler validate "$dmg_path"
-spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
+if [[ "$signing_mode" == developer-id ]]; then
+  grep -Fq "Authority=$signing_identity" <<<"$signature_details" \
+    || die "application is not signed by the configured Developer ID identity"
+  team_identifier="$(sed -n 's/^TeamIdentifier=//p' <<<"$signature_details")"
+  [[ "$team_identifier" == "$expected_team_id" ]] \
+    || die "application TeamIdentifier does not match the committed Portal signer"
+  grep -Eq '^flags=.*runtime' <<<"$signature_details" \
+    || die "application signature does not enable hardened runtime"
+  spctl --assess --type execute --verbose=4 "$app_path"
+  xcrun stapler validate "$app_path"
+  xcrun stapler validate "$dmg_path"
+  spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
+else
+  # arm64 macOS will not execute an unsigned binary at all, so the ad-hoc
+  # signature is a functional requirement rather than a security claim.
+  grep -Fq 'Signature=adhoc' <<<"$signature_details" \
+    || die "ad-hoc release must carry the mandatory arm64 ad-hoc signature"
+  if grep -q '^Authority=' <<<"$signature_details"; then
+    die "ad-hoc release unexpectedly carries a certificate authority chain"
+  fi
+  if grep -q '^TeamIdentifier=[A-Z0-9]' <<<"$signature_details"; then
+    die "ad-hoc release unexpectedly carries an Apple TeamIdentifier"
+  fi
+  if xcrun stapler validate "$dmg_path" >/dev/null 2>&1; then
+    die "ad-hoc release unexpectedly carries a notarization ticket"
+  fi
+fi
 
 executable="$app_path/Contents/MacOS/portal"
 [[ -x "$executable" ]] || die "client executable is missing"
@@ -156,12 +205,13 @@ manifest_path="$output_dir/Portal-${version}-arm64.json"
 install -m 0644 "$dmg_path" "$artifact_path"
 artifact_sha256="$(shasum -a 256 "$artifact_path" | awk '{print $1}')"
 printf '%s  %s\n' "$artifact_sha256" "$artifact_name" >"$artifact_path.sha256"
-python3 - "$manifest_path" "$release_tag" "$version" "$git_commit" "$artifact_name" "$artifact_sha256" <<'PY'
+python3 - "$manifest_path" "$release_tag" "$version" "$git_commit" "$artifact_name" "$artifact_sha256" "$signing_mode" <<'PY'
 import json
 import pathlib
 import sys
 
-path, release_tag, version, git_commit, asset, digest = sys.argv[1:]
+path, release_tag, version, git_commit, asset, digest, signing = sys.argv[1:]
+developer_id = signing == "developer-id"
 manifest = {
     "architecture": "arm64",
     "architectures": ["arm64"],
@@ -169,17 +219,18 @@ manifest = {
     "bundle_identifier": "sh.goq.portal",
     "checksum_asset": f"{asset}.sha256",
     "demo_direct_node": False,
-    "developer_id_signed": True,
-    "format": 1,
-    "gatekeeper_verified": True,
+    "developer_id_signed": developer_id,
+    "format": 2,
+    "gatekeeper_verified": developer_id,
     "git_commit": git_commit,
-    "hardened_runtime": True,
-    "notarized": True,
+    "hardened_runtime": developer_id,
+    "notarized": developer_id,
     "platform": "macos",
     "product": "portal-client",
     "release_tag": release_tag,
     "sha256": digest,
-    "stapled": True,
+    "signing": signing,
+    "stapled": developer_id,
     "version": version,
 }
 pathlib.Path(path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -195,5 +246,10 @@ printf 'client_package_sha256=%s\n' "$artifact_sha256"
 printf 'client_architectures=%s\n' "$architectures"
 printf 'client_release_tag=%s\n' "$release_tag"
 printf 'client_git_commit=%s\n' "$git_commit"
-printf 'client_signing=developer-id-hardened-runtime\n'
-printf 'client_notarization=stapled-and-validated\n'
+if [[ "$signing_mode" == developer-id ]]; then
+  printf 'client_signing=developer-id-hardened-runtime\n'
+  printf 'client_notarization=stapled-and-validated\n'
+else
+  printf 'client_signing=adhoc\n'
+  printf 'client_notarization=none\n'
+fi

@@ -162,17 +162,36 @@ test('normalizes v4 network diagnostics without changing v1-v3 behavior', () => 
     complete: true,
   };
   const raw = {
-    version: 1,
+    version: 2,
     session_elapsed_ms: 1000,
     media: leg,
     input: leg,
     audio: null,
     input_ack: inputAck,
+    adaptive: {
+      scope: 'local_viewer',
+      local_pressure: 'awaiting_report',
+      aggregate_target_kbps: null,
+      aggregate_state: 'unavailable',
+      recovery_state: 'active',
+      applied: false,
+    },
+    session: {
+      mode: 'legacy_exclusive_v1',
+      local_handle: null,
+      focus_generation: null,
+      roster_revision: null,
+      roster_age_ms: null,
+      subscription_expires_at_unix: null,
+      subscription_seconds_remaining: null,
+      stale_snapshot_total: 0,
+      invalid_snapshot_total: 0,
+    },
   };
 
-  const v4 = normalizeFrameStatsPayload({ stats_version: 4, network_diagnostics: raw });
-  assert.equal(v4.networkDiagnostics.media.mode, 'direct');
-  assert.equal(v4.networkDiagnostics.inputAck.acknowledgedTotal, 1);
+  const v5 = normalizeFrameStatsPayload({ stats_version: 5, network_diagnostics: raw });
+  assert.equal(v5.networkDiagnostics.media.mode, 'direct');
+  assert.equal(v5.networkDiagnostics.inputAck.acknowledgedTotal, 1);
 
   const v3 = normalizeFrameStatsPayload({ stats_version: 3, network_diagnostics: raw });
   assert.equal(v3.networkDiagnostics, null);

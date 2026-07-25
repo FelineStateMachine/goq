@@ -87,12 +87,24 @@ Ordinary release builds and shipped Sigil packages reject the flag.
 
 ### Current security boundary
 
-Portal derives a stable client Iroh identity from the security key. Sigil signs
-a short-lived invitation bound to its host identity, that exact Portal peer,
-an enrollment epoch, a nonce, expiry, and the requested grants. The first media
-handshake consumes the invitation atomically; later sessions authenticate the
-durably enrolled peer without replaying it. View, pointer/keyboard, and gamepad
-grants are intersected with operational protocol capabilities on both sides.
+Each Portal derives a stable client Iroh identity from its security key. Sigil
+signs a short-lived invitation bound to its host identity, that exact Portal
+peer, an enrollment epoch, a nonce, expiry, and the requested grants. The first
+media handshake consumes the invitation atomically; later sessions authenticate
+the durably enrolled peer without replaying it. Authorization state supports a
+fixed bounded viewer set independently of the concurrent `max_viewers` cap.
+View, pointer/keyboard, and gamepad grants are intersected with operational
+protocol capabilities on both sides, and committed reductions apply to the
+running daemon before the administration operation returns.
+
+Control v2 is the native-MoQ multi-viewer path. It admits three concurrent
+viewers by default and at most eight, all on one host-owned video/audio media
+generation. Slot 0 has at most one input-focus holder. Eligibility comes from
+pointer/keyboard or gamepad grants; possession comes only from the current
+revisioned focus snapshot. Focus handoff, replacement, disconnect, or live
+revocation invalidates the old focus generation and neutralizes every virtual
+input device before a successor can inject. Control v1 and grouped-v3 remain
+strictly exclusive and never coexist with a v2 generation.
 
 `--dev-connect` remains only a build-time-contained routing bypass in Portal.
 It does not grant access to a configured host, and ordinary release builds
@@ -101,8 +113,8 @@ reject the option. Only the explicit direct test-pattern proof form of
 Replay, expiry, wrong-peer, cross-host, stale-epoch, and capability-escalation
 attempts are rejected before capture starts.
 
-For first enrollment, use Portal's **show portal id** action, then issue the
-short-lived file on the host:
+For each enrollment, use that Portal's **show portal id** action, then issue one
+short-lived file on the host. Omit input flags for a view-only spectator:
 
 ```bash
 sigil invitation create \
@@ -114,9 +126,13 @@ sigil invitation create \
 ```
 
 Open the file with Portal and confirm its bounded summary with the controller.
-After the first accepted media handshake, verify the durable grant with
-`sigil enrollment show --config ~/.config/sigil-spark/host.toml`. Revocation is
-explicit and invalidates all outstanding invitations:
+After the first accepted media handshake, verify the bounded durable roster
+with `sigil enrollment list --config ~/.config/sigil-spark/host.toml`.
+Peer/grant revocation is available through the daemon-owned administration
+path; removing input grants defocuses and neutralizes only that viewer, while
+removing `VIEW` disconnects it without interrupting survivors. The reset below
+remains the explicit all-viewer recovery operation and invalidates outstanding
+invitations:
 
 ```bash
 fingerprint="$(sigil appliance status \
@@ -1683,7 +1699,9 @@ Sanitize journals before exporting them. Save:
 - Host service journal and Gamescope/PipeWire session journal.
 - Direct versus relayed iroh path.
 - Frame counts, queue depth, drops, queue age, RSS, CPU, and GPU utilization.
-- Reconnect and second-client rejection results.
+- Three-viewer native-MoQ progress, same-peer replacement, focus handoff
+  latency, live revocation, slow-viewer isolation, and final cleanup results.
+- Separate legacy-exclusive second-client rejection results.
 
 Never copy the host identity seed into an evidence bundle. Treat node IDs and
 connection metadata as operationally sensitive until client authorization
@@ -1775,7 +1793,8 @@ sudo systemctl reload sshd.service
   frontend, and decoder drop counters do not grow after startup during the
   demo soak.
 - Input transport remains responsive during video load.
-- One-client enforcement and 100 reconnect cycles pass.
+- Three-viewer native-MoQ admission, exclusive slot-0 focus, replacement, and
+  reconnect cycles pass; the separate legacy path still rejects a second client.
 
 ### Fresh Bazzite host
 
@@ -1788,3 +1807,8 @@ sudo systemctl reload sshd.service
 - A cold, physically headless boot produces a Gamescope PipeWire node.
 - Switching to Gamescope capture does not require a portal or a physical
   display.
+- Three exact-candidate Portals share one authenticated video/audio generation;
+  one constrained viewer can recover or detach without survivor latency growth.
+- Controller focus handoff, live input/view revocation, same-peer replacement,
+  resource percentiles, and final-viewer cleanup pass, followed by restoration
+  of the ordinary authenticated `sigil-host.service`.

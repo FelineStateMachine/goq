@@ -2,10 +2,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use moq_net::{BroadcastConsumer, Error as MoqError, Track, TrackConsumer};
-use sigil_protocol::{GoqCatalogDocument, MAX_MOQ_CATALOG_BYTES};
+use sigil_protocol::{
+    GoqCatalogDocument, GoqCatalogDocumentV2, MAX_MOQ_CATALOG_BYTES,
+    SignedMediaGenerationCertificate,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MoqCatalogMode {
+    GoqV2Authenticated,
     GoqV1,
     AbsentStaticTrackCompat,
 }
@@ -13,6 +17,7 @@ pub(crate) enum MoqCatalogMode {
 impl MoqCatalogMode {
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::GoqV2Authenticated => "goq-v2-authenticated",
             Self::GoqV1 => "goq-v1",
             Self::AbsentStaticTrackCompat => "absent-static-track-compat",
         }
@@ -22,6 +27,7 @@ impl MoqCatalogMode {
 pub(crate) struct MoqCatalogSelection {
     pub(crate) track: TrackConsumer,
     pub(crate) mode: MoqCatalogMode,
+    pub(crate) certificate: Option<SignedMediaGenerationCertificate>,
 }
 
 fn is_track_not_found(error: &MoqError) -> bool {
@@ -36,6 +42,7 @@ fn subscribe_static_video_track(broadcast: &BroadcastConsumer) -> Result<MoqCata
     Ok(MoqCatalogSelection {
         track,
         mode: MoqCatalogMode::AbsentStaticTrackCompat,
+        certificate: None,
     })
 }
 
@@ -98,6 +105,66 @@ pub(crate) async fn subscribe_goq_video_track(
     Ok(MoqCatalogSelection {
         track,
         mode: MoqCatalogMode::GoqV1,
+        certificate: None,
+    })
+}
+
+pub(crate) async fn subscribe_authenticated_goq_video_track(
+    broadcast: &BroadcastConsumer,
+    timeout: Duration,
+    expected_host: [u8; 32],
+    expected_generation: u64,
+    now_unix: u64,
+) -> Result<MoqCatalogSelection> {
+    let mut catalog_track = broadcast
+        .subscribe_track(&hang::Catalog::default_track())
+        .context("authenticated v2 media requires catalog.json")?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut group = tokio::time::timeout_at(deadline, catalog_track.next_group())
+        .await
+        .context("timed out waiting for authenticated Goq catalog")?
+        .context("reading authenticated Goq catalog")?
+        .context("authenticated Goq catalog ended before its snapshot")?;
+    anyhow::ensure!(
+        group.sequence == 0,
+        "authenticated Goq catalog must be immutable group 0"
+    );
+    let frame_count = tokio::time::timeout_at(deadline, group.finished())
+        .await
+        .context("timed out finishing authenticated Goq catalog")?
+        .context("finishing authenticated Goq catalog")?;
+    anyhow::ensure!(
+        frame_count == 1,
+        "authenticated Goq catalog must contain one frame"
+    );
+    let mut frame = tokio::time::timeout_at(deadline, group.get_frame(0))
+        .await
+        .context("timed out opening authenticated Goq catalog")?
+        .context("opening authenticated Goq catalog")?
+        .context("authenticated Goq catalog has no frame 0")?;
+    anyhow::ensure!(
+        frame.size <= MAX_MOQ_CATALOG_BYTES as u64,
+        "authenticated Goq catalog exceeds {MAX_MOQ_CATALOG_BYTES} bytes"
+    );
+    let snapshot = tokio::time::timeout_at(deadline, frame.read_all())
+        .await
+        .context("timed out reading authenticated Goq catalog")?
+        .context("reading authenticated Goq catalog")?;
+    let document: GoqCatalogDocumentV2 =
+        serde_json::from_slice(&snapshot).context("decoding authenticated Goq catalog")?;
+    let certificate = document
+        .validate()
+        .context("validating authenticated Goq catalog")?;
+    certificate
+        .verify_binding(expected_host, expected_generation, now_unix)
+        .context("verifying media generation certificate binding")?;
+    let track = broadcast
+        .subscribe_track(&Track::new(document.goq.video.track.name))
+        .context("subscribing to authenticated Goq video track")?;
+    Ok(MoqCatalogSelection {
+        track,
+        mode: MoqCatalogMode::GoqV2Authenticated,
+        certificate: Some(certificate),
     })
 }
 

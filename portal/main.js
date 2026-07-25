@@ -9,6 +9,14 @@ import {
 } from './input-state.mjs';
 import { createInputRuntime } from './input-runtime.mjs';
 import { createControlRuntime } from './control-runtime.mjs';
+import { createSessionState } from './session-state.mjs';
+import { createFocusRuntime } from './focus-runtime.mjs';
+import {
+  focusOverlayStillCurrent,
+  handoffProposalForSelf,
+  preemptionCandidateForSelf,
+} from './focus-overlay.mjs';
+import { renderRoster, rosterPresentation } from './roster-ui.mjs';
 import { formatVideoDiscardTelemetry } from './frame-stats.mjs';
 import { networkDiagnosticsPresentation } from './network-diagnostics.mjs';
 import {
@@ -50,6 +58,9 @@ let activePointerSession = null;
 let controllerActivationInProgress = false;
 let controlRuntime = null;
 let controllerRuntime = null;
+let sessionStateRuntime = null;
+let focusRuntime = null;
+let activeFocusOverlay = null;
 
 const invoke = (...args) => window.__TAURI__.core.invoke(...args);
 const listen = (...args) => window.__TAURI__.event.listen(...args);
@@ -128,7 +139,8 @@ function showInvitationSummary(value) {
   document.getElementById('invitation-host').textContent = summary.hostFingerprint;
   document.getElementById('invitation-peer').textContent = summary.peerFingerprint;
   document.getElementById('invitation-expiry').textContent = formatInvitationExpiry(summary.expiresAtUnix);
-  document.getElementById('invitation-grants').textContent = summary.grants.map(grantLabel).join(' · ');
+  const access = summary.viewOnly ? 'view only' : 'input-capable';
+  document.getElementById('invitation-grants').textContent = `${access} · ${summary.grants.map(grantLabel).join(' · ')}`;
   document.getElementById('invitation-status').textContent = '';
   document.getElementById('invitation-overlay').classList.remove('hidden');
   setTimeout(() => setControllerFocus(document.getElementById('confirm-invitation')), 0);
@@ -440,7 +452,7 @@ async function teardownConnectionAttempt(attempt) {
   await audioPipeline.teardown();
 }
 
-function updateAcceptedConnectionState({ attempt, state }) {
+function updateAcceptedConnectionState({ result, attempt, state }) {
   const session = attempt.pointerSession;
   if (!state.inputCapabilities.pointerPositionFeedback) {
     session.remotePosition = null;
@@ -449,6 +461,13 @@ function updateAcceptedConnectionState({ attempt, state }) {
     session.remotePosition = attempt.initialPointerFeedback.position;
     session.remoteVisible = attempt.initialPointerFeedback.pointer_visible;
   }
+  sessionStateRuntime.acceptConnection({
+    nativeGeneration: result.media_generation,
+    controlProtocol: connectionState.controlProtocol,
+    initialSnapshot: result.session_snapshot ?? null,
+    eligible: state.inputCapabilities.control,
+  });
+  focusRuntime.reset();
   controlRuntime.resetAcceptedConnection();
 }
 
@@ -492,6 +511,8 @@ async function teardownConnectedResources() {
 }
 
 async function showDisconnectedState() {
+  focusRuntime.reset();
+  sessionStateRuntime.reset();
   controlRuntime.resetDisconnected();
   updatePanelVisibility();
   setStatus('', 'idle');
@@ -572,6 +593,68 @@ function togglePanel(force) {
   if (open) setTimeout(() => document.getElementById('panel-close').focus(), 0);
 }
 
+function closeFocusOverlay() {
+  activeFocusOverlay = null;
+  document.getElementById('focus-handoff-overlay').classList.add('hidden');
+  document.getElementById('focus-preempt-overlay').classList.add('hidden');
+}
+
+function renderFocusOverlay() {
+  const session = sessionStateRuntime?.snapshot();
+  if (!session) return;
+  const handoff = handoffProposalForSelf(session);
+  if (handoff) {
+    activeFocusOverlay = handoff;
+    document.getElementById('focus-preempt-overlay').classList.add('hidden');
+    document.getElementById('focus-handoff-requester').textContent = handoff.requester;
+    document.getElementById('focus-handoff-overlay').classList.remove('hidden');
+    setTimeout(() => setControllerFocus(document.getElementById('deny-focus-handoff')), 0);
+    return;
+  }
+  if (activeFocusOverlay && !focusOverlayStillCurrent(activeFocusOverlay, session)) {
+    closeFocusOverlay();
+  }
+}
+
+function openFocusPreempt() {
+  const candidate = preemptionCandidateForSelf(sessionStateRuntime.snapshot());
+  if (!candidate) return false;
+  activeFocusOverlay = candidate;
+  document.getElementById('focus-preempt-holder').textContent = candidate.holder;
+  document.getElementById('focus-preempt-overlay').classList.remove('hidden');
+  setTimeout(() => setControllerFocus(document.getElementById('cancel-focus-preempt')), 0);
+  return true;
+}
+
+function cancelFocusPreempt() {
+  if (activeFocusOverlay?.type !== 'preempt') return;
+  closeFocusOverlay();
+  setControllerFocus(document.getElementById('control-toggle'));
+}
+
+async function approveFocusHandoff() {
+  if (activeFocusOverlay?.type !== 'handoff'
+    || !focusOverlayStillCurrent(activeFocusOverlay, sessionStateRuntime.snapshot())) return false;
+  controlRuntime.exit({ releaseHostFocus: false, resetEscape: true });
+  await inputRuntime.drain(250);
+  closeFocusOverlay();
+  return focusRuntime.approve();
+}
+
+async function denyFocusHandoff() {
+  if (activeFocusOverlay?.type !== 'handoff'
+    || !focusOverlayStillCurrent(activeFocusOverlay, sessionStateRuntime.snapshot())) return false;
+  closeFocusOverlay();
+  return focusRuntime.deny();
+}
+
+async function confirmFocusPreempt() {
+  if (activeFocusOverlay?.type !== 'preempt'
+    || !focusOverlayStillCurrent(activeFocusOverlay, sessionStateRuntime.snapshot())) return false;
+  closeFocusOverlay();
+  return focusRuntime.preempt({ controllerInitiated: controllerActivationInProgress });
+}
+
 // ─── WebCodecs detection ──────────────────────────────────────────────────────
 // Finish the codec probe and publish the result to Rust before exposing any
 // connect handlers. Rust refuses to connect when WebCodecs is unavailable, so
@@ -599,7 +682,11 @@ controlRuntime = createControlRuntime({
   getConnection: () => ({
     connected: connectionState.connected,
     disconnecting: connectionState.disconnecting,
-    capabilities: connectionState.inputCapabilities,
+    capabilities: {
+      ...connectionState.inputCapabilities,
+      control: connectionState.inputCapabilities.control
+        && (connectionState.controlProtocol !== 'control-v2' || sessionStateRuntime?.focused === true),
+    },
   }),
   inputRuntime,
   invokeCursorGrab: (grab) => invoke('set_client_cursor_grab', { grab }),
@@ -619,8 +706,34 @@ controlRuntime = createControlRuntime({
   },
   publishController: () => controllerRuntime?.publishCurrentState(),
   resetControllerEscape: () => controllerRuntime?.resetEscape(),
-  onChange: () => updateControlUI(),
+  onChange: () => {
+    sessionStateRuntime?.setLocallyActive(controlRuntime.active);
+    updateControlUI();
+  },
+  onExit: () => {
+    if (connectionState.controlProtocol === 'control-v2') {
+      return focusRuntime?.release().catch((error) => {
+        console.error('focus release failed:', error);
+        return false;
+      });
+    }
+    return false;
+  },
   onReleaseFailure: () => setStatus('err', 'cursor release failed · quit app'),
+});
+sessionStateRuntime = createSessionState({
+  onFocusLoss: () => controlRuntime.exit({ releaseHostFocus: false, resetEscape: true }),
+  onChange: () => updateSessionUI(),
+});
+focusRuntime = createFocusRuntime({
+  invokeCommand: invoke,
+  getSession: () => sessionStateRuntime.snapshot(),
+  startFocusedInput: async () => {
+    const capabilities = await invoke('iroh_client_start_focused_input');
+    connectionState.updateInputCapabilities(capabilities);
+  },
+  activateLocalControl: ({ controllerInitiated }) => controlRuntime.toggle({ controllerInitiated }),
+  onChange: () => updateControlUI(),
 });
 videoPipeline = createVideoPipelineSession({
   canvas,
@@ -746,7 +859,7 @@ function updateStreamStats() {
   document.getElementById('stream-network-audio').textContent = networkPresentation.audio;
   document.getElementById('stream-network-input-ack').textContent = networkPresentation.inputAck;
   document.getElementById('stream-adaptive-feedback').textContent = adaptiveFeedbackAvailable
-    ? 'authenticated · 1 Hz bounded reports'
+    ? `authenticated · 1 Hz bounded reports · ${networkPresentation.adaptive}`
     : adaptiveFeedbackError || 'unavailable';
   document.getElementById('stream-adaptive-decision').textContent = formatAdaptiveDecision(
     adaptiveDecision,
@@ -788,6 +901,15 @@ listen('audio-stats', (event) => {
 async function toggleControl() {
   // Capture synchronous controller provenance before cursor acquisition yields.
   // The DOM click dispatcher does not await this async handler.
+  if (connectionState.controlProtocol === 'control-v2' && !sessionStateRuntime.focused) {
+    if (preemptionCandidateForSelf(sessionStateRuntime.snapshot())) {
+      openFocusPreempt();
+      return;
+    }
+    await focusRuntime.request({ controllerInitiated: controllerActivationInProgress });
+    updateControlUI();
+    return;
+  }
   await controlRuntime.toggle({ controllerInitiated: controllerActivationInProgress });
 }
 
@@ -838,13 +960,27 @@ function renderRemotePointer() {
 function updateControlUI() {
   const el = document.getElementById('control-toggle');
   const capabilities = connectionState.inputCapabilities;
-  const available = connectionState.connected && capabilities.control;
+  const available = connectionState.connected
+    && capabilities.control
+    && (connectionState.controlProtocol !== 'control-v2' || sessionStateRuntime.eligible);
   const controlling = controlRuntime.setInactiveIfUnavailable(available);
+  const v2 = connectionState.controlProtocol === 'control-v2';
+  const occupiedByAnother = v2
+    && sessionStateRuntime.snapshot().snapshot?.focus?.state === 'held'
+    && !sessionStateRuntime.focused;
+  const focusPending = focusRuntime?.snapshot().pending === true;
+  const ownerCanPreempt = preemptionCandidateForSelf(sessionStateRuntime.snapshot()) !== null;
+  const controlAction = focusPending
+    ? 'control request pending'
+    : v2 && !sessionStateRuntime.focused
+      ? ownerCanPreempt ? 'spectating · take control' : occupiedByAnother ? 'spectating · request control' : 'request control'
+    : controlling ? 'release control' : 'activate control';
   el.textContent = available
-    ? `${controlling ? 'controlling' : 'take control'} · ${describeInputCapabilities()}${controlling && capabilities.relativePointer ? ' · Ctrl+Alt+Esc to exit' : controlling && capabilities.gamepad ? ' · hold Back+Start to exit' : ''}`
+    ? `${controlAction} · ${describeInputCapabilities()}${controlling && capabilities.relativePointer ? ' · Ctrl+Alt+Esc to exit' : controlling && capabilities.gamepad ? ' · hold Back+Start to exit' : ''}`
     : 'view only · input unavailable';
   el.classList.toggle('active', controlling);
   el.classList.toggle('disabled', !available);
+  el.classList.toggle('hidden', v2 && !sessionStateRuntime.eligible);
   el.setAttribute('aria-disabled', available ? 'false' : 'true');
   document.body.classList.toggle(
     'native-pointer-control',
@@ -859,6 +995,30 @@ function updateControlUI() {
   if (streamControl) {
     streamControl.textContent = available ? describeInputCapabilities() : 'view only · unavailable';
   }
+}
+
+function updateSessionUI() {
+  updateControlUI();
+  renderFocusOverlay();
+  const viewerStatus = document.getElementById('viewer-status');
+  const rosterSection = document.getElementById('roster-section');
+  const rosterSummary = document.getElementById('roster-summary');
+  const rosterList = document.getElementById('roster-list');
+  const session = sessionStateRuntime.snapshot();
+  const visible = session.mode === 'control-v2' && session.snapshot !== null;
+  viewerStatus.classList.toggle('hidden', !visible);
+  rosterSection.classList.toggle('hidden', !visible);
+  if (!visible) {
+    viewerStatus.textContent = 'viewers: unavailable';
+    rosterSummary.textContent = 'Roster unavailable';
+    rosterList.replaceChildren();
+    return;
+  }
+  const presentation = rosterPresentation(session.snapshot);
+  viewerStatus.textContent = presentation.shell;
+  viewerStatus.setAttribute('aria-label', presentation.shell);
+  rosterSummary.textContent = `${presentation.count} connected · ${presentation.focus}`;
+  renderRoster(rosterList, session.snapshot);
 }
 
 function scaleCoords(clientX, clientY) {
@@ -987,6 +1147,11 @@ window.addEventListener('blur', () => {
   controlRuntime.exit();
 });
 
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden || (!controlRuntime.active && !controlRuntime.transitioning)) return;
+  controlRuntime.exit();
+});
+
 // ─── Controller PIN entry ─────────────────────────────────────────────────────
 let activePinInput = null;
 let pinPadReturnFocus = null;
@@ -1054,6 +1219,10 @@ for (const id of ['enrollment-pin', 'intro-pin', 'pin-input']) {
 function controllerScope() {
   const tap = document.getElementById('tap-overlay');
   if (!tap.classList.contains('hidden')) return tap;
+  const handoff = document.getElementById('focus-handoff-overlay');
+  if (!handoff.classList.contains('hidden')) return handoff;
+  const preempt = document.getElementById('focus-preempt-overlay');
+  if (!preempt.classList.contains('hidden')) return preempt;
   const pinPad = document.getElementById('pin-pad-overlay');
   if (!pinPad.classList.contains('hidden')) return pinPad;
   const resetEnrollment = document.getElementById('reset-enrollment-overlay');
@@ -1111,7 +1280,11 @@ function activateControllerFocus() {
 }
 
 function controllerBack() {
-  if (!document.getElementById('pin-pad-overlay').classList.contains('hidden')) {
+  if (!document.getElementById('focus-handoff-overlay').classList.contains('hidden')) {
+    void denyFocusHandoff();
+  } else if (!document.getElementById('focus-preempt-overlay').classList.contains('hidden')) {
+    cancelFocusPreempt();
+  } else if (!document.getElementById('pin-pad-overlay').classList.contains('hidden')) {
     closePinPad();
   } else if (!document.getElementById('reset-enrollment-overlay').classList.contains('hidden')) {
     cancelEnrollmentReset();
@@ -1188,6 +1361,24 @@ listen('dev-connect-routing', (event) => {
   console.warn('[development direct-node routing]', event.payload.warning, event.payload.host_node_id);
 });
 
+listen('session-state', (event) => {
+  try {
+    if (sessionStateRuntime.applyNativeSnapshot(event.payload)) {
+      void focusRuntime.observeSession().catch((error) => {
+        console.error('focused input activation failed:', error);
+        controlRuntime.exit();
+      });
+    }
+  } catch (error) {
+    console.error('invalid session-state payload:', error);
+    void disconnect();
+  }
+});
+
+listen('focus-command-result', (event) => {
+  focusRuntime.observeResult(event.payload);
+});
+
 listen('invitation-pending', (event) => {
   try { showInvitationSummary(event.payload); }
   catch (error) { console.error('invalid native invitation summary:', error); }
@@ -1200,6 +1391,7 @@ Object.assign(window, {
   openPinPad, closePinPad, pinPadDigit, pinPadBackspace, pinPadClear,
   openEnrollmentReset, cancelEnrollmentReset, confirmEnrollmentReset,
   derivePortalIdentity, chooseInvitationFile, confirmInvitation, cancelInvitation,
+  approveFocusHandoff, denyFocusHandoff, cancelFocusPreempt, confirmFocusPreempt,
   sigilController: Object.freeze({
     getLatestState: () => controllerRuntime.latest,
     setObserver: controllerRuntime.setObserver,

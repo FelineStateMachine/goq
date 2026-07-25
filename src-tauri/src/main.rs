@@ -105,6 +105,12 @@ fn main() {
             commands::network::iroh_client_ack_audio,
             commands::network::iroh_client_stop_audio,
             commands::network::iroh_client_send_input,
+            commands::network::iroh_client_request_focus,
+            commands::network::iroh_client_release_focus,
+            commands::network::iroh_client_approve_focus,
+            commands::network::iroh_client_deny_focus,
+            commands::network::iroh_client_preempt_focus,
+            commands::network::iroh_client_start_focused_input,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Portal application");

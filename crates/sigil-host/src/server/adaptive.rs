@@ -1,6 +1,10 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
 use super::session::{
-    AdaptiveEncoderProposal, FeedbackLease, MediaV3TelemetrySnapshot, ResolutionEncoderProposal,
-    SessionRegistry,
+    AdaptiveEncoderProposal, FeedbackLease, FeedbackScope, MediaV3TelemetrySnapshot,
+    ResolutionEncoderProposal, SessionRegistry,
 };
 use super::*;
 
@@ -25,6 +29,15 @@ const FEEDBACK_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 // consumer observes a stale 5-second window instead of a deceptively fresh
 // latest report.
 const MEDIA_FEEDBACK_INTERVAL_MAX_MS: u64 = 5_000;
+const AGGREGATE_TICK_INTERVAL: Duration = Duration::from_millis(250);
+const FLOOR_BREACH_WINDOWS: u8 = 3;
+const ISOLATED_RECOVERY_CLEAN_WINDOWS: u8 = 3;
+const ISOLATED_RECOVERY_PRESSURE_WINDOWS: u8 = 3;
+const ISOLATED_RECOVERY_MAX_ATTEMPTS: u8 = 2;
+const ISOLATED_RECOVERY_BACKOFF: Duration = Duration::from_secs(2);
+// All policy state is one fixed record per hard-bounded viewer. Reports use a
+// latest cumulative ingress slot and the generation owns one actuator/queued
+// plan, so eight viewers cannot multiply encoder work or queue history.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FeedbackSeverity {
@@ -440,6 +453,567 @@ fn cumulative_feedback_delta(total: u64, baseline: u64) -> u32 {
         .expect("feedback delta is clamped to u32")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GenerationContributorKey {
+    remote: EndpointId,
+    session_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContributorRecoveryState {
+    Active {
+        floor_breach_windows: u8,
+    },
+    Recovering {
+        attempt: u8,
+        retry_at: Instant,
+        clean_windows: u8,
+        pressure_windows: u8,
+    },
+    Detaching,
+}
+
+impl Default for ContributorRecoveryState {
+    fn default() -> Self {
+        Self::Active {
+            floor_breach_windows: 0,
+        }
+    }
+}
+
+impl ContributorRecoveryState {
+    fn contributes(self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+
+    fn observe(
+        &mut self,
+        evaluation: &AdaptiveBitrateEvaluation,
+        now: Instant,
+    ) -> RecoveryMutation {
+        let pressured = evaluation.fresh
+            && matches!(
+                evaluation.pressure_severity,
+                FeedbackSeverity::Moderate | FeedbackSeverity::Severe
+            );
+        let severe = evaluation.fresh && evaluation.pressure_severity == FeedbackSeverity::Severe;
+        let clean = evaluation.fresh
+            && evaluation.pressure_severity == FeedbackSeverity::Clean
+            && evaluation.clean_recovery_evidence;
+        match *self {
+            Self::Active {
+                ref mut floor_breach_windows,
+            } => {
+                if severe && evaluation.decision.target_kbps == evaluation.decision.floor_kbps {
+                    *floor_breach_windows = floor_breach_windows.saturating_add(1);
+                } else {
+                    *floor_breach_windows = 0;
+                }
+                if *floor_breach_windows < FLOOR_BREACH_WINDOWS {
+                    return RecoveryMutation::None;
+                }
+                *self = Self::Recovering {
+                    attempt: 1,
+                    retry_at: now + ISOLATED_RECOVERY_BACKOFF,
+                    clean_windows: 0,
+                    pressure_windows: 0,
+                };
+                RecoveryMutation::RequestRecovery
+            }
+            Self::Recovering {
+                attempt,
+                retry_at,
+                ref mut clean_windows,
+                ref mut pressure_windows,
+            } => {
+                if now < retry_at {
+                    return RecoveryMutation::None;
+                }
+                if clean {
+                    *clean_windows = clean_windows.saturating_add(1);
+                    *pressure_windows = 0;
+                    if *clean_windows >= ISOLATED_RECOVERY_CLEAN_WINDOWS {
+                        *self = Self::default();
+                        return RecoveryMutation::Recovered;
+                    }
+                } else if pressured {
+                    *pressure_windows = pressure_windows.saturating_add(1);
+                    *clean_windows = 0;
+                    if *pressure_windows >= ISOLATED_RECOVERY_PRESSURE_WINDOWS {
+                        if attempt >= ISOLATED_RECOVERY_MAX_ATTEMPTS {
+                            *self = Self::Detaching;
+                            return RecoveryMutation::Detach;
+                        }
+                        let next_attempt = attempt.saturating_add(1);
+                        *self = Self::Recovering {
+                            attempt: next_attempt,
+                            retry_at: now
+                                + ISOLATED_RECOVERY_BACKOFF.saturating_mul(u32::from(next_attempt)),
+                            clean_windows: 0,
+                            pressure_windows: 0,
+                        };
+                        return RecoveryMutation::RequestRecovery;
+                    }
+                } else {
+                    *clean_windows = 0;
+                    *pressure_windows = 0;
+                }
+                RecoveryMutation::None
+            }
+            Self::Detaching => RecoveryMutation::None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryMutation {
+    None,
+    RequestRecovery,
+    Recovered,
+    Detach,
+}
+
+struct GenerationContributor {
+    authorization_revision: u64,
+    ingress: CumulativeFeedbackIngress,
+    cursor: FeedbackIngressCursor,
+    controller: ShadowBitrateController,
+    latest_report: Option<MediaFeedbackReportV1>,
+    latest_evaluation: Option<AdaptiveBitrateEvaluation>,
+    last_received_at: Option<Instant>,
+    recovery: ContributorRecoveryState,
+    telemetry: Arc<super::session::MediaV3Telemetry>,
+    decisions: tokio::sync::watch::Sender<Option<AdaptiveBitrateDecisionV1>>,
+    detach: tokio::sync::watch::Sender<bool>,
+}
+
+struct GenerationAggregateState {
+    contributors: HashMap<GenerationContributorKey, GenerationContributor>,
+    next_decision_id: u64,
+    target_kbps: u32,
+}
+
+pub(super) struct GenerationAdaptiveCoordinator {
+    generation_id: u64,
+    ceiling_kbps: u32,
+    state: Mutex<GenerationAggregateState>,
+    changed: tokio::sync::Notify,
+    recovering_viewers: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for GenerationAdaptiveCoordinator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationAdaptiveCoordinator")
+            .field("generation_id", &self.generation_id)
+            .field("ceiling_kbps", &self.ceiling_kbps)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(super) struct GenerationFeedbackRegistration {
+    coordinator: Arc<GenerationAdaptiveCoordinator>,
+    key: GenerationContributorKey,
+    authorization_revision: u64,
+    pub(super) decisions: tokio::sync::watch::Receiver<Option<AdaptiveBitrateDecisionV1>>,
+    pub(super) detach: tokio::sync::watch::Receiver<bool>,
+}
+
+impl GenerationFeedbackRegistration {
+    pub(super) fn observe(&self, report: MediaFeedbackReportV1) -> Result<()> {
+        report.validate()?;
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("generation adaptive state poisoned"))?;
+        let contributor = state
+            .contributors
+            .get_mut(&self.key)
+            .filter(|contributor| contributor.authorization_revision == self.authorization_revision)
+            .context("feedback contributor no longer matches the active viewer generation")?;
+        contributor.ingress.observe(report);
+        drop(state);
+        self.coordinator.changed.notify_one();
+        Ok(())
+    }
+}
+
+impl Drop for GenerationFeedbackRegistration {
+    fn drop(&mut self) {
+        self.coordinator
+            .unregister(self.key, self.authorization_revision);
+    }
+}
+
+impl GenerationAdaptiveCoordinator {
+    pub(super) fn start(
+        config: HostConfig,
+        generation_id: u64,
+        encoder_control: Option<EncoderControl>,
+        producer_telemetry: Arc<super::session::MediaV3Telemetry>,
+        keyframe_requests: tokio::sync::watch::Sender<Option<MediaControlRequestV3>>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        recovering_viewers: Arc<AtomicUsize>,
+    ) -> Result<(Arc<Self>, tokio::task::JoinHandle<Result<()>>)> {
+        let ceiling_kbps = adaptive_bitrate_ceiling_kbps(&config)?;
+        let coordinator = Arc::new(Self {
+            generation_id,
+            ceiling_kbps,
+            state: Mutex::new(GenerationAggregateState {
+                contributors: HashMap::with_capacity(crate::config::MAX_VIEWERS.into()),
+                next_decision_id: 1,
+                target_kbps: ceiling_kbps,
+            }),
+            changed: tokio::sync::Notify::new(),
+            recovering_viewers,
+        });
+        let task_coordinator = Arc::clone(&coordinator);
+        let task = tokio::spawn(async move {
+            task_coordinator
+                .run(
+                    config,
+                    encoder_control,
+                    producer_telemetry,
+                    keyframe_requests,
+                    shutdown,
+                )
+                .await
+        });
+        Ok((coordinator, task))
+    }
+
+    pub(super) fn register(
+        self: &Arc<Self>,
+        remote: EndpointId,
+        session_id: u64,
+        authorization_revision: u64,
+        media_generation_id: u64,
+        telemetry: Arc<super::session::MediaV3Telemetry>,
+    ) -> Result<GenerationFeedbackRegistration> {
+        ensure!(
+            media_generation_id == self.generation_id,
+            "feedback media generation does not match the shared generation"
+        );
+        ensure!(
+            authorization_revision != 0,
+            "feedback authorization revision must be non-zero"
+        );
+        let key = GenerationContributorKey { remote, session_id };
+        let (decisions, decision_rx) = tokio::sync::watch::channel(None);
+        let (detach, detach_rx) = tokio::sync::watch::channel(false);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("generation adaptive state poisoned"))?;
+        ensure!(
+            state.contributors.len() < usize::from(crate::config::MAX_VIEWERS)
+                || state.contributors.contains_key(&key),
+            "generation feedback contributor capacity is full"
+        );
+        state.contributors.insert(
+            key,
+            GenerationContributor {
+                authorization_revision,
+                ingress: CumulativeFeedbackIngress::default(),
+                cursor: FeedbackIngressCursor::default(),
+                controller: ShadowBitrateController::new(self.ceiling_kbps, telemetry.snapshot()),
+                latest_report: None,
+                latest_evaluation: None,
+                last_received_at: None,
+                recovery: ContributorRecoveryState::default(),
+                telemetry,
+                decisions,
+                detach,
+            },
+        );
+        self.update_recovering_count(&state);
+        drop(state);
+        self.changed.notify_one();
+        Ok(GenerationFeedbackRegistration {
+            coordinator: Arc::clone(self),
+            key,
+            authorization_revision,
+            decisions: decision_rx,
+            detach: detach_rx,
+        })
+    }
+
+    fn unregister(&self, key: GenerationContributorKey, authorization_revision: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state
+            .contributors
+            .get(&key)
+            .is_some_and(|contributor| contributor.authorization_revision == authorization_revision)
+        {
+            state.contributors.remove(&key);
+            self.update_recovering_count(&state);
+            drop(state);
+            self.changed.notify_one();
+        }
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        config: HostConfig,
+        encoder_control: Option<EncoderControl>,
+        producer_telemetry: Arc<super::session::MediaV3Telemetry>,
+        keyframe_requests: tokio::sync::watch::Sender<Option<MediaControlRequestV3>>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        let actuation_enabled =
+            adaptive_bitrate_actuation_enabled(&config) && encoder_control.is_some();
+        let mut resolution_controller = if actuation_enabled {
+            encoder_control
+                .as_ref()
+                .map(motion_resolution_policy_for_encoder)
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let initial_resolution = resolution_controller
+            .as_ref()
+            .map(MotionResolutionPolicy::target);
+        let mut actuator = GenerationAdaptiveActuator::new(
+            encoder_control,
+            actuation_enabled,
+            self.ceiling_kbps,
+            initial_resolution,
+        );
+        let mut tick = tokio::time::interval(AGGREGATE_TICK_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        break;
+                    }
+                }
+                acknowledgement = actuator.acknowledgements.join_next(), if actuator.pending => {
+                    actuator.complete(acknowledgement)?;
+                    actuator.start_queued();
+                }
+                _ = self.changed.notified() => {}
+                _ = tick.tick() => {}
+            }
+            if let Some(update) = self.evaluate(
+                Instant::now(),
+                producer_telemetry.snapshot(),
+                actuator.bitrate_is_applied(),
+                resolution_controller.as_mut(),
+            )? {
+                if update.request_recovery {
+                    let request_id = update.decision_id;
+                    keyframe_requests.send_replace(Some(MediaControlRequestV3::request_keyframe(
+                        request_id,
+                        update.last_sequence,
+                        KeyframeRequestReasonV3::FrontendBackpressure,
+                    )));
+                }
+                actuator.submit(update.plan);
+            }
+        }
+        actuator.abort_and_drain().await;
+        Ok(())
+    }
+
+    fn evaluate(
+        &self,
+        now: Instant,
+        producer_telemetry: MediaV3TelemetrySnapshot,
+        bitrate_applied: bool,
+        resolution_controller: Option<&mut MotionResolutionPolicy>,
+    ) -> Result<Option<GenerationAggregateUpdate>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("generation adaptive state poisoned"))?;
+        let mut changed_keys = Vec::new();
+        let mut request_recovery = false;
+        for (key, contributor) in &mut state.contributors {
+            let Some((report, next_cursor)) =
+                contributor.ingress.report_since(contributor.cursor)?
+            else {
+                continue;
+            };
+            contributor.cursor = next_cursor;
+            // Configured GOP supersession and producer-wide send state are not
+            // charged to every viewer as local transport pressure. The shared
+            // values remain available to generation diagnostics and actuation.
+            let telemetry = contributor.telemetry.snapshot();
+            let evaluation = contributor.controller.evaluate(&report, telemetry, now)?;
+            match contributor.recovery.observe(&evaluation, now) {
+                RecoveryMutation::RequestRecovery => request_recovery = true,
+                RecoveryMutation::Detach => {
+                    contributor.detach.send_replace(true);
+                }
+                RecoveryMutation::None | RecoveryMutation::Recovered => {}
+            }
+            contributor.latest_report = Some(report);
+            contributor.latest_evaluation = Some(evaluation);
+            contributor.last_received_at = Some(now);
+            changed_keys.push(*key);
+        }
+        self.update_recovering_count(&state);
+
+        let active = state
+            .contributors
+            .values()
+            .filter(|contributor| {
+                contributor.recovery.contributes()
+                    && contributor.last_received_at.is_some_and(|received| {
+                        now.saturating_duration_since(received) <= FEEDBACK_STALE_ARRIVAL_GAP
+                    })
+                    && contributor
+                        .latest_evaluation
+                        .is_some_and(|evaluation| evaluation.fresh)
+            })
+            .filter_map(|contributor| contributor.latest_evaluation.zip(contributor.latest_report))
+            .collect::<Vec<_>>();
+        if changed_keys.is_empty() && active.is_empty() {
+            return Ok(None);
+        }
+        let (target_kbps, all_clean) =
+            aggregate_target_and_clean(&active, state.target_kbps, self.ceiling_kbps);
+        let previous_target = state.target_kbps;
+        if changed_keys.is_empty() && target_kbps == previous_target {
+            return Ok(None);
+        }
+        state.target_kbps = target_kbps;
+        let global_state = match target_kbps.cmp(&previous_target) {
+            std::cmp::Ordering::Less => AdaptiveBitrateStateV1::Decrease,
+            std::cmp::Ordering::Greater => AdaptiveBitrateStateV1::Increase,
+            std::cmp::Ordering::Equal => AdaptiveBitrateStateV1::Hold,
+        };
+        let worst = active
+            .iter()
+            .max_by_key(|(evaluation, _)| feedback_severity_rank(evaluation.pressure_severity));
+        let (aggregate_evaluation, aggregate_report, aggregate_reasons) = match worst {
+            Some((evaluation, report)) => {
+                let mut aggregate = *evaluation;
+                aggregate.clean_recovery_evidence = all_clean;
+                (Some(aggregate), Some(*report), evaluation.decision.reasons)
+            }
+            None => (None, None, AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE),
+        };
+        let resolution_decision = resolution_controller.and_then(|policy| {
+            aggregate_evaluation
+                .zip(aggregate_report)
+                .map(|(evaluation, report)| policy.observe_window(&report, &evaluation, now))
+        });
+        let plan_decision_id = state.next_decision_id;
+        let plan_report_id = aggregate_report.map_or(1, |report| report.report_id);
+        let plan = AdaptiveCommitPlan {
+            decision: AdaptiveBitrateDecisionV1 {
+                decision_id: plan_decision_id,
+                report_id: plan_report_id,
+                target_kbps,
+                floor_kbps: ADAPTIVE_BITRATE_FLOOR_KBPS,
+                ceiling_kbps: self.ceiling_kbps,
+                state: global_state,
+                reasons: aggregate_reasons,
+                applied: bitrate_applied,
+            },
+            telemetry: producer_telemetry,
+            resolution_decision,
+            force_keyframe: request_recovery
+                || aggregate_report
+                    .is_some_and(|report| report.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE)),
+        };
+
+        for key in changed_keys {
+            let Some((evaluation, decisions)) =
+                state.contributors.get(&key).and_then(|contributor| {
+                    contributor
+                        .latest_evaluation
+                        .map(|evaluation| (evaluation, contributor.decisions.clone()))
+                })
+            else {
+                continue;
+            };
+            let decision_id = state.next_decision_id;
+            state.next_decision_id = state
+                .next_decision_id
+                .checked_add(1)
+                .context("generation adaptive decision ID exhausted")?;
+            let decision = AdaptiveBitrateDecisionV1 {
+                decision_id,
+                report_id: evaluation.decision.report_id,
+                target_kbps,
+                floor_kbps: ADAPTIVE_BITRATE_FLOOR_KBPS,
+                ceiling_kbps: self.ceiling_kbps,
+                state: global_state,
+                reasons: evaluation.decision.reasons,
+                applied: bitrate_applied,
+            };
+            decision.validate()?;
+            decisions.send_replace(Some(decision));
+        }
+        plan.decision.validate()?;
+        Ok(Some(GenerationAggregateUpdate {
+            plan,
+            request_recovery,
+            decision_id: plan_decision_id,
+            last_sequence: aggregate_report.and_then(|report| report.last_sequence),
+        }))
+    }
+
+    fn update_recovering_count(&self, state: &GenerationAggregateState) {
+        let count = state
+            .contributors
+            .values()
+            .filter(|contributor| {
+                !matches!(
+                    contributor.recovery,
+                    ContributorRecoveryState::Active { .. }
+                )
+            })
+            .count();
+        debug_assert!(count <= usize::from(crate::config::MAX_VIEWERS));
+        self.recovering_viewers.store(count, Ordering::Relaxed);
+    }
+}
+
+fn feedback_severity_rank(severity: FeedbackSeverity) -> u8 {
+    match severity {
+        FeedbackSeverity::Clean => 0,
+        FeedbackSeverity::InsufficientEvidence => 1,
+        FeedbackSeverity::Moderate => 2,
+        FeedbackSeverity::Severe => 3,
+        FeedbackSeverity::Stale => 4,
+    }
+}
+
+fn aggregate_target_and_clean(
+    active: &[(AdaptiveBitrateEvaluation, MediaFeedbackReportV1)],
+    current_target_kbps: u32,
+    ceiling_kbps: u32,
+) -> (u32, bool) {
+    let target = active
+        .iter()
+        .map(|(evaluation, _)| evaluation.decision.target_kbps)
+        .min()
+        .unwrap_or(current_target_kbps)
+        .clamp(ADAPTIVE_BITRATE_FLOOR_KBPS, ceiling_kbps);
+    let all_clean = !active.is_empty()
+        && active.iter().all(|(evaluation, _)| {
+            evaluation.pressure_severity == FeedbackSeverity::Clean
+                && evaluation.clean_recovery_evidence
+        });
+    (target, all_clean)
+}
+
+struct GenerationAggregateUpdate {
+    plan: AdaptiveCommitPlan,
+    request_recovery: bool,
+    decision_id: u64,
+    last_sequence: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 struct ShadowBitrateController {
     floor_kbps: u32,
@@ -681,7 +1255,7 @@ impl ShadowBitrateController {
                     FeedbackSeverity::Severe,
                     AdaptiveBitrateReasonFlagsV1::RTT_INFLATION,
                 );
-            } else if rtt >= baseline.saturating_mul(3) / 2 {
+            } else if rtt >= (baseline.saturating_mul(3) / 2).max(40_000) {
                 add_feedback_signal(
                     &mut severity,
                     &mut reasons,
@@ -897,6 +1471,198 @@ struct AdaptiveCommitCoordinator {
     acknowledgements: tokio::task::JoinSet<AdaptiveCommitAcknowledgement>,
 }
 
+#[derive(Debug)]
+struct GenerationAdaptiveAcknowledgement {
+    bitrate_kbps: Option<u32>,
+    resolution: Option<VideoDimensions>,
+}
+
+struct GenerationAdaptiveActuator {
+    control: Option<EncoderControl>,
+    actuation_enabled: bool,
+    desired_bitrate_kbps: u32,
+    requested_bitrate_kbps: u32,
+    committed_bitrate_kbps: u32,
+    desired_resolution: Option<VideoDimensions>,
+    requested_resolution: Option<VideoDimensions>,
+    committed_resolution: Option<VideoDimensions>,
+    pending: bool,
+    queued: Option<AdaptiveCommitPlan>,
+    acknowledgements: tokio::task::JoinSet<Result<GenerationAdaptiveAcknowledgement>>,
+}
+
+impl GenerationAdaptiveActuator {
+    fn new(
+        control: Option<EncoderControl>,
+        actuation_enabled: bool,
+        bitrate_kbps: u32,
+        resolution: Option<VideoDimensions>,
+    ) -> Self {
+        Self {
+            control,
+            actuation_enabled,
+            desired_bitrate_kbps: bitrate_kbps,
+            requested_bitrate_kbps: bitrate_kbps,
+            committed_bitrate_kbps: bitrate_kbps,
+            desired_resolution: resolution,
+            requested_resolution: resolution,
+            committed_resolution: resolution,
+            pending: false,
+            queued: None,
+            acknowledgements: tokio::task::JoinSet::new(),
+        }
+    }
+
+    fn bitrate_is_applied(&self) -> bool {
+        self.actuation_enabled
+            && !self.pending
+            && self.desired_bitrate_kbps == self.committed_bitrate_kbps
+    }
+
+    fn submit(&mut self, mut plan: AdaptiveCommitPlan) {
+        self.desired_bitrate_kbps = plan.decision.target_kbps;
+        if let Some(resolution) = plan.resolution_decision {
+            self.desired_resolution = Some(resolution.target);
+        }
+        if self.pending {
+            if let Some(queued) = self.queued {
+                plan.force_keyframe |= queued.force_keyframe;
+            }
+            self.queued = Some(plan);
+            return;
+        }
+        self.start(plan);
+    }
+
+    fn start_queued(&mut self) {
+        if let Some(plan) = self.queued.take() {
+            self.start(plan);
+        }
+    }
+
+    fn start(&mut self, plan: AdaptiveCommitPlan) {
+        if !self.actuation_enabled {
+            return;
+        }
+        let Some(control) = self.control.clone() else {
+            return;
+        };
+        let bitrate_target = plan.decision.target_kbps;
+        let bitrate_revision = if bitrate_target != self.requested_bitrate_kbps
+            || bitrate_target != self.committed_bitrate_kbps
+        {
+            match control.request_bitrate_kbps(bitrate_target) {
+                Ok(revision) => {
+                    self.requested_bitrate_kbps = bitrate_target;
+                    Some(revision)
+                }
+                Err(error) => {
+                    warn!(%error, bitrate_target, "generation adaptive bitrate request failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let resolution_target = plan.resolution_decision.map(|decision| decision.target);
+        let resolution_revision = if let Some(target) = resolution_target.filter(|target| {
+            Some(*target) != self.requested_resolution || Some(*target) != self.committed_resolution
+        }) {
+            match control.request_resolution(target.width, target.height) {
+                Ok(revision) => {
+                    self.requested_resolution = Some(target);
+                    Some((revision, target))
+                }
+                Err(error) => {
+                    warn!(%error, width = target.width, height = target.height, "generation adaptive resolution request failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if bitrate_revision.is_none() && resolution_revision.is_none() {
+            return;
+        }
+        self.pending = true;
+        self.acknowledgements.spawn(async move {
+            let bitrate_kbps = if let Some(revision) = bitrate_revision {
+                let status = control
+                    .wait_for_bitrate_applied(revision, ENCODER_CONTROL_COMMIT_TIMEOUT)
+                    .await?;
+                ensure!(
+                    status.applied_bitrate_revision == Some(revision)
+                        && status.applied_bitrate_kbps == Some(bitrate_target),
+                    "generation bitrate acknowledgement did not match revision {revision} at {bitrate_target} kbps"
+                );
+                Some(bitrate_target)
+            } else {
+                None
+            };
+            let resolution = if let Some((revision, target)) = resolution_revision {
+                let status = control
+                    .wait_for_resolution_applied(
+                        revision,
+                        target.width,
+                        target.height,
+                        ENCODER_CONTROL_COMMIT_TIMEOUT,
+                    )
+                    .await?;
+                ensure!(
+                    status.applied_resolution_revision == Some(revision)
+                        && status.applied_width == Some(target.width)
+                        && status.applied_height == Some(target.height),
+                    "generation resolution acknowledgement did not match revision {revision} at {}x{}",
+                    target.width,
+                    target.height
+                );
+                Some(target)
+            } else {
+                None
+            };
+            Ok(GenerationAdaptiveAcknowledgement {
+                bitrate_kbps,
+                resolution,
+            })
+        });
+    }
+
+    fn complete(
+        &mut self,
+        result: Option<Result<Result<GenerationAdaptiveAcknowledgement>, tokio::task::JoinError>>,
+    ) -> Result<()> {
+        ensure!(
+            self.pending,
+            "generation adaptive acknowledgement was not pending"
+        );
+        self.pending = false;
+        match result
+            .context("generation adaptive task ended without a result")?
+            .context("generation adaptive task failed")?
+        {
+            Ok(acknowledgement) => {
+                if let Some(bitrate_kbps) = acknowledgement.bitrate_kbps {
+                    self.committed_bitrate_kbps = bitrate_kbps;
+                }
+                if let Some(resolution) = acknowledgement.resolution {
+                    self.committed_resolution = Some(resolution);
+                }
+            }
+            Err(error) => {
+                warn!(%error, "generation adaptive commit was not applied");
+            }
+        }
+        Ok(())
+    }
+
+    async fn abort_and_drain(&mut self) {
+        self.pending = false;
+        self.queued = None;
+        self.acknowledgements.abort_all();
+        while self.acknowledgements.join_next().await.is_some() {}
+    }
+}
+
 impl AdaptiveCommitCoordinator {
     fn new(
         sessions: Arc<SessionRegistry>,
@@ -1106,7 +1872,9 @@ pub(super) async fn serve_media_feedback(
     connection: Connection,
     config: &HostConfig,
     sessions: &Arc<SessionRegistry>,
+    generations: &Arc<MediaGenerationManager>,
     authorization: &AuthorizationPolicy,
+    input_operations: &Arc<InputOperations>,
 ) -> Result<()> {
     let remote = connection.remote_id();
     let handshake_permit = sessions
@@ -1146,6 +1914,32 @@ pub(super) async fn serve_media_feedback(
     };
     let encoder_actuation_available =
         adaptive_bitrate_actuation_enabled(config) && lease.encoder_control.is_some();
+    // Shadow mode computes every decision and applies none. Say why, or a host
+    // silently never adapts and nothing in the logs explains it.
+    if !encoder_actuation_available {
+        let reason = if !adaptive_bitrate_actuation_enabled(config) {
+            match config.gamescope_pipewire.as_ref() {
+                Some(gamescope)
+                    if gamescope.encoder_backend != GamescopeEncoderBackend::InProcessGstreamer =>
+                {
+                    "gamescope_pipewire.encoder_backend is not in-process-gstreamer"
+                }
+                Some(gamescope) if gamescope.rate_control != VaapiRateControl::Cbr => {
+                    "gamescope_pipewire.rate_control is not cbr"
+                }
+                Some(_) => "adaptive bitrate actuation is unavailable for this configuration",
+                None => "the configured source is not gamescope-pipewire",
+            }
+        } else {
+            "this session has no encoder control handle"
+        };
+        warn!(
+            %remote,
+            session_id = lease.session_id,
+            reason,
+            "adaptive bitrate and resolution run in shadow: decisions are computed but never applied"
+        );
+    }
 
     write_host_hello(
         &mut send,
@@ -1155,9 +1949,44 @@ pub(super) async fn serve_media_feedback(
         ),
     )
     .await?;
+    if lease.scope == FeedbackScope::SharedGeneration {
+        let adaptive = generations.adaptive(lease.media_generation_id).await?;
+        let registration = adaptive.register(
+            remote,
+            lease.session_id,
+            lease.authorization_revision,
+            lease.media_generation_id,
+            Arc::clone(&lease.telemetry),
+        )?;
+        info!(
+            %remote,
+            session_id = lease.session_id,
+            media_generation_id = lease.media_generation_id,
+            authorization_revision = lease.authorization_revision,
+            ceiling_kbps,
+            mode = if encoder_actuation_available { "aggregate-active" } else { "aggregate-shadow" },
+            "media feedback contributor attached to shared generation"
+        );
+        let result = run_generation_feedback_session(
+            &connection,
+            &mut send,
+            recv,
+            remote,
+            sessions,
+            input_operations,
+            &lease,
+            registration,
+        )
+        .await;
+        let _ = send.finish();
+        drop(lease);
+        info!(%remote, "shared-generation media feedback contributor released");
+        return result;
+    }
     info!(
         %remote,
         session_id = lease.session_id,
+        authorization_revision = lease.authorization_revision,
         ceiling_kbps,
         applied = false,
         mode = if encoder_actuation_available { "active" } else { "shadow" },
@@ -1186,6 +2015,99 @@ pub(super) async fn serve_media_feedback(
     let _ = send.finish();
     drop(lease);
     info!(%remote, "media feedback client released");
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_generation_feedback_session<W>(
+    connection: &Connection,
+    send: &mut W,
+    recv: iroh::endpoint::RecvStream,
+    remote: EndpointId,
+    sessions: &Arc<SessionRegistry>,
+    input_operations: &Arc<InputOperations>,
+    lease: &FeedbackLease,
+    mut registration: GenerationFeedbackRegistration,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (feedback_sender, mut feedback_receiver) =
+        tokio::sync::watch::channel(CumulativeFeedbackIngress::default());
+    let mut reader_task = tokio::spawn(forward_media_feedback_reports(recv, feedback_sender));
+    let mut feedback_cursor = FeedbackIngressCursor::default();
+    let result = loop {
+        let session_changed = sessions.session_changed.notified();
+        tokio::pin!(session_changed);
+        session_changed.as_mut().enable();
+        if !sessions.is_active(remote, lease.session_id) {
+            break Ok(());
+        }
+        tokio::select! {
+            reader_result = &mut reader_task => {
+                break reader_result
+                    .context("shared-generation feedback reader task failed")?
+                    .context("reading shared-generation feedback reports");
+            }
+            changed = feedback_receiver.changed() => {
+                if changed.is_err() {
+                    break Ok(());
+                }
+                let ingress = *feedback_receiver.borrow_and_update();
+                let Some((report, next_cursor)) = ingress.report_since(feedback_cursor)? else {
+                    continue;
+                };
+                feedback_cursor = next_cursor;
+                registration.observe(report)?;
+            }
+            changed = registration.decisions.changed() => {
+                changed.context("shared-generation adaptive decision publisher stopped")?;
+                let Some(decision) = *registration.decisions.borrow_and_update() else {
+                    continue;
+                };
+                tokio::time::timeout(
+                    FEEDBACK_WRITE_TIMEOUT,
+                    write_adaptive_bitrate_decision_v1(send, &decision),
+                )
+                .await
+                .context("timed out writing shared-generation adaptive decision")??;
+            }
+            changed = registration.detach.changed() => {
+                changed.context("shared-generation recovery state publisher stopped")?;
+                if !*registration.detach.borrow_and_update() {
+                    continue;
+                }
+                if let Some(transition) = sessions.invalidate_v2_focus(
+                    remote,
+                    lease.session_id,
+                    FocusTransitionReasonV2::Disconnected,
+                )? {
+                    input_operations.neutralize_focus_transition(
+                        sessions,
+                        transition.transition_id,
+                        FocusTransitionReasonV2::Disconnected,
+                    )?;
+                }
+                sessions.disconnect_v2_viewer(remote, lease.session_id)?;
+                info!(
+                    %remote,
+                    session_id = lease.session_id,
+                    media_generation_id = lease.media_generation_id,
+                    "detached persistently below-floor viewer after bounded isolated recovery"
+                );
+                break Ok(());
+            }
+            _ = &mut session_changed => {}
+            reason = connection.closed() => {
+                debug!(%remote, ?reason, "shared-generation feedback connection closed");
+                break Ok(());
+            }
+        }
+    };
+    if !reader_task.is_finished() {
+        reader_task.abort();
+        let _ = reader_task.await;
+    }
     result
 }
 
@@ -1753,6 +2675,151 @@ mod tests {
             decode_p95_ms: Some(3),
             presentation_p95_ms: Some(5),
         }
+    }
+
+    fn aggregate_evaluation(
+        report_id: u64,
+        target_kbps: u32,
+        severity: FeedbackSeverity,
+        clean: bool,
+    ) -> AdaptiveBitrateEvaluation {
+        AdaptiveBitrateEvaluation {
+            decision: AdaptiveBitrateDecisionV1 {
+                decision_id: report_id,
+                report_id,
+                target_kbps,
+                floor_kbps: ADAPTIVE_BITRATE_FLOOR_KBPS,
+                ceiling_kbps: 12_000,
+                state: AdaptiveBitrateStateV1::Hold,
+                reasons: if severity == FeedbackSeverity::Clean {
+                    AdaptiveBitrateReasonFlagsV1::CLEAN_RECOVERY
+                } else {
+                    AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE
+                },
+                applied: false,
+            },
+            pressure_severity: severity,
+            clean_recovery_evidence: clean,
+            fresh: severity != FeedbackSeverity::Stale,
+        }
+    }
+
+    #[test]
+    fn aggregate_uses_worst_fresh_target_and_requires_every_contributor_clean() {
+        let clean = aggregate_evaluation(1, 10_000, FeedbackSeverity::Clean, true);
+        let pressured = aggregate_evaluation(2, 6_000, FeedbackSeverity::Moderate, false);
+        let active = vec![(clean, clean_feedback(1)), (pressured, clean_feedback(2))];
+        assert_eq!(
+            aggregate_target_and_clean(&active, 12_000, 12_000),
+            (6_000, false)
+        );
+
+        let recovered = vec![
+            (clean, clean_feedback(3)),
+            (
+                aggregate_evaluation(4, 8_000, FeedbackSeverity::Clean, true),
+                clean_feedback(4),
+            ),
+        ];
+        assert_eq!(
+            aggregate_target_and_clean(&recovered, 6_000, 12_000),
+            (8_000, true)
+        );
+    }
+
+    #[test]
+    fn sub_millisecond_rtt_jitter_does_not_become_permanent_moderate_pressure() {
+        let now = Instant::now();
+        let baseline = MediaV3TelemetrySnapshot {
+            selected_path_rtt_micros: 500,
+            ..Default::default()
+        };
+        let mut controller = ShadowBitrateController::new(12_000, baseline);
+        controller
+            .evaluate(&clean_feedback(1), baseline, now)
+            .unwrap();
+        let jitter = MediaV3TelemetrySnapshot {
+            selected_path_rtt_micros: 1_000,
+            ..Default::default()
+        };
+        let evaluation = controller
+            .evaluate(&clean_feedback(2), jitter, now + Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            !evaluation
+                .decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::RTT_INFLATION)
+        );
+        assert_eq!(evaluation.pressure_severity, FeedbackSeverity::Clean);
+    }
+
+    #[test]
+    fn persistent_floor_breach_retries_then_detaches_without_holding_survivors_down() {
+        let now = Instant::now();
+        let severe = aggregate_evaluation(
+            1,
+            ADAPTIVE_BITRATE_FLOOR_KBPS,
+            FeedbackSeverity::Severe,
+            false,
+        );
+        let mut recovery = ContributorRecoveryState::default();
+        assert_eq!(recovery.observe(&severe, now), RecoveryMutation::None);
+        assert_eq!(recovery.observe(&severe, now), RecoveryMutation::None);
+        assert_eq!(
+            recovery.observe(&severe, now),
+            RecoveryMutation::RequestRecovery
+        );
+        assert!(!recovery.contributes());
+
+        let first_retry = now + ISOLATED_RECOVERY_BACKOFF;
+        assert_eq!(
+            recovery.observe(&severe, first_retry),
+            RecoveryMutation::None
+        );
+        assert_eq!(
+            recovery.observe(&severe, first_retry),
+            RecoveryMutation::None
+        );
+        assert_eq!(
+            recovery.observe(&severe, first_retry),
+            RecoveryMutation::RequestRecovery
+        );
+        let second_retry = first_retry + ISOLATED_RECOVERY_BACKOFF.saturating_mul(2);
+        assert_eq!(
+            recovery.observe(&severe, second_retry),
+            RecoveryMutation::None
+        );
+        assert_eq!(
+            recovery.observe(&severe, second_retry),
+            RecoveryMutation::None
+        );
+        assert_eq!(
+            recovery.observe(&severe, second_retry),
+            RecoveryMutation::Detach
+        );
+        assert_eq!(recovery, ContributorRecoveryState::Detaching);
+    }
+
+    #[test]
+    fn isolated_viewer_rejoins_only_after_bounded_clean_recovery() {
+        let now = Instant::now();
+        let severe = aggregate_evaluation(
+            1,
+            ADAPTIVE_BITRATE_FLOOR_KBPS,
+            FeedbackSeverity::Severe,
+            false,
+        );
+        let clean = aggregate_evaluation(2, 2_000, FeedbackSeverity::Clean, true);
+        let mut recovery = ContributorRecoveryState::default();
+        for _ in 0..FLOOR_BREACH_WINDOWS {
+            let _ = recovery.observe(&severe, now);
+        }
+        let retry = now + ISOLATED_RECOVERY_BACKOFF;
+        assert_eq!(recovery.observe(&clean, retry), RecoveryMutation::None);
+        assert_eq!(recovery.observe(&clean, retry), RecoveryMutation::None);
+        assert_eq!(recovery.observe(&clean, retry), RecoveryMutation::Recovered);
+        assert!(recovery.contributes());
     }
 
     fn controller_decide(

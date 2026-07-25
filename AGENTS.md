@@ -16,7 +16,14 @@ Sigil host.
   identity, configuration, or Linux input-injection assets.
 - Iroh owns native connectivity, endpoint identity, encryption, direct-path
   discovery, and relay fallback.
-- Exactly one media session and one matching client are active at a time.
+- Exactly one media generation is active at a time. Native MoQ control v2
+  shares that single generation with up to `max_viewers` authenticated clients
+  (default 3, hard ceiling 8); control v1 and grouped v3 stay single-client
+  exclusive and reject a second client. No capture, encoder, publisher, or
+  actuator scales with viewer count.
+- At most one viewer holds slot-0 input focus. Every other viewer is a
+  spectator, and a former holder is fully neutralized before a successor is
+  granted.
 - Controller is the primary interaction model. Keyboard and relative mouse are
   secondary inputs.
 
@@ -58,12 +65,18 @@ Sigil host.
   Linux binary was explicitly built with that feature and its runtime
   GStreamer elements are available. The opt-in backend currently requires CBR;
   CQP remains on the external compatibility backend.
-- The preferred media path authenticates and claims the single client over
-  `sigil/control/1`, then admits that exact peer to a session-scoped upstream
-  `iroh-moq` broadcast and static H.264 track. One configured GOP maps to one
+- The preferred media path authenticates each viewer over `sigil/control/2`,
+  then admits that exact peer to one host-owned upstream `iroh-moq` broadcast
+  and static H.264 track shared by every viewer. One configured GOP maps to one
   bounded native MoQ group; a newer independently decodable group cancels its
-  predecessor and provides the latest-frame barrier. The custom media v3, v2,
-  and v1 protocols remain explicit compatibility fallbacks.
+  predecessor and provides the latest-frame barrier. `sigil/control/1` and the
+  custom media v3, v2, and v1 protocols remain explicit single-client
+  compatibility fallbacks.
+- Media objects on the shared generation are Ed25519-authenticated against a
+  host-signed generation certificate, and each viewer's MoQ attachment carries
+  an endpoint-bound, expiring subscription capability. The host advertises the
+  authorization revision it minted that capability against in the same accepted
+  control-v2 hello, so a client never has to assume an enrollment revision.
 - Portal crosses Rust-to-webview video and audio through bounded binary Tauri
   channels. It reports transport, frontend, decoder, presentation, and audio
   queue/drop timing separately.
@@ -72,7 +85,11 @@ Sigil host.
   keyboard, and gamepad state when a session ends.
 - Relative pointer movement, scroll, keyboard, virtual gamepad reports, Opus
   audio, reconnects, and second-client rejection have focused and loopback
-  coverage. Hardware acceptance that remains incomplete is listed below.
+  coverage. So does the multi-viewer path: bounded admission, one shared
+  generation, slot-0 focus handoff with the former holder neutralized before a
+  successor is granted, same-peer replacement, slow-viewer isolation, and
+  admission against a configured host at real enrollment revisions. Hardware
+  acceptance that remains incomplete is listed below.
 - Portal preserves the user's native window geometry across sessions and
   relaunches. The stream surface scales and letterboxes within those bounds so
   larger or differently shaped client windows never stretch the host image.
@@ -115,15 +132,17 @@ Sigil host.
   `release/sigil-target-contract.txt`. That name describes the binary ABI, not
   validated host support; the public bootstrap remains Bazzite-only until
   another environment passes its own packaging and hardware gates.
-- Portal is a compiled desktop download, never a shell install. The first
-  public target is macOS arm64 and requires Developer ID signing, hardened
-  runtime, notarization, stapling, and strict Gatekeeper verification. Its
-  TeamIdentifier must equal `release/portal-apple-team-id.txt`, and every
-  Portal asset must carry protected exact-tag GitHub build provenance. Do not
-  advertise an unavailable platform/architecture as a download.
-- The Minisign secret, Apple certificate, notarization credentials, host
-  identity, and FIDO-derived secrets must never enter the repository, release
-  archive, logs, command line, or general website deployment environment.
+- Portal is a compiled desktop download, never a shell install. The only
+  published target is macOS arm64. It is ad-hoc signed and deliberately NOT
+  Developer ID signed or notarized, so trust comes from exact-tag GitHub build
+  provenance plus the published SHA-256, and every Portal asset must carry that
+  provenance. The packaging gate refuses to build in ad-hoc mode if any
+  `APPLE_*` credential is present, and no published surface may claim
+  notarization or Gatekeeper verification. Do not advertise an unavailable
+  platform/architecture as a download.
+- The Minisign secret, host identity, and FIDO-derived secrets must never enter
+  the repository, release archive, logs, command line, or general website
+  deployment environment.
 
 ## Latency and correctness invariants
 
@@ -152,8 +171,9 @@ Sigil host.
 - Issue #4: configure the offline Minisign trust root, publish the signed Sigil
   asset set, and prove clean install plus upgrade/rollback from the public
   command.
-- Issue #5: configure the committed Apple TeamIdentifier pin, then publish the
-  signed/notarized/attested macOS arm64 Portal DMG, digest, and manifest.
+- Issue #5: publish the ad-hoc signed, attested macOS arm64 Portal DMG, digest,
+  and manifest, with the un-notarized first-launch consequence stated plainly on
+  every user-facing surface.
 - Issue #6: prove physically headless cold boot, physical client controller
   gameplay, mouse buttons consumed by Gamescope/an actual game, sustained A/V
   and resource percentiles without latency growth, difficult-NAT relay
@@ -179,8 +199,9 @@ Sigil host.
   selected GstVA encoder plugin; never treat build headers as runtime payload.
 - Run `./scripts/verify-demo-build.sh` for the complete repository gate. It
   covers Rust format/tests/clippy, the Linux cross-build when available,
-  frontend syntax/tests, ShellCheck, package tests, loopback transport, and
-  release-profile containment of `--dev-connect`.
+  frontend syntax/tests, ShellCheck, package tests, loopback transport
+  including three-viewer admission and slot-0 focus handoff, legacy
+  second-client rejection, and release-profile containment of `--dev-connect`.
 - Run `./scripts/verify-website.sh` for every website or public installer
   change. Exercise interactive website changes in a real browser.
 - Treat `docs/fresh-bazzite-host.md`, `docs/public-release-delivery.md`, and

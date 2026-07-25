@@ -12,7 +12,14 @@ export function normalizeInvitationSummary(value, nowUnix = Math.floor(Date.now(
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError('invitation summary must be an object');
   }
-  const allowed = new Set(['host_node_id', 'peer_node_id', 'expires_at_unix', 'grants']);
+  const allowed = new Set([
+    'host_node_id',
+    'peer_node_id',
+    'expires_at_unix',
+    'grants',
+    'view_only',
+    'input_capable',
+  ]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new TypeError(`unknown invitation summary field: ${key}`);
   }
@@ -31,6 +38,13 @@ export function normalizeInvitationSummary(value, nowUnix = Math.floor(Date.now(
     }
     grants.push(grant);
   }
+  const inputCapable = grants.includes('pointer_keyboard') || grants.includes('gamepad');
+  if (value.input_capable !== undefined && value.input_capable !== inputCapable) {
+    throw new TypeError('invitation input eligibility conflicts with its grants');
+  }
+  if (value.view_only !== undefined && value.view_only !== !inputCapable) {
+    throw new TypeError('invitation view-only state conflicts with its grants');
+  }
   return Object.freeze({
     hostNodeId: value.host_node_id,
     peerNodeId: value.peer_node_id,
@@ -38,6 +52,8 @@ export function normalizeInvitationSummary(value, nowUnix = Math.floor(Date.now(
     peerFingerprint: shortPeerFingerprint(value.peer_node_id),
     expiresAtUnix: value.expires_at_unix,
     grants: Object.freeze(grants),
+    viewOnly: !inputCapable,
+    inputCapable,
   });
 }
 

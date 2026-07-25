@@ -1,11 +1,12 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iroh::{Endpoint, SecretKey, endpoint::presets};
 use serde::Serialize;
 use sigil_protocol::{
     InputEvent, InvitationGrants, KeyframeRequestReasonV3, PointerSurfaceDimensions,
+    SignedSubscriptionCapability,
 };
 use tauri::{
     AppHandle, Emitter,
@@ -20,18 +21,25 @@ use crate::media::adaptive_feedback::{
     run_media_feedback_session,
 };
 use crate::media::audio_delivery::{
-    AudioStartRequest, lock_audio_deliveries, next_audio_generation, try_start_audio,
+    AudioStartRequest, MoqAudioStartRequest, lock_audio_deliveries, next_audio_generation,
+    try_start_audio, try_start_moq_audio,
 };
 use crate::media::frame_channel::{close_generation_connection, next_media_generation};
 use crate::media::input_delivery::{
-    CLIENT_INPUT_QUEUE_CAPACITY, InputSession, PointerFeedbackPayload, open_input_session,
-    run_input_feedback, run_input_forwarder,
+    CLIENT_INPUT_QUEUE_CAPACITY, InputSession, PointerFeedbackPayload, V2InputContext,
+    open_input_session, run_input_feedback, run_input_forwarder, v2_input_eligibility,
 };
 use crate::media::media_control::run_media_control_writer_v3;
-use crate::media::moq_receiver::open_upstream_moq_media;
-use crate::media::network_diagnostics::NetworkSessionDiagnostics;
+use crate::media::moq_receiver::{MoqAuthenticationExpectation, open_upstream_moq_media};
+use crate::media::network_diagnostics::{
+    MediaDeliveryRole, NetworkSessionDiagnostics, lock_network_diagnostics,
+};
+use crate::media::session_control::{
+    SESSION_CONTROL_COMMAND_CAPACITY, install_initial_snapshot, run_session_control,
+};
 use crate::media::transport::{
-    CLIENT_ENDPOINT_CLOSE_TIMEOUT, MediaTransport, open_negotiated_media_stream,
+    CLIENT_ENDPOINT_CLOSE_TIMEOUT, ControlProtocol, MediaTransport, NegotiatedMediaStream,
+    open_negotiated_media_stream,
 };
 use crate::media::video_delivery::{VideoDeliveryRequest, run_video_delivery};
 
@@ -70,6 +78,8 @@ pub struct ConnectResult {
     pub host_node_id: Option<String>,
     pub development_mode: bool,
     pub media_transport: &'static str,
+    pub control_protocol: &'static str,
+    pub session_snapshot: Option<sigil_protocol::SessionSnapshotV2>,
     pub pointer_surface_dimensions: Option<PointerSurfaceDimensions>,
     pub relative_pointer_available: bool,
     pub pointer_position_feedback_available: bool,
@@ -176,51 +186,114 @@ pub(crate) async fn connect_client(
     let first_attempt =
         open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, invitation.as_deref())
             .await;
-    let (frame_conn, frame_recv, media_control_stream, media_negotiation, media_transport) =
-        match first_attempt {
-            Ok(result) => result,
-            Err(invitation_error)
-                if invitation.is_some()
-                    && invitation_error.contains("Portal peer is not authorized") =>
-            {
-                // Recover only the narrow crash window where Sigil durably
-                // consumed the invitation but Portal did not durably clear it.
-                // The replay itself remains rejected; a second, ticket-free
-                // connection can succeed only as the already-enrolled Iroh
-                // peer authenticated by the exact invited host.
-                open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, None)
+    let (
+        frame_conn,
+        frame_recv,
+        media_control_stream,
+        media_negotiation,
+        media_transport,
+        control_protocol,
+    ) = match first_attempt {
+        Ok(result) => result,
+        Err(invitation_error)
+            if invitation.is_some()
+                && invitation_error.contains("Portal peer is not authorized") =>
+        {
+            // Recover only the narrow crash window where Sigil durably
+            // consumed the invitation but Portal did not durably clear it.
+            // The replay itself remains rejected; a second, ticket-free
+            // connection can succeed only as the already-enrolled Iroh
+            // peer authenticated by the exact invited host.
+            open_negotiated_media_stream(&endpoint, &addr, handshake_nonce, None)
                     .await
                     .map_err(|retry_error| {
                         format!(
                             "{invitation_error}; ticket-free enrollment recovery also failed: {retry_error}"
                         )
                     })?
-            }
-            Err(error) => return Err(error),
-        };
-    let media_session_id = media_negotiation.session_id;
-    let (upstream_moq_media, frame_connection_for_stats) = if media_transport
+        }
+        Err(error) => return Err(error),
+    };
+    let media_session_id = media_negotiation.session_id();
+    let pointer_surface_dimensions = media_negotiation.pointer_surface_dimensions();
+    let initial_session_snapshot = match &media_negotiation {
+        NegotiatedMediaStream::V2(negotiation) => Some(negotiation.initial_snapshot.clone()),
+        NegotiatedMediaStream::V1(_) => None,
+    };
+    let advertised_media = initial_session_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.media.clone());
+    let moq_authentication = match &media_negotiation {
+        NegotiatedMediaStream::V2(negotiation) => Some(MoqAuthenticationExpectation {
+            expected_host: *host_node_id.as_bytes(),
+            subscription_capability: negotiation.media_subscription_capability.clone(),
+            authorization_revision: negotiation.media_authorization_revision,
+            now_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| "System clock is before the Unix epoch".to_string())?
+                .as_secs(),
+        }),
+        NegotiatedMediaStream::V1(_) => None,
+    };
+    let subscription_expires_at_unix = match &media_negotiation {
+        NegotiatedMediaStream::V2(negotiation) => Some(
+            SignedSubscriptionCapability::decode(&negotiation.media_subscription_capability)
+                .map_err(|error| format!("Invalid media subscription capability: {error}"))?
+                .claims
+                .expires_at_unix,
+        ),
+        NegotiatedMediaStream::V1(_) => None,
+    };
+    let media_generation = next_media_generation(&state.client_media_generation)?;
+    let network_diagnostics = Arc::new(StdMutex::new(NetworkSessionDiagnostics::new(
+        Instant::now(),
+        false,
+    )));
+    if moq_authentication.is_some() {
+        let mut diagnostics = lock_network_diagnostics(&network_diagnostics);
+        diagnostics.configure_authenticated_media(MediaDeliveryRole::DirectHost);
+        diagnostics.configure_v2_session(
+            initial_session_snapshot
+                .as_ref()
+                .ok_or_else(|| "Control v2 omitted its diagnostics snapshot".to_string())?,
+            subscription_expires_at_unix
+                .ok_or_else(|| "Control v2 omitted its subscription expiry".to_string())?,
+            Instant::now(),
+        )?;
+    }
+    let media_verification_failures =
+        lock_network_diagnostics(&network_diagnostics).media_verification_failure_counter();
+    let (upstream_moq_media, upstream_moq_audio, frame_connection_for_stats) = if media_transport
         == MediaTransport::UpstreamMoq
     {
-        let (receiver, diagnostics_connection) =
-            match open_upstream_moq_media(&endpoint, &addr, media_session_id).await {
-                Ok(media) => media,
-                Err(error) => {
-                    // CONTROL already authenticated and owns the host's
-                    // one-client lease. A post-auth MoQ failure is
-                    // terminal, and must explicitly release that lease;
-                    // it must never fall through to a legacy media ALPN.
-                    frame_conn.close(1_u32.into(), b"upstream MoQ setup failed");
-                    let _ =
-                        tokio::time::timeout(CLIENT_ENDPOINT_CLOSE_TIMEOUT, endpoint.close()).await;
-                    return Err(error);
-                }
-            };
-        (Some(receiver), diagnostics_connection)
+        let (receiver, audio_receiver, diagnostics_connection) = match open_upstream_moq_media(
+            &endpoint,
+            &addr,
+            media_session_id,
+            advertised_media.as_ref().map(|media| media.generation_id),
+            advertised_media
+                .as_ref()
+                .map(|media| media.broadcast_name.as_str()),
+            moq_authentication,
+            media_verification_failures,
+        )
+        .await
+        {
+            Ok(media) => media,
+            Err(error) => {
+                // CONTROL already authenticated and owns the host's
+                // one-client lease. A post-auth MoQ failure is
+                // terminal, and must explicitly release that lease;
+                // it must never fall through to a legacy media ALPN.
+                frame_conn.close(1_u32.into(), b"upstream MoQ setup failed");
+                let _ = tokio::time::timeout(CLIENT_ENDPOINT_CLOSE_TIMEOUT, endpoint.close()).await;
+                return Err(error);
+            }
+        };
+        (Some(receiver), audio_receiver, diagnostics_connection)
     } else {
-        (None, frame_conn.clone())
+        (None, None, frame_conn.clone())
     };
-    let pointer_surface_dimensions = media_negotiation.pointer_surface_dimensions;
     if !development_mode && let Some(expected_invitation) = invitation.as_deref() {
         // An accepted media hello means Sigil durably committed the one-time
         // enrollment before returning. Future PIN/tap/play sessions send no
@@ -250,56 +323,89 @@ pub(crate) async fn connect_client(
         }
     };
 
-    let InputSession {
-        connection: input_connection,
-        send: input_send,
-        recv: input_recv,
-        capabilities: input_capabilities,
-        availability: input_availability,
-    } = open_input_session(&endpoint, &addr, handshake_nonce, media_session_id, grants).await?;
-
-    let network_diagnostics = Arc::new(StdMutex::new(NetworkSessionDiagnostics::new(
-        Instant::now(),
-        input_availability.input_ack,
-    )));
-
-    if input_availability.pointer_position_feedback || input_availability.input_ack {
-        let feedback_diagnostics = Arc::clone(&network_diagnostics);
-        let pointer_feedback_enabled = input_availability.pointer_position_feedback;
-        let input_ack_enabled = input_availability.input_ack;
-        tokio::spawn(run_input_feedback(
-            input_recv,
-            feedback_diagnostics,
-            pointer_feedback_enabled,
-            input_ack_enabled,
-            pointer_channel,
-        ));
+    let mut input_connection_for_stats = None;
+    let (input_availability, v1_input_forwarder) = if control_protocol == ControlProtocol::V1 {
+        let InputSession {
+            connection: input_connection,
+            send: input_send,
+            recv: input_recv,
+            capabilities: input_capabilities,
+            availability: input_availability,
+        } = open_input_session(&endpoint, &addr, handshake_nonce, media_session_id, grants).await?;
+        lock_network_diagnostics(&network_diagnostics)
+            .set_input_ack_negotiated(input_availability.input_ack);
+        input_connection_for_stats = Some(input_connection.clone());
+        if input_availability.pointer_position_feedback || input_availability.input_ack {
+            tokio::spawn(run_input_feedback(
+                input_recv,
+                Arc::clone(&network_diagnostics),
+                input_availability.pointer_position_feedback,
+                input_availability.input_ack,
+                pointer_channel,
+            ));
+        } else {
+            drop(input_recv);
+        }
+        (input_availability, Some((input_send, input_capabilities)))
     } else {
-        drop(input_recv);
-    }
+        *state.v2_input_context.lock().await = Some(V2InputContext {
+            endpoint: endpoint.clone(),
+            address: addr.clone(),
+            nonce: handshake_nonce,
+            media_session_id,
+            native_generation: media_generation,
+            grants,
+            pointer_channel,
+            network_diagnostics: Arc::clone(&network_diagnostics),
+        });
+        (v2_input_eligibility(grants), None)
+    };
 
     let audio_generation = next_audio_generation(&state.audio_connection_generation)?;
     lock_audio_deliveries(&state.audio_deliveries).begin_generation(audio_generation)?;
-    let audio_result = try_start_audio(
-        app.clone(),
-        &endpoint,
-        AudioStartRequest {
-            address: addr.clone(),
-            handshake_nonce,
-            media_session_id,
-            audio_supported,
-            audio_channel,
-            audio_deliveries: Arc::clone(&state.audio_deliveries),
-            connection_generation: Arc::clone(&state.audio_connection_generation),
-            generation: audio_generation,
-        },
-    )
-    .await;
+    let audio_result = if control_protocol == ControlProtocol::V2 {
+        let receiver = upstream_moq_audio
+            .ok_or_else(|| "Host did not advertise an authenticated MoQ Opus track".to_string());
+        match receiver {
+            Ok(receiver) => try_start_moq_audio(
+                app.clone(),
+                receiver,
+                MoqAudioStartRequest {
+                    audio_supported,
+                    audio_channel,
+                    audio_deliveries: Arc::clone(&state.audio_deliveries),
+                    connection_generation: Arc::clone(&state.audio_connection_generation),
+                    generation: audio_generation,
+                },
+            )
+            .map(|()| None),
+            Err(error) => Err(error),
+        }
+    } else {
+        try_start_audio(
+            app.clone(),
+            &endpoint,
+            AudioStartRequest {
+                address: addr.clone(),
+                handshake_nonce,
+                media_session_id,
+                audio_supported,
+                audio_channel,
+                audio_deliveries: Arc::clone(&state.audio_deliveries),
+                connection_generation: Arc::clone(&state.audio_connection_generation),
+                generation: audio_generation,
+            },
+        )
+        .await
+        .map(Some)
+    };
     let mut audio_connection_for_stats = None;
     let (audio_available, connected_audio_generation, audio_error) = match audio_result {
         Ok(connection) => {
-            audio_connection_for_stats = Some(connection.clone());
-            *state.audio_connection.lock().await = Some((audio_generation, connection));
+            if let Some(connection) = connection {
+                audio_connection_for_stats = Some(connection.clone());
+                *state.audio_connection.lock().await = Some((audio_generation, connection));
+            }
             (true, Some(audio_generation), None)
         }
         Err(error) => {
@@ -307,12 +413,11 @@ pub(crate) async fn connect_client(
             (false, None, Some(error))
         }
     };
-    let media_generation = next_media_generation(&state.client_media_generation)?;
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent>(CLIENT_INPUT_QUEUE_CAPACITY);
-    {
-        let mut input_send_guard = state.input_send.lock().await;
-        *input_send_guard = Some(tx);
+    let mut v1_input_receiver = None;
+    if let Some((input_send, input_capabilities)) = v1_input_forwarder {
+        let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent>(CLIENT_INPUT_QUEUE_CAPACITY);
+        *state.input_send.lock().await = Some(tx);
+        v1_input_receiver = Some((input_send, rx, input_capabilities));
     }
 
     {
@@ -332,11 +437,12 @@ pub(crate) async fn connect_client(
             send,
             recv,
             feedback_rx,
+            Arc::clone(&network_diagnostics),
         ));
     } else {
         *state.media_feedback.lock().await = None;
     }
-    let media_control_requests = {
+    let media_control_requests = if control_protocol == ControlProtocol::V1 {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
         *state.media_control.lock().await = Some((media_generation, control_tx.clone()));
         tokio::spawn(run_media_control_writer_v3(
@@ -347,6 +453,30 @@ pub(crate) async fn connect_client(
             let _ = control_tx.try_send((KeyframeRequestReasonV3::Join, None));
         }
         Some(control_tx)
+    } else {
+        let initial_snapshot = initial_session_snapshot
+            .clone()
+            .ok_or_else(|| "Control v2 omitted its initial session snapshot".to_string())?;
+        install_initial_snapshot(
+            &app,
+            &state.session_snapshot,
+            media_generation,
+            initial_snapshot.clone(),
+        )
+        .await?;
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(SESSION_CONTROL_COMMAND_CAPACITY);
+        *state.session_control.lock().await = Some((media_generation, control_tx));
+        tokio::spawn(run_session_control(
+            app.clone(),
+            media_generation,
+            initial_snapshot.media.generation_id,
+            media_control_stream,
+            frame_recv,
+            control_rx,
+            Arc::clone(&state.session_snapshot),
+            Arc::clone(&network_diagnostics),
+        ));
+        None
     };
     let frame_events_in_flight = Arc::new(AtomicUsize::new(0));
     *state.frame_delivery.lock().await =
@@ -356,19 +486,20 @@ pub(crate) async fn connect_client(
     // dropped at the 60 Hz boundary. Relative motion is displacement, so it
     // owns a separate accumulator and timer that coalesces rather than drops.
     let input_send_diagnostics = Arc::clone(&network_diagnostics);
-    tokio::spawn(run_input_forwarder(
-        input_send,
-        rx,
-        input_capabilities,
-        input_send_diagnostics,
-    ));
+    if let Some((input_send, rx, input_capabilities)) = v1_input_receiver {
+        tokio::spawn(run_input_forwarder(
+            input_send,
+            rx,
+            input_capabilities,
+            input_send_diagnostics,
+        ));
+    }
 
     tokio::spawn(run_video_delivery(VideoDeliveryRequest {
         app,
         endpoint,
-        frame_recv,
         frame_connection: frame_connection_for_stats,
-        input_connection,
+        input_connection: input_connection_for_stats,
         audio_connection: audio_connection_for_stats,
         network_diagnostics,
         media_control_requests,
@@ -385,6 +516,8 @@ pub(crate) async fn connect_client(
         host_node_id: Some(host_node_id.to_string()),
         development_mode,
         media_transport: media_transport.diagnostic_name(),
+        control_protocol: control_protocol.diagnostic_name(),
+        session_snapshot: initial_session_snapshot,
         pointer_surface_dimensions,
         relative_pointer_available: input_availability.relative_pointer,
         pointer_position_feedback_available: input_availability.pointer_position_feedback,
@@ -410,6 +543,9 @@ pub(crate) async fn disconnect_client(state: &AppState) -> Result<bool, String> 
     next_audio_generation(&state.audio_connection_generation)?;
     lock_audio_deliveries(&state.audio_deliveries).clear();
     *state.media_control.lock().await = None;
+    *state.session_control.lock().await = None;
+    *state.session_snapshot.lock().await = None;
+    *state.v2_input_context.lock().await = None;
     if let Some((_generation, connection, _sender)) = state.media_feedback.lock().await.take() {
         connection.close(0_u32.into(), b"client disconnected");
     }
@@ -422,6 +558,9 @@ pub(crate) async fn disconnect_client(state: &AppState) -> Result<bool, String> 
         connection.close(0_u32.into(), b"client disconnected");
     });
     close_generation_connection(state.audio_connection.lock().await.take(), |connection| {
+        connection.close(0_u32.into(), b"client disconnected");
+    });
+    close_generation_connection(state.input_connection.lock().await.take(), |connection| {
         connection.close(0_u32.into(), b"client disconnected");
     });
     {

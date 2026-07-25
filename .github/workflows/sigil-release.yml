@@ -206,15 +206,11 @@ jobs:
             --source-commit "${{ steps.source.outputs.commit }}" \
             --public-key-file "$GITHUB_WORKSPACE/release/sigil-minisign.pub"
 
-      - name: Verify signed Portal assets against the same source tag
-        env:
-          PORTAL_APPLE_TEAM_ID: ${{ secrets.PORTAL_APPLE_TEAM_ID }}
+      - name: Verify Portal assets against the same source tag
         run: |
           portal_dir="$RUNNER_TEMP/portal-release"
           install -d -m 0700 "$portal_dir"
           gh release download "$RELEASE_TAG" --dir "$portal_dir" --pattern 'Portal-*'
-          expected_team_id="$(<release/portal-apple-team-id.txt)"
-          test "$PORTAL_APPLE_TEAM_ID" = "$expected_team_id"
           python3 scripts/verify-portal-release.py assets \
             --repo-dir "$GITHUB_WORKSPACE" \
             --release-tag "$RELEASE_TAG" \
@@ -230,13 +226,13 @@ jobs:
           ./scripts/verify-macos-portal-signature.sh \
             --dmg "$portal_dir/Portal-${RELEASE_TAG#v}-arm64.dmg" \
             --expected-version "${RELEASE_TAG#v}" \
-            --expected-team-id "$expected_team_id"
+            --signing adhoc
 
       - name: Publish verified prerelease
         run: |
           gh release edit "$RELEASE_TAG" \
             --draft=false \
             --prerelease \
-            --notes "Verified public alpha for $RELEASE_TAG: signed Linux glibc 2.17 x86_64 Sigil host package, validated on the supported Bazzite appliance, plus Developer ID signed, notarized, stapled macOS arm64 Portal. Hardware UAT remains tracked separately."
+            --notes "Verified public alpha for $RELEASE_TAG: Minisign-signed Linux glibc 2.17 x86_64 Sigil host package, validated on the supported Bazzite appliance, plus an ad-hoc signed macOS arm64 Portal DMG. Portal is NOT notarized: macOS will refuse it on first launch until you allow it under System Settings > Privacy & Security. Verify the DMG with its published SHA-256 and with 'gh attestation verify'. Hardware UAT remains tracked separately."
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = false
           test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease')" = true

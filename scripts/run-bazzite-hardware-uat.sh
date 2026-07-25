@@ -146,7 +146,7 @@ if [[ "${SIGIL_HARDWARE_UAT_SOURCE_ONLY:-}" == 1 ]]; then
 fi
 
 usage() {
-  echo "usage: $0 UAT_ROOT UAT_COMMIT WORKFLOW_RUN_ID [--render-node PATH --va-encoder FACTORY]" >&2
+  echo "usage: $0 UAT_ROOT UAT_COMMIT WORKFLOW_RUN_ID [--render-node PATH --va-encoder FACTORY] [--multi-viewer-evidence FILE]" >&2
 }
 
 if [[ $# -lt 3 ]]; then
@@ -162,6 +162,7 @@ render_node_override=''
 va_encoder_override=''
 render_node_override_set=false
 va_encoder_override_set=false
+multi_viewer_evidence=''
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --render-node)
@@ -178,12 +179,57 @@ while [[ $# -gt 0 ]]; do
       va_encoder_override_set=true
       shift 2
       ;;
+    --multi-viewer-evidence)
+      [[ $# -ge 2 && -z "$multi_viewer_evidence" && "$2" == /* ]] \
+        || { usage; exit 64; }
+      multi_viewer_evidence="$2"
+      shift 2
+      ;;
     *)
       usage
       exit 64
       ;;
   esac
 done
+
+multi_viewer_value() {
+  local key="$1"
+  awk -F= -v wanted="$key" '
+    $1 == wanted { count += 1; value = substr($0, index($0, "=") + 1) }
+    END { if (count != 1 || value == "") exit 1; print value }
+  ' "$multi_viewer_evidence"
+}
+
+validate_multi_viewer_evidence() {
+  local size mode key value
+  [[ -f "$multi_viewer_evidence" && ! -L "$multi_viewer_evidence" ]]
+  size="$(stat -c '%s' "$multi_viewer_evidence")"
+  mode="$(stat -c '%a' "$multi_viewer_evidence")"
+  [[ "$size" =~ ^[0-9]+$ && "$size" -le 65536 ]]
+  [[ "$mode" =~ ^[0-7]{3,4}$ && $((8#$mode & 8#022)) -eq 0 ]]
+  awk -F= '
+    NF != 2 || $1 !~ /^[a-z0-9_]+$/ || $2 !~ /^[A-Za-z0-9.,_:+-]+$/ { exit 1 }
+    seen[$1]++ { if (seen[$1] > 1) exit 1 }
+  ' "$multi_viewer_evidence"
+  [[ "$(multi_viewer_value source_commit)" == "$uat_commit" ]]
+  [[ "$(multi_viewer_value protocol_mode)" == native-moq-v2 ]]
+  [[ "$(multi_viewer_value concurrent_viewers)" -eq 3 ]]
+  for key in shared_video_sources shared_video_encoders shared_audio_sources \
+    shared_audio_encoders shared_publishers shared_adaptive_actuators slot_0_holders_max; do
+    [[ "$(multi_viewer_value "$key")" -eq 1 ]]
+  done
+  value="$(multi_viewer_value focus_handoff_p95_ms)"
+  [[ "$value" =~ ^[0-9]+$ && "$value" -le 1000 ]]
+  value="$(multi_viewer_value reconnect_cycles)"
+  [[ "$value" =~ ^[0-9]+$ && "$value" -ge 3 ]]
+  value="$(multi_viewer_value rss_p95_mib)"
+  [[ "$value" =~ ^[0-9]+$ && "$value" -le 2048 ]]
+  for key in media_progress audio_progress slow_viewer_isolation same_peer_replacement \
+    live_view_revocation survivors_uninterrupted bounded_queues final_cleanup \
+    ordinary_service_restored; do
+    [[ "$(multi_viewer_value "$key")" == pass ]]
+  done
+}
 if [[ "$render_node_override_set" == true || "$va_encoder_override_set" == true ]]; then
   [[ "$render_node_override_set" == true && "$va_encoder_override_set" == true ]] || {
     echo "--render-node and --va-encoder must be provided together" >&2
@@ -1057,9 +1103,25 @@ sha256sum -c "$private/original-identity.sha256"
 [[ "$(readlink "$HOME/.local/libexec/sigil-spark/current")" == "$(cat "$private/original-current-link")" ]]
 [[ "$(stat -c '%i:%s:%Y:%a:%U:%G' "$real_identity")" == "$(cat "$private/original-identity.stat")" ]]
 
+multi_viewer_status=not-run
+if [[ -n "$multi_viewer_evidence" ]]; then
+  validate_multi_viewer_evidence
+  multi_viewer_status=pass
+fi
+
 {
   echo hardware_uat=pass
   cat "$private/summary.pending"
+  echo "multi_viewer_uat=$multi_viewer_status"
+  if [[ "$multi_viewer_status" == pass ]]; then
+    for key in protocol_mode concurrent_viewers shared_video_sources shared_video_encoders \
+      shared_audio_sources shared_audio_encoders shared_publishers shared_adaptive_actuators \
+      slot_0_holders_max focus_handoff_p95_ms reconnect_cycles rss_p95_mib \
+      slow_viewer_isolation same_peer_replacement live_view_revocation survivors_uninterrupted \
+      bounded_queues final_cleanup; do
+      printf 'multi_viewer_%s=%s\n' "$key" "$(multi_viewer_value "$key")"
+    done
+  fi
   echo original_service_restored=pass
   echo original_config_preserved=pass
   echo original_identity_preserved=pass

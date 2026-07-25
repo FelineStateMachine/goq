@@ -4,19 +4,21 @@ use std::time::{Duration, Instant};
 use iroh::Endpoint;
 use serde::Serialize;
 use sigil_protocol::{
-    Capability, INPUT_ALPN_V1, InputEvent, InvitationGrants, PointerPosition,
-    RELATIVE_POINTER_DELTA_MAX, RELATIVE_POINTER_DELTA_MIN, read_input_ack, write_input_event,
+    Capability, ControllerSlot, INPUT_ALPN_V1, INPUT_ALPN_V2, InputClientHelloV2, InputEvent,
+    InputEventV2, InvitationGrants, PointerPosition, RELATIVE_POINTER_DELTA_MAX,
+    RELATIVE_POINTER_DELTA_MIN, read_input_ack, read_input_ack_v2, read_input_host_hello_v2,
+    write_input_client_hello_v2, write_input_event, write_input_event_v2,
 };
 use tauri::ipc::Channel;
 
-use crate::commands::state::AppState;
+use crate::commands::state::{AppState, SessionSnapshotState};
 use crate::media::network_diagnostics::{NetworkSessionDiagnostics, lock_network_diagnostics};
 use crate::media::transport::{NegotiatedV1Stream, negotiate_v1};
 use crate::platform_capabilities::relative_pointer_capture_enabled;
 
 pub(crate) const CLIENT_INPUT_QUEUE_CAPACITY: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct InputAvailability {
     pub(crate) relative_pointer: bool,
     pub(crate) pointer_position_feedback: bool,
@@ -26,6 +28,14 @@ pub(crate) struct InputAvailability {
     pub(crate) gamepad: bool,
     pub(crate) input_ack: bool,
     pub(crate) control: bool,
+}
+
+pub(crate) fn v2_input_eligibility(grants: InvitationGrants) -> InputAvailability {
+    let capabilities = input_capability_offers(grants)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    InputAvailability::from_capabilities(&capabilities)
 }
 
 impl InputAvailability {
@@ -268,16 +278,14 @@ fn input_event_allowed(capabilities: &[Capability], event: &InputEvent) -> bool 
 }
 
 async fn write_client_input_event(
-    stream: &mut iroh::endpoint::SendStream,
+    stream: &mut InputWire,
     event: &InputEvent,
     diagnostics: Option<&Arc<StdMutex<NetworkSessionDiagnostics>>>,
 ) -> Result<(), String> {
     if let Some(diagnostics) = diagnostics {
         lock_network_diagnostics(diagnostics).begin_input_send(Instant::now());
     }
-    write_input_event(stream, event)
-        .await
-        .map_err(|error| error.to_string())
+    stream.write(event).await
 }
 
 fn observe_input_ack_if_negotiated(
@@ -294,10 +302,85 @@ fn observe_input_ack_if_negotiated(
 
 pub(crate) struct InputSession {
     pub(crate) connection: iroh::endpoint::Connection,
-    pub(crate) send: iroh::endpoint::SendStream,
+    pub(crate) send: InputWire,
     pub(crate) recv: iroh::endpoint::RecvStream,
     pub(crate) capabilities: Vec<Capability>,
     pub(crate) availability: InputAvailability,
+}
+
+#[derive(Clone)]
+pub(crate) struct V2InputContext {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) address: iroh::EndpointAddr,
+    pub(crate) nonce: [u8; 16],
+    pub(crate) media_session_id: u64,
+    pub(crate) native_generation: u64,
+    pub(crate) grants: InvitationGrants,
+    pub(crate) pointer_channel: Channel<PointerFeedbackPayload>,
+    pub(crate) network_diagnostics: Arc<StdMutex<NetworkSessionDiagnostics>>,
+}
+
+pub(crate) enum InputWire {
+    V1(iroh::endpoint::SendStream),
+    V2 {
+        send: iroh::endpoint::SendStream,
+        session_id: u64,
+        slot: ControllerSlot,
+        focus_generation: u64,
+        native_generation: u64,
+        session_snapshot: Arc<tokio::sync::Mutex<Option<SessionSnapshotState>>>,
+    },
+}
+
+impl InputWire {
+    async fn write(&mut self, event: &InputEvent) -> Result<(), String> {
+        match self {
+            Self::V1(send) => write_input_event(send, event)
+                .await
+                .map_err(|error| error.to_string()),
+            Self::V2 {
+                send,
+                session_id,
+                slot,
+                focus_generation,
+                native_generation,
+                session_snapshot,
+            } => {
+                let owns_focus =
+                    session_snapshot
+                        .lock()
+                        .await
+                        .as_ref()
+                        .is_some_and(|(generation, snapshot)| {
+                            *generation == *native_generation
+                                && snapshot.self_focus_generation() == Some(*focus_generation)
+                        });
+                if !owns_focus {
+                    return Err(
+                        "Authoritative focus changed before the input wire write".to_string()
+                    );
+                }
+                write_input_event_v2(
+                    send,
+                    &InputEventV2 {
+                        session_id: *session_id,
+                        slot: *slot,
+                        focus_generation: *focus_generation,
+                        event: event.clone(),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        let result = match self {
+            Self::V1(send) | Self::V2 { send, .. } => send.finish(),
+        };
+        let _ = result;
+    }
 }
 
 pub(crate) async fn open_input_session(
@@ -337,11 +420,156 @@ pub(crate) async fn open_input_session(
     let availability = InputAvailability::from_capabilities(&capabilities);
     Ok(InputSession {
         connection,
-        send,
+        send: InputWire::V1(send),
         recv,
         capabilities,
         availability,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_input_session_v2(
+    endpoint: &Endpoint,
+    address: &iroh::EndpointAddr,
+    nonce: [u8; 16],
+    media_session_id: u64,
+    focus_generation: u64,
+    native_generation: u64,
+    session_snapshot: Arc<tokio::sync::Mutex<Option<SessionSnapshotState>>>,
+    grants: InvitationGrants,
+) -> Result<InputSession, String> {
+    let offered = input_capability_offers(grants)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let connection = endpoint
+        .connect(address.clone(), INPUT_ALPN_V2)
+        .await
+        .map_err(|error| format!("Failed to connect input v2 stream: {error}"))?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| format!("Failed to open input v2 stream: {error}"))?;
+    let hello = InputClientHelloV2::new(
+        "portal/0.1.0",
+        nonce,
+        media_session_id,
+        ControllerSlot::ZERO,
+        focus_generation,
+        offered.clone(),
+    );
+    write_input_client_hello_v2(&mut send, &hello)
+        .await
+        .map_err(|error| format!("Failed to send input v2 handshake: {error}"))?;
+    let response =
+        tokio::time::timeout(Duration::from_secs(10), read_input_host_hello_v2(&mut recv))
+            .await
+            .map_err(|_| "Timed out waiting for input v2 handshake".to_string())?
+            .map_err(|error| format!("Invalid input v2 handshake: {error}"))?
+            .ok_or_else(|| "Host closed during input v2 handshake".to_string())?;
+    if !response.accepted {
+        return Err(format!(
+            "Host rejected input v2 stream: {}",
+            response.message.as_deref().unwrap_or("unspecified reason")
+        ));
+    }
+    if response.session_id != Some(media_session_id)
+        || response.slot != Some(ControllerSlot::ZERO)
+        || response.focus_generation != Some(focus_generation)
+    {
+        return Err("Host returned a mismatched input v2 focus binding".to_string());
+    }
+    if let Some(unoffered) = response
+        .capabilities
+        .iter()
+        .find(|capability| !offered.contains(capability))
+    {
+        return Err(format!(
+            "Host accepted unoffered input v2 capability {unoffered:?}"
+        ));
+    }
+    let capabilities = mask_unavailable_relative_pointer_capabilities(
+        response.capabilities,
+        relative_pointer_capture_enabled(),
+    );
+    let availability = InputAvailability::from_capabilities(&capabilities);
+    Ok(InputSession {
+        connection,
+        send: InputWire::V2 {
+            send,
+            session_id: media_session_id,
+            slot: ControllerSlot::ZERO,
+            focus_generation,
+            native_generation,
+            session_snapshot,
+        },
+        recv,
+        capabilities,
+        availability,
+    })
+}
+
+pub(crate) async fn start_focused_input_v2(state: &AppState) -> Result<InputAvailability, String> {
+    let context = state
+        .v2_input_context
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "No control v2 input context is active".to_string())?;
+    let snapshot = state
+        .session_snapshot
+        .lock()
+        .await
+        .as_ref()
+        .filter(|(generation, _)| *generation == context.native_generation)
+        .map(|(_, snapshot)| snapshot.clone())
+        .ok_or_else(|| "No matching control v2 session snapshot is active".to_string())?;
+    let focus_generation = snapshot
+        .self_focus_generation()
+        .ok_or_else(|| "This Portal does not hold slot-0 input focus".to_string())?;
+    if state.input_send.lock().await.is_some() {
+        return Ok(v2_input_eligibility(context.grants));
+    }
+    let InputSession {
+        connection,
+        send,
+        recv,
+        capabilities,
+        availability,
+    } = open_input_session_v2(
+        &context.endpoint,
+        &context.address,
+        context.nonce,
+        context.media_session_id,
+        focus_generation,
+        context.native_generation,
+        Arc::clone(&state.session_snapshot),
+        context.grants,
+    )
+    .await?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent>(CLIENT_INPUT_QUEUE_CAPACITY);
+    *state.input_send.lock().await = Some(tx);
+    *state.input_connection.lock().await = Some((context.native_generation, connection));
+    if availability.pointer_position_feedback || availability.input_ack {
+        tokio::spawn(run_input_feedback_v2(
+            recv,
+            Arc::clone(&context.network_diagnostics),
+            availability.pointer_position_feedback,
+            availability.input_ack,
+            context.pointer_channel,
+            context.media_session_id,
+            focus_generation,
+        ));
+    } else {
+        drop(recv);
+    }
+    tokio::spawn(run_input_forwarder(
+        send,
+        rx,
+        capabilities,
+        Arc::clone(&context.network_diagnostics),
+    ));
+    Ok(availability)
 }
 
 pub(crate) async fn run_input_feedback(
@@ -398,7 +626,7 @@ pub(crate) async fn run_input_feedback(
 }
 
 pub(crate) async fn run_input_forwarder(
-    mut input_stream: iroh::endpoint::SendStream,
+    mut input_stream: InputWire,
     rx: tokio::sync::mpsc::Receiver<InputEvent>,
     input_capabilities: Vec<Capability>,
     input_send_diagnostics: Arc<StdMutex<NetworkSessionDiagnostics>>,
@@ -509,10 +737,75 @@ pub(crate) async fn run_input_forwarder(
             break;
         }
     }
-    let _ = input_stream.finish();
+    input_stream.finish();
+}
+
+pub(crate) async fn run_input_feedback_v2(
+    mut input_feedback: iroh::endpoint::RecvStream,
+    feedback_diagnostics: Arc<StdMutex<NetworkSessionDiagnostics>>,
+    mut pointer_feedback_enabled: bool,
+    input_ack_enabled: bool,
+    pointer_channel: Channel<PointerFeedbackPayload>,
+    session_id: u64,
+    focus_generation: u64,
+) {
+    let terminal_reason = loop {
+        let response = match read_input_ack_v2(&mut input_feedback).await {
+            Ok(Some(response)) => response,
+            Ok(None) => break PointerFeedbackTerminalReason::Eof,
+            Err(error) => {
+                eprintln!("[client] invalid input v2 feedback: {error}");
+                break PointerFeedbackTerminalReason::Malformed;
+            }
+        };
+        if response.session_id != session_id
+            || response.slot != ControllerSlot::ZERO
+            || response.focus_generation != focus_generation
+        {
+            break PointerFeedbackTerminalReason::Malformed;
+        }
+        if observe_input_ack_if_negotiated(
+            &feedback_diagnostics,
+            input_ack_enabled,
+            response.ack.sequence,
+            Instant::now(),
+        )
+        .is_err()
+        {
+            break PointerFeedbackTerminalReason::Malformed;
+        }
+        if pointer_feedback_enabled
+            && pointer_channel
+                .send(PointerFeedbackPayload::Position {
+                    sequence: response.ack.sequence,
+                    position: response.ack.pointer_position,
+                    pointer_visible: response.ack.pointer_visible,
+                })
+                .is_err()
+        {
+            pointer_feedback_enabled = false;
+            if !input_ack_enabled {
+                return;
+            }
+        }
+    };
+    let _ = pointer_channel.send(PointerFeedbackPayload::Terminal {
+        reason: terminal_reason,
+    });
 }
 
 pub(crate) async fn send_input(state: &AppState, event: InputEvent) -> Result<bool, String> {
+    if state.session_control.lock().await.is_some() {
+        let focused = state
+            .session_snapshot
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|(_, snapshot)| snapshot.self_focus_generation().is_some());
+        if !focused {
+            return Ok(false);
+        }
+    }
     let tx = state
         .input_send
         .lock()

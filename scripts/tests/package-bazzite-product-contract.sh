@@ -65,12 +65,12 @@ git -C "$fixture_repo" config user.name 'Sigil Release Test'
 git -C "$fixture_repo" config user.email 'release-test@invalid.example'
 git -C "$fixture_repo" add .
 git -C "$fixture_repo" commit -qm 'fixture release'
-git -C "$fixture_repo" tag v0.1.0
+git -C "$fixture_repo" tag v0.1.1
 source_commit="$(git -C "$fixture_repo" rev-parse HEAD)"
 
-archive="$temp_root/output/sigil-v0.1.0-linux-glibc2.17-x86_64.tar.gz"
+archive="$temp_root/output/sigil-v0.1.1-linux-glibc2.17-x86_64.tar.gz"
 PATH="$temp_root/bin:$PATH" "$fixture_repo/scripts/package-bazzite-release.sh" \
-  --release-tag v0.1.0 --output "$archive" >"$temp_root/product.log"
+  --release-tag v0.1.1 --output "$archive" >"$temp_root/product.log"
 grep -Fq 'publisher_signature=pending-offline' "$temp_root/product.log"
 packaged_input_rules="$temp_root/output/70-sigil-remote-input.rules"
 tar -xOzf "$archive" payload/release/assets/70-sigil-remote-input.rules \
@@ -81,7 +81,7 @@ cmp -s "$repo_dir/scripts/70-sigil-remote-input.rules" "$packaged_input_rules" \
     exit 1
   }
 "$repo_dir/scripts/verify-sigil-release.sh" \
-  --tag v0.1.0 --archive "$archive" --source-commit "$source_commit" --candidate \
+  --tag v0.1.1 --archive "$archive" --source-commit "$source_commit" --candidate \
   | grep -Fq 'sigil_release_verification=ok'
 
 # Exercise the offline boundary with a recording Minisign fixture. The archive
@@ -105,7 +105,7 @@ chmod 0600 "$secret_key"
 printf '%s\n%s\n' 'untrusted comment: fixture public key' \
   'RWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' >"$public_key"
 PATH="$temp_root/bin:$PATH" "$repo_dir/scripts/sign-bazzite-release.sh" \
-  --tag v0.1.0 \
+  --tag v0.1.1 \
   --archive "$archive" \
   --source-commit "$source_commit" \
   --minisign-key "$secret_key" \
@@ -135,11 +135,11 @@ assert_rejected() {
 }
 
 printf 'dirty\n' >"$fixture_repo/dirty-file"
-assert_rejected dirty-source 'worktree is dirty' v0.1.0
+assert_rejected dirty-source 'worktree is dirty' v0.1.1
 git -C "$fixture_repo" add dirty-file
 git -C "$fixture_repo" commit -qm 'new untagged source'
-assert_rejected tag-head-mismatch 'must resolve exactly to clean HEAD' v0.1.0
-git -C "$fixture_repo" tag v0.1.1
-assert_rejected tag-version-mismatch 'does not match Sigil version v0.1.0' v0.1.1
+assert_rejected tag-head-mismatch 'must resolve exactly to clean HEAD' v0.1.1
+git -C "$fixture_repo" tag v0.1.2
+assert_rejected tag-version-mismatch 'does not match Sigil version v0.1.1' v0.1.2
 
 printf 'package_bazzite_product_contract_tests=ok\n'

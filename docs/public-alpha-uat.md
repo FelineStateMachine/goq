@@ -57,15 +57,16 @@ Before creating the bundle the harness performs all of these fail-closed checks:
 - `gh attestation verify` validates all three Portal files against the exact
   `FelineStateMachine/goq/.github/workflows/portal-release.yml` signer workflow,
   `refs/tags/vVERSION`, tagged source commit, and GitHub-hosted runner boundary.
-- `scripts/verify-macos-portal-signature.sh` validates the DMG, Developer ID
-  signature, hardened runtime, notarization ticket, staple, Gatekeeper result,
-  bundle identity/version, arm64-only executable, containment boundary, and the
-  exact Apple TeamIdentifier pinned in `release/portal-apple-team-id.txt`.
+- `scripts/verify-macos-portal-signature.sh --signing adhoc` validates the DMG,
+  the mandatory arm64 ad-hoc signature, bundle identity/version, arm64-only
+  executable, and containment boundary. It also proves the negative: no
+  certificate authority chain, no Apple TeamIdentifier, and no notarization
+  ticket. Portal is not notarized, so there is no Gatekeeper result to record.
 
 If the reviewed Sigil key is still the `unconfigured` sentinel, Minisign or
-macOS verification tools are unavailable, the Apple TeamIdentifier pin is
-invalid, the GitHub API or attestations cannot be verified, the macOS verifier
-is absent, or any verification cannot run, initialization fails. There is no
+macOS verification tools are unavailable, the GitHub API or attestations cannot
+be verified, the macOS verifier is absent, or any verification cannot run,
+initialization fails. There is no
 candidate, offline, or test bypass in the UAT command.
 
 The bundle format is intentionally append-only at the command boundary. To

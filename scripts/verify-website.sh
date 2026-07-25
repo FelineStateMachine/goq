@@ -63,6 +63,14 @@ grep -Fq 'class="portal-download disabled"' "$site_dir/index.html"
 grep -Fq 'id="portal-download" aria-disabled="true"' "$site_dir/index.html"
 grep -Fq 'window.fetch("./portal-release.json"' "$site_dir/dither.js"
 grep -Fq 'PORTAL_BUILDS["macos-arm"] = portalBuildFromManifest(manifest)' "$site_dir/dither.js"
+# Portal is not notarized. The site must say so plainly and must not silently
+# start accepting a manifest that claims Apple verification it does not have.
+grep -Fq 'adhoc-signed+github-attested+sha256' "$site_dir/dither.js"
+grep -Fq 'portal is not notarized by apple' "$site_dir/index.html"
+if grep -Fq 'developer-id+hardened-runtime+notarized+stapled+gatekeeper' "$site_dir/dither.js"; then
+  echo 'website must not claim Developer ID notarization' >&2
+  exit 1
+fi
 grep -Fq "connect-src 'self'" "$site_dir/_headers"
 for issue_number in 7 8 9 10; do
   grep -Fq "github.com/FelineStateMachine/goq/issues/$issue_number" "$site_dir/index.html"

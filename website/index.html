@@ -11,8 +11,9 @@
 <body>
   <a class="skip" href="#main">Skip to content</a>
 
-  <!-- Portal is downloaded as a signed desktop app. Sigil is installed on a
-       dedicated Bazzite machine through the fail-closed bootstrap command. -->
+  <!-- Portal is downloaded as a compiled desktop app, ad-hoc signed rather than
+       Apple-notarized. Sigil is installed on a dedicated Bazzite machine
+       through the fail-closed bootstrap command. -->
   <!-- ─── First screen: full-viewport dither with a floating panel ─── -->
   <div class="screen">
     <header class="topbar">
@@ -80,6 +81,7 @@
             </div>
             <a class="portal-download disabled" id="portal-download" aria-disabled="true">no macos arm64 build yet</a>
             <p class="release-note"><span id="portal-release-status">portal for macos/arm64 is not released yet · macos arm64 comes first</span> · <a class="release-history" href="https://github.com/FelineStateMachine/goq/releases" rel="noopener">release history</a></p>
+            <p class="release-note">portal is not notarized by apple · macos blocks the first launch, then allow it under system settings › privacy &amp; security · verify the published sha-256 and the github build attestation before you open it</p>
           </div>
           <div class="release-action" data-release-target="sigil" hidden>
             <div class="install" data-copy="curl -fsSL https://goq.sh/install-sigil | bash">
@@ -131,13 +133,8 @@
     <section class="roadmap" id="roadmap">
       <div class="section-rule" aria-hidden="true"></div>
       <h2 class="section-title"><span aria-hidden="true">##</span> hardening next</h2>
-      <p class="roadmap-intro">The first target stays deliberately narrow: hardware H.264 at 1280×800/60. These are the promoted steps from a proven stream to one that adapts without accumulating latency.</p>
+      <p class="roadmap-intro">The first target stays deliberately narrow: hardware H.264 at 1280×800/60. <a href="https://github.com/FelineStateMachine/goq/issues/7" rel="noopener">Bounded Iroh/MoQ media objects</a> have landed: video now rides prioritized, cancellable groups with explicit GOP boundaries and keyframe recovery, and the legacy media tiers and JPEG fallback are gone. These are the promoted steps still ahead.</p>
       <ol class="roadmap-grid">
-        <li class="roadmap-item reveal">
-          <span class="roadmap-status">promoted · transport</span>
-          <h3><a href="https://github.com/FelineStateMachine/goq/issues/7" rel="noopener">Iroh/MoQ media objects</a></h3>
-          <p>Prioritized, cancellable video objects with explicit GOP boundaries and keyframe recovery. Input remains independent.</p>
-        </li>
         <li class="roadmap-item reveal">
           <span class="roadmap-status">promoted · control</span>
           <h3><a href="https://github.com/FelineStateMachine/goq/issues/8" rel="noopener">Adaptive bitrate</a></h3>
@@ -152,6 +149,11 @@
           <span class="roadmap-status">promoted · codec</span>
           <h3><a href="https://github.com/FelineStateMachine/goq/issues/10" rel="noopener">Auto Codec</a></h3>
           <p>Select from end-to-end hardware support and measured latency. H.264 remains the safe baseline; compression ratio alone never wins.</p>
+        </li>
+        <li class="roadmap-item reveal">
+          <span class="roadmap-status">planned · sessions</span>
+          <h3><a href="https://github.com/FelineStateMachine/goq/issues/74" rel="noopener">One to many viewers</a></h3>
+          <p>Today a session admits exactly one client, enforced. The planned pivot adds N viewers with a single transferable input focus, per-peer revocation, and media fan-out over MoQ groups. Not built yet.</p>
         </li>
       </ol>
     </section>
@@ -214,12 +216,12 @@
         <li class="start-step reveal">
           <span class="start-num" aria-hidden="true">01</span>
           <h3>provision sigil</h3>
-          <p>Run the Sigil setup command on a dedicated AMD Bazzite machine. It accepts only signed runtime packages; Gamescope becomes the headless display.</p>
+          <p>Run the Sigil setup command on a dedicated AMD Bazzite machine. It accepts only signed runtime packages; Gamescope becomes the headless display. A controller-first Decky Loader plugin manages the appliance from the couch, no SSH or keyboard needed.</p>
         </li>
         <li class="start-step reveal">
           <span class="start-num" aria-hidden="true">02</span>
           <h3>open portal</h3>
-          <p>Download a signed Portal build on your client machine. Tap your FIDO2 key; the D-pad PIN pad keeps onboarding couch-friendly.</p>
+          <p>Download the Portal build for your client machine and verify its published SHA-256. Tap your FIDO2 key; the D-pad PIN pad keeps onboarding couch-friendly.</p>
         </li>
         <li class="start-step reveal">
           <span class="start-num" aria-hidden="true">03</span>
@@ -227,7 +229,7 @@
           <p>Tap the same key anywhere else: SteamOS appears, your controller just works. Hold Back+Start for a second to escape the session.</p>
         </li>
       </ol>
-      <p class="start-note">You'll need a FIDO2 key with hmac-secret support (YubiKey, Google Titan, …) and an AMD Bazzite machine for Sigil. The first signed Portal release targets macOS; other client packages remain source builds until they receive an equally strict release path. <a class="footer-link" href="https://github.com/FelineStateMachine/goq" rel="noopener">Runbook and source →</a></p>
+      <p class="start-note">You'll need a FIDO2 key with hmac-secret support (YubiKey, Google Titan, …) and an AMD Bazzite machine for Sigil. The first Portal release targets macOS arm64. It is ad-hoc signed rather than Apple-notarized, so macOS blocks the first launch until you allow it. Linux and Windows are built and attested every release but are not published; build from source until they pass their own acceptance gate. <a class="footer-link" href="https://github.com/FelineStateMachine/goq" rel="noopener">Runbook and source →</a></p>
     </section>
   </main>
 
@@ -243,6 +245,7 @@
         <li>h.264 + opus</li>
         <li>webcodecs</li>
         <li>uinput</li>
+        <li>decky loader</li>
         <li>ctap-hid-fido2</li>
         <li>no npm · no build step</li>
       </ul>

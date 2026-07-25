@@ -1914,6 +1914,32 @@ pub(super) async fn serve_media_feedback(
     };
     let encoder_actuation_available =
         adaptive_bitrate_actuation_enabled(config) && lease.encoder_control.is_some();
+    // Shadow mode computes every decision and applies none. Say why, or a host
+    // silently never adapts and nothing in the logs explains it.
+    if !encoder_actuation_available {
+        let reason = if !adaptive_bitrate_actuation_enabled(config) {
+            match config.gamescope_pipewire.as_ref() {
+                Some(gamescope)
+                    if gamescope.encoder_backend != GamescopeEncoderBackend::InProcessGstreamer =>
+                {
+                    "gamescope_pipewire.encoder_backend is not in-process-gstreamer"
+                }
+                Some(gamescope) if gamescope.rate_control != VaapiRateControl::Cbr => {
+                    "gamescope_pipewire.rate_control is not cbr"
+                }
+                Some(_) => "adaptive bitrate actuation is unavailable for this configuration",
+                None => "the configured source is not gamescope-pipewire",
+            }
+        } else {
+            "this session has no encoder control handle"
+        };
+        warn!(
+            %remote,
+            session_id = lease.session_id,
+            reason,
+            "adaptive bitrate and resolution run in shadow: decisions are computed but never applied"
+        );
+    }
 
     write_host_hello(
         &mut send,

@@ -115,15 +115,17 @@ Sigil host.
   `release/sigil-target-contract.txt`. That name describes the binary ABI, not
   validated host support; the public bootstrap remains Bazzite-only until
   another environment passes its own packaging and hardware gates.
-- Portal is a compiled desktop download, never a shell install. The first
-  public target is macOS arm64 and requires Developer ID signing, hardened
-  runtime, notarization, stapling, and strict Gatekeeper verification. Its
-  TeamIdentifier must equal `release/portal-apple-team-id.txt`, and every
-  Portal asset must carry protected exact-tag GitHub build provenance. Do not
-  advertise an unavailable platform/architecture as a download.
-- The Minisign secret, Apple certificate, notarization credentials, host
-  identity, and FIDO-derived secrets must never enter the repository, release
-  archive, logs, command line, or general website deployment environment.
+- Portal is a compiled desktop download, never a shell install. The only
+  published target is macOS arm64. It is ad-hoc signed and deliberately NOT
+  Developer ID signed or notarized, so trust comes from exact-tag GitHub build
+  provenance plus the published SHA-256, and every Portal asset must carry that
+  provenance. The packaging gate refuses to build in ad-hoc mode if any
+  `APPLE_*` credential is present, and no published surface may claim
+  notarization or Gatekeeper verification. Do not advertise an unavailable
+  platform/architecture as a download.
+- The Minisign secret, host identity, and FIDO-derived secrets must never enter
+  the repository, release archive, logs, command line, or general website
+  deployment environment.
 
 ## Latency and correctness invariants
 
@@ -152,8 +154,9 @@ Sigil host.
 - Issue #4: configure the offline Minisign trust root, publish the signed Sigil
   asset set, and prove clean install plus upgrade/rollback from the public
   command.
-- Issue #5: configure the committed Apple TeamIdentifier pin, then publish the
-  signed/notarized/attested macOS arm64 Portal DMG, digest, and manifest.
+- Issue #5: publish the ad-hoc signed, attested macOS arm64 Portal DMG, digest,
+  and manifest, with the un-notarized first-launch consequence stated plainly on
+  every user-facing surface.
 - Issue #6: prove physically headless cold boot, physical client controller
   gameplay, mouse buttons consumed by Gamescope/an actual game, sustained A/V
   and resource percentiles without latency growth, difficult-NAT relay

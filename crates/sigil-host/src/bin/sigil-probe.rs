@@ -159,6 +159,18 @@ struct Args {
         ]
     )]
     resolution_stall_smoke: Option<PathBuf>,
+    /// After the stall is released, submit this many clean, sequence-advancing
+    /// feedback windows and require the controller to climb back out of the
+    /// pressure trough. The host needs CLEAN_WINDOWS plus COOLDOWN_WINDOWS of
+    /// clean evidence, so fewer than about twelve cannot observe an increase.
+    /// 0 keeps the historical behaviour of ending at the resume barrier.
+    #[arg(
+        long,
+        value_name = "WINDOWS",
+        default_value_t = 0,
+        requires = "resolution_stall_smoke"
+    )]
+    resolution_recovery_windows: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1452,6 +1464,17 @@ struct ResolutionStallEvidence {
     resume_input_ack_micros: u64,
     resume_media_micros: u64,
     resume_sequence_advance: u64,
+    recovery: Option<ResolutionRecoveryEvidence>,
+}
+
+#[derive(Debug)]
+struct ResolutionRecoveryEvidence {
+    windows: u64,
+    trough_kbps: u32,
+    final_kbps: u32,
+    increase_observed: bool,
+    final_dimensions: (u16, u16),
+    restored_native: bool,
 }
 
 struct ResolutionStallGate {
@@ -1832,6 +1855,7 @@ async fn run_resolution_stall_smoke(
     expected_ack: &mut u64,
     expected_native: Option<(u16, u16)>,
     timeout: Duration,
+    recovery_windows: u64,
 ) -> Result<ResolutionStallEvidence> {
     let gate = ResolutionStallGate::new(gate_directory)?;
     let initial = tokio::time::timeout(timeout, next_resolution_stall_moq_frame(receiver))
@@ -1868,6 +1892,7 @@ async fn run_resolution_stall_smoke(
     );
     let pressure_decision =
         exchange_feedback_report(feedback_send, feedback_recv, &pressure).await?;
+    let mut trough_kbps = pressure_decision.target_kbps;
     ensure!(
         pressure_decision
             .reasons
@@ -1935,6 +1960,7 @@ async fn run_resolution_stall_smoke(
         let sent_at = Instant::now();
         fresh_started.get_or_insert(sent_at);
         let decision = exchange_feedback_report(feedback_send, feedback_recv, &report).await?;
+        trough_kbps = trough_kbps.min(decision.target_kbps);
         ensure!(
             decision.state != AdaptiveBitrateStateV1::Increase,
             "no-progress feedback unexpectedly increased adaptive bitrate"
@@ -2002,6 +2028,72 @@ async fn run_resolution_stall_smoke(
     let resume_media_micros =
         u64::try_from(media_resumed_at.elapsed().as_micros()).unwrap_or(u64::MAX);
 
+    // Proving the descent is only half of the contract. Feed clean, genuinely
+    // advancing evidence for long enough to clear the clean-window and
+    // cooldown counters, then require the controller to climb back out.
+    let recovery = if recovery_windows > 0 {
+        let mut latest_sequence = resumed.sequence;
+        let mut latest_dimensions = (resumed.width, resumed.height);
+        let mut final_kbps = trough_kbps;
+        let mut increase_observed = false;
+        let mut last_feedback_at = Instant::now();
+        for _ in 0..recovery_windows {
+            // Drain as fast as frames arrive until the next feedback deadline.
+            // Consuming a single frame per window would starve the receiver and
+            // manufacture exactly the cancellation backpressure this loop
+            // exists to prove has cleared, so the controller would correctly
+            // refuse to climb and the test would be measuring its own harness.
+            let deadline = last_feedback_at + RESOLUTION_STALL_FEEDBACK_INTERVAL;
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match tokio::time::timeout(
+                    deadline - now,
+                    next_resolution_stall_moq_frame(receiver),
+                )
+                .await
+                {
+                    Ok(Ok(frame)) => {
+                        latest_sequence = frame.sequence;
+                        latest_dimensions = (frame.width, frame.height);
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => break,
+                }
+            }
+            report_id += 1;
+            let report =
+                complete_feedback_report(report_id, MediaFeedbackFlags::NONE, latest_sequence);
+            let sent_at = Instant::now();
+            let decision = exchange_feedback_report(feedback_send, feedback_recv, &report).await?;
+            last_feedback_at = sent_at;
+            final_kbps = decision.target_kbps;
+            if decision.state == AdaptiveBitrateStateV1::Increase {
+                increase_observed = true;
+            }
+        }
+        ensure!(
+            increase_observed,
+            "adaptive bitrate never increased across {recovery_windows} clean recovery windows              (trough {trough_kbps} kbps, final {final_kbps} kbps)"
+        );
+        ensure!(
+            final_kbps > trough_kbps,
+            "adaptive bitrate recovered no ground: trough {trough_kbps} kbps, final {final_kbps} kbps"
+        );
+        Some(ResolutionRecoveryEvidence {
+            windows: recovery_windows,
+            trough_kbps,
+            final_kbps,
+            increase_observed,
+            final_dimensions: latest_dimensions,
+            restored_native: latest_dimensions == native_dimensions,
+        })
+    } else {
+        None
+    };
+
     Ok(ResolutionStallEvidence {
         native_dimensions,
         reduced_dimensions,
@@ -2012,6 +2104,7 @@ async fn run_resolution_stall_smoke(
         resume_input_ack_micros,
         resume_media_micros,
         resume_sequence_advance,
+        recovery,
     })
 }
 
@@ -2326,6 +2419,7 @@ async fn main() -> Result<()> {
             &mut expected_ack,
             args.expect_size,
             Duration::from_secs(args.timeout_seconds),
+            args.resolution_recovery_windows,
         )
         .await?;
 
@@ -2369,6 +2463,33 @@ async fn main() -> Result<()> {
             "resolution_stall_input_ack_micros={}",
             evidence.stall_input_ack_micros
         );
+        match evidence.recovery.as_ref() {
+            Some(recovery) => {
+                println!("resolution_recovery_windows={}", recovery.windows);
+                println!("resolution_recovery_trough_kbps={}", recovery.trough_kbps);
+                println!("resolution_recovery_final_kbps={}", recovery.final_kbps);
+                println!(
+                    "resolution_recovery_increase_observed={}",
+                    recovery.increase_observed
+                );
+                println!(
+                    "resolution_recovery_final_dimensions={}x{}",
+                    recovery.final_dimensions.0, recovery.final_dimensions.1
+                );
+                println!(
+                    "resolution_recovery_restored_native={}",
+                    recovery.restored_native
+                );
+            }
+            None => {
+                println!("resolution_recovery_windows=not-requested");
+                println!("resolution_recovery_trough_kbps=not-requested");
+                println!("resolution_recovery_final_kbps=not-requested");
+                println!("resolution_recovery_increase_observed=not-requested");
+                println!("resolution_recovery_final_dimensions=not-requested");
+                println!("resolution_recovery_restored_native=not-requested");
+            }
+        }
         println!(
             "resolution_resume_input_ack_micros={}",
             evidence.resume_input_ack_micros

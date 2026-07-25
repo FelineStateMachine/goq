@@ -2,7 +2,7 @@
   "builds": {
     "macos-arm64": {
       "available": false,
-      "reason": "No signed and notarized public Portal release has been promoted yet."
+      "reason": "No public Portal release has been promoted yet. Portal is ad-hoc signed and GitHub-attested, never Apple-notarized."
     }
   },
   "format": 1,

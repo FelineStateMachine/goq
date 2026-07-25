@@ -27,6 +27,25 @@ test('accepts revision gaps and ignores stale or native-generation-mismatched sn
   assert.equal(runtime.applyNativeSnapshot({ native_generation: 3, snapshot: snapshot(7) }), false);
 });
 
+test('mirrors complete multi-viewer roster replacements without changing local identity', () => {
+  const runtime = createSessionState();
+  runtime.acceptConnection({
+    nativeGeneration: 3,
+    controlProtocol: 'control-v2',
+    initialSnapshot: snapshot(1),
+  });
+  const joined = snapshot(5, {
+    state: 'held', slot: 0, holder: 'viewer-2', session_id: 8, focus_generation: 2,
+  });
+  joined.viewers.push({
+    presence_id: 'viewer-2', session_id: 8, input_capable: true, you: false,
+  });
+  assert.equal(runtime.applyNativeSnapshot({ native_generation: 3, snapshot: joined }), true);
+  assert.equal(runtime.snapshot().snapshot.viewers.length, 2);
+  assert.equal(runtime.focused, false);
+  assert.equal(runtime.eligible, true);
+});
+
 test('publishes focus teardown before exposing self-focus loss', () => {
   const order = [];
   const runtime = createSessionState({

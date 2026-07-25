@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+pub const DEFAULT_MAX_VIEWERS: u8 = 3;
+pub const MAX_VIEWERS: u8 = 8;
 const REVISION_PREFIX: &str = "sha256:";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -118,6 +120,10 @@ fn default_source() -> VideoSource {
 
 fn default_input_mode() -> InputMode {
     InputMode::Disabled
+}
+
+const fn default_max_viewers() -> u8 {
+    DEFAULT_MAX_VIEWERS
 }
 
 fn default_ffmpeg() -> PathBuf {
@@ -363,6 +369,10 @@ fn validate_pipewire_property(name: &str, value: &str) -> Result<()> {
 pub struct HostConfig {
     pub identity_path: PathBuf,
     pub state_path: PathBuf,
+    /// Concurrent native-MoQ v2 viewers. Durable enrollment has a separate
+    /// fixed bound and legacy transports remain exclusive.
+    #[serde(default = "default_max_viewers")]
+    pub max_viewers: u8,
     #[serde(default = "default_source")]
     pub source: VideoSource,
     /// Optional encoded-size override. Gamescope uses its advertised native
@@ -467,6 +477,10 @@ impl HostConfig {
         ensure!(
             !self.state_path.as_os_str().is_empty(),
             "state_path is required"
+        );
+        ensure!(
+            (1..=MAX_VIEWERS).contains(&self.max_viewers),
+            "max_viewers must be between 1 and {MAX_VIEWERS}"
         );
         match (self.width, self.height) {
             (Some(width), Some(height)) => validate_video_dimensions(width, height)?,
@@ -695,8 +709,31 @@ state_path = "/tmp/state"
         )
         .unwrap();
         config.validate().unwrap();
+        assert_eq!(config.max_viewers, DEFAULT_MAX_VIEWERS);
         assert_eq!(config.configured_dimensions(), None);
         assert_eq!(config.test_pattern_dimensions().unwrap(), (1_280, 800));
+    }
+
+    #[test]
+    fn max_viewers_defaults_to_three_and_rejects_values_outside_one_through_eight() {
+        let mut config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.max_viewers, 3);
+        config.validate().unwrap();
+
+        config.max_viewers = 1;
+        config.validate().unwrap();
+        config.max_viewers = 8;
+        config.validate().unwrap();
+        config.max_viewers = 0;
+        assert!(config.validate().is_err());
+        config.max_viewers = 9;
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -11,6 +11,7 @@ import { createInputRuntime } from './input-runtime.mjs';
 import { createControlRuntime } from './control-runtime.mjs';
 import { createSessionState } from './session-state.mjs';
 import { createFocusRuntime } from './focus-runtime.mjs';
+import { renderRoster, rosterPresentation } from './roster-ui.mjs';
 import { formatVideoDiscardTelemetry } from './frame-stats.mjs';
 import { networkDiagnosticsPresentation } from './network-diagnostics.mjs';
 import {
@@ -650,7 +651,7 @@ controlRuntime = createControlRuntime({
 });
 sessionStateRuntime = createSessionState({
   onFocusLoss: () => controlRuntime.exit({ releaseHostFocus: false, resetEscape: true }),
-  onChange: () => updateControlUI(),
+  onChange: () => updateSessionUI(),
 });
 focusRuntime = createFocusRuntime({
   invokeCommand: invoke,
@@ -887,14 +888,19 @@ function updateControlUI() {
     && capabilities.control
     && (connectionState.controlProtocol !== 'control-v2' || sessionStateRuntime.eligible);
   const controlling = controlRuntime.setInactiveIfUnavailable(available);
-  const controlAction = connectionState.controlProtocol === 'control-v2' && !sessionStateRuntime.focused
-    ? 'request control'
-    : controlling ? 'controlling' : 'activate control';
+  const v2 = connectionState.controlProtocol === 'control-v2';
+  const occupiedByAnother = v2
+    && sessionStateRuntime.snapshot().snapshot?.focus?.state === 'held'
+    && !sessionStateRuntime.focused;
+  const controlAction = v2 && !sessionStateRuntime.focused
+    ? occupiedByAnother ? 'spectating · request control' : 'request control'
+    : controlling ? 'release control' : 'activate control';
   el.textContent = available
     ? `${controlAction} · ${describeInputCapabilities()}${controlling && capabilities.relativePointer ? ' · Ctrl+Alt+Esc to exit' : controlling && capabilities.gamepad ? ' · hold Back+Start to exit' : ''}`
     : 'view only · input unavailable';
   el.classList.toggle('active', controlling);
   el.classList.toggle('disabled', !available);
+  el.classList.toggle('hidden', v2 && !sessionStateRuntime.eligible);
   el.setAttribute('aria-disabled', available ? 'false' : 'true');
   document.body.classList.toggle(
     'native-pointer-control',
@@ -909,6 +915,29 @@ function updateControlUI() {
   if (streamControl) {
     streamControl.textContent = available ? describeInputCapabilities() : 'view only · unavailable';
   }
+}
+
+function updateSessionUI() {
+  updateControlUI();
+  const viewerStatus = document.getElementById('viewer-status');
+  const rosterSection = document.getElementById('roster-section');
+  const rosterSummary = document.getElementById('roster-summary');
+  const rosterList = document.getElementById('roster-list');
+  const session = sessionStateRuntime.snapshot();
+  const visible = session.mode === 'control-v2' && session.snapshot !== null;
+  viewerStatus.classList.toggle('hidden', !visible);
+  rosterSection.classList.toggle('hidden', !visible);
+  if (!visible) {
+    viewerStatus.textContent = 'viewers: unavailable';
+    rosterSummary.textContent = 'Roster unavailable';
+    rosterList.replaceChildren();
+    return;
+  }
+  const presentation = rosterPresentation(session.snapshot);
+  viewerStatus.textContent = presentation.shell;
+  viewerStatus.setAttribute('aria-label', presentation.shell);
+  rosterSummary.textContent = `${presentation.count} connected · ${presentation.focus}`;
+  renderRoster(rosterList, session.snapshot);
 }
 
 function scaleCoords(clientX, clientY) {

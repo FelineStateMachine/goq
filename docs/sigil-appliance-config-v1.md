@@ -57,10 +57,28 @@ fields survive an update.
 
 Enrollment capacity is authorization state, not a host configuration field.
 Authorization v2 durably supports at most 32 enrolled viewers, while this
-implementation phase intentionally keeps the concurrent v2 runtime cap at one
-until shared media-generation ownership is available. A later configuration
-revision adds the independently bounded `max_viewers` setting; it does not
-change the durable enrollment ceiling.
+implementation independently bounds concurrent native-MoQ v2 viewers with the
+strict `max_viewers` host setting. The setting defaults to `3`, accepts only
+`1` through `8`, and does not change the durable enrollment ceiling. It is a
+direct TOML setting rather than part of the appliance config v1 editable
+projection, so changing it follows the same reviewed host-configuration and
+service-restart process as other non-managed fields.
+
+Multi-viewer operation is available only through `sigil/control/2` and the
+authenticated native-MoQ generation. Every admitted viewer gets an independent
+control connection, consume-once media attachment, feedback claim, and bounded
+delivery state while sharing one video source, video encoder, optional Opus
+source/encoder, signed broadcast, and keyframe coordinator. `control/1` and
+grouped-v3 remain strictly one-client compatibility modes. An active legacy
+generation rejects v2 admission, and any live v2 generation rejects legacy
+admission, including while old sidecars are draining.
+
+Concurrent capacity and durable enrollment are intentionally separate:
+
+| Bound | Default | Hard limit | Scope |
+|---|---:|---:|---|
+| `max_viewers` | 3 | 8 | Simultaneously connected native-MoQ v2 viewers |
+| `MAX_ENROLLED_VIEWERS` | fixed | 32 | Durable authorization-v2 viewer records |
 
 Requests are strict JSON and contain an optimistic-concurrency revision:
 

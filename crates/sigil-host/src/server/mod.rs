@@ -194,6 +194,7 @@ fn moq_test_config() -> HostConfig {
     HostConfig {
         identity_path: "identity".into(),
         state_path: "state".into(),
+        max_viewers: crate::config::DEFAULT_MAX_VIEWERS,
         source: VideoSource::TestPattern,
         width: Some(1280),
         height: Some(800),

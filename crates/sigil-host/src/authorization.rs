@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, ensure};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sigil_protocol::{
     INVITATION_CLOCK_SKEW_SECS, InvitationClaims, InvitationGrants, MAX_INVITATION_TTL_SECS,
     SignedInvitation,
@@ -1125,7 +1126,7 @@ impl AuthorizationPolicy {
                     "unrestricted development modes do not accept invitations"
                 );
                 Ok(AuthorizedViewer {
-                    handle: "viewer-0000000000000000".to_owned(),
+                    handle: development_viewer_handle(remote),
                     grants: InvitationGrants::ALL,
                     authorization_revision: 1,
                     committed_revision: 1,
@@ -1143,6 +1144,16 @@ impl AuthorizationPolicy {
         self.authorize_or_redeem_viewer(remote, invitation_token, now)
             .map(|viewer| viewer.grants)
     }
+}
+
+fn development_viewer_handle(remote: EndpointId) -> String {
+    let digest =
+        Sha256::digest([b"goq-development-viewer-v1\0".as_slice(), remote.as_bytes()].concat());
+    let suffix = digest[..VIEWER_HANDLE_RANDOM_BYTES]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("viewer-{suffix}")
 }
 
 pub fn unix_timestamp_now() -> Result<u64> {

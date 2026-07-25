@@ -441,7 +441,7 @@ pub(crate) async fn connect_client(
             &app,
             &state.session_snapshot,
             media_generation,
-            initial_snapshot,
+            initial_snapshot.clone(),
         )
         .await?;
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(SESSION_CONTROL_COMMAND_CAPACITY);
@@ -449,7 +449,7 @@ pub(crate) async fn connect_client(
         tokio::spawn(run_session_control(
             app.clone(),
             media_generation,
-            media_session_id,
+            initial_snapshot.media.generation_id,
             media_control_stream,
             frame_recv,
             control_rx,

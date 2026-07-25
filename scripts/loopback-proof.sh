@@ -26,6 +26,9 @@ expected_path_mode=direct
 control_v2=false
 viewers=1
 assert_shared_generation=false
+replace_viewer=0
+legacy_exclusive=false
+expect_second_rejected=false
 
 usage() {
   cat <<'EOF'
@@ -47,9 +50,12 @@ Options:
   --relay-only                  Remove direct probe transports and require the
                                 control, media, and input paths to stay relayed
   --control-v2                  Exercise explicit control/2 and input/2 focus
-  --viewers COUNT               Viewer count for control-v2 (Phase 1 requires 1)
+  --viewers COUNT               Concurrent viewers (control-v2 supports 1..3 here)
   --assert-shared-generation    Require host-scoped generation naming, one
                                 producer start, and final-viewer cleanup
+  --replace-viewer INDEX        Replace this 1-based control-v2 viewer identity
+  --legacy-exclusive            Exercise the unchanged exclusive legacy path
+  --expect-second-rejected      Require explicit legacy second-client rejection
   --help                        Show this help
 EOF
 }
@@ -128,6 +134,19 @@ while [[ $# -gt 0 ]]; do
       assert_shared_generation=true
       shift
       ;;
+    --replace-viewer)
+      [[ $# -ge 2 ]] || die "--replace-viewer requires a value"
+      replace_viewer="$2"
+      shift 2
+      ;;
+    --legacy-exclusive)
+      legacy_exclusive=true
+      shift
+      ;;
+    --expect-second-rejected)
+      expect_second_rejected=true
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -152,11 +171,23 @@ require_positive_integer "--reconnect-cycles" "$reconnect_cycles"
 require_positive_integer "--reconnect-frames" "$reconnect_frames"
 require_positive_integer "--probe-timeout-seconds" "$probe_timeout_seconds"
 require_positive_integer "--viewers" "$viewers"
-if [[ "$control_v2" == true && "$viewers" -ne 1 ]]; then
-  die "Phase 1 control-v2 proof supports exactly --viewers 1"
+if [[ "$control_v2" == true && ( "$viewers" -lt 1 || "$viewers" -gt 3 ) ]]; then
+  die "this bounded control-v2 proof supports --viewers 1 through 3"
+fi
+case "$replace_viewer" in
+  ''|*[!0-9]*) die "--replace-viewer must be a non-negative integer" ;;
+esac
+if [[ "$replace_viewer" -gt "$viewers" ]]; then
+  die "--replace-viewer must identify one of the configured viewers"
 fi
 if [[ "$control_v2" == true && "$media_v3" == true ]]; then
   die "--control-v2 conflicts with --media-v3"
+fi
+if [[ "$legacy_exclusive" == true && "$control_v2" == true ]]; then
+  die "--legacy-exclusive conflicts with --control-v2"
+fi
+if [[ "$legacy_exclusive" == true && "$viewers" -ne 2 ]]; then
+  die "--legacy-exclusive currently proves exactly --viewers 2"
 fi
 [[ "$primary_frames" -ge 4 ]] \
   || die "--primary-frames must be at least 4 for keyframe recovery"
@@ -200,6 +231,7 @@ primary_watchdog_pid=""
 bounded_pid=""
 bounded_watchdog_pid=""
 watchdog_pid=""
+viewer_pids=()
 
 stop_pid() {
   local pid="$1"
@@ -235,6 +267,10 @@ cleanup() {
   [[ -z "$bounded_watchdog_pid" ]] || wait "$bounded_watchdog_pid" 2>/dev/null || true
   stop_pid "$primary_pid"
   [[ -z "$primary_watchdog_pid" ]] || wait "$primary_watchdog_pid" 2>/dev/null || true
+  for viewer_pid in "${viewer_pids[@]-}"; do
+    [[ -n "$viewer_pid" ]] || continue
+    stop_pid "$viewer_pid"
+  done
   stop_pid "$host_pid"
   [[ -z "$host_watchdog_pid" ]] || wait "$host_watchdog_pid" 2>/dev/null || true
 
@@ -535,6 +571,111 @@ host_node_id="$(sed -n 's/^node_id=//p' "$host_log" | tail -n 1)"
 [[ "$host_node_id" == "$node_id" ]] || die "ready host node ID does not match its identity"
 
 if [[ "$control_v2" == true ]]; then
+  if [[ "$viewers" -gt 1 ]]; then
+    viewer_logs=()
+    viewer_identities=()
+    viewer_pids=()
+    replacement_log=""
+    viewer=1
+    while [[ "$viewer" -le "$viewers" ]]; do
+      viewer_identity="$tmp_root/viewer-${viewer}.key"
+      "$host_bin" identity init --output "$viewer_identity" \
+        >"$tmp_root/viewer-${viewer}-identity.log" 2>&1
+      viewer_identities+=("$viewer_identity")
+      viewer_log="$tmp_root/control-v2-viewer-${viewer}.log"
+      viewer_logs+=("$viewer_log")
+      if [[ "$viewer" -gt 1 ]]; then
+        "$probe_bin" --control-v2 --spectator \
+          --identity "$viewer_identity" --node-id "$node_id" --frames "$primary_frames" \
+          --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800 \
+          >"$viewer_log" 2>&1 &
+      else
+        "$probe_bin" --control-v2 --disconnect-with-focus \
+          --identity "$viewer_identity" --node-id "$node_id" --frames "$primary_frames" \
+          --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800 \
+          >"$viewer_log" 2>&1 &
+      fi
+      viewer_pids+=("$!")
+      if [[ "$viewer" -eq 1 ]]; then
+        wait_for_log_count "$host_log" 'input v2 client accepted' 1 "$host_pid" 'sigil' \
+          || die "slot-0 holder did not acquire focused input before spectators joined"
+      fi
+      viewer=$((viewer + 1))
+    done
+
+    wait_for_log_count "$host_log" 'MoQ control v2 client accepted' "$viewers" "$host_pid" 'sigil' \
+      || die "not all control-v2 viewers were admitted"
+    wait_for_log_count "$host_log" 'authorized MoQ media attachment accepted' "$viewers" "$host_pid" 'sigil' \
+      || die "not all control-v2 viewers attached to native MoQ"
+
+    if [[ "$replace_viewer" -gt 0 ]]; then
+      replacement_log="$tmp_root/control-v2-replacement-${replace_viewer}.log"
+      if ! run_bounded "$command_timeout_seconds" "$replacement_log" \
+        "$probe_bin" --control-v2 --spectator \
+        --identity "${viewer_identities[$((replace_viewer - 1))]}" \
+        --node-id "$node_id" --frames "$reconnect_frames" \
+        --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800; then
+        sed -n '1,240p' "$replacement_log" >&2 || true
+        die "same-peer replacement probe failed"
+      fi
+      grep -Fxq 'probe=ok' "$replacement_log" || die "replacement viewer did not progress"
+      grep -Fxq "roster_viewers=${viewers}" "$replacement_log" \
+        || die "replacement did not preserve bounded roster cardinality"
+    fi
+
+    viewer=1
+    for viewer_pid in "${viewer_pids[@]}"; do
+      if wait "$viewer_pid"; then viewer_status=0; else viewer_status=$?; fi
+      if [[ "$viewer" -eq "$replace_viewer" ]]; then
+        viewer=$((viewer + 1))
+        continue
+      fi
+      [[ "$viewer_status" -eq 0 ]] || {
+        sed -n '1,240p' "${viewer_logs[$((viewer - 1))]}" >&2 || true
+        die "control-v2 viewer $viewer failed"
+      }
+      grep -Fxq 'probe=ok' "${viewer_logs[$((viewer - 1))]}" \
+        || die "control-v2 viewer $viewer did not complete"
+      viewer=$((viewer + 1))
+    done
+    viewer_pids=()
+    grep -Fxq 'slot_0_input=ok' "${viewer_logs[0]}" || die "slot-0 holder input failed"
+    spectator=2
+    while [[ "$spectator" -le "$viewers" ]]; do
+      if [[ "$spectator" -eq "$replace_viewer" ]]; then
+        spectator=$((spectator + 1))
+        continue
+      fi
+      grep -Fxq 'spectator=ok' "${viewer_logs[$((spectator - 1))]}" \
+        || die "viewer $spectator did not remain a spectator"
+      spectator=$((spectator + 1))
+    done
+    roster_logs=("${viewer_logs[@]}")
+    if [[ -n "$replacement_log" ]]; then roster_logs+=("$replacement_log"); fi
+    grep -Fhq "roster_viewers=${viewers}" "${roster_logs[@]}" 2>/dev/null \
+      || die "no viewer observed the complete roster"
+    wait_for_log_count "$host_log" 'shared media generation stopped with all sources cleaned up' \
+      1 "$host_pid" 'sigil' || die "shared generation did not stop after the final viewer"
+    [[ "$(grep -Fc -- 'shared media generation started' "$host_log" || true)" -eq 1 ]] \
+      || die "multi-viewer control-v2 started more than one generation"
+    [[ "$(grep -Fc -- 'shared media generation stopped with all sources cleaned up' "$host_log" || true)" -eq 1 ]] \
+      || die "multi-viewer control-v2 stopped the generation more than once"
+
+    kill -TERM "$host_pid" 2>/dev/null || true
+    if wait "$host_pid"; then host_status=0; else host_status=$?; fi
+    host_pid=""
+    wait "$host_watchdog_pid" 2>/dev/null || true
+    host_watchdog_pid=""
+    [[ "$host_status" -eq 0 ]] || die "host exited with status $host_status"
+    printf 'loopback_proof=ok\n'
+    printf 'control_v2=ok\n'
+    printf 'viewers=%s\n' "$viewers"
+    printf 'same_peer_replacement=%s\n' "$([[ "$replace_viewer" -gt 0 ]] && printf ok || printf not-requested)"
+    printf 'shared_generation=ok\n'
+    printf 'slot_0_single_holder=ok\n'
+    printf 'spectator_progress=ok\n'
+    exit 0
+  fi
   v2_log="$tmp_root/control-v2.log"
   v1_log="$tmp_root/control-v1-compatibility.log"
   if ! run_bounded "$command_timeout_seconds" "$v2_log" \

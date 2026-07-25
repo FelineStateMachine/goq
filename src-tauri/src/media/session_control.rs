@@ -47,7 +47,7 @@ pub(crate) async fn install_initial_snapshot(
 pub(crate) async fn run_session_control(
     app: AppHandle,
     native_generation: u64,
-    session_id: u64,
+    media_generation_id: u64,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     mut commands: tokio::sync::mpsc::Receiver<ClientControlEnvelopeV2>,
@@ -65,7 +65,7 @@ pub(crate) async fn run_session_control(
             envelope = read_server_control_v2(&mut recv) => {
                 match envelope {
                     Ok(Some(ServerControlEnvelopeV2::Snapshot { snapshot })) => {
-                        if snapshot.media.generation_id != session_id {
+                        if snapshot.media.generation_id != media_generation_id {
                             eprintln!("[client] control v2 snapshot changed media generation");
                             break;
                         }

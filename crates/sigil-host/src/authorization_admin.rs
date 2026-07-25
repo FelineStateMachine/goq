@@ -416,6 +416,7 @@ mod tests {
         InputBackend::initialize(&HostConfig {
             identity_path: state_path.join("unused-identity"),
             state_path: state_path.to_path_buf(),
+            max_viewers: crate::config::DEFAULT_MAX_VIEWERS,
             source: VideoSource::TestPattern,
             width: Some(1280),
             height: Some(800),

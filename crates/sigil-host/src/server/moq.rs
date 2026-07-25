@@ -733,10 +733,10 @@ pub(super) async fn serve_control_moq_v2(
         authorized.grants.contains(InvitationGrants::VIEW),
         "authorized MoQ control v2 peer lacks view permission"
     );
-    let lease = match sessions.claim_v2_authorized(remote, hello.nonce, authorized) {
+    let mut lease = match sessions.claim_v2_authorized(remote, hello.nonce, authorized) {
         Ok(lease) => lease,
         Err(error) => {
-            send_rejection_v2(&mut send, "host already has an active client").await?;
+            send_rejection_v2(&mut send, error.to_string()).await?;
             return Err(error);
         }
     };
@@ -749,7 +749,7 @@ pub(super) async fn serve_control_moq_v2(
         }
     };
     let shared = Arc::clone(&generation.shared);
-    let initial_snapshot = sessions.bind_v2_generation(
+    let mut initial_snapshot = sessions.bind_v2_generation(
         remote,
         lease.session_id,
         shared.generation_id,
@@ -757,6 +757,14 @@ pub(super) async fn serve_control_moq_v2(
         Arc::clone(&shared.telemetry),
         shared.encoder_control.clone(),
     )?;
+    if lease.replacement_neutralize {
+        input_operations.reset()?;
+        initial_snapshot = sessions.complete_v2_replacement(remote, lease.session_id)?;
+    }
+    // Keep the predecessor's generation lease alive until this viewer has
+    // acquired the shared generation, then retire only that replaced control
+    // stream. Survivors and the producer remain untouched.
+    lease.retire_replaced_viewer();
     let issued_at_unix = unix_timestamp_now()?;
     let mut subscription_nonce = [0_u8; 32];
     getrandom::fill(&mut subscription_nonce).context("generating subscription capability nonce")?;
@@ -846,6 +854,10 @@ pub(super) async fn serve_control_moq_v2(
         FocusTransitionReasonV2::Disconnected,
     )? {
         input_operations.reset()?;
+        sessions.complete_v2_focus_neutralization(
+            lease.session_id,
+            FocusTransitionReasonV2::Disconnected,
+        )?;
     }
     drop(lease);
     generation.release().await;

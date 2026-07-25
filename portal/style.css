@@ -139,6 +139,16 @@ body {
   font-size: 10px;
   color: var(--muted-fg);
 }
+.viewer-status {
+  max-width: 220px;
+  overflow: hidden;
+  color: var(--sand);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.viewer-status.hidden { display: none; }
 .controller-status.connected { color: var(--green); }
 .controller-status.warning { color: var(--yellow); }
 .link-btn {
@@ -372,6 +382,10 @@ body.native-pointer-control * { cursor: none !important; }
 .pin-label.hidden { display: none; }
 
 @media (max-width: 720px) {
+  .topbar { gap: 8px; padding-inline: 10px; }
+  .topbar-right { gap: 8px; min-width: 0; }
+  .node-id { display: none; }
+  .viewer-status { max-width: 34vw; }
   .bottombar {
     grid-template-columns: auto minmax(0, 1fr) auto;
     padding-inline: 10px;
@@ -381,6 +395,8 @@ body.native-pointer-control * { cursor: none !important; }
 }
 
 @media (max-width: 480px) {
+  .controller-status { display: none; }
+  .viewer-status { max-width: 45vw; }
   .bottombar { padding-inline: 8px; }
   .pin-input { width: 60px; }
   #control-toggle { max-width: 40vw; }
@@ -715,6 +731,53 @@ body.native-pointer-control * { cursor: none !important; }
   margin-bottom: 8px;
 }
 .panel-section h3 .hash { color: var(--ochre); font-weight: 500; }
+.roster-section {
+  margin: 0 -6px 18px;
+  padding: 10px 6px 12px;
+  border-bottom: 1px solid var(--border-strong);
+}
+.roster-section.hidden { display: none; }
+.roster-summary {
+  margin-bottom: 7px;
+  color: var(--sand);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.roster-list { list-style: none; }
+.roster-viewer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+  padding: 7px 6px;
+  border-top: 1px solid var(--border);
+}
+.roster-viewer.focus-holder {
+  border-left: 3px solid var(--moss);
+  background: color-mix(in srgb, var(--moss) 8%, transparent);
+}
+.roster-handle {
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.roster-you {
+  align-self: center;
+  padding: 1px 4px;
+  border: 1px solid var(--ochre);
+  color: var(--ochre);
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+.roster-role,
+.roster-adaptive {
+  color: var(--muted-fg);
+  font-size: 10px;
+}
+.roster-adaptive { text-align: right; }
 .info-row {
   display: flex;
   justify-content: space-between;

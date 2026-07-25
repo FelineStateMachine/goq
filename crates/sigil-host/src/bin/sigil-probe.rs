@@ -82,6 +82,13 @@ struct Args {
     /// Exercise the explicit revisioned control/2 and focus-bound input/2 path.
     #[arg(long, conflicts_with = "media_v3")]
     control_v2: bool,
+    /// Join control/2 as a view-only exercise without requesting slot-0 focus.
+    #[arg(long, requires = "control_v2")]
+    spectator: bool,
+    /// End focused v2 proof by disconnecting instead of issuing a release
+    /// against a roster revision that may advance while spectators join.
+    #[arg(long, requires = "control_v2", conflicts_with = "spectator")]
+    disconnect_with_focus: bool,
     /// Request a configured recovery keyframe after three accepted frames,
     /// then prove no delta history is delivered before the recovery barrier.
     #[arg(long)]
@@ -751,6 +758,8 @@ async fn run_control_v2_smoke(
     frames: u32,
     timeout_seconds: u64,
     expected_size: Option<(u16, u16)>,
+    spectator: bool,
+    disconnect_with_focus: bool,
 ) -> Result<()> {
     let control_connection = endpoint
         .connect(address.clone(), CONTROL_ALPN_V2)
@@ -790,9 +799,15 @@ async fn run_control_v2_smoke(
         .snapshot
         .context("host omitted initial control v2 snapshot")?;
     ensure!(
-        initial.revision > 0 && matches!(initial.focus, FocusStateV2::Vacant { .. }),
-        "initial control v2 snapshot was not a revisioned vacant slot"
+        initial.revision > 0,
+        "initial control v2 snapshot was not revisioned"
     );
+    if !spectator {
+        ensure!(
+            matches!(initial.focus, FocusStateV2::Vacant { .. }),
+            "initial control v2 snapshot did not advertise a vacant slot"
+        );
+    }
     let generation_id = initial.media.generation_id;
     let broadcast_name = initial.media.broadcast_name.clone();
 
@@ -813,6 +828,43 @@ async fn run_control_v2_smoke(
         }),
     )
     .await?;
+    if spectator {
+        let mut accepted = 0_u32;
+        let mut last_sequence = None;
+        while accepted < frames {
+            let outcome = tokio::time::timeout(Duration::from_secs(timeout_seconds), media.next())
+                .await
+                .context("timed out waiting for spectator media")??
+                .context("spectator media ended before requested frames")?;
+            let MoqProbeOutcome::Frame { frame, .. } = outcome else {
+                continue;
+            };
+            if let Some((width, height)) = expected_size {
+                ensure!(
+                    frame.header.width == width && frame.header.height == height,
+                    "spectator media dimensions did not match {width}x{height}"
+                );
+            }
+            if let Some(previous) = last_sequence {
+                ensure!(
+                    frame.header.sequence > previous,
+                    "spectator media sequence regressed"
+                );
+            }
+            last_sequence = Some(frame.header.sequence);
+            accepted += 1;
+        }
+        control_connection.close(0_u32.into(), b"spectator probe complete");
+        println!("probe=ok");
+        println!("transport=iroh-moq");
+        println!("control_alpn=sigil/control/2");
+        println!("media_generation_id={generation_id}");
+        println!("media_broadcast_name={broadcast_name}");
+        println!("roster_viewers={}", initial.viewers.len());
+        println!("frames={accepted}");
+        println!("spectator=ok");
+        return Ok(());
+    }
     let focus_request = FocusCommandV2 {
         request_id: 1,
         action: FocusCommandActionV2::Request,
@@ -924,26 +976,32 @@ async fn run_control_v2_smoke(
         accepted += 1;
     }
 
-    let release = FocusCommandV2 {
-        request_id: 2,
-        action: FocusCommandActionV2::Release,
-        slot: ControllerSlot::ZERO,
-        expected_revision: focused.revision,
-        expected_focus_generation: Some(focus_generation),
+    let released = if disconnect_with_focus {
+        None
+    } else {
+        let release = FocusCommandV2 {
+            request_id: 2,
+            action: FocusCommandActionV2::Release,
+            slot: ControllerSlot::ZERO,
+            expected_revision: focused.revision,
+            expected_focus_generation: Some(focus_generation),
+        };
+        write_client_control_v2(
+            &mut control_send,
+            &ClientControlEnvelopeV2::Focus { command: release },
+        )
+        .await
+        .context("releasing control v2 focus")?;
+        Some(
+            read_v2_snapshot_after(
+                &mut control_recv,
+                focused.revision,
+                timeout_seconds,
+                |snapshot| matches!(snapshot.focus, FocusStateV2::Vacant { .. }),
+            )
+            .await?,
+        )
     };
-    write_client_control_v2(
-        &mut control_send,
-        &ClientControlEnvelopeV2::Focus { command: release },
-    )
-    .await
-    .context("releasing control v2 focus")?;
-    let released = read_v2_snapshot_after(
-        &mut control_recv,
-        focused.revision,
-        timeout_seconds,
-        |snapshot| matches!(snapshot.focus, FocusStateV2::Vacant { .. }),
-    )
-    .await?;
     input_send.finish().context("finishing input v2 stream")?;
     input_connection.close(0_u32.into(), b"focus released");
     control_connection.close(0_u32.into(), b"probe complete");
@@ -963,8 +1021,13 @@ async fn run_control_v2_smoke(
     println!("focus_grant_revision={}", focused.revision);
     println!("focus_generation={focus_generation}");
     println!("slot_0_input=ok");
-    println!("focus_release_revision={}", released.revision);
-    println!("focus_release=ok");
+    if let Some(released) = released {
+        println!("focus_release_revision={}", released.revision);
+        println!("focus_release=ok");
+    } else {
+        println!("focus_release_revision=disconnect");
+        println!("focus_release=disconnect");
+    }
     Ok(())
 }
 
@@ -1598,6 +1661,8 @@ async fn main() -> Result<()> {
             args.frames,
             args.timeout_seconds,
             args.expect_size,
+            args.spectator,
+            args.disconnect_with_focus,
         )
         .await;
     }

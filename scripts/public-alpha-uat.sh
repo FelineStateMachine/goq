@@ -17,7 +17,6 @@ sigil_release_verifier="$script_dir/verify-sigil-release.sh"
 portal_release_verifier="$script_dir/verify-portal-release.py"
 portal_signature_verifier="$script_dir/verify-macos-portal-signature.sh"
 sigil_public_key="$repo_dir/release/sigil-minisign.pub"
-portal_apple_team_id_file="$repo_dir/release/portal-apple-team-id.txt"
 
 usage() {
   cat <<'EOF'
@@ -30,7 +29,7 @@ The harness never runs hardware tests or invents attestations. `record` ingests
 strict key=value evidence and `verify` succeeds only when every required gate is
 present, current, bound to an exact signed release tag and verified release
 assets, and internally valid. Hardware UAT initialization and verification must
-run on macOS so Portal signature, notarization, and Gatekeeper checks can run.
+run on macOS so the Portal ad-hoc signature and bundle checks can run.
 EOF
 }
 
@@ -271,7 +270,6 @@ verify_release_inputs() {
   local head
   local worktree_status
   local expected_names
-  local portal_apple_team_id
 
   require_release_tag "$release_tag"
   require_absolute_path "$archive"
@@ -286,7 +284,6 @@ verify_release_inputs() {
   require_safe_regular_file "$portal_release_verifier"
   require_safe_regular_file "$portal_signature_verifier"
   require_safe_regular_file "$sigil_public_key"
-  require_safe_regular_file "$portal_apple_team_id_file"
 
   verified_commit="$(git -C "$repo_dir" rev-parse --verify "refs/tags/$release_tag^{commit}" 2>/dev/null)" \
     || die "release tag does not resolve through refs/tags/$release_tag"
@@ -346,18 +343,12 @@ PY
     --asset-dir "$portal_assets" > /dev/null \
     || die "Portal release asset verification failed"
 
-  portal_apple_team_id="$(awk 'NF { count += 1; value = $0 } END { if (count != 1) exit 1; print value }' \
-    "$portal_apple_team_id_file")" \
-    || die "committed Portal Apple TeamIdentifier pin must contain exactly one non-empty line"
-  [[ "$portal_apple_team_id" =~ ^[A-Z0-9]{10}$ ]] \
-    || die "committed Portal Apple TeamIdentifier pin is invalid"
-
   [[ "$(uname -s)" == Darwin ]] || die "hardware UAT release verification must run on macOS"
   bash "$portal_signature_verifier" \
     --dmg "$verified_portal_dmg" \
     --expected-version "$version" \
-    --expected-team-id "$portal_apple_team_id" > /dev/null \
-    || die "Portal macOS signature verification failed"
+    --signing adhoc > /dev/null \
+    || die "Portal macOS ad-hoc release verification failed"
 
   verify_published_release \
     "$release_tag" \

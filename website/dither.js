@@ -404,13 +404,13 @@
     if (typeof version !== "string" || tag !== "v" + version ||
         build.platform !== "macos" || build.architecture !== "arm64" ||
         asset !== expectedAsset || build.download_url !== expectedBase + expectedAsset ||
-        build.verification !== "developer-id+hardened-runtime+notarized+stapled+gatekeeper") {
+        build.verification !== "adhoc-signed+github-attested+sha256") {
       throw new Error("invalid available Portal release entry");
     }
     return {
       href: build.download_url,
       label: "download Portal " + version + " · macOS arm64",
-      note: "Portal " + version + " · macOS arm64 · signed, notarized, and Gatekeeper verified",
+      note: "Portal " + version + " · macOS arm64 · not notarized: macOS will block the first launch until you allow it in System Settings › Privacy & Security. Verify the SHA-256 before opening.",
     };
   }
 

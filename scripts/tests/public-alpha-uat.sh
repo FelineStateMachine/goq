@@ -64,9 +64,7 @@ cp "$production_harness" "$fixture_repo/scripts/public-alpha-uat.sh"
 chmod 755 "$fixture_repo/scripts/public-alpha-uat.sh"
 printf '%s\n' 'untrusted comment: fixture key' 'RWRmaXh0dXJlUHVibGljS2V5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=' \
   > "$fixture_repo/release/sigil-minisign.pub"
-printf '%s\n' 'ABC123DEF4' > "$fixture_repo/release/portal-apple-team-id.txt"
 chmod 644 "$fixture_repo/release/sigil-minisign.pub"
-chmod 644 "$fixture_repo/release/portal-apple-team-id.txt"
 
 # The single-quoted fixture lines intentionally defer expansion to the generated verifier.
 # shellcheck disable=SC2016
@@ -117,7 +115,7 @@ printf '%s\n' \
   '[[ "$1" == --dmg && "$3" == --expected-version && "$4" == 1.2.3 ]]' \
   '[[ "$(<"$2")" == "verified portal dmg fixture" ]]' \
   'if [[ -n "${UAT_SIGNATURE_MARKER:-}" ]]; then printf invoked > "$UAT_SIGNATURE_MARKER"; fi' \
-  '[[ "$5" == --expected-team-id && "$6" == ABC123DEF4 ]]' \
+  '[[ "$5" == --signing && "$6" == adhoc ]]' \
   'printf "portal_signature_verification=ok\\n"' \
   > "$fixture_repo/scripts/verify-macos-portal-signature.sh"
 chmod 755 "$fixture_repo/scripts/verify-macos-portal-signature.sh"

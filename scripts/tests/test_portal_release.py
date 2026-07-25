@@ -112,7 +112,7 @@ class PortalReleaseVerifierTests(unittest.TestCase):
         assets.mkdir()
         dmg_name, checksum_name, manifest_name = VERIFIER.expected_asset_names("v0.1.0")
         dmg = assets / dmg_name
-        dmg.write_bytes(b"signed-notarized-dmg")
+        dmg.write_bytes(b"adhoc-signed-dmg")
         digest = hashlib.sha256(dmg.read_bytes()).hexdigest()
         (assets / checksum_name).write_text(f"{digest}  {dmg_name}\n", encoding="utf-8")
         manifest = VERIFIER.expected_release_manifest("v0.1.0", "a" * 40, digest)
@@ -125,7 +125,13 @@ class PortalReleaseVerifierTests(unittest.TestCase):
             assets = root / "assets"
             self.write_assets(assets)
             result = VERIFIER.validate_assets(repo, "v0.1.0", assets, FakeGit())
-            self.assertTrue(result["gatekeeper_verified"])
+            self.assertFalse(result["gatekeeper_verified"])
+            self.assertFalse(result["notarized"])
+            self.assertFalse(result["developer_id_signed"])
+            self.assertFalse(result["stapled"])
+            self.assertFalse(result["hardened_runtime"])
+            self.assertEqual(result["signing"], "adhoc")
+            self.assertEqual(result["format"], 2)
             _, checksum_name, manifest_name = VERIFIER.expected_asset_names("v0.1.0")
             original_checksum = (assets / checksum_name).read_text(encoding="utf-8")
             (assets / checksum_name).write_text("0" * 64 + "  wrong.dmg\n", encoding="utf-8")
@@ -133,7 +139,7 @@ class PortalReleaseVerifierTests(unittest.TestCase):
                 VERIFIER.validate_assets(repo, "v0.1.0", assets, FakeGit())
             (assets / checksum_name).write_text(original_checksum, encoding="utf-8")
             manifest = json.loads((assets / manifest_name).read_text(encoding="utf-8"))
-            manifest["notarized"] = False
+            manifest["notarized"] = True
             (assets / manifest_name).write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(VERIFIER.VerificationError, "release manifest"):
                 VERIFIER.validate_assets(repo, "v0.1.0", assets, FakeGit())
@@ -222,6 +228,10 @@ class PortalReleaseVerifierTests(unittest.TestCase):
         self.assertNotIn("release create", workflow)
         self.assertNotIn("--draft=false --prerelease", workflow)
         self.assertNotIn("demo-direct-node", workflow)
+        self.assertNotIn("PORTAL_APPLE_CERTIFICATE_BASE64", workflow)
+        self.assertNotIn("APPLE_SIGNING_IDENTITY", workflow)
+        self.assertNotIn("security create-keychain", workflow)
+        self.assertIn("--signing adhoc", workflow)
 
         sigil_workflow = (REPO_DIR / ".github" / "workflows" / "sigil-release.yml").read_text(
             encoding="utf-8"
@@ -234,7 +244,9 @@ class PortalReleaseVerifierTests(unittest.TestCase):
         self.assertIn("--signer-workflow", sigil_workflow)
         self.assertIn("--source-ref", sigil_workflow)
         self.assertIn("--source-digest", sigil_workflow)
-        self.assertIn("portal-apple-team-id.txt", sigil_workflow)
+        self.assertNotIn("portal-apple-team-id.txt", sigil_workflow)
+        self.assertNotIn("PORTAL_APPLE_TEAM_ID", sigil_workflow)
+        self.assertIn("--signing adhoc", sigil_workflow)
         self.assertLess(
             sigil_workflow.index("verify-portal-release.py assets"),
             sigil_workflow.index("--draft=false"),
@@ -248,7 +260,8 @@ class PortalReleaseVerifierTests(unittest.TestCase):
         self.assertIn('[[ "$architectures" == arm64 ]]', package)
         self.assertNotIn("--expected-arch", package)
         self.assertNotIn("--features", package)
-        self.assertIn("portal-apple-team-id.txt", package)
+        self.assertIn("--signing adhoc|developer-id is required", package)
+        self.assertIn("Signature=adhoc", package)
         self.assertIn('[[ "${APPLE_TEAM_ID:-}" == "$expected_team_id" ]]', package)
 
         native_verifier = (REPO_DIR / "scripts" / "verify-macos-portal-signature.sh").read_text(
@@ -256,6 +269,8 @@ class PortalReleaseVerifierTests(unittest.TestCase):
         )
         self.assertIn("--expected-team-id", native_verifier)
         self.assertIn('[[ "$team_identifier" == "$expected_team_id" ]]', native_verifier)
+        self.assertIn("Signature=adhoc", native_verifier)
+        self.assertIn("unexpectedly carries a notarization ticket", native_verifier)
 
 
 if __name__ == "__main__":

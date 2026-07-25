@@ -181,10 +181,16 @@ assets carry a single frozen build-target suffix, `linux-glibc2.17-x86_64`,
 pinned by `release/sigil-target-contract.txt`; that name describes the binary
 ABI (glibc 2.17, x86-64), not a distribution, so one build runs across the
 supported AMD hosts. Portal is a compiled, signed desktop application, never a
-shell install; the first public target is macOS arm64. The packaging, signing,
-and publication ceremonies are documented in
+shell install; the only published target is macOS arm64, which is ad-hoc signed
+rather than Apple-notarized, so macOS blocks its first launch until you allow it
+under System Settings, Privacy and Security. macOS x86_64,
+Linux x86_64, and Windows x86_64 are built and attested every release as
+unpublished preview artifacts. The packaging, signing, and publication
+ceremonies are documented in
 [public release delivery](docs/public-release-delivery.md) and the
-[Portal release runbook](docs/portal-release.md).
+[Portal release runbook](docs/portal-release.md). The operator path from the
+committed `unconfigured` trust pins to a first published release is
+[release credential bring-up](docs/release-credentials.md).
 
 ## License
 

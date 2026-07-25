@@ -85,7 +85,11 @@ Sigil host.
   keyboard, and gamepad state when a session ends.
 - Relative pointer movement, scroll, keyboard, virtual gamepad reports, Opus
   audio, reconnects, and second-client rejection have focused and loopback
-  coverage. Hardware acceptance that remains incomplete is listed below.
+  coverage. So does the multi-viewer path: bounded admission, one shared
+  generation, slot-0 focus handoff with the former holder neutralized before a
+  successor is granted, same-peer replacement, slow-viewer isolation, and
+  admission against a configured host at real enrollment revisions. Hardware
+  acceptance that remains incomplete is listed below.
 - Portal preserves the user's native window geometry across sessions and
   relaunches. The stream surface scales and letterboxes within those bounds so
   larger or differently shaped client windows never stretch the host image.
@@ -195,8 +199,9 @@ Sigil host.
   selected GstVA encoder plugin; never treat build headers as runtime payload.
 - Run `./scripts/verify-demo-build.sh` for the complete repository gate. It
   covers Rust format/tests/clippy, the Linux cross-build when available,
-  frontend syntax/tests, ShellCheck, package tests, loopback transport, and
-  release-profile containment of `--dev-connect`.
+  frontend syntax/tests, ShellCheck, package tests, loopback transport
+  including three-viewer admission and slot-0 focus handoff, legacy
+  second-client rejection, and release-profile containment of `--dev-connect`.
 - Run `./scripts/verify-website.sh` for every website or public installer
   change. Exercise interactive website changes in a real browser.
 - Treat `docs/fresh-bazzite-host.md`, `docs/public-release-delivery.md`, and

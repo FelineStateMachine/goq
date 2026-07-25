@@ -342,6 +342,31 @@ bounded_queues=ok
 final_cleanup=ok
 ```
 
+Slot-0 handoff has its own proof. It is the only preflight that exercises the
+transfer itself, so run it alongside the record above when the physical gate
+will measure handoff latency:
+
+```bash
+./scripts/loopback-proof.sh --profile release --control-v2 --viewers 3 \
+  --focus-handoffs 3 --assert-neutral-before-successor \
+  --primary-frames 600 --reconnect-cycles 3 \
+  | sed '/^node_id=/d' \
+  >> /absolute/path/to/loopback-preflight.evidence
+```
+
+Its normalized record requires:
+
+```text
+loopback_proof=ok
+focus_handoffs=3
+slot_0_single_holder=ok
+neutral_before_successor=ok
+final_cleanup=ok
+```
+
+`neutral_before_successor=ok` proves ordering only, not latency. The p95
+handoff budget above is still a physical-gate measurement.
+
 The harness ingests the output by value and never mutates the Bazzite host.
 
 ## 5. Verify and retain

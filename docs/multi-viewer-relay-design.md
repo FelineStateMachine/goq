@@ -45,9 +45,10 @@ A shared-MAC contingency may be evaluated only if an exact Bazzite host or suppo
 
 Sigil and every Portal retain normal Iroh endpoints. Iroh owns endpoint identity, encryption, direct-path discovery, NAT traversal, and relay fallback. A media relay is another authenticated Iroh delivery hop; it does not become Sigil and does not receive input or administration authority.
 
-The future attachment sequence is:
+Steps 1 and 2 ship today and carry every direct multi-viewer attachment. Steps
+3 through 5 are the relay extension and are not built.
 
-1. Sigil admits Portal B over control v2 and issues a short-lived subscription capability for B's exact Iroh endpoint, media generation, authorization revision, tracks, expiry, nonce, and one relay hop.
+1. Sigil admits Portal B over control v2 and issues a short-lived subscription capability for B's exact Iroh endpoint, media generation, authorization revision, tracks, expiry, nonce, and one relay hop. The accepted hello also states the authorization revision the capability was minted against, because a viewer cannot know its own enrollment revision; a hello whose capability disagrees with that advertisement is rejected before use.
 2. Sigil's catalog certifies the generation key and media authentication format.
 3. Sigil or a selected Portal A advertises an alternate publisher for a bounded group range. A production descriptor must identify the publisher endpoint, generation, track, group range, expiry, and host signature; raw peer identities must not enter the shared roster UI.
 4. Portal B connects to Portal A through Iroh and presents the capability. Portal A verifies the host signature and compares the authenticated downstream `remote_id()` with the capability subscriber.

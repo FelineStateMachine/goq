@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>goq.sh: one-to-one SteamOS streaming over iroh</title>
-  <meta name="description" content="goq.sh pairs Portal, a native client, with Sigil, a headless Gamescope host, for games over QUIC. One-to-one, low-latency SteamOS streaming over iroh. Your key is the address." />
+  <title>goq.sh: low-latency SteamOS streaming over iroh</title>
+  <meta name="description" content="goq.sh pairs Portal, a native client, with Sigil, a headless Gamescope host, for games over QUIC. Low-latency SteamOS streaming over iroh, a few viewers and one controller. Your key is the address." />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024' shape-rendering='crispEdges'%3E%3Crect x='100' y='100' width='824' height='824' rx='185' fill='%23ece3d2'/%3E%3Cg transform='translate(224,356) scale(44)' fill='%232b2119' fill-opacity='0.18'%3E%3Crect width='6' height='8'/%3E%3Crect x='6' y='3' width='8' height='2'/%3E%3Crect x='9' y='5' width='2' height='2'/%3E%3Crect x='12' y='5' width='2' height='3'/%3E%3C/g%3E%3Cg transform='translate(204,336) scale(44)'%3E%3Crect width='6' height='8' fill='%23b5623b'/%3E%3Crect x='2' y='3' width='2' height='2' fill='%23ece3d2'/%3E%3Crect x='6' y='3' width='8' height='2' fill='%23c98a3a'/%3E%3Crect x='9' y='5' width='2' height='2' fill='%236b7145'/%3E%3Crect x='12' y='5' width='2' height='3' fill='%236b7145'/%3E%3C/g%3E%3C/svg%3E" />
   <link rel="stylesheet" href="./styles.css" />
 </head>
@@ -91,7 +91,7 @@
             <p class="release-note">non-root Bazzite setup · signed release channel pending</p>
           </div>
         </div>
-        <p class="hero-note">Games over QUIC: one-to-one SteamOS streaming over iroh <br> Work in progress. Not a finished product.</p>
+        <p class="hero-note">Games over QUIC: low-latency SteamOS streaming over iroh <br> Work in progress. Not a finished product.</p>
       </div>
     </section>
   </div>
@@ -123,8 +123,8 @@
           <p>Frame handoff capped at four, decode queue at two, every buffer bounded. Stale frames are dropped, not queued, so latency never drifts.</p>
         </li>
         <li class="feature reveal">
-          <h3>One host, one client</h3>
-          <p>A single active client, enforced, over an end-to-end encrypted iroh link, relay-assisted when a direct path isn't possible. No third-party streaming service.</p>
+          <h3>One host, a few viewers</h3>
+          <p>Three viewers by default, eight at most, sharing one encoded stream over end-to-end encrypted iroh links, relay-assisted when a direct path isn't possible. Exactly one holds the controller. No third-party streaming service.</p>
         </li>
       </ol>
     </section>
@@ -133,7 +133,7 @@
     <section class="roadmap" id="roadmap">
       <div class="section-rule" aria-hidden="true"></div>
       <h2 class="section-title"><span aria-hidden="true">##</span> hardening next</h2>
-      <p class="roadmap-intro">The first target stays deliberately narrow: hardware H.264 at 1280×800/60. <a href="https://github.com/FelineStateMachine/goq/issues/7" rel="noopener">Bounded Iroh/MoQ media objects</a> have landed: video now rides prioritized, cancellable groups with explicit GOP boundaries and keyframe recovery, and the legacy media tiers and JPEG fallback are gone. These are the promoted steps still ahead.</p>
+      <p class="roadmap-intro">The first target stays deliberately narrow: hardware H.264 at 1280×800/60. <a href="https://github.com/FelineStateMachine/goq/issues/7" rel="noopener">Bounded Iroh/MoQ media objects</a> have landed: video now rides prioritized, cancellable groups with explicit GOP boundaries and keyframe recovery, and the legacy media tiers and JPEG fallback are gone. <a href="https://github.com/FelineStateMachine/goq/issues/74" rel="noopener">One to many viewers</a> has landed as well: one encoded generation now serves up to eight authenticated viewers with a single transferable slot-0 input focus and per-peer revocation, while legacy clients stay strictly exclusive. These are the promoted steps still ahead.</p>
       <ol class="roadmap-grid">
         <li class="roadmap-item reveal">
           <span class="roadmap-status">promoted · control</span>
@@ -149,11 +149,6 @@
           <span class="roadmap-status">promoted · codec</span>
           <h3><a href="https://github.com/FelineStateMachine/goq/issues/10" rel="noopener">Auto Codec</a></h3>
           <p>Select from end-to-end hardware support and measured latency. H.264 remains the safe baseline; compression ratio alone never wins.</p>
-        </li>
-        <li class="roadmap-item reveal">
-          <span class="roadmap-status">planned · sessions</span>
-          <h3><a href="https://github.com/FelineStateMachine/goq/issues/74" rel="noopener">One to many viewers</a></h3>
-          <p>Today a session admits exactly one client, enforced. The planned pivot adds N viewers with a single transferable input focus, per-peer revocation, and media fan-out over MoQ groups. Not built yet.</p>
         </li>
       </ol>
     </section>
@@ -203,7 +198,7 @@
 
       <ul class="dg-notes">
         <li>Paired by your <strong>FIDO2 security key</strong>: same key, same address. No passwords, no accounts.</li>
-        <li><strong>One host, one client</strong>. Media and input ride separate end-to-end encrypted iroh connections.</li>
+        <li><strong>One host, up to eight viewers</strong>. Media and input ride separate end-to-end encrypted iroh connections, and only the focus holder's input reaches the host.</li>
         <li><strong>Every queue bounded</strong>. Stale frames are dropped, not queued, so it never drifts behind.</li>
       </ul>
     </section>

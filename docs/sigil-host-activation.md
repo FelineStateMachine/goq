@@ -1,9 +1,8 @@
 # Activate an installed Sigil host
 
 This is the portable post-install path for a dedicated Bazzite or SteamOS-like
-AMD gaming host. Run it as the gaming user that owns the Gamescope session, not
-as root. The commands use only `$HOME` and `$USER`; no hostname or account name
-is assumed.
+AMD gaming host. Run it as the gaming user that owns the Gamescope session. The
+commands use only `$HOME` and `$USER`; no hostname or account name is assumed.
 
 The package installer deliberately stops before these steps. Identity creation,
 system input permissions, PipeWire restart, hardware configuration, and service

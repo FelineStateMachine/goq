@@ -12,15 +12,21 @@ use moq_net::{
 };
 use sigil_protocol::{
     AUDIO_HEADER_LEN, AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1,
-    AdaptiveBitrateStateV1, AudioFlags, AudioPacket, AudioPacketHeader, Capability, ClientHello,
-    FrameFlags, HostHello, InputAck, InvitationGrants, KeyframeRequestReasonV3,
-    MAX_AUDIO_PAYLOAD_LEN, MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS,
-    MAX_MEDIA_OBJECT_ID_V3, MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MOQ_VIDEO_H264_TRACK,
-    MOQ_VIDEO_TRACK_PRIORITY, MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1,
-    MediaFrame, MediaFrameHeader, MediaObjectHeaderV3, MediaObjectV3, encode_media_frame_object,
-    media_moq_broadcast_name, read_client_hello, read_input_event, read_media_control_request_v3,
+    AdaptiveBitrateStateV1, AudioFlags, AudioPacket, AudioPacketHeader, Capability,
+    ClientControlEnvelopeV2, ClientHello, FocusCommandResultV2, FocusTransitionReasonV2,
+    FrameFlags, HostHello, HostHelloV2, InputAck, InputAckV2, InputClientHelloV2, InputEventV2,
+    InputHostHelloV2, InvitationGrants, KeyframeRequestReasonV3, MAX_AUDIO_PAYLOAD_LEN,
+    MAX_MEDIA_GROUP_BYTES_V3, MAX_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MAX_MEDIA_OBJECT_ID_V3,
+    MIN_MEDIA_OBJECT_DELIVERY_TIMEOUT_MS, MOQ_VIDEO_H264_TRACK, MOQ_VIDEO_TRACK_PRIORITY,
+    MediaControlRequestV3, MediaFeedbackFlags, MediaFeedbackReportV1, MediaFrame, MediaFrameHeader,
+    MediaGenerationSigningKey, MediaObjectCoordinates, MediaObjectHeaderV3, MediaObjectV3,
+    MediaTrack, ServerControlEnvelopeV2, SignedSubscriptionCapability, SubscriptionClaims,
+    SubscriptionTracks, encode_media_frame_object, media_moq_broadcast_name,
+    read_client_control_v2, read_client_hello, read_client_hello_v2, read_input_client_hello_v2,
+    read_input_event, read_input_event_v2, read_media_control_request_v3,
     read_media_feedback_report_v1, write_adaptive_bitrate_decision_v1, write_host_hello,
-    write_input_ack, write_media_object_v3,
+    write_host_hello_v2, write_input_ack, write_input_ack_v2, write_input_host_hello_v2,
+    write_media_object_v3, write_server_control_v2,
 };
 use tracing::{debug, error, info, warn};
 
@@ -43,6 +49,8 @@ const SOURCE_REAP_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 const ENCODER_CONTROL_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 mod adaptive;
+mod focus;
+mod generation;
 mod handlers;
 mod media_v3;
 mod moq;
@@ -51,19 +59,22 @@ mod startup;
 
 pub(crate) use adaptive::VideoDimensions;
 use adaptive::serve_media_feedback;
+pub(crate) use generation::MediaGenerationManager;
 pub use handlers::{
-    AudioHandler, AuthorizedMoqHandler, ControlHandler, InputHandler, MediaFeedbackHandler,
-    MediaV3Handler,
+    AudioHandler, AuthorizedMoqHandler, ControlHandler, ControlV2Handler, InputHandler,
+    InputOperations, InputV2Handler, MediaFeedbackHandler, MediaV3Handler,
 };
 use handlers::{
     HANDSHAKE_TIMEOUT, MEDIA_CAPABILITIES, negotiated_capabilities, receive_hello, send_rejection,
+    send_rejection_v2,
 };
 use media_v3::{
     MediaV3GroupCursor, forward_media_v3_control_requests, new_current_gop_frames, serve_media_v3,
 };
-use moq::{MOQ_REJECT_CODE, serve_authorized_moq, serve_control_moq};
+use moq::{MOQ_REJECT_CODE, serve_authorized_moq, serve_control_moq, serve_control_moq_v2};
 
 pub use session::SessionRegistry;
+pub(crate) use session::SessionRuntimeStatus;
 use session::{
     ClaimedMoqAttachment, ForcedIdrCoordinator, ForcedIdrDisposition, MediaV3Telemetry,
     MoqAttachmentWait, SourceTaskGuard,
@@ -181,10 +192,12 @@ fn endpoint(byte: u8) -> EndpointId {
 }
 
 #[cfg(test)]
-fn moq_test_config() -> HostConfig {
+pub(crate) fn moq_test_config() -> HostConfig {
     HostConfig {
         identity_path: "identity".into(),
         state_path: "state".into(),
+        max_viewers: crate::config::DEFAULT_MAX_VIEWERS,
+        focus_owner: None,
         source: VideoSource::TestPattern,
         width: Some(1280),
         height: Some(800),

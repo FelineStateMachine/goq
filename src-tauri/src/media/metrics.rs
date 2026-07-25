@@ -250,7 +250,7 @@ impl ClientMediaMetrics {
             .max(frontend_resync_current_duration.unwrap_or_default());
         FrameStatsPayload {
             generation,
-            stats_version: 4,
+            stats_version: 5,
             transport_receive_fps,
             frontend_send_fps,
             transport_received_total: self.transport_received_total,
@@ -435,7 +435,7 @@ mod tests {
         let json = serde_json::to_value(payload).unwrap();
 
         assert_eq!(json["generation"], 9);
-        assert_eq!(json["stats_version"], 4);
+        assert_eq!(json["stats_version"], 5);
         assert_eq!(json["transport_received_total"], 2);
         assert_eq!(json["frontend_sent_total"], 1);
         assert_eq!(json["sequence_dropped_total"], 2);
@@ -469,7 +469,7 @@ mod tests {
         assert_eq!(json["keyframe"], true);
         assert_eq!(json["path_mode"], "direct");
         assert_eq!(json["path_rtt_ms"], 8.0);
-        assert_eq!(json["network_diagnostics"]["version"], 1);
+        assert_eq!(json["network_diagnostics"]["version"], 2);
 
         assert_eq!(json["count"], json["frontend_sent_total"]);
         assert_eq!(json["host_dropped_frames"], json["sequence_dropped_total"]);

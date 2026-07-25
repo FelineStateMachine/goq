@@ -55,6 +55,47 @@ PipeWire selectors, audio/input configuration, identity, and state paths are
 not editable through this contract. Operator comments and all non-managed TOML
 fields survive an update.
 
+Enrollment capacity is authorization state, not a host configuration field.
+Authorization v2 durably supports at most 32 enrolled viewers, while this
+implementation independently bounds concurrent native-MoQ v2 viewers with the
+strict `max_viewers` host setting. The setting defaults to `3`, accepts only
+`1` through `8`, and does not change the durable enrollment ceiling. It is a
+direct TOML setting rather than part of the appliance config v1 editable
+projection, so changing it follows the same reviewed host-configuration and
+service-restart process as other non-managed fields.
+
+Multi-viewer operation is available only through `sigil/control/2` and the
+authenticated native-MoQ generation. Every admitted viewer gets an independent
+control connection, consume-once media attachment, feedback claim, and bounded
+delivery state while sharing one video source, video encoder, optional Opus
+source/encoder, signed broadcast, and keyframe coordinator. `control/1` and
+grouped-v3 remain strictly one-client compatibility modes. An active legacy
+generation rejects v2 admission, and any live v2 generation rejects legacy
+admission, including while old sidecars are draining.
+
+Concurrent capacity and durable enrollment are intentionally separate:
+
+| Bound | Default | Hard limit | Scope |
+|---|---:|---:|---|
+| `max_viewers` | 3 | 8 | Simultaneously connected native-MoQ v2 viewers |
+| `MAX_ENROLLED_VIEWERS` | fixed | 32 | Durable authorization-v2 viewer records |
+
+Slot-0 focus uses one bounded holder-approved handoff proposal, not a FIFO.
+When the slot is free, the first eligible request wins. While occupied, one
+requester may wait up to 15 seconds for the holder to approve, deny, or release
+toward it; additional requests receive a busy response. A grant must activate
+an input-v2 sidecar within 10 seconds or Sigil revokes it. Every transfer first
+publishes a no-inject neutralizing state, resets all virtual input devices, and
+only then publishes a successor focus generation.
+
+An operator may set `focus_owner = "viewer-<16 lowercase hex digits>"` to the
+stable opaque handle shown by enrollment administration. That exact enrolled
+viewer may request controller-confirmed preemption. The setting does not grant
+view or input capability, does not allow another viewer to preempt, and does
+not create an administrative or arbitrary preemption path. Like
+`max_viewers`, it is a reviewed direct TOML setting and requires service
+restart; omission disables owner preemption.
+
 Requests are strict JSON and contain an optimistic-concurrency revision:
 
 ```json

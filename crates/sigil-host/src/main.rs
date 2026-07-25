@@ -1,6 +1,7 @@
 mod appliance;
 mod audio;
 mod authorization;
+mod authorization_admin;
 mod clock;
 mod config;
 mod config_management;
@@ -29,21 +30,20 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId};
 use moq_net::Origin;
 use sigil_protocol::{
-    AUDIO_ALPN_V1, CONTROL_ALPN_V1, INPUT_ALPN_V1, InvitationGrants, MAX_INVITATION_TTL_SECS,
-    MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1, SignedInvitation,
+    AUDIO_ALPN_V1, CONTROL_ALPN_V1, CONTROL_ALPN_V2, INPUT_ALPN_V1, INPUT_ALPN_V2,
+    InvitationGrants, MAX_INVITATION_TTL_SECS, MEDIA_ALPN_V3, MEDIA_FEEDBACK_ALPN_V1,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::authorization::{
-    AuthorizationPolicy, AuthorizationStore, grant_names, unix_timestamp_now,
-};
+use crate::authorization::{AuthorizationPolicy, AuthorizationStore, grant_names};
 use crate::config::{ConfigRevision, HostConfig, InputMode, VideoSource};
 use crate::cursor::PointerPositionTracker;
 use crate::input::InputBackend;
 use crate::server::{
-    AudioHandler, AuthorizedMoqHandler, ControlHandler, InputHandler, MediaFeedbackHandler,
-    MediaV3Handler, SessionRegistry,
+    AudioHandler, AuthorizedMoqHandler, ControlHandler, ControlV2Handler, InputHandler,
+    InputOperations, InputV2Handler, MediaFeedbackHandler, MediaGenerationManager, MediaV3Handler,
+    SessionRegistry,
 };
 
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,7 +83,7 @@ enum Command {
         #[command(subcommand)]
         command: InvitationCommand,
     },
-    /// Inspect or revoke the one enrolled Portal peer.
+    /// Inspect or administer enrolled Portal viewers.
     Enrollment {
         #[command(subcommand)]
         command: EnrollmentCommand,
@@ -235,6 +235,9 @@ enum InvitationCommand {
         pointer_keyboard: bool,
         #[arg(long)]
         gamepad: bool,
+        /// Explicitly issue a view-only invitation.
+        #[arg(long, conflicts_with_all = ["pointer_keyboard", "gamepad"])]
+        view_only: bool,
         #[arg(long)]
         output: PathBuf,
         /// Also print the short-lived invitation as a goq:// deep link.
@@ -250,6 +253,11 @@ enum EnrollmentCommand {
         #[arg(long)]
         config: PathBuf,
     },
+    /// List all enrolled viewers by stable opaque handle.
+    List {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Remove the enrolled peer and invalidate every outstanding invitation.
     Revoke {
         #[arg(long)]
@@ -260,6 +268,24 @@ enum EnrollmentCommand {
         /// Emit the stable machine-readable schema.
         #[arg(long, required = true)]
         json: bool,
+        /// Revoke one viewer through the running daemon. Without this option,
+        /// the command retains the stopped-service reset-all compatibility path.
+        #[arg(long)]
+        handle: Option<String>,
+    },
+    /// Atomically replace one viewer's grants through the running daemon.
+    SetCapabilities {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        handle: String,
+        /// Remove view permission and revoke this viewer completely.
+        #[arg(long, conflicts_with_all = ["pointer_keyboard", "gamepad"])]
+        revoke_view: bool,
+        #[arg(long)]
+        pointer_keyboard: bool,
+        #[arg(long)]
+        gamepad: bool,
     },
 }
 
@@ -322,6 +348,14 @@ struct ServeArgs {
     height: u32,
     #[arg(long, default_value_t = 60)]
     framerate: u32,
+    /// Concurrent native-MoQ viewers in direct proof mode.
+    #[arg(
+        long,
+        default_value_t = config::DEFAULT_MAX_VIEWERS,
+        value_parser = clap::value_parser!(u8).range(1..=8),
+        requires = "identity"
+    )]
+    max_viewers: u8,
     #[arg(long, default_value = "ffmpeg")]
     ffmpeg: PathBuf,
     /// Exit after this many seconds; intended for bounded automation.
@@ -375,8 +409,8 @@ async fn run() -> CliResult<()> {
         Command::Identity { command } => identity_command(command).map_err(Into::into),
         Command::Config { command } => config_command(command).await.map_err(Into::into),
         Command::Capture { command } => capture_command(command).await.map_err(Into::into),
-        Command::Invitation { command } => invitation_command(command).map_err(Into::into),
-        Command::Enrollment { command } => enrollment_command(command).map_err(Into::into),
+        Command::Invitation { command } => invitation_command(command).await.map_err(Into::into),
+        Command::Enrollment { command } => enrollment_command(command).await.map_err(Into::into),
         Command::Serve(args) => serve_command(args).await.map_err(Into::into),
     }
 }
@@ -474,7 +508,7 @@ fn authorization_snapshot_from_config(
     Ok((config, secret, inspection.snapshot))
 }
 
-fn invitation_command(command: InvitationCommand) -> Result<()> {
+async fn invitation_command(command: InvitationCommand) -> Result<()> {
     match command {
         InvitationCommand::Create {
             config,
@@ -482,10 +516,13 @@ fn invitation_command(command: InvitationCommand) -> Result<()> {
             expires_in_seconds,
             pointer_keyboard,
             gamepad,
+            view_only: _,
             output,
             print_deep_link,
         } => {
-            let (_config, secret, snapshot) = authorization_snapshot_from_config(&config)?;
+            let config = HostConfig::load(&config)?;
+            config.ensure_runtime_directory()?;
+            let secret = identity::load(&config.identity_path)?;
             let mut grants = InvitationGrants::VIEW;
             if pointer_keyboard {
                 grants = grants.union(InvitationGrants::POINTER_KEYBOARD);
@@ -493,21 +530,23 @@ fn invitation_command(command: InvitationCommand) -> Result<()> {
             if gamepad {
                 grants = grants.union(InvitationGrants::GAMEPAD);
             }
-            let mut nonce = [0_u8; 32];
-            getrandom::fill(&mut nonce).context("generating invitation nonce")?;
-            let now = unix_timestamp_now()?;
-            let claims = AuthorizationStore::issue_claims_from_snapshot(
-                secret.public(),
-                snapshot,
-                peer,
-                grants,
-                expires_in_seconds,
-                now,
-                nonce,
-            )?;
-            let expires_at = claims.expires_at_unix;
-            let invitation = SignedInvitation::issue(claims, &secret.to_bytes())?;
-            let token = invitation.encode();
+            let result = authorization_admin::request(
+                &config.state_path,
+                &authorization_admin::AuthorizationAdminRequest::CreateInvitation {
+                    peer_node_id: peer.to_string(),
+                    grants: grants.bits(),
+                    expires_in_seconds,
+                },
+            )
+            .await?;
+            let authorization_admin::AuthorizationAdminResult::Invitation {
+                token,
+                expires_at_unix: expires_at,
+                ..
+            } = result
+            else {
+                anyhow::bail!("authorization daemon returned an unexpected invitation response");
+            };
             write_invitation_file(&output, &token)?;
             println!("invitation={}", output.display());
             println!("host_node_id={}", secret.public());
@@ -522,27 +561,105 @@ fn invitation_command(command: InvitationCommand) -> Result<()> {
     Ok(())
 }
 
-fn enrollment_command(command: EnrollmentCommand) -> Result<()> {
+async fn enrollment_command(command: EnrollmentCommand) -> Result<()> {
     match command {
         EnrollmentCommand::Show { config } => {
             let (_config, _secret, snapshot) = authorization_snapshot_from_config(&config)?;
             println!("enrollment_epoch={}", snapshot.epoch);
-            match (snapshot.peer, snapshot.grants) {
-                (Some(peer), Some(grants)) => {
-                    println!("enrollment=active");
-                    println!("peer_node_id={peer}");
-                    println!("grants={}", grant_names(grants));
+            println!("committed_revision={}", snapshot.committed_revision);
+            println!("viewer_count={}", snapshot.viewers.len());
+            if snapshot.viewers.is_empty() {
+                println!("enrollment=none");
+            } else {
+                println!("enrollment=active");
+                for viewer in snapshot.viewers {
+                    println!(
+                        "viewer={} grants={} authorization_revision={} enrolled_at_unix={}",
+                        viewer.handle,
+                        grant_names(viewer.grants),
+                        viewer.authorization_revision,
+                        viewer.enrolled_at_unix
+                    );
                 }
-                (None, None) => println!("enrollment=none"),
-                _ => unreachable!("validated authorization state is internally consistent"),
+            }
+        }
+        EnrollmentCommand::List { config } => {
+            let config = HostConfig::load(&config)?;
+            let result = authorization_admin::request(
+                &config.state_path,
+                &authorization_admin::AuthorizationAdminRequest::List,
+            )
+            .await?;
+            let authorization_admin::AuthorizationAdminResult::Viewers {
+                committed_revision,
+                enrollment_epoch,
+                viewers,
+            } = result
+            else {
+                anyhow::bail!("authorization daemon returned an unexpected list response");
+            };
+            println!("committed_revision={committed_revision}");
+            println!("enrollment_epoch={enrollment_epoch}");
+            println!("viewer_count={}", viewers.len());
+            for viewer in viewers {
+                println!(
+                    "viewer={} grants={} authorization_revision={} enrolled_at_unix={}",
+                    viewer.handle,
+                    viewer.grants.join(","),
+                    viewer.authorization_revision,
+                    viewer.enrolled_at_unix
+                );
             }
         }
         EnrollmentCommand::Revoke {
             config,
             expected_host_fingerprint,
             json: _,
+            handle,
         } => {
-            let result = appliance::reset_enrollment(&config, &expected_host_fingerprint)?;
+            if let Some(handle) = handle {
+                let config = HostConfig::load(&config)?;
+                let secret = identity::load(&config.identity_path)?;
+                ensure!(
+                    expected_host_fingerprint == appliance::fingerprint(secret.public()),
+                    "expected host fingerprint does not match this Sigil appliance"
+                );
+                let result = authorization_admin::request(
+                    &config.state_path,
+                    &authorization_admin::AuthorizationAdminRequest::RevokeViewer { handle },
+                )
+                .await?;
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                let result = appliance::reset_enrollment(&config, &expected_host_fingerprint)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+        }
+        EnrollmentCommand::SetCapabilities {
+            config,
+            handle,
+            revoke_view,
+            pointer_keyboard,
+            gamepad,
+        } => {
+            let config = HostConfig::load(&config)?;
+            let grants = if revoke_view {
+                None
+            } else {
+                let mut grants = InvitationGrants::VIEW;
+                if pointer_keyboard {
+                    grants = grants.union(InvitationGrants::POINTER_KEYBOARD);
+                }
+                if gamepad {
+                    grants = grants.union(InvitationGrants::GAMEPAD);
+                }
+                Some(grants.bits())
+            };
+            let result = authorization_admin::request(
+                &config.state_path,
+                &authorization_admin::AuthorizationAdminRequest::ReplaceGrants { handle, grants },
+            )
+            .await?;
             println!("{}", serde_json::to_string(&result)?);
         }
     }
@@ -660,6 +777,8 @@ async fn probe_test_pattern(args: CaptureProbeArgs) -> Result<()> {
     let config = HostConfig {
         identity_path: PathBuf::from("unused-by-capture-probe"),
         state_path: PathBuf::from("."),
+        max_viewers: config::DEFAULT_MAX_VIEWERS,
+        focus_owner: None,
         source: VideoSource::TestPattern,
         width: Some(width),
         height: Some(height),
@@ -869,10 +988,16 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         (loaded.config, loaded.revision, lifecycle)
     };
     let secret = identity::load(&config.identity_path)?;
-    let sessions = Arc::new(SessionRegistry::default());
+    let host_secret = secret.to_bytes();
+    let sessions = Arc::new(SessionRegistry::new_with_focus_owner(
+        config.max_viewers,
+        config.focus_owner.clone(),
+    ));
+    let media_generations = MediaGenerationManager::new(config.clone(), host_secret);
     let publisher = appliance::RuntimePublisher::start(
         secret.public(),
         Arc::clone(&sessions),
+        Arc::clone(&media_generations),
         configured_service,
         loaded_config_revision,
     )?;
@@ -1001,7 +1126,31 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     }
 
     let moq_origin = Origin::random();
+    let input_operations = Arc::new(InputOperations::new(input_backend.clone()));
+    let authorization_admin = match &authorization {
+        AuthorizationPolicy::Required(store) => Some(
+            authorization_admin::AuthorizationAdminServer::start(
+                &config.state_path,
+                store.clone(),
+                Arc::clone(&sessions),
+                Arc::clone(&input_operations),
+                host_secret,
+            )
+            .context("starting local authorization administration listener")?,
+        ),
+        AuthorizationPolicy::TestPatternProof | AuthorizationPolicy::DevelopmentBypass => None,
+    };
     let router = Router::builder(endpoint)
+        .accept(
+            CONTROL_ALPN_V2,
+            ControlV2Handler {
+                sessions: Arc::clone(&sessions),
+                generations: Arc::clone(&media_generations),
+                authorization: authorization.clone(),
+                input_operations: Arc::clone(&input_operations),
+                host_secret,
+            },
+        )
         .accept(
             CONTROL_ALPN_V1,
             ControlHandler {
@@ -1030,7 +1179,17 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
             MediaFeedbackHandler {
                 config: config.clone(),
                 sessions: Arc::clone(&sessions),
-                authorization,
+                generations: Arc::clone(&media_generations),
+                authorization: authorization.clone(),
+                input_operations: Arc::clone(&input_operations),
+            },
+        )
+        .accept(
+            INPUT_ALPN_V2,
+            InputV2Handler {
+                operations: Arc::clone(&input_operations),
+                pointer_positions: pointer_positions.clone(),
+                sessions: Arc::clone(&sessions),
             },
         )
         .accept(
@@ -1077,6 +1236,9 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         && let Err(error) = publisher.mark_stopping().await
     {
         warn!(%error, "publishing stopping appliance status failed; continuing shutdown");
+    }
+    if let Some(administration) = authorization_admin {
+        administration.shutdown().await;
     }
     degrade_on_error(
         publisher.as_ref(),
@@ -1185,6 +1347,8 @@ fn load_serve_config(args: &ServeArgs) -> Result<LoadedServeConfig> {
         config: HostConfig {
             identity_path,
             state_path,
+            max_viewers: args.max_viewers,
+            focus_owner: None,
             source: source.into(),
             width: Some(args.width),
             height: Some(args.height),

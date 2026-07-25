@@ -1,14 +1,21 @@
 use std::{
     collections::VecDeque,
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard},
     time::{Duration, Instant},
 };
 
 use iroh::endpoint::{Connection, PathId};
 use serde::Serialize;
+use sigil_protocol::{
+    AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1, FocusStateV2,
+    MediaFeedbackFlags, MediaFeedbackReportV1, SessionSnapshotV2,
+};
 
 const LATENCY_BUCKETS_MS: usize = 5_001;
 pub(crate) const INPUT_ACK_PENDING_CAPACITY: usize = 1_024;
+const MAX_DIAGNOSTIC_VIEWERS: usize = 8;
 
 pub(crate) fn lock_network_diagnostics(
     diagnostics: &StdMutex<NetworkSessionDiagnostics>,
@@ -44,6 +51,236 @@ pub(crate) enum NetworkLeg {
     Media,
     Input,
     Audio,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MediaDeliveryRole {
+    #[default]
+    DirectHost,
+    #[allow(dead_code)]
+    ViewerRelay,
+}
+
+#[derive(Clone, Debug)]
+struct MediaAuthenticationDiagnostics {
+    mode: &'static str,
+    generation_certified: bool,
+    delivery_role: MediaDeliveryRole,
+    verification_failures: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug)]
+struct SessionProtocolDiagnostics {
+    mode: &'static str,
+    local_handle: Option<String>,
+    focus_generation: Option<u64>,
+    roster_revision: Option<u64>,
+    roster_updated_at: Option<Instant>,
+    subscription_expires_at_unix: Option<u64>,
+    stale_snapshot_total: u64,
+    invalid_snapshot_total: u64,
+}
+
+impl Default for SessionProtocolDiagnostics {
+    fn default() -> Self {
+        Self {
+            mode: "legacy_exclusive_v1",
+            local_handle: None,
+            focus_generation: None,
+            roster_revision: None,
+            roster_updated_at: None,
+            subscription_expires_at_unix: None,
+            stale_snapshot_total: 0,
+            invalid_snapshot_total: 0,
+        }
+    }
+}
+
+impl SessionProtocolDiagnostics {
+    fn configure_v2(
+        &mut self,
+        snapshot: &SessionSnapshotV2,
+        subscription_expires_at_unix: u64,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.mode = "moq_multi_viewer_v2";
+        self.subscription_expires_at_unix = Some(subscription_expires_at_unix);
+        self.observe_snapshot(snapshot, now, true)
+    }
+
+    fn observe_snapshot(
+        &mut self,
+        snapshot: &SessionSnapshotV2,
+        now: Instant,
+        initial: bool,
+    ) -> Result<(), String> {
+        if let Err(error) = snapshot.validate() {
+            self.invalid_snapshot_total = self.invalid_snapshot_total.saturating_add(1);
+            return Err(format!("Invalid session diagnostics snapshot: {error}"));
+        }
+        if snapshot.viewers.len() > MAX_DIAGNOSTIC_VIEWERS {
+            self.invalid_snapshot_total = self.invalid_snapshot_total.saturating_add(1);
+            return Err("Session diagnostics roster exceeds the hard viewer bound".to_string());
+        }
+        if !initial
+            && self
+                .roster_revision
+                .is_some_and(|revision| snapshot.revision <= revision)
+        {
+            self.stale_snapshot_total = self.stale_snapshot_total.saturating_add(1);
+            return Ok(());
+        }
+        let local = snapshot.self_viewer();
+        self.local_handle = Some(local.presence_id.as_str().to_owned());
+        self.focus_generation = match &snapshot.focus {
+            FocusStateV2::Held {
+                holder,
+                session_id,
+                focus_generation,
+                ..
+            } if holder == &local.presence_id && *session_id == local.session_id => {
+                Some(*focus_generation)
+            }
+            _ => None,
+        };
+        self.roster_revision = Some(snapshot.revision);
+        self.roster_updated_at = Some(now);
+        Ok(())
+    }
+
+    fn snapshot(&self, now: Instant, now_unix: u64) -> SessionProtocolSnapshot {
+        SessionProtocolSnapshot {
+            mode: self.mode,
+            local_handle: self.local_handle.clone(),
+            focus_generation: self.focus_generation,
+            roster_revision: self.roster_revision,
+            roster_age_ms: self.roster_updated_at.map(|updated| {
+                u64::try_from(now.saturating_duration_since(updated).as_millis())
+                    .unwrap_or(u64::MAX)
+            }),
+            subscription_expires_at_unix: self.subscription_expires_at_unix,
+            subscription_seconds_remaining: self
+                .subscription_expires_at_unix
+                .map(|expiry| expiry.saturating_sub(now_unix)),
+            stale_snapshot_total: self.stale_snapshot_total,
+            invalid_snapshot_total: self.invalid_snapshot_total,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SessionProtocolSnapshot {
+    mode: &'static str,
+    local_handle: Option<String>,
+    focus_generation: Option<u64>,
+    roster_revision: Option<u64>,
+    roster_age_ms: Option<u64>,
+    subscription_expires_at_unix: Option<u64>,
+    subscription_seconds_remaining: Option<u64>,
+    stale_snapshot_total: u64,
+    invalid_snapshot_total: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AdaptiveViewerSnapshot {
+    scope: &'static str,
+    local_pressure: &'static str,
+    aggregate_target_kbps: Option<u32>,
+    aggregate_state: &'static str,
+    recovery_state: &'static str,
+    applied: bool,
+}
+
+impl Default for AdaptiveViewerSnapshot {
+    fn default() -> Self {
+        Self {
+            scope: "local_viewer",
+            local_pressure: "awaiting_report",
+            aggregate_target_kbps: None,
+            aggregate_state: "unavailable",
+            recovery_state: "active",
+            applied: false,
+        }
+    }
+}
+
+impl AdaptiveViewerSnapshot {
+    fn observe_report(&mut self, report: &MediaFeedbackReportV1) {
+        let drops = report
+            .transport_dropped_delta
+            .saturating_add(report.frontend_dropped_delta)
+            .saturating_add(report.decoder_dropped_delta)
+            .saturating_add(report.presenter_dropped_delta);
+        let queued = report.frontend_queue_depth > 0
+            || report.decode_queue_depth > 0
+            || report.presenter_queue_depth > 0;
+        self.local_pressure = if report.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE) {
+            "recovering"
+        } else if drops > 0 || queued {
+            "pressured"
+        } else {
+            "clean"
+        };
+    }
+
+    fn observe_decision(&mut self, decision: &AdaptiveBitrateDecisionV1) {
+        self.aggregate_target_kbps = Some(decision.target_kbps);
+        self.aggregate_state = match decision.state {
+            AdaptiveBitrateStateV1::Hold => "hold",
+            AdaptiveBitrateStateV1::Decrease => "decrease",
+            AdaptiveBitrateStateV1::Increase => "increase",
+        };
+        let local_pressure = decision
+            .reasons
+            .contains(AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE)
+            || decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG)
+            || decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::DELIVERY_LATENCY);
+        self.recovery_state = if local_pressure && decision.target_kbps == decision.floor_kbps {
+            "floor_limited"
+        } else {
+            "active"
+        };
+        self.applied = decision.applied;
+    }
+
+    fn detach(&mut self) {
+        self.recovery_state = "detached";
+    }
+}
+
+impl Default for MediaAuthenticationDiagnostics {
+    fn default() -> Self {
+        Self {
+            mode: "transport-authenticated-v1",
+            generation_certified: false,
+            delivery_role: MediaDeliveryRole::DirectHost,
+            verification_failures: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl MediaAuthenticationDiagnostics {
+    fn snapshot(&self) -> MediaAuthenticationSnapshot {
+        MediaAuthenticationSnapshot {
+            mode: self.mode,
+            generation_certified: self.generation_certified,
+            delivery_role: self.delivery_role,
+            verification_failures: self.verification_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct MediaAuthenticationSnapshot {
+    mode: &'static str,
+    generation_certified: bool,
+    delivery_role: MediaDeliveryRole,
+    verification_failures: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -487,6 +724,9 @@ pub(crate) struct NetworkSessionDiagnostics {
     input: LegDiagnostics,
     audio: Option<LegDiagnostics>,
     input_ack: InputAckDiagnostics,
+    media_authentication: MediaAuthenticationDiagnostics,
+    adaptive: AdaptiveViewerSnapshot,
+    session: SessionProtocolDiagnostics,
 }
 
 impl NetworkSessionDiagnostics {
@@ -497,7 +737,47 @@ impl NetworkSessionDiagnostics {
             input: LegDiagnostics::default(),
             audio: None,
             input_ack: InputAckDiagnostics::new(input_ack_negotiated),
+            media_authentication: MediaAuthenticationDiagnostics::default(),
+            adaptive: AdaptiveViewerSnapshot::default(),
+            session: SessionProtocolDiagnostics::default(),
         }
+    }
+
+    pub(crate) fn configure_v2_session(
+        &mut self,
+        snapshot: &SessionSnapshotV2,
+        subscription_expires_at_unix: u64,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.session
+            .configure_v2(snapshot, subscription_expires_at_unix, now)
+    }
+
+    pub(crate) fn observe_session_snapshot(
+        &mut self,
+        snapshot: &SessionSnapshotV2,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.session.observe_snapshot(snapshot, now, false)
+    }
+
+    pub(crate) fn mark_session_snapshot_invalid(&mut self) {
+        self.session.invalid_snapshot_total = self.session.invalid_snapshot_total.saturating_add(1);
+    }
+
+    pub(crate) fn configure_authenticated_media(&mut self, delivery_role: MediaDeliveryRole) {
+        self.media_authentication.mode = sigil_protocol::MediaAuthMode::Ed25519.label();
+        self.media_authentication.generation_certified = true;
+        self.media_authentication.delivery_role = delivery_role;
+    }
+
+    pub(crate) fn media_verification_failure_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.media_authentication.verification_failures)
+    }
+
+    pub(crate) fn set_input_ack_negotiated(&mut self, negotiated: bool) {
+        debug_assert_eq!(self.input_ack.sent_total, 0);
+        self.input_ack = InputAckDiagnostics::new(negotiated);
     }
 
     pub(crate) fn observe_connection(&mut self, leg: NetworkLeg, connection: &Connection) {
@@ -529,9 +809,24 @@ impl NetworkSessionDiagnostics {
         }
     }
 
+    pub(crate) fn observe_adaptive_report(&mut self, report: &MediaFeedbackReportV1) {
+        self.adaptive.observe_report(report);
+    }
+
+    pub(crate) fn observe_adaptive_decision(&mut self, decision: &AdaptiveBitrateDecisionV1) {
+        self.adaptive.observe_decision(decision);
+    }
+
+    pub(crate) fn mark_adaptive_detached(&mut self) {
+        self.adaptive.detach();
+    }
+
     pub(crate) fn snapshot(&self, now: Instant) -> NetworkDiagnosticsSnapshot {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
         NetworkDiagnosticsSnapshot {
-            version: 1,
+            version: 2,
             session_elapsed_ms: u64::try_from(
                 now.saturating_duration_since(self.started_at).as_millis(),
             )
@@ -540,6 +835,9 @@ impl NetworkSessionDiagnostics {
             input: self.input.snapshot(),
             audio: self.audio.as_ref().map(LegDiagnostics::snapshot),
             input_ack: self.input_ack.snapshot(),
+            media_authentication: self.media_authentication.snapshot(),
+            adaptive: self.adaptive.clone(),
+            session: self.session.snapshot(now, now_unix),
         }
     }
 }
@@ -552,6 +850,9 @@ pub(crate) struct NetworkDiagnosticsSnapshot {
     input: NetworkLegSnapshot,
     audio: Option<NetworkLegSnapshot>,
     input_ack: InputAckSnapshot,
+    media_authentication: MediaAuthenticationSnapshot,
+    adaptive: AdaptiveViewerSnapshot,
+    session: SessionProtocolSnapshot,
 }
 
 #[cfg(test)]
@@ -732,5 +1033,75 @@ mod tests {
                 "serialized forbidden field {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn authenticated_media_diagnostics_are_truthful_and_expose_no_key_material() {
+        let now = Instant::now();
+        let mut diagnostics = NetworkSessionDiagnostics::new(now, false);
+        diagnostics.configure_authenticated_media(MediaDeliveryRole::ViewerRelay);
+        diagnostics
+            .media_verification_failure_counter()
+            .fetch_add(2, Ordering::Relaxed);
+        let json = serde_json::to_value(diagnostics.snapshot(now)).unwrap();
+        assert_eq!(json["media_authentication"]["mode"], "ed25519-v1");
+        assert_eq!(json["media_authentication"]["generation_certified"], true);
+        assert_eq!(
+            json["media_authentication"]["delivery_role"],
+            "viewer_relay"
+        );
+        assert_eq!(json["media_authentication"]["verification_failures"], 2);
+        let serialized = json.to_string();
+        assert!(!serialized.contains("certificate"));
+        assert!(!serialized.contains("capability"));
+        assert!(!serialized.contains("public_key"));
+    }
+
+    #[test]
+    fn adaptive_diagnostics_separate_local_pressure_from_the_aggregate_decision() {
+        let now = Instant::now();
+        let mut diagnostics = NetworkSessionDiagnostics::new(now, false);
+        let mut report = MediaFeedbackReportV1 {
+            report_id: 1,
+            interval_ms: 1_000,
+            flags: MediaFeedbackFlags::RESYNC_ACTIVE,
+            last_sequence: Some(10),
+            transport_dropped_delta: 1,
+            frontend_dropped_delta: 0,
+            decoder_dropped_delta: 0,
+            presenter_dropped_delta: 0,
+            frontend_queue_depth: 1,
+            frontend_queue_capacity: 4,
+            decode_queue_depth: 0,
+            decode_queue_capacity: 4,
+            presenter_queue_depth: 0,
+            presenter_queue_capacity: 2,
+            transport_delivery_p95_ms: Some(10),
+            decode_p95_ms: Some(3),
+            presentation_p95_ms: Some(5),
+        };
+        diagnostics.observe_adaptive_report(&report);
+        let decision = AdaptiveBitrateDecisionV1 {
+            decision_id: 1,
+            report_id: 1,
+            target_kbps: 1_000,
+            floor_kbps: 1_000,
+            ceiling_kbps: 12_000,
+            state: AdaptiveBitrateStateV1::Decrease,
+            reasons: AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE,
+            applied: false,
+        };
+        diagnostics.observe_adaptive_decision(&decision);
+        let value = serde_json::to_value(diagnostics.snapshot(now)).unwrap();
+        assert_eq!(value["adaptive"]["scope"], "local_viewer");
+        assert_eq!(value["adaptive"]["local_pressure"], "recovering");
+        assert_eq!(value["adaptive"]["aggregate_target_kbps"], 1_000);
+        assert_eq!(value["adaptive"]["recovery_state"], "floor_limited");
+        report.flags = MediaFeedbackFlags::NONE;
+        diagnostics.observe_adaptive_report(&report);
+        assert_eq!(
+            serde_json::to_value(diagnostics.snapshot(now)).unwrap()["adaptive"]["local_pressure"],
+            "pressured"
+        );
     }
 }

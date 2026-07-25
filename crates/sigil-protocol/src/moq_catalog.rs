@@ -1,13 +1,21 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{MOQ_VIDEO_H264_TRACK, ProtocolError, Result};
+use crate::{
+    MEDIA_GENERATION_CERTIFICATE_TOKEN_PREFIX, MOQ_AUDIO_OPUS_TRACK, MOQ_VIDEO_H264_TRACK,
+    MediaAuthMode, ProtocolError, Result, SignedMediaGenerationCertificate,
+};
 
 pub const MOQ_CATALOG_EXTENSION_VERSION_V1: u16 = 1;
+pub const MOQ_CATALOG_EXTENSION_VERSION_V2: u16 = 2;
 /// Maximum immutable catalog snapshot accepted from a peer before JSON decoding.
 pub const MAX_MOQ_CATALOG_BYTES: usize = 4 * 1024;
 pub const MOQ_MEDIA_OBJECT_FORMAT_V1: &str = "sigil/media-frame/1";
+pub const MOQ_AUTHENTICATED_MEDIA_OBJECT_FORMAT_V1: &str = "sigil/authenticated-media-object/1";
 pub const MOQ_GOP_GROUP_FORMAT_V1: &str = "sigil/moq-gop/1";
+pub const MOQ_AUDIO_OBJECT_FORMAT_V1: &str = "sigil/audio-packet/1";
+pub const MOQ_AUDIO_GROUP_FORMAT_V1: &str = "sigil/moq-audio-group/1";
 pub const MOQ_VIDEO_TRACK_PRIORITY: u8 = u8::MAX;
+pub const MOQ_AUDIO_TRACK_PRIORITY: u8 = u8::MAX - 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -89,6 +97,158 @@ impl MoqCatalogExtensionV1 {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MoqTrackAuthenticationV2 {
+    pub mode: String,
+    pub object_format: String,
+    pub generation_certificate: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MoqVideoCatalogV2 {
+    pub track: MoqTrackDescriptorV1,
+    pub codec: String,
+    pub payload_format: String,
+    pub group_format: String,
+    pub authentication: MoqTrackAuthenticationV2,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MoqAudioCatalogV2 {
+    pub track: MoqTrackDescriptorV1,
+    pub codec: String,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub frame_samples: u16,
+    pub payload_format: String,
+    pub group_format: String,
+    pub authentication: MoqTrackAuthenticationV2,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MoqCatalogExtensionV2 {
+    pub version: u16,
+    pub generation_id: u64,
+    pub video: MoqVideoCatalogV2,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<MoqAudioCatalogV2>,
+}
+
+impl MoqCatalogExtensionV2 {
+    pub fn video_h264(
+        generation_id: u64,
+        certificate: &SignedMediaGenerationCertificate,
+    ) -> Result<Self> {
+        let extension = Self {
+            version: MOQ_CATALOG_EXTENSION_VERSION_V2,
+            generation_id,
+            video: MoqVideoCatalogV2 {
+                track: MoqTrackDescriptorV1 {
+                    name: MOQ_VIDEO_H264_TRACK.to_owned(),
+                    priority: MOQ_VIDEO_TRACK_PRIORITY,
+                },
+                codec: "h264".to_owned(),
+                payload_format: MOQ_MEDIA_OBJECT_FORMAT_V1.to_owned(),
+                group_format: MOQ_GOP_GROUP_FORMAT_V1.to_owned(),
+                authentication: MoqTrackAuthenticationV2 {
+                    mode: MediaAuthMode::Ed25519.label().to_owned(),
+                    object_format: MOQ_AUTHENTICATED_MEDIA_OBJECT_FORMAT_V1.to_owned(),
+                    generation_certificate: certificate.encode(),
+                },
+            },
+            audio: None,
+        };
+        extension.validate()?;
+        Ok(extension)
+    }
+
+    pub fn video_h264_opus(
+        generation_id: u64,
+        certificate: &SignedMediaGenerationCertificate,
+    ) -> Result<Self> {
+        let mut extension = Self::video_h264(generation_id, certificate)?;
+        extension.audio = Some(MoqAudioCatalogV2 {
+            track: MoqTrackDescriptorV1 {
+                name: MOQ_AUDIO_OPUS_TRACK.to_owned(),
+                priority: MOQ_AUDIO_TRACK_PRIORITY,
+            },
+            codec: "opus".to_owned(),
+            sample_rate: crate::OPUS_SAMPLE_RATE,
+            channels: crate::OPUS_CHANNELS,
+            frame_samples: crate::OPUS_FRAME_SAMPLES,
+            payload_format: MOQ_AUDIO_OBJECT_FORMAT_V1.to_owned(),
+            group_format: MOQ_AUDIO_GROUP_FORMAT_V1.to_owned(),
+            authentication: MoqTrackAuthenticationV2 {
+                mode: MediaAuthMode::Ed25519.label().to_owned(),
+                object_format: MOQ_AUTHENTICATED_MEDIA_OBJECT_FORMAT_V1.to_owned(),
+                generation_certificate: certificate.encode(),
+            },
+        });
+        extension.validate()?;
+        Ok(extension)
+    }
+
+    pub fn validate(&self) -> Result<SignedMediaGenerationCertificate> {
+        if self.version != MOQ_CATALOG_EXTENSION_VERSION_V2 || self.generation_id == 0 {
+            return invalid_v2("unsupported extension version or zero generation");
+        }
+        if self.video.track.name != MOQ_VIDEO_H264_TRACK
+            || self.video.track.priority != MOQ_VIDEO_TRACK_PRIORITY
+            || self.video.codec != "h264"
+            || self.video.payload_format != MOQ_MEDIA_OBJECT_FORMAT_V1
+            || self.video.group_format != MOQ_GOP_GROUP_FORMAT_V1
+        {
+            return invalid_v2("video track contract does not match authenticated H.264");
+        }
+        if self.video.authentication.mode != MediaAuthMode::Ed25519.label()
+            || self.video.authentication.object_format != MOQ_AUTHENTICATED_MEDIA_OBJECT_FORMAT_V1
+            || !self
+                .video
+                .authentication
+                .generation_certificate
+                .starts_with(MEDIA_GENERATION_CERTIFICATE_TOKEN_PREFIX)
+        {
+            return invalid_v2("unknown or malformed media authentication contract");
+        }
+        if let Some(audio) = &self.audio
+            && (audio.track.name != MOQ_AUDIO_OPUS_TRACK
+                || audio.track.priority != MOQ_AUDIO_TRACK_PRIORITY
+                || audio.codec != "opus"
+                || audio.sample_rate != crate::OPUS_SAMPLE_RATE
+                || audio.channels != crate::OPUS_CHANNELS
+                || audio.frame_samples != crate::OPUS_FRAME_SAMPLES
+                || audio.payload_format != MOQ_AUDIO_OBJECT_FORMAT_V1
+                || audio.group_format != MOQ_AUDIO_GROUP_FORMAT_V1
+                || audio.authentication.mode != MediaAuthMode::Ed25519.label()
+                || audio.authentication.object_format != MOQ_AUTHENTICATED_MEDIA_OBJECT_FORMAT_V1
+                || audio.authentication.generation_certificate
+                    != self.video.authentication.generation_certificate)
+        {
+            return invalid_v2("audio track contract does not match authenticated Opus");
+        }
+        let certificate = SignedMediaGenerationCertificate::decode(
+            &self.video.authentication.generation_certificate,
+        )?;
+        if certificate.claims.generation_id != self.generation_id
+            || certificate.claims.authentication_mode != MediaAuthMode::Ed25519
+        {
+            return invalid_v2("generation certificate does not match the catalog generation");
+        }
+        Ok(certificate)
+    }
+}
+
+fn invalid_v2<T>(reason: &'static str) -> Result<T> {
+    Err(ProtocolError::InvalidMessage {
+        message_type: "Goq MoQ catalog extension v2",
+        reason,
+    })
+}
+
 /// The immutable catalog.json document both peers must agree on byte-for-byte:
 /// a default (empty) Hang catalog envelope carrying the Goq extension. This is
 /// the single definition — the host producer, Portal subscriber, and probe all
@@ -120,9 +280,66 @@ impl GoqCatalogDocument {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoqCatalogDocumentV2 {
+    #[serde(flatten)]
+    pub media: hang::Catalog,
+    pub goq: MoqCatalogExtensionV2,
+}
+
+impl GoqCatalogDocumentV2 {
+    pub fn video_h264(
+        generation_id: u64,
+        certificate: &SignedMediaGenerationCertificate,
+    ) -> Result<Self> {
+        Ok(Self {
+            media: hang::Catalog::default(),
+            goq: MoqCatalogExtensionV2::video_h264(generation_id, certificate)?,
+        })
+    }
+
+    pub fn video_h264_opus(
+        generation_id: u64,
+        certificate: &SignedMediaGenerationCertificate,
+    ) -> Result<Self> {
+        Ok(Self {
+            media: hang::Catalog::default(),
+            goq: MoqCatalogExtensionV2::video_h264_opus(generation_id, certificate)?,
+        })
+    }
+
+    pub fn validate(&self) -> Result<SignedMediaGenerationCertificate> {
+        if self.media != hang::Catalog::default() {
+            return Err(ProtocolError::InvalidMessage {
+                message_type: "Goq MoQ catalog document v2",
+                reason: "catalog must not advertise a standard Hang rendition for enveloped media",
+            });
+        }
+        self.goq.validate()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MediaGenerationSigningKey;
+    use ed25519_dalek::SigningKey;
+
+    fn v2_document() -> GoqCatalogDocumentV2 {
+        let host = SigningKey::from_bytes(&[7; 32]);
+        let generation = MediaGenerationSigningKey::from_bytes(&[9; 32]);
+        let certificate = generation
+            .certify(
+                host.verifying_key().to_bytes(),
+                &[7; 32],
+                42,
+                1_700_000_000,
+                1_700_000_600,
+            )
+            .unwrap();
+        GoqCatalogDocumentV2::video_h264(42, &certificate).unwrap()
+    }
 
     #[test]
     fn goq_catalog_extension_has_a_stable_golden_document() {
@@ -179,5 +396,55 @@ mod tests {
     fn goq_catalog_extension_rejects_unknown_fields() {
         let json = r#"{"version":1,"video":{"track":{"name":"video/h264","priority":255,"extra":true},"codec":"h264","objectFormat":"sigil/media-frame/1","groupFormat":"sigil/moq-gop/1"}}"#;
         assert!(serde_json::from_str::<MoqCatalogExtensionV1>(json).is_err());
+    }
+
+    #[test]
+    fn authenticated_v2_catalog_is_strict_and_preserves_v1_decoding() {
+        let document = v2_document();
+        let certificate = document.validate().unwrap();
+        assert_eq!(certificate.claims.generation_id, 42);
+        let json = serde_json::to_string(&document).unwrap();
+        assert!(json.contains(r#""version":2"#));
+        assert!(json.contains(r#""mode":"ed25519-v1""#));
+        assert!(json.contains(MOQ_AUTHENTICATED_MEDIA_OBJECT_FORMAT_V1));
+        assert_eq!(
+            serde_json::from_str::<GoqCatalogDocumentV2>(&json).unwrap(),
+            document
+        );
+
+        let legacy = serde_json::to_string(&GoqCatalogDocument::video_h264()).unwrap();
+        serde_json::from_str::<GoqCatalogDocument>(&legacy)
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert!(serde_json::from_str::<GoqCatalogDocumentV2>(&legacy).is_err());
+    }
+
+    #[test]
+    fn authenticated_v2_catalog_rejects_unknown_mode_generation_and_fields() {
+        let mut wrong_mode = v2_document();
+        wrong_mode.goq.video.authentication.mode = "shared-mac-v1".into();
+        assert!(wrong_mode.validate().is_err());
+
+        let mut wrong_generation = v2_document();
+        wrong_generation.goq.generation_id = 43;
+        assert!(wrong_generation.validate().is_err());
+
+        let mut value = serde_json::to_value(v2_document()).unwrap();
+        value["goq"]["video"]["authentication"]["key"] = serde_json::json!("secret");
+        assert!(serde_json::from_value::<GoqCatalogDocumentV2>(value).is_err());
+    }
+
+    #[test]
+    fn authenticated_v2_catalog_advertises_opus_on_the_shared_clock() {
+        let base = v2_document();
+        let certificate = base.validate().unwrap();
+        let document = GoqCatalogDocumentV2::video_h264_opus(42, &certificate).unwrap();
+        let audio = document.goq.audio.as_ref().unwrap();
+        assert_eq!(audio.track.name, MOQ_AUDIO_OPUS_TRACK);
+        assert_eq!(audio.sample_rate, crate::OPUS_SAMPLE_RATE);
+        assert_eq!(audio.channels, crate::OPUS_CHANNELS);
+        assert_eq!(audio.frame_samples, crate::OPUS_FRAME_SAMPLES);
+        assert_eq!(document.validate().unwrap(), certificate);
     }
 }

@@ -3,6 +3,38 @@ export const MAX_STREAM_RATE_SAMPLES = 240;
 export const CADENCE_HITCH_25_MS = 25;
 export const CADENCE_HITCH_33_333_MS = 33.333;
 
+export function mediaAuthenticationPresentation(networkDiagnostics) {
+  const authentication = networkDiagnostics?.media_authentication;
+  const modes = new Set(['ed25519-v1', 'transport-authenticated-v1']);
+  const deliveryRoles = new Set(['direct_host', 'viewer_relay']);
+  if (!authentication
+    || !modes.has(authentication.mode)
+    || !deliveryRoles.has(authentication.delivery_role)
+    || typeof authentication.generation_certified !== 'boolean'
+    || !Number.isSafeInteger(authentication.verification_failures)
+    || authentication.verification_failures < 0) {
+    return {
+      mode: 'invalid',
+      generationState: 'unverified',
+      deliveryRole: 'unknown',
+      verificationFailures: null,
+      trusted: false,
+    };
+  }
+  const authenticated = authentication.mode === 'ed25519-v1';
+  return {
+    mode: authentication.mode,
+    generationState: authentication.generation_certified ? 'certified' : 'transport-bound',
+    deliveryRole: authentication.delivery_role,
+    verificationFailures: authentication.verification_failures,
+    trusted: authenticated
+      ? authentication.generation_certified && authentication.verification_failures === 0
+      : authentication.delivery_role === 'direct_host'
+        && !authentication.generation_certified
+        && authentication.verification_failures === 0,
+  };
+}
+
 /**
  * A bounded, monotonic rolling-rate estimator. Callers supply their own clock
  * so the same implementation is deterministic in tests and uses

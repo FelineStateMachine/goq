@@ -96,6 +96,7 @@ export function newConnectionState({
     developmentMode: false,
     inputCapabilities: emptyInputCapabilities(),
     mediaTransport: 'unknown',
+    controlProtocol: 'unknown',
   };
 
   const snapshot = () => ({
@@ -105,6 +106,7 @@ export function newConnectionState({
     developmentMode: state.developmentMode,
     inputCapabilities: { ...state.inputCapabilities },
     mediaTransport: state.mediaTransport,
+    controlProtocol: state.controlProtocol,
   });
 
   async function connect({ pin = '' } = {}) {
@@ -143,6 +145,7 @@ export function newConnectionState({
       state.disconnecting = false;
       state.inputCapabilities = normalizeInputCapabilities(result);
       state.mediaTransport = normalizeMediaTransport(result.media_transport);
+      state.controlProtocol = result.control_protocol === 'control-v2' ? 'control-v2' : 'legacy-v1';
       onStatus('ok', connectionStatus(result, state.inputCapabilities), {
         result,
         attempt,
@@ -182,6 +185,7 @@ export function newConnectionState({
     state.connected = false;
     state.inputCapabilities = emptyInputCapabilities();
     state.mediaTransport = 'unknown';
+    state.controlProtocol = 'unknown';
     await onDisconnected({ state: snapshot() });
     state.disconnecting = false;
     return true;
@@ -194,9 +198,22 @@ export function newConnectionState({
     get developmentMode() { return state.developmentMode; },
     get inputCapabilities() { return { ...state.inputCapabilities }; },
     get mediaTransport() { return state.mediaTransport; },
+    get controlProtocol() { return state.controlProtocol; },
     snapshot,
     setDevelopmentMode(enabled) {
       state.developmentMode = enabled === true;
+    },
+    updateInputCapabilities(result) {
+      state.inputCapabilities = normalizeInputCapabilities({
+        relative_pointer_available: result.relative_pointer,
+        pointer_position_feedback_available: result.pointer_position_feedback,
+        absolute_pointer_available: result.absolute_pointer,
+        keyboard_available: result.keyboard,
+        text_available: result.text,
+        gamepad_available: result.gamepad,
+        control_available: result.control,
+      });
+      return { ...state.inputCapabilities };
     },
     connect,
     disconnect,

@@ -23,6 +23,18 @@ keyframe_recovery="ok"
 media_v3=false
 relay_only=false
 expected_path_mode=direct
+control_v2=false
+viewers=1
+assert_shared_generation=false
+replace_viewer=0
+legacy_exclusive=false
+expect_second_rejected=false
+focus_handoffs=0
+assert_neutral_before_successor=false
+stall_viewer=0
+assert_survivor_recovery=false
+stress=false
+host_rss_samples=""
 
 usage() {
   cat <<'EOF'
@@ -43,6 +55,21 @@ Options:
                                 instead of upstream MoQ
   --relay-only                  Remove direct probe transports and require the
                                 control, media, and input paths to stay relayed
+  --control-v2                  Exercise explicit control/2 and input/2 focus
+  --viewers COUNT               Concurrent viewers (control-v2 supports 1..8)
+  --assert-shared-generation    Require host-scoped generation naming, one
+                                producer start, and final-viewer cleanup
+  --replace-viewer INDEX        Replace this 1-based control-v2 viewer identity
+  --legacy-exclusive            Exercise the unchanged exclusive legacy path
+  --expect-second-rejected      Require explicit legacy second-client rejection
+  --focus-handoffs COUNT        Run bounded holder-approved control transfers
+  --assert-neutral-before-successor
+                                Require host ordering evidence for every transfer
+  --stall-viewer INDEX          Drive this control-v2 viewer persistently below
+                                the shared bitrate floor
+  --assert-survivor-recovery    Require clean viewers to recover after isolation
+  --stress                      Require the release-profile eight-viewer churn,
+                                pressure isolation, and resource-bound gate
   --help                        Show this help
 EOF
 }
@@ -105,6 +132,57 @@ while [[ $# -gt 0 ]]; do
       media_v3=true
       shift
       ;;
+    --control-v2)
+      control_v2=true
+      media_accept_log="MoQ control v2 client accepted"
+      media_release_log="MoQ control v2 client released"
+      session_gate_name="control v2"
+      shift
+      ;;
+    --viewers)
+      [[ $# -ge 2 ]] || die "--viewers requires a value"
+      viewers="$2"
+      shift 2
+      ;;
+    --assert-shared-generation)
+      assert_shared_generation=true
+      shift
+      ;;
+    --replace-viewer)
+      [[ $# -ge 2 ]] || die "--replace-viewer requires a value"
+      replace_viewer="$2"
+      shift 2
+      ;;
+    --legacy-exclusive)
+      legacy_exclusive=true
+      shift
+      ;;
+    --expect-second-rejected)
+      expect_second_rejected=true
+      shift
+      ;;
+    --focus-handoffs)
+      [[ $# -ge 2 ]] || die "--focus-handoffs requires a value"
+      focus_handoffs="$2"
+      shift 2
+      ;;
+    --assert-neutral-before-successor)
+      assert_neutral_before_successor=true
+      shift
+      ;;
+    --stall-viewer)
+      [[ $# -ge 2 ]] || die "--stall-viewer requires a value"
+      stall_viewer="$2"
+      shift 2
+      ;;
+    --assert-survivor-recovery)
+      assert_survivor_recovery=true
+      shift
+      ;;
+    --stress)
+      stress=true
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -128,6 +206,76 @@ require_positive_integer "--primary-frames" "$primary_frames"
 require_positive_integer "--reconnect-cycles" "$reconnect_cycles"
 require_positive_integer "--reconnect-frames" "$reconnect_frames"
 require_positive_integer "--probe-timeout-seconds" "$probe_timeout_seconds"
+require_positive_integer "--viewers" "$viewers"
+case "$focus_handoffs" in
+  ''|*[!0-9]*) die "--focus-handoffs must be a non-negative integer" ;;
+esac
+if [[ "$focus_handoffs" -gt 0 && ( "$control_v2" != true || "$viewers" -lt 2 ) ]]; then
+  die "--focus-handoffs requires --control-v2 with at least two viewers"
+fi
+if [[ "$assert_neutral_before_successor" == true && "$focus_handoffs" -eq 0 ]]; then
+  die "--assert-neutral-before-successor requires --focus-handoffs"
+fi
+if [[ "$control_v2" == true && ( "$viewers" -lt 1 || "$viewers" -gt 8 ) ]]; then
+  die "this bounded control-v2 proof supports --viewers 1 through 8"
+fi
+case "$replace_viewer" in
+  ''|*[!0-9]*) die "--replace-viewer must be a non-negative integer" ;;
+esac
+if [[ "$replace_viewer" -gt "$viewers" ]]; then
+  die "--replace-viewer must identify one of the configured viewers"
+fi
+case "$stall_viewer" in
+  ''|*[!0-9]*) die "--stall-viewer must be a non-negative integer" ;;
+esac
+if [[ "$stall_viewer" -gt "$viewers" ]]; then
+  die "--stall-viewer must identify one of the configured viewers"
+fi
+if [[ "$stall_viewer" -gt 0 && ( "$control_v2" != true || "$viewers" -lt 2 ) ]]; then
+  die "--stall-viewer requires --control-v2 with at least two viewers"
+fi
+if [[ "$assert_survivor_recovery" == true && "$stall_viewer" -eq 0 ]]; then
+  die "--assert-survivor-recovery requires --stall-viewer"
+fi
+if [[ "$stall_viewer" -gt 0 && "$command_timeout_seconds" -lt 75 ]]; then
+  command_timeout_seconds=75
+fi
+if [[ "$control_v2" == true && "$media_v3" == true ]]; then
+  die "--control-v2 conflicts with --media-v3"
+fi
+if [[ "$legacy_exclusive" == true && "$control_v2" == true ]]; then
+  die "--legacy-exclusive conflicts with --control-v2"
+fi
+if [[ "$legacy_exclusive" == true && "$viewers" -ne 2 ]]; then
+  die "--legacy-exclusive currently proves exactly --viewers 2"
+fi
+if [[ "$legacy_exclusive" == true && "$expect_second_rejected" != true ]]; then
+  die "--legacy-exclusive requires --expect-second-rejected"
+fi
+if [[ "$stress" == true ]]; then
+  [[ "$control_v2" == true && "$profile" == release && "$viewers" -eq 8 ]] \
+    || die "--stress requires --profile release --control-v2 --viewers 8"
+  assert_shared_generation=true
+  stall_viewer=8
+  assert_survivor_recovery=true
+fi
+if [[ "$control_v2" == true && "$viewers" -gt 1 && "$reconnect_cycles" -gt 0 \
+  && "$replace_viewer" -eq 0 ]]; then
+  if [[ "$focus_handoffs" -gt 0 ]]; then
+    # Viewers 1 and 2 are the focus-handoff participants. Replacing one tears
+    # down its control session mid-exchange, so it can never observe the
+    # required handoffs. Replace a viewer outside the participant set, and
+    # leave replacement off entirely when the roster has no spare viewer.
+    if [[ "$viewers" -gt 2 ]]; then
+      replace_viewer=3
+    fi
+  else
+    replace_viewer=2
+  fi
+fi
+if [[ "$focus_handoffs" -gt 0 && "$replace_viewer" -gt 0 && "$replace_viewer" -le 2 ]]; then
+  die "--replace-viewer must target a viewer above 2 when --focus-handoffs is requested"
+fi
 [[ "$primary_frames" -ge 4 ]] \
   || die "--primary-frames must be at least 4 for keyframe recovery"
 [[ "$reconnect_frames" -ge 4 ]] \
@@ -142,6 +290,10 @@ scaled_host_runtime_seconds=$((120 + estimated_primary_seconds + reconnect_cycle
 if [[ "$scaled_host_runtime_seconds" -gt "$host_runtime_seconds" ]]; then
   host_runtime_seconds="$scaled_host_runtime_seconds"
 fi
+scaled_command_timeout_seconds=$((estimated_primary_seconds + 45))
+if [[ "$scaled_command_timeout_seconds" -gt "$command_timeout_seconds" ]]; then
+  command_timeout_seconds="$scaled_command_timeout_seconds"
+fi
 
 if [[ -f "${HOME}/.cargo/env" ]]; then
   # The project pins its Rust toolchain, but Cargo may not yet be on PATH in a
@@ -153,7 +305,13 @@ fi
 command -v cargo >/dev/null 2>&1 || die "cargo is required"
 ffmpeg_bin="$(command -v ffmpeg || true)"
 [[ -n "$ffmpeg_bin" ]] || die "ffmpeg is required"
-if ! "$ffmpeg_bin" -hide_banner -encoders 2>/dev/null | grep -q '[[:space:]]libx264[[:space:]]'; then
+# Capture the encoder list before matching. Piping it straight into `grep -q`
+# lets grep exit on the first hit, which hands ffmpeg a SIGPIPE, and `pipefail`
+# then reports the whole probe as failed. A full ffmpeg build emits enough
+# encoders to lose that race every time, so the check rejected exactly the
+# builds that do provide libx264.
+ffmpeg_encoders="$("$ffmpeg_bin" -hide_banner -encoders 2>/dev/null || true)"
+if ! grep -q '[[:space:]]libx264[[:space:]]' <<<"$ffmpeg_encoders"; then
   die "ffmpeg does not provide the required libx264 encoder"
 fi
 
@@ -170,6 +328,8 @@ primary_watchdog_pid=""
 bounded_pid=""
 bounded_watchdog_pid=""
 watchdog_pid=""
+viewer_pids=()
+resource_sampler_pid=""
 
 stop_pid() {
   local pid="$1"
@@ -205,6 +365,11 @@ cleanup() {
   [[ -z "$bounded_watchdog_pid" ]] || wait "$bounded_watchdog_pid" 2>/dev/null || true
   stop_pid "$primary_pid"
   [[ -z "$primary_watchdog_pid" ]] || wait "$primary_watchdog_pid" 2>/dev/null || true
+  for viewer_pid in "${viewer_pids[@]-}"; do
+    [[ -n "$viewer_pid" ]] || continue
+    stop_pid "$viewer_pid"
+  done
+  stop_pid "$resource_sampler_pid"
   stop_pid "$host_pid"
   [[ -z "$host_watchdog_pid" ]] || wait "$host_watchdog_pid" 2>/dev/null || true
 
@@ -495,6 +660,7 @@ RUST_LOG='info,sigil::server=debug' "$host_bin" serve \
   --width 1280 \
   --height 800 \
   --framerate 60 \
+  --max-viewers "$viewers" \
   --ffmpeg "$ffmpeg_bin" \
   >"$host_log" 2>&1 &
 host_pid=$!
@@ -503,6 +669,361 @@ host_watchdog_pid="$watchdog_pid"
 wait_for_log_line "$host_log" 'status=ready' "$host_pid" 'sigil' || die "host did not become ready"
 host_node_id="$(sed -n 's/^node_id=//p' "$host_log" | tail -n 1)"
 [[ "$host_node_id" == "$node_id" ]] || die "ready host node ID does not match its identity"
+if [[ "$stress" == true ]]; then
+  host_rss_samples="$tmp_root/host-rss-kib.txt"
+  (
+    while kill -0 "$host_pid" 2>/dev/null; do
+      ps -o rss= -p "$host_pid" 2>/dev/null | tr -d ' ' >>"$host_rss_samples" || true
+      sleep 0.25
+    done
+  ) &
+  resource_sampler_pid=$!
+fi
+
+if [[ "$control_v2" == true ]]; then
+  if [[ "$viewers" -gt 1 ]]; then
+    viewer_logs=()
+    viewer_identities=()
+    viewer_pids=()
+    replacement_log=""
+    replacement_logs=()
+    viewer=1
+    while [[ "$viewer" -le "$viewers" ]]; do
+      viewer_identity="$tmp_root/viewer-${viewer}.key"
+      "$host_bin" identity init --output "$viewer_identity" \
+        >"$tmp_root/viewer-${viewer}-identity.log" 2>&1
+      viewer_identities+=("$viewer_identity")
+      viewer_log="$tmp_root/control-v2-viewer-${viewer}.log"
+      viewer_logs+=("$viewer_log")
+      if [[ "$stall_viewer" -gt 0 ]]; then
+        adaptive_profile="clean"
+        if [[ "$viewer" -eq "$stall_viewer" ]]; then adaptive_profile="floor-breach"; fi
+        "$probe_bin" --control-v2 --spectator --adaptive-profile "$adaptive_profile" \
+          --identity "$viewer_identity" --node-id "$node_id" --frames "$primary_frames" \
+          --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800 \
+          >"$viewer_log" 2>&1 &
+      elif [[ "$focus_handoffs" -gt 0 && "$viewer" -le 2 ]]; then
+        "$probe_bin" --control-v2 --focus-handoffs "$focus_handoffs" \
+          --identity "$viewer_identity" --node-id "$node_id" --frames "$primary_frames" \
+          --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800 \
+          >"$viewer_log" 2>&1 &
+      elif [[ "$viewer" -gt 1 ]]; then
+        "$probe_bin" --control-v2 --spectator \
+          --identity "$viewer_identity" --node-id "$node_id" --frames "$primary_frames" \
+          --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800 \
+          >"$viewer_log" 2>&1 &
+      else
+        "$probe_bin" --control-v2 --disconnect-with-focus \
+          --identity "$viewer_identity" --node-id "$node_id" --frames "$primary_frames" \
+          --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800 \
+          >"$viewer_log" 2>&1 &
+      fi
+      viewer_pids+=("$!")
+      if [[ "$viewer" -eq 1 && "$focus_handoffs" -eq 0 && "$stall_viewer" -eq 0 ]]; then
+        wait_for_log_count "$host_log" 'input v2 client accepted' 1 "$host_pid" 'sigil' \
+          || die "slot-0 holder did not acquire focused input before spectators joined"
+      fi
+      viewer=$((viewer + 1))
+    done
+
+    wait_for_log_count "$host_log" 'MoQ control v2 client accepted' "$viewers" "$host_pid" 'sigil' \
+      || die "not all control-v2 viewers were admitted"
+    wait_for_log_count "$host_log" 'authorized MoQ media attachment accepted' "$viewers" "$host_pid" 'sigil' \
+      || die "not all control-v2 viewers attached to native MoQ"
+
+    if [[ "$replace_viewer" -gt 0 ]]; then
+      cycle=1
+      while [[ "$cycle" -le "$reconnect_cycles" ]]; do
+        replacement_log="$tmp_root/control-v2-replacement-${replace_viewer}-${cycle}.log"
+        replacement_logs+=("$replacement_log")
+        replacement_role=(--spectator)
+        if [[ "$stress" == true && "$cycle" -eq 1 ]]; then
+          replacement_role=(--disconnect-with-focus)
+        fi
+        if ! run_bounded "$command_timeout_seconds" "$replacement_log" \
+          "$probe_bin" --control-v2 "${replacement_role[@]}" \
+          --identity "${viewer_identities[$((replace_viewer - 1))]}" \
+          --node-id "$node_id" --frames "$reconnect_frames" \
+          --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800; then
+          sed -n '1,240p' "$replacement_log" >&2 || true
+          die "same-peer replacement cycle $cycle failed"
+        fi
+        grep -Fxq 'probe=ok' "$replacement_log" \
+          || die "replacement viewer cycle $cycle did not progress"
+        if [[ "$stress" == true ]]; then
+          grep -Eq '^roster_viewers=(7|8)$' "$replacement_log" \
+            || die "replacement cycle $cycle exceeded the bounded stress roster"
+        else
+          observed_roster="$(sed -n 's/^roster_viewers=\([0-9][0-9]*\)$/\1/p' \
+            "$replacement_log" | head -1)"
+          [[ -n "$observed_roster" ]] \
+            || die "replacement cycle $cycle did not report a roster cardinality"
+          # Cycle 1 runs immediately after every viewer attached and long
+          # before any of them exhausts its frame budget, so the full roster is
+          # deterministic there. Later cycles race the primaries' own exit, so
+          # assert only what same-peer replacement actually governs: the roster
+          # never grows past the configured bound, and the replacement joined a
+          # generation that still has at least one survivor.
+          if [[ "$cycle" -eq 1 ]]; then
+            [[ "$observed_roster" -eq "$viewers" ]] \
+              || die "replacement cycle 1 observed roster $observed_roster instead of $viewers"
+          else
+            [[ "$observed_roster" -ge 2 && "$observed_roster" -le "$viewers" ]] \
+              || die "replacement cycle $cycle observed unbounded roster $observed_roster"
+          fi
+        fi
+        grep -Fxq 'media_progress=monotonic' "$replacement_log" \
+          || die "replacement cycle $cycle did not report monotonic progress"
+        if [[ "$stress" == true && "$cycle" -eq 1 ]]; then
+          grep -Fxq 'slot_0_input=ok' "$replacement_log" \
+            || die "stress replacement did not prove the single slot-0 input holder"
+        fi
+        cycle=$((cycle + 1))
+      done
+    fi
+
+    viewer=1
+    for viewer_pid in "${viewer_pids[@]}"; do
+      if wait "$viewer_pid"; then viewer_status=0; else viewer_status=$?; fi
+      if [[ "$viewer" -eq "$replace_viewer" ]]; then
+        viewer=$((viewer + 1))
+        continue
+      fi
+      [[ "$viewer_status" -eq 0 ]] || {
+        sed -n '1,240p' "${viewer_logs[$((viewer - 1))]}" >&2 || true
+        die "control-v2 viewer $viewer failed"
+      }
+      grep -Fxq 'probe=ok' "${viewer_logs[$((viewer - 1))]}" \
+        || die "control-v2 viewer $viewer did not complete"
+      viewer=$((viewer + 1))
+    done
+    viewer_pids=()
+    if [[ "$stall_viewer" -gt 0 ]]; then
+      viewer=1
+      while [[ "$viewer" -le "$viewers" ]]; do
+        if [[ "$viewer" -eq "$replace_viewer" ]]; then
+          viewer=$((viewer + 1))
+          continue
+        elif [[ "$viewer" -eq "$stall_viewer" ]]; then
+          grep -Fxq 'adaptive_profile=floor-breach' "${viewer_logs[$((viewer - 1))]}" \
+            || die "stalled viewer did not run the floor-breach profile"
+          grep -Fxq 'adaptive_floor_detach=ok' "${viewer_logs[$((viewer - 1))]}" \
+            || die "stalled viewer was not detached after bounded isolated recovery"
+        elif [[ "$assert_survivor_recovery" == true ]]; then
+          grep -Fxq 'adaptive_profile=clean' "${viewer_logs[$((viewer - 1))]}" \
+            || die "survivor did not run the clean adaptive profile"
+          grep -Fxq 'adaptive_survivor_recovery=ok' "${viewer_logs[$((viewer - 1))]}" \
+            || die "survivor did not recover after the stalled viewer was isolated"
+        fi
+        viewer=$((viewer + 1))
+      done
+      grep -Fq 'detached persistently below-floor viewer after bounded isolated recovery' "$host_log" \
+        || die "host did not record terminal slow-viewer isolation"
+      if [[ "$stress" == true ]]; then
+        grep -Fq 'input v2 client accepted' "$host_log" \
+          || die "stress run did not admit a focused input path"
+      fi
+    elif [[ "$focus_handoffs" -gt 0 ]]; then
+      participant=1
+      while [[ "$participant" -le 2 ]]; do
+        grep -Fxq "focus_handoffs_observed=${focus_handoffs}" "${viewer_logs[$((participant - 1))]}" \
+          || die "focus participant $participant did not observe all handoffs"
+        participant=$((participant + 1))
+      done
+    else
+      grep -Fxq 'slot_0_input=ok' "${viewer_logs[0]}" || die "slot-0 holder input failed"
+    fi
+    spectator=$([[ "$focus_handoffs" -gt 0 ]] && printf 3 || printf 2)
+    if [[ "$stall_viewer" -gt 0 ]]; then spectator=1; fi
+    while [[ "$spectator" -le "$viewers" ]]; do
+      if [[ "$spectator" -eq "$replace_viewer" ]]; then
+        spectator=$((spectator + 1))
+        continue
+      fi
+      grep -Fxq 'spectator=ok' "${viewer_logs[$((spectator - 1))]}" \
+        || die "viewer $spectator did not remain a spectator"
+      spectator=$((spectator + 1))
+    done
+    roster_logs=("${viewer_logs[@]}")
+    if [[ "${#replacement_logs[@]}" -gt 0 ]]; then roster_logs+=("${replacement_logs[@]}"); fi
+    grep -Fhq "roster_viewers=${viewers}" "${roster_logs[@]}" 2>/dev/null \
+      || die "no viewer observed the complete roster"
+    wait_for_log_count "$host_log" 'shared media generation stopped with all sources cleaned up' \
+      1 "$host_pid" 'sigil' || die "shared generation did not stop after the final viewer"
+    [[ "$(grep -Fc -- 'shared media generation started' "$host_log" || true)" -eq 1 ]] \
+      || die "multi-viewer control-v2 started more than one generation"
+    [[ "$(grep -Fc -- 'shared media generation stopped with all sources cleaned up' "$host_log" || true)" -eq 1 ]] \
+      || die "multi-viewer control-v2 stopped the generation more than once"
+    clean_resource_log="$tmp_root/host-shared-resources.log"
+    sed $'s/\033\[[0-9;]*m//g' "$host_log" >"$clean_resource_log"
+    for resource_field in \
+      'video_sources=1' 'video_encoders=1' 'audio_sources=0' 'audio_encoders=0' \
+      'publishers=1' 'adaptive_actuators=1'; do
+      grep -F 'shared media generation started' "$clean_resource_log" \
+        | grep -Fq -- "$resource_field" \
+        || die "shared generation resource-count evidence is missing $resource_field"
+    done
+    expected_membership_changes=$((viewers + reconnect_cycles))
+    [[ "$(grep -Fc -- 'multi-viewer session membership changed' "$host_log" || true)" -ge "$expected_membership_changes" ]] \
+      || die "host did not record bounded connect/replacement/disconnect audit events"
+    for viewer_log in "${viewer_logs[@]}" "${replacement_logs[@]}"; do
+      [[ -f "$viewer_log" ]] || continue
+      grep -Fxq 'probe=ok' "$viewer_log" || continue
+      grep -Fxq 'resource_summary_version=1' "$viewer_log" \
+        || die "viewer resource summary is missing"
+      grep -Fxq 'probe_media_object_capacity=4' "$viewer_log" \
+        || die "viewer media-object queue bound is missing"
+    done
+    if [[ "$assert_neutral_before_successor" == true ]]; then
+      clean_focus_log="$tmp_root/host-focus-transitions.log"
+      sed $'s/\033\[[0-9;]*m//g' "$host_log" >"$clean_focus_log"
+      if ! awk -v required="$focus_handoffs" '
+        function transition_id(line, value) {
+          if (match(line, /transition_id=[0-9]+/)) {
+            value = substr(line, RSTART + 14, RLENGTH - 14)
+            return value + 0
+          }
+          return 0
+        }
+        /focus transition entered no-inject neutralizing state/ {
+          id = transition_id($0); if (id > 0) entered[id] = NR
+        }
+        /focus transition virtual input neutralized/ {
+          id = transition_id($0); if (id > 0) neutral[id] = NR
+        }
+        /focus transition successor committed after neutralization/ {
+          id = transition_id($0)
+          if (id > 0) {
+            committed[id] = NR
+            count += 1
+          }
+        }
+        END {
+          if (count < required) exit 1
+          for (id in committed) {
+            if (!(id in entered) || !(id in neutral) || entered[id] >= neutral[id] || neutral[id] >= committed[id]) exit 1
+          }
+        }
+      ' "$clean_focus_log"; then
+        grep -F 'focus transition' "$clean_focus_log" >&2 || true
+        die "focus successor was published before complete neutralization evidence"
+      fi
+    fi
+
+    kill -TERM "$host_pid" 2>/dev/null || true
+    if wait "$host_pid"; then host_status=0; else host_status=$?; fi
+    host_pid=""
+    wait "$host_watchdog_pid" 2>/dev/null || true
+    host_watchdog_pid=""
+    [[ "$host_status" -eq 0 ]] || die "host exited with status $host_status"
+    maximum_rss_kib=0
+    if [[ "$stress" == true ]]; then
+      stop_pid "$resource_sampler_pid"
+      resource_sampler_pid=""
+      maximum_rss_kib="$(awk 'NF && $1 > maximum { maximum = $1 } END { print maximum + 0 }' "$host_rss_samples")"
+      [[ "$maximum_rss_kib" -gt 0 && "$maximum_rss_kib" -le 2097152 ]] \
+        || die "stress RSS exceeded the bounded 2048 MiB gate"
+    fi
+    printf 'loopback_proof=ok\n'
+    printf 'profile=%s\n' "$profile"
+    printf 'host_sha256=%s\n' "$(sha256_file "$host_bin")"
+    printf 'control_v2=ok\n'
+    printf 'viewers=%s\n' "$viewers"
+    printf 'same_peer_replacement=%s\n' "$([[ "$replace_viewer" -gt 0 ]] && printf ok || printf not-requested)"
+    printf 'reconnect_cycles=%s\n' "$reconnect_cycles"
+    printf 'shared_generation=ok\n'
+    printf 'slot_0_single_holder=ok\n'
+    printf 'focus_handoffs=%s\n' "$focus_handoffs"
+    printf 'neutral_before_successor=%s\n' "$([[ "$assert_neutral_before_successor" == true ]] && printf ok || printf not-requested)"
+    printf 'stalled_viewer=%s\n' "$stall_viewer"
+    printf 'survivor_recovery=%s\n' "$([[ "$assert_survivor_recovery" == true ]] && printf ok || printf not-requested)"
+    printf 'spectator_progress=ok\n'
+    printf 'resource_summary_version=1\n'
+    printf 'shared_video_sources=1\n'
+    printf 'shared_video_encoders=1\n'
+    printf 'shared_audio_sources=0\n'
+    printf 'shared_audio_encoders=0\n'
+    printf 'shared_publishers=1\n'
+    printf 'shared_adaptive_actuators=1\n'
+    printf 'maximum_host_rss_kib=%s\n' "$maximum_rss_kib"
+    printf 'bounded_queues=ok\n'
+    printf 'revocation_isolation=not-applicable-direct-proof-mode\n'
+    printf 'final_cleanup=ok\n'
+    printf 'stress=%s\n' "$([[ "$stress" == true ]] && printf ok || printf not-requested)"
+    exit 0
+  fi
+  v2_log="$tmp_root/control-v2.log"
+  v1_log="$tmp_root/control-v1-compatibility.log"
+  if ! run_bounded "$command_timeout_seconds" "$v2_log" \
+    "$probe_bin" --control-v2 --node-id "$node_id" --frames "$primary_frames" \
+    --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800; then
+    sed -n '1,240p' "$v2_log" >&2 || true
+    die "control-v2 probe failed"
+  fi
+  grep -Fxq 'probe=ok' "$v2_log" || die "control-v2 probe did not complete"
+  grep -Fxq 'control_alpn=sigil/control/2' "$v2_log" || die "control-v2 ALPN evidence is missing"
+  grep -Fxq 'input_alpn=sigil/input/2' "$v2_log" || die "input-v2 ALPN evidence is missing"
+  grep -Fxq 'slot_0_input=ok' "$v2_log" || die "slot-0 input evidence is missing"
+  grep -Fxq 'focus_release=ok' "$v2_log" || die "focus release evidence is missing"
+  if [[ "$assert_shared_generation" == true ]]; then
+    grep -Fxq 'media_generation_scope=host' "$v2_log" \
+      || die "host-scoped media generation evidence is missing"
+    grep -Eq '^media_generation_id=[1-9][0-9]*$' "$v2_log" \
+      || die "media generation ID evidence is missing"
+    grep -Eq '^media_broadcast_name=sigil/generation/[1-9][0-9]*/media$' "$v2_log" \
+      || die "generation-scoped broadcast evidence is missing"
+  fi
+  awk -F= '$1 == "initial_snapshot_revision" && $2 ~ /^[1-9][0-9]*$/ { found=1 } END { exit !found }' \
+    "$v2_log" || die "initial snapshot evidence is missing"
+  awk -F= '$1 == "focus_generation" && $2 ~ /^[1-9][0-9]*$/ { found=1 } END { exit !found }' \
+    "$v2_log" || die "focus generation evidence is missing"
+  wait_for_log_count "$host_log" 'MoQ control v2 client released' 1 "$host_pid" 'sigil' \
+    || die "control-v2 session was not released"
+  wait_for_log_count "$host_log" 'input v2 client released' 1 "$host_pid" 'sigil' \
+    || die "input-v2 session was not neutralized and released"
+  if [[ "$assert_shared_generation" == true ]]; then
+    clean_host_log="$tmp_root/host-shared-generation.log"
+    sed $'s/\033\[[0-9;]*m//g' "$host_log" >"$clean_host_log"
+    wait_for_log_count "$host_log" 'shared media generation stopped with all sources cleaned up' \
+      1 "$host_pid" 'sigil' || die "shared generation did not clean up after the final viewer"
+    [[ "$(grep -Fc -- 'shared media generation started' "$host_log" || true)" -eq 1 ]] \
+      || die "control-v2 started more than one shared media generation"
+    [[ "$(grep -Fc -- 'shared media generation stopped with all sources cleaned up' "$host_log" || true)" -eq 1 ]] \
+      || die "control-v2 stopped the shared media generation more than once"
+    for resource_field in \
+      'video_sources=1' 'video_encoders=1' 'audio_sources=0' 'audio_encoders=0' 'publishers=1'; do
+      grep -F 'shared media generation started' "$clean_host_log" | grep -Fq -- "$resource_field" \
+        || die "shared generation resource-count evidence is missing $resource_field"
+    done
+  fi
+
+  # The unchanged v1 path remains explicitly usable after a v2 generation.
+  if ! run_bounded "$command_timeout_seconds" "$v1_log" \
+    "$probe_bin" --node-id "$node_id" --frames 4 \
+    --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800; then
+    sed -n '1,160p' "$v1_log" >&2 || true
+    die "v1 compatibility probe failed after control-v2"
+  fi
+  grep -Fxq 'probe=ok' "$v1_log" || die "v1 compatibility probe did not complete"
+  grep -Fxq 'control_alpn=sigil/control/1' "$v1_log" || die "v1 compatibility ALPN evidence is missing"
+
+  kill -TERM "$host_pid" 2>/dev/null || true
+  if wait "$host_pid"; then host_status=0; else host_status=$?; fi
+  host_pid=""
+  wait "$host_watchdog_pid" 2>/dev/null || true
+  host_watchdog_pid=""
+  [[ "$host_status" -eq 0 ]] || die "host exited with status $host_status"
+  printf 'loopback_proof=ok\n'
+  printf 'control_v2=ok\n'
+  printf 'viewers=1\n'
+  printf 'initial_snapshot=ok\n'
+  printf 'slot_0_focus=grant-release\n'
+  printf 'input_v2=ok\n'
+  printf 'neutralization=reset-before-input-lease-release\n'
+  printf 'v1_compatibility=ok\n'
+  printf 'shared_generation=%s\n' "$([[ "$assert_shared_generation" == true ]] && printf ok || printf not-requested)"
+  exit 0
+fi
 
 primary_probe_args=(
   --node-id "$node_id"

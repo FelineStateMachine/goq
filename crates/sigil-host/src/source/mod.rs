@@ -812,6 +812,8 @@ mod tests {
         HostConfig {
             identity_path: PathBuf::from("/tmp/host.key"),
             state_path: PathBuf::from("/tmp/state"),
+            max_viewers: crate::config::DEFAULT_MAX_VIEWERS,
+            focus_owner: None,
             source: VideoSource::GamescopePipewire,
             width: Some(1280),
             height: Some(800),

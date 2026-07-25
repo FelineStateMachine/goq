@@ -5,11 +5,12 @@ set -euo pipefail
 LC_ALL=C
 export LC_ALL
 
-test_dir="${1:-}"
-if [[ -z "$test_dir" ]]; then
-  printf 'usage: %s TEST_DIRECTORY\n' "${0##*/}" >&2
+if [[ $# -gt 1 ]]; then
+  printf 'usage: %s [TEST_DIRECTORY]\n' "${0##*/}" >&2
   exit 2
 fi
+script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+test_dir="${1:-$script_dir/tests}"
 if [[ -L "$test_dir" || ! -d "$test_dir" ]]; then
   printf 'shell test directory must be a real directory: %s\n' "$test_dir" >&2
   exit 1

@@ -2,14 +2,14 @@
 
 set -euo pipefail
 
-FORMAT='goq-public-alpha-uat-v2'
-EVIDENCE_SCHEMA='goq-public-alpha-evidence-v2'
+FORMAT='goq-public-alpha-uat-v3'
+EVIDENCE_SCHEMA='goq-public-alpha-evidence-v3'
 MAX_SOURCE_BYTES=$((1024 * 1024))
 DEFAULT_MAX_AGE_SECONDS=$((7 * 24 * 60 * 60))
 FUTURE_SKEW_SECONDS=300
 GITHUB_REPOSITORY='FelineStateMachine/goq'
 SIGIL_ASSET_TARGET_CONTRACT='linux-glibc2.17-x86_64'
-required_kinds=(cold-boot controller mouse soak network-direct network-relay reconnect second-client)
+required_kinds=(cold-boot controller mouse soak network-direct network-relay reconnect multi-viewer second-client)
 all_kinds=("${required_kinds[@]}" loopback-preflight)
 script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_dir="$(CDPATH='' cd -- "$script_dir/.." && pwd -P)"
@@ -431,11 +431,20 @@ kind_keys() {
         keyframe_recovery_p95_ms
       ;;
     second-client)
-      printf '%s\n' second_client_attempts second_client_rejections \
+      printf '%s\n' protocol_mode second_client_attempts second_client_rejections \
         authorized_primary_uninterrupted rejection_reason
       ;;
+    multi-viewer)
+      printf '%s\n' protocol_mode configured_viewer_capacity concurrent_viewers \
+        shared_media_generation shared_video_sources shared_video_encoders \
+        shared_audio_sources shared_audio_encoders shared_publishers shared_adaptive_actuators \
+        viewer_progress slot_0_holders_max focus_handoff_p95_ms slow_viewer_isolation \
+        same_peer_replacement live_view_revocation survivors_uninterrupted final_cleanup \
+        ordinary_service_restored
+      ;;
     loopback-preflight)
-      printf '%s\n' loopback_proof profile host_sha256 active_client_rejection reconnect_cycles cleanup
+      printf '%s\n' loopback_proof profile host_sha256 control_v2 viewers reconnect_cycles \
+        same_peer_replacement shared_generation slot_0_single_holder bounded_queues final_cleanup
       ;;
     *) return 1 ;;
   esac
@@ -595,12 +604,46 @@ validate_reconnect() {
 validate_second_client() {
   local source="$1"
   local attempts rejections
+  require_equal "$(source_get "$source" protocol_mode)" legacy-exclusive-v1 protocol_mode
   attempts="$(source_get "$source" second_client_attempts)"; require_number "$attempts" second_client_attempts
   rejections="$(source_get "$source" second_client_rejections)"; require_number "$rejections" second_client_rejections
   number_ge "$attempts" 3 || die "second-client evidence requires at least three attempts"
   require_equal "$rejections" "$attempts" second_client_rejections
   require_equal "$(source_get "$source" authorized_primary_uninterrupted)" pass authorized_primary_uninterrupted
-  require_equal "$(source_get "$source" rejection_reason)" active-client rejection_reason
+  require_equal "$(source_get "$source" rejection_reason)" legacy-active-client rejection_reason
+}
+
+validate_multi_viewer() {
+  local source="$1"
+  local capacity viewers handoff_p95
+  require_equal "$(source_get "$source" protocol_mode)" native-moq-v2 protocol_mode
+  capacity="$(source_get "$source" configured_viewer_capacity)"
+  viewers="$(source_get "$source" concurrent_viewers)"
+  handoff_p95="$(source_get "$source" focus_handoff_p95_ms)"
+  require_number "$capacity" configured_viewer_capacity
+  require_number "$viewers" concurrent_viewers
+  require_number "$handoff_p95" focus_handoff_p95_ms
+  number_ge "$capacity" 3 || die "multi-viewer capacity must be at least three"
+  number_le "$capacity" 8 || die "multi-viewer capacity exceeds the hard ceiling"
+  number_ge "$viewers" 3 || die "multi-viewer evidence requires three concurrent viewers"
+  number_le "$viewers" "$capacity" || die "concurrent viewers exceed configured capacity"
+  number_le "$handoff_p95" 1000 || die "focus handoff p95 exceeds 1000 ms"
+  for key in shared_video_sources shared_video_encoders shared_audio_sources \
+    shared_audio_encoders shared_publishers shared_adaptive_actuators slot_0_holders_max; do
+    require_number "$(source_get "$source" "$key")" "$key"
+  done
+  require_equal "$(source_get "$source" shared_video_sources)" 1 shared_video_sources
+  require_equal "$(source_get "$source" shared_video_encoders)" 1 shared_video_encoders
+  require_equal "$(source_get "$source" shared_audio_sources)" 1 shared_audio_sources
+  require_equal "$(source_get "$source" shared_audio_encoders)" 1 shared_audio_encoders
+  require_equal "$(source_get "$source" shared_publishers)" 1 shared_publishers
+  require_equal "$(source_get "$source" shared_adaptive_actuators)" 1 shared_adaptive_actuators
+  require_equal "$(source_get "$source" slot_0_holders_max)" 1 slot_0_holders_max
+  for key in shared_media_generation viewer_progress slow_viewer_isolation \
+    same_peer_replacement live_view_revocation survivors_uninterrupted final_cleanup \
+    ordinary_service_restored; do
+    require_equal "$(source_get "$source" "$key")" pass "$key"
+  done
 }
 
 validate_loopback() {
@@ -609,8 +652,13 @@ validate_loopback() {
   require_equal "$(source_get "$source" loopback_proof)" ok loopback_proof
   require_equal "$(source_get "$source" profile)" release profile
   require_equal "$(source_get "$source" host_sha256)" "$(source_get "$source" sigil_sha256)" host_sha256
-  require_equal "$(source_get "$source" active_client_rejection)" ok active_client_rejection
-  require_equal "$(source_get "$source" cleanup)" ok cleanup
+  require_equal "$(source_get "$source" control_v2)" ok control_v2
+  require_equal "$(source_get "$source" viewers)" 3 viewers
+  require_equal "$(source_get "$source" same_peer_replacement)" ok same_peer_replacement
+  require_equal "$(source_get "$source" shared_generation)" ok shared_generation
+  require_equal "$(source_get "$source" slot_0_single_holder)" ok slot_0_single_holder
+  require_equal "$(source_get "$source" bounded_queues)" ok bounded_queues
+  require_equal "$(source_get "$source" final_cleanup)" ok final_cleanup
   cycles="$(source_get "$source" reconnect_cycles)"; require_number "$cycles" reconnect_cycles
   number_ge "$cycles" 3 || die "loopback preflight requires at least three reconnect cycles"
 }
@@ -623,6 +671,7 @@ validate_kind() {
     soak) validate_soak "$1" ;;
     network-direct|network-relay) validate_network "$1" "$2" ;;
     reconnect) validate_reconnect "$1" ;;
+    multi-viewer) validate_multi_viewer "$1" ;;
     second-client) validate_second_client "$1" ;;
     loopback-preflight) validate_loopback "$1" ;;
     *) die "unsupported evidence kind: $2" ;;

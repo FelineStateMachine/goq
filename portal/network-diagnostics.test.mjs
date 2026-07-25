@@ -40,7 +40,7 @@ function leg(overrides = {}) {
 
 function snapshot(overrides = {}) {
   return {
-    version: 1,
+    version: 2,
     session_elapsed_ms: 12345,
     media: leg(),
     input: leg({ mode: 'relay', direct_samples: 0, relay_samples: 3 }),
@@ -62,13 +62,32 @@ function snapshot(overrides = {}) {
       latency_overflow_total: 0,
       complete: true,
     },
+    adaptive: {
+      scope: 'local_viewer',
+      local_pressure: 'pressured',
+      aggregate_target_kbps: 6000,
+      aggregate_state: 'decrease',
+      recovery_state: 'active',
+      applied: true,
+    },
+    session: {
+      mode: 'moq_multi_viewer_v2',
+      local_handle: 'viewer-one',
+      focus_generation: 7,
+      roster_revision: 9,
+      roster_age_ms: 25,
+      subscription_expires_at_unix: 2_000_000_000,
+      subscription_seconds_remaining: 30,
+      stale_snapshot_total: 0,
+      invalid_snapshot_total: 0,
+    },
     ...overrides,
   };
 }
 
-test('normalizes a bounded v1 snapshot and keeps transport legs separate', () => {
+test('normalizes a bounded v2 snapshot and keeps transport legs separate', () => {
   const diagnostics = normalizeNetworkDiagnostics(snapshot());
-  assert.equal(diagnostics.version, 1);
+  assert.equal(diagnostics.version, 2);
   assert.equal(diagnostics.sessionElapsedMs, 12345);
   assert.equal(diagnostics.media.mode, 'direct');
   assert.equal(diagnostics.input.mode, 'relay');
@@ -82,6 +101,15 @@ test('normalizes a bounded v1 snapshot and keeps transport legs separate', () =>
     overflowTotal: 0,
   });
   assert.equal(diagnostics.inputAck.pendingCount, 1);
+  assert.deepEqual(diagnostics.adaptive, {
+    scope: 'local-viewer',
+    localPressure: 'pressured',
+    aggregateTargetKbps: 6000,
+    aggregateState: 'decrease',
+    recoveryState: 'active',
+    applied: true,
+  });
+  assert.equal(diagnostics.session.localHandle, 'viewer-one');
 });
 
 test('validates exact counters, classified samples, percentiles, and completeness', () => {
@@ -155,6 +183,8 @@ test('renders legs and ACK health without exposing identifiers or addresses', ()
   assert.match(presentation.input, /^relay · RTT/);
   assert.equal(presentation.audio, 'unavailable');
   assert.match(presentation.inputAck, /^negotiated · 9\/10 acknowledged/);
+  assert.match(presentation.adaptive, /^local-viewer · local pressured · aggregate 6000 kbps decrease/);
+  assert.match(presentation.session, /native MoQ multi-viewer v2 · viewer-one/);
   assert.doesNotMatch(JSON.stringify(presentation), /secret|192\.0\.2\.1|endpoint/i);
 });
 
@@ -165,5 +195,24 @@ test('formats a missing v4 snapshot as explicitly unavailable', () => {
     input: 'unavailable',
     audio: 'unavailable',
     inputAck: 'unavailable',
+    adaptive: 'unavailable',
   });
+});
+
+test('adaptive diagnostics expose only local contribution and aggregate decision', () => {
+  const diagnostics = normalizeNetworkDiagnostics(snapshot({
+    adaptive: {
+      scope: 'local_viewer',
+      local_pressure: 'recovering',
+      aggregate_target_kbps: 1000,
+      aggregate_state: 'hold',
+      recovery_state: 'floor_limited',
+      applied: false,
+      other_viewer_rtt_ms: 900,
+      contributor_peer: 'secret-peer',
+    },
+  }));
+  assert.equal(diagnostics.adaptive.localPressure, 'recovering');
+  assert.equal(diagnostics.adaptive.recoveryState, 'floor-limited');
+  assert.doesNotMatch(JSON.stringify(diagnostics.adaptive), /other|peer|rtt/i);
 });

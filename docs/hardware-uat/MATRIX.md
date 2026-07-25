@@ -69,8 +69,12 @@ structured fields bind:
   `/dev/dri/renderD128`, `amdgpu`, or `vah264enc`;
 - passing fixed and native capture outcomes, zero post-encode drops, measured
   cadence, and at least 55 fps for the fixed 1280x800 leg;
-- a preferred-Iroh/MoQ Portal session with passing video, audio, input,
-  reconnect, and second-client rejection evidence;
+- a preferred-Iroh/MoQ control-v2 generation with three simultaneous viewers,
+  one shared video/audio producer and adaptive actuator, monotonic survivor
+  progress, at most one slot-0 holder, measured focus handoff, slow-viewer
+  isolation, same-peer replacement, live revocation, reconnect, bounded
+  resource percentiles, and final-viewer cleanup;
+- a separate legacy-exclusive session with explicit second-client rejection;
 - restoration of the installed service, configuration, identity, and release
   activation after the run.
 

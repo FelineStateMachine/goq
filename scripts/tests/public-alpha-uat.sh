@@ -238,7 +238,7 @@ write_common() {
   local observed="$3"
   local output="$4"
   {
-    printf 'uat_schema=goq-public-alpha-evidence-v2\n'
+    printf 'uat_schema=goq-public-alpha-evidence-v3\n'
     printf 'evidence_kind=%s\n' "$kind"
     printf 'observed_at_unix=%s\n' "$observed"
     printf 'git_commit=%s\n' "$(manifest_value "$bundle" git_commit)"
@@ -302,13 +302,26 @@ write_fixture() {
         'keyframe_recovery_p95_ms=900' >> "$output"
       ;;
     second-client)
-      printf '%s\n' 'second_client_attempts=3' 'second_client_rejections=3' \
-        'authorized_primary_uninterrupted=pass' 'rejection_reason=active-client' >> "$output"
+      printf '%s\n' 'protocol_mode=legacy-exclusive-v1' 'second_client_attempts=3' \
+        'second_client_rejections=3' 'authorized_primary_uninterrupted=pass' \
+        'rejection_reason=legacy-active-client' >> "$output"
+      ;;
+    multi-viewer)
+      printf '%s\n' 'protocol_mode=native-moq-v2' 'configured_viewer_capacity=3' \
+        'concurrent_viewers=3' 'shared_media_generation=pass' \
+        'shared_video_sources=1' 'shared_video_encoders=1' 'shared_audio_sources=1' \
+        'shared_audio_encoders=1' 'shared_publishers=1' 'shared_adaptive_actuators=1' \
+        'viewer_progress=pass' 'slot_0_holders_max=1' 'focus_handoff_p95_ms=250' \
+        'slow_viewer_isolation=pass' 'same_peer_replacement=pass' \
+        'live_view_revocation=pass' 'survivors_uninterrupted=pass' 'final_cleanup=pass' \
+        'ordinary_service_restored=pass' >> "$output"
       ;;
     loopback-preflight)
       printf '%s\n' 'loopback_proof=ok' 'profile=release' \
         "host_sha256=$(manifest_value "$bundle" sigil_sha256)" \
-        'active_client_rejection=ok' 'reconnect_cycles=3' 'cleanup=ok' >> "$output"
+        'control_v2=ok' 'viewers=3' 'reconnect_cycles=3' 'same_peer_replacement=ok' \
+        'shared_generation=ok' 'slot_0_single_holder=ok' 'bounded_queues=ok' \
+        'final_cleanup=ok' >> "$output"
       ;;
     *) printf 'unknown fixture kind: %s\n' "$kind" >&2; exit 1 ;;
   esac
@@ -319,7 +332,7 @@ record_all_required() {
   local bundle="$1"
   local kind
   local evidence
-  for kind in cold-boot controller mouse soak network-direct network-relay reconnect second-client; do
+  for kind in cold-boot controller mouse soak network-direct network-relay reconnect multi-viewer second-client; do
     evidence="$temporary_root/$kind-$RANDOM.evidence"
     write_fixture "$bundle" "$kind" "$evidence"
     "$harness" record --evidence-dir "$bundle" --kind "$kind" --file "$evidence" > /dev/null

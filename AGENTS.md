@@ -16,7 +16,14 @@ Sigil host.
   identity, configuration, or Linux input-injection assets.
 - Iroh owns native connectivity, endpoint identity, encryption, direct-path
   discovery, and relay fallback.
-- Exactly one media session and one matching client are active at a time.
+- Exactly one media generation is active at a time. Native MoQ control v2
+  shares that single generation with up to `max_viewers` authenticated clients
+  (default 3, hard ceiling 8); control v1 and grouped v3 stay single-client
+  exclusive and reject a second client. No capture, encoder, publisher, or
+  actuator scales with viewer count.
+- At most one viewer holds slot-0 input focus. Every other viewer is a
+  spectator, and a former holder is fully neutralized before a successor is
+  granted.
 - Controller is the primary interaction model. Keyboard and relative mouse are
   secondary inputs.
 
@@ -58,12 +65,18 @@ Sigil host.
   Linux binary was explicitly built with that feature and its runtime
   GStreamer elements are available. The opt-in backend currently requires CBR;
   CQP remains on the external compatibility backend.
-- The preferred media path authenticates and claims the single client over
-  `sigil/control/1`, then admits that exact peer to a session-scoped upstream
-  `iroh-moq` broadcast and static H.264 track. One configured GOP maps to one
+- The preferred media path authenticates each viewer over `sigil/control/2`,
+  then admits that exact peer to one host-owned upstream `iroh-moq` broadcast
+  and static H.264 track shared by every viewer. One configured GOP maps to one
   bounded native MoQ group; a newer independently decodable group cancels its
-  predecessor and provides the latest-frame barrier. The custom media v3, v2,
-  and v1 protocols remain explicit compatibility fallbacks.
+  predecessor and provides the latest-frame barrier. `sigil/control/1` and the
+  custom media v3, v2, and v1 protocols remain explicit single-client
+  compatibility fallbacks.
+- Media objects on the shared generation are Ed25519-authenticated against a
+  host-signed generation certificate, and each viewer's MoQ attachment carries
+  an endpoint-bound, expiring subscription capability. The host advertises the
+  authorization revision it minted that capability against in the same accepted
+  control-v2 hello, so a client never has to assume an enrollment revision.
 - Portal crosses Rust-to-webview video and audio through bounded binary Tauri
   channels. It reports transport, frontend, decoder, presentation, and audio
   queue/drop timing separately.

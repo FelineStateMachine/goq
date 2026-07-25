@@ -4,6 +4,11 @@ Portal's only supported download is macOS arm64. Its relative-pointer path uses
 CoreGraphics cursor disassociation and has live Mac-to-Gamescope hardware
 evidence. No other target is published, advertised, or reachable from goq.sh.
 
+All platform claims also inherit the multi-viewer acceptance boundary: native
+MoQ control v2 supports three viewers by default (hard ceiling eight), while
+control v1/grouped-v3 remains exclusive. Only one viewer may hold slot-0 input
+focus, regardless of client platform.
+
 ## Release tiers
 
 Building a target and supporting a target are separate decisions. Portal has
@@ -87,7 +92,16 @@ the evidence.
 6. Run `./scripts/verify-demo-build.sh` and retain the exact Portal-to-UMPC
    session evidence required by `AGENTS.md`. A config check, unit test, or
    compile-only result is not hardware acceptance.
-7. On Windows, close the enrollment-storage gap before proposing support.
+7. Join the exact candidate as one of three simultaneous control-v2 viewers.
+   Verify the roster and local opaque handle, request and transfer slot-0 focus
+   by controller, and confirm focus loss immediately tears down local pointer,
+   keyboard, and gamepad routing before another viewer injects.
+8. While this platform is the holder and while it is a spectator, exercise
+   same-peer replacement, live input and view revocation, and one constrained
+   viewer. Survivor video/audio and diagnostics must continue on the same media
+   generation with bounded queues. Repeat legacy mode separately and confirm a
+   second client receives the explicit exclusive-mode rejection.
+9. On Windows, close the enrollment-storage gap before proposing support.
    `secure_config_dir` and `read_bounded_file` in
    `src-tauri/src/commands/enrollment.rs` hard-gate their ownership check,
    `0o700` tightening, and `O_NOFOLLOW` open behind `#[cfg(unix)]`. A Windows

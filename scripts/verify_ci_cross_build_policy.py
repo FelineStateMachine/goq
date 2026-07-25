@@ -36,6 +36,27 @@ from pathlib import Path
 
 
 CHECKOUT_ACTION = "actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8"
+CACHE_DIGEST = "0400d5f644dc74513175e3cd8d07132dd4860809"
+CACHE_RESTORE_ACTION = f"actions/cache/restore@{CACHE_DIGEST}"
+CACHE_SAVE_ACTION = f"actions/cache/save@{CACHE_DIGEST}"
+COMBINED_CACHE_ACTION = f"actions/cache@{CACHE_DIGEST}"
+COMBINED_CACHE_ALLOWED_PATHS = frozenset({"~/.cargo/bin/cargo-zigbuild"})
+
+# A cache entry is scoped to the branch that writes it, so writing from pull
+# requests gave every open pull request its own multi-gigabyte set and evicted
+# the entries the legs depend on. Saves are therefore gated to pushes. These are
+# the only step-level conditions the policy permits at all: a conditional step
+# is otherwise a way to silently stop running a check.
+PUSH_ONLY_SAVE = "github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'"
+ALLOWED_STEP_CONDITIONS = frozenset(
+    {
+        PUSH_ONLY_SAVE,
+        # Matrix legs that share one cache entry nominate a single writer, so no
+        # two concurrent legs race to reserve the same key.
+        f"{PUSH_ONLY_SAVE} && matrix.save == 'true'",
+    }
+)
+
 GATE_SCRIPT = "./scripts/verify-demo-build.sh"
 LINUX_CROSS_BUILD_GATE = "./scripts/run-linux-cross-build-gate.sh"
 DEPENDENCY_SCRIPT = "./scripts/install-linux-build-deps.sh"
@@ -309,9 +330,18 @@ def _check_no_failure_suppression(job_name: str, job: dict) -> None:
         if "continue-on-error" in step:
             raise PolicyError(f"jobs.{job_name} has a step that suppresses failures")
         if "if" in step:
-            raise PolicyError(
-                f"jobs.{job_name} has a conditionally disabled step; gate a whole leg instead"
-            )
+            # Only a push-gated cache save may be conditional. Anything else
+            # would be a way to stop running a check without saying so.
+            if step.get("uses") != CACHE_SAVE_ACTION:
+                raise PolicyError(
+                    f"jobs.{job_name} has a conditionally disabled step; "
+                    "gate a whole leg instead"
+                )
+            if step["if"] not in ALLOWED_STEP_CONDITIONS:
+                raise PolicyError(
+                    f"jobs.{job_name} saves its cache under an unapproved "
+                    f"condition: {step['if']!r}"
+                )
         body = _run_body(step)
         for token in FORBIDDEN_RUN_TOKENS:
             if token in body:
@@ -332,6 +362,64 @@ def _check_no_failure_suppression(job_name: str, job: dict) -> None:
                 )
             if "with" in step:
                 raise PolicyError(f"jobs.{job_name} overrides the checked-out ref")
+
+
+def _validate_caches(job_name: str, job: dict) -> None:
+    steps = _steps(job, job_name)
+    restores = [step for step in steps if step.get("uses") == CACHE_RESTORE_ACTION]
+    saves = [step for step in steps if step.get("uses") == CACHE_SAVE_ACTION]
+    combined = [step for step in steps if step.get("uses") == COMBINED_CACHE_ACTION]
+
+    # The combined action reads and writes from every branch, so it stays
+    # available only for the one entry small enough not to matter.
+    for step in combined:
+        with_fields = step.get("with")
+        path = with_fields.get("path", "") if isinstance(with_fields, dict) else ""
+        if path.strip() not in COMBINED_CACHE_ALLOWED_PATHS:
+            raise PolicyError(
+                f"jobs.{job_name} may only read-write cache the pinned "
+                f"cargo-zigbuild binary, not {path.strip()!r}"
+            )
+
+    # Without this an unconditional save would quietly restore the per-pull-
+    # request cache sets that exhausted the repository's cache ceiling.
+    for step in saves:
+        if "if" not in step:
+            raise PolicyError(
+                f"jobs.{job_name} saves its Cargo cache unconditionally; "
+                "saves must be gated to pushes"
+            )
+
+    if len(restores) > 1 or len(saves) > 1:
+        raise PolicyError(
+            f"jobs.{job_name} must restore and save at most one Cargo cache"
+        )
+    if len(restores) != len(saves):
+        raise PolicyError(
+            f"jobs.{job_name} must pair its Cargo cache restore with a save so "
+            "main keeps a fresh entry"
+        )
+    if not restores:
+        return
+
+    restore_with = restores[0].get("with")
+    save_with = saves[0].get("with")
+    if not isinstance(restore_with, dict) or not isinstance(save_with, dict):
+        raise PolicyError(f"jobs.{job_name} Cargo cache steps need a with mapping")
+    if restores[0].get("id") != "cargo-cache":
+        raise PolicyError(
+            f"jobs.{job_name} must give its Cargo cache restore the cargo-cache id "
+            "that the save condition reads"
+        )
+    if restore_with.get("key") != save_with.get("key"):
+        raise PolicyError(
+            f"jobs.{job_name} saves its Cargo cache under a different key than it "
+            "restores"
+        )
+    if restore_with.get("path") != save_with.get("path"):
+        raise PolicyError(
+            f"jobs.{job_name} saves a different set of paths than it restores"
+        )
 
 
 def _gate_invocation(job_name: str, job: dict) -> dict:
@@ -510,6 +598,7 @@ def verify(workflow_text: str) -> None:
 
     for name, job in jobs.items():
         _check_no_failure_suppression(name, _require_mapping(job, f"jobs.{name}"))
+        _validate_caches(name, jobs[name])
 
     for name in sorted(ALWAYS_RUN_JOBS):
         if "if" in jobs[name]:

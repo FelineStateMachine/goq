@@ -17,6 +17,12 @@ concurrency:
 # with `demo-gate` as the single required status check: it fails unless every
 # leg either succeeded or was a leg the audited docs-only scope may skip.
 #
+# Caches are restored everywhere but written only on a push to main. A cache
+# entry is scoped to the branch that wrote it, so saving on pull requests gave
+# every open pull request its own ~9GB set and the repository blew through the
+# 10GB ceiling, evicting the entries the legs depend on. Pull requests read
+# main's entries through restore-keys instead, so the repository holds one set.
+#
 # scripts/verify_ci_cross_build_policy.py enforces that structure, and
 # scripts/tests/demo-gate-stages.sh proves the legs still spend every check the
 # single job used to run. Adding a leg means adding it to `demo-gate.needs`;
@@ -108,7 +114,8 @@ jobs:
         run: ./scripts/install-linux-build-deps.sh --profile full
 
       - name: Restore the Cargo build cache
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: |
             ~/.cargo/registry/index
@@ -121,6 +128,17 @@ jobs:
 
       - name: Run the repository test stage
         run: ./scripts/verify-demo-build.sh --stage repo-tests
+
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-repo-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
   native-tests:
     name: Workspace tests and Clippy
@@ -139,7 +157,8 @@ jobs:
         run: ./scripts/install-linux-build-deps.sh --profile full
 
       - name: Restore the Cargo build cache
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: |
             ~/.cargo/registry/index
@@ -152,6 +171,17 @@ jobs:
 
       - name: Run the native gate stage
         run: ./scripts/verify-demo-build.sh --stage native
+
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-native-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
   cross-build:
     name: Linux glibc cross build
@@ -169,6 +199,8 @@ jobs:
       - name: Install Linux build dependencies
         run: ./scripts/install-linux-build-deps.sh --profile full
 
+      # A megabyte, and worth writing from every branch so a pull request never
+      # pays the cargo-zigbuild compile.
       - name: Restore pinned cargo-zigbuild
         uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
@@ -176,7 +208,8 @@ jobs:
           key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.0
 
       - name: Restore the Cargo build cache
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: |
             ~/.cargo/registry/index
@@ -220,6 +253,17 @@ jobs:
           GOQ_REQUIRE_LINUX_CROSS_BUILD: "1"
         run: ./scripts/verify-demo-build.sh --stage cross
 
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-cross-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
   gstreamer-gate:
     name: In-process GStreamer gate
     runs-on: ubuntu-24.04
@@ -237,7 +281,8 @@ jobs:
         run: ./scripts/install-linux-build-deps.sh --profile full
 
       - name: Restore the Cargo build cache
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: |
             ~/.cargo/registry/index
@@ -253,6 +298,17 @@ jobs:
           GOQ_VERIFY_IN_PROCESS_GSTREAMER: "1"
         run: ./scripts/verify-demo-build.sh --stage gstreamer
 
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-gstreamer-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
   loopback:
     name: Loopback proof ${{ matrix.case }}
     runs-on: ubuntu-24.04
@@ -261,8 +317,24 @@ jobs:
     if: needs.scope.outputs.code == 'true'
     strategy:
       fail-fast: false
+      # Cases 1-3 are all debug-profile builds of the same binaries, so they
+      # share one cache entry instead of storing three near-identical copies.
+      # One designated case per entry writes it, which also means no two
+      # concurrent matrix legs race to reserve the same key.
       matrix:
-        case: [1, 2, 3, 4]
+        include:
+          - case: 1
+            cache: debug
+            save: "true"
+          - case: 2
+            cache: debug
+            save: "false"
+          - case: 3
+            cache: debug
+            save: "false"
+          - case: 4
+            cache: release
+            save: "true"
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: "1"
@@ -274,19 +346,31 @@ jobs:
         run: ./scripts/install-linux-build-deps.sh --profile full
 
       - name: Restore the Cargo build cache
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-loopback-${{ matrix.case }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: cargo-loopback-${{ matrix.cache }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            cargo-loopback-${{ matrix.case }}-${{ runner.os }}-
+            cargo-loopback-${{ matrix.cache }}-${{ runner.os }}-
 
       - name: Run the loopback proof
         run: ./scripts/verify-demo-build.sh --stage loopback --loopback-case ${{ matrix.case }}
+
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' && matrix.save == 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-loopback-${{ matrix.cache }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
   release-containment:
     name: Release-profile bypass containment
@@ -305,7 +389,8 @@ jobs:
         run: ./scripts/install-linux-build-deps.sh --profile full
 
       - name: Restore the Cargo build cache
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        id: cargo-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: |
             ~/.cargo/registry/index
@@ -318,6 +403,17 @@ jobs:
 
       - name: Run the release containment stage
         run: ./scripts/verify-demo-build.sh --stage containment
+
+      - name: Save the Cargo build cache
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-containment-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
   decky-gate:
     name: Decky plugin gate

@@ -502,5 +502,145 @@ class GateScriptTests(unittest.TestCase):
             verify_gate_script(mutated)
 
 
+class CacheBudgetTests(unittest.TestCase):
+    """A cache entry belongs to the branch that wrote it.
+
+    Saving from pull requests gave every open pull request its own
+    multi-gigabyte set, which exhausted the repository's cache ceiling and
+    evicted the entries the legs depend on. These assert that saves stay gated
+    to pushes and that a leg cannot smuggle in an unpaired or mismatched entry.
+    """
+
+    def test_rejects_unconditional_cache_save(self) -> None:
+        mutated = replace_once(
+            WORKFLOW,
+            "      - name: Save the Cargo build cache\n"
+            "        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'\n"
+            "        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4\n"
+            "        with:\n"
+            "          path: |\n"
+            "            ~/.cargo/registry/index\n"
+            "            ~/.cargo/registry/cache\n"
+            "            ~/.cargo/git/db\n"
+            "            target\n"
+            "          key: cargo-repo-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}\n",
+            "      - name: Save the Cargo build cache\n"
+            "        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4\n"
+            "        with:\n"
+            "          path: |\n"
+            "            ~/.cargo/registry/index\n"
+            "            ~/.cargo/registry/cache\n"
+            "            ~/.cargo/git/db\n"
+            "            target\n"
+            "          key: cargo-repo-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "unconditionally"):
+            verify(mutated)
+
+    def test_rejects_cache_save_on_pull_requests(self) -> None:
+        for condition in (
+            "if: always()",
+            "if: github.event_name == 'pull_request'",
+            "if: steps.cargo-cache.outputs.cache-hit != 'true'",
+        ):
+            with self.subTest(condition=condition):
+                mutated = in_job(
+                    WORKFLOW,
+                    "native-tests",
+                    "if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'",
+                    condition,
+                )
+                with self.assertRaisesRegex(PolicyError, "unapproved condition"):
+                    verify(mutated)
+
+    def test_rejects_conditional_step_that_is_not_a_cache_save(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "native-tests",
+            "      - name: Run the native gate stage\n",
+            "      - name: Run the native gate stage\n"
+            "        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "conditionally disabled step"):
+            verify(mutated)
+
+    def test_rejects_restore_without_a_paired_save(self) -> None:
+        start = WORKFLOW.index("      - name: Save the Cargo build cache\n")
+        end = WORKFLOW.index("  native-tests:\n")
+        mutated = WORKFLOW[:start] + WORKFLOW[end:]
+        with self.assertRaisesRegex(PolicyError, "pair its Cargo cache restore"):
+            verify(mutated)
+
+    def test_rejects_save_under_a_different_key(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "release-containment",
+            "      - name: Save the Cargo build cache\n"
+            "        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'\n"
+            "        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4\n"
+            "        with:\n"
+            "          path: |\n"
+            "            ~/.cargo/registry/index\n"
+            "            ~/.cargo/registry/cache\n"
+            "            ~/.cargo/git/db\n"
+            "            target\n"
+            "          key: cargo-containment-",
+            "      - name: Save the Cargo build cache\n"
+            "        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'\n"
+            "        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4\n"
+            "        with:\n"
+            "          path: |\n"
+            "            ~/.cargo/registry/index\n"
+            "            ~/.cargo/registry/cache\n"
+            "            ~/.cargo/git/db\n"
+            "            target\n"
+            "          key: cargo-elsewhere-",
+        )
+        with self.assertRaisesRegex(PolicyError, "different key"):
+            verify(mutated)
+
+    def test_rejects_missing_cargo_cache_id(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "gstreamer-gate",
+            "      - name: Restore the Cargo build cache\n        id: cargo-cache\n",
+            "      - name: Restore the Cargo build cache\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "cargo-cache id"):
+            verify(mutated)
+
+    def test_rejects_read_write_cache_beyond_the_zigbuild_binary(self) -> None:
+        mutated = in_job(
+            WORKFLOW,
+            "cross-build",
+            "          path: ~/.cargo/bin/cargo-zigbuild\n",
+            "          path: target\n",
+        )
+        with self.assertRaisesRegex(PolicyError, "cargo-zigbuild binary"):
+            verify(mutated)
+
+    def test_shared_matrix_cache_nominates_exactly_one_writer(self) -> None:
+        """Two concurrent legs must not race to reserve the same key.
+
+        Cases 1-3 share one debug entry and case 4 owns the release entry, so
+        exactly one leg per distinct cache key may carry save: "true".
+        """
+        legs = WORKFLOW[WORKFLOW.index(job_marker("loopback")) :]
+        legs = legs[: legs.index(job_marker("release-containment"))]
+        writers: dict[str, int] = {}
+        cache = None
+        for line in legs.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- case:") or stripped.startswith("cache:"):
+                if stripped.startswith("cache:"):
+                    cache = stripped.split(":", 1)[1].strip()
+                    writers.setdefault(cache, 0)
+            elif stripped.startswith("save:"):
+                if stripped.split(":", 1)[1].strip().strip('"') == "true":
+                    assert cache is not None
+                    writers[cache] += 1
+        self.assertEqual(writers, {"debug": 1, "release": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

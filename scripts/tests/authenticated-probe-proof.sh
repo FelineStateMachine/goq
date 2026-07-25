@@ -87,11 +87,17 @@ first_log="$temp_root/first.log"
 reconnect_log="$temp_root/reconnect.log"
 compat_log="$temp_root/compat.log"
 replay_log="$temp_root/replay.log"
+control_v2_log="$temp_root/control-v2.log"
+second_identity="$temp_root/second.key"
+second_invitation="$temp_root/second.goq-invite"
+second_v2_log="$temp_root/control-v2-second.log"
 
 "$host_bin" identity init --output "$host_identity" >"$temp_root/host-identity.log"
 "$host_bin" identity init --output "$probe_identity" >"$temp_root/probe-identity.log"
+"$host_bin" identity init --output "$second_identity" >"$temp_root/second-identity.log"
 host_node_id="$(sed -n 's/^node_id=//p' "$temp_root/host-identity.log")"
 probe_node_id="$(sed -n 's/^node_id=//p' "$temp_root/probe-identity.log")"
+second_node_id="$(sed -n 's/^node_id=//p' "$temp_root/second-identity.log")"
 [[ -n "$host_node_id" && -n "$probe_node_id" ]] || die 'identity output is incomplete'
 
 printf '%s\n' \
@@ -150,6 +156,75 @@ wait_for_log_count 'MoQ control client released' 2 \
 wait_for_log_count 'media v3 client released' 1 \
   || die 'grouped-v3 session did not drain'
 
+# Enrolled control-v2 coverage. Every other control-v2 proof runs the host
+# without a config, which selects TestPatternProof and pins
+# authorization_revision to 1. A configured host mints each viewer's
+# subscription capability at that viewer's real enrollment revision, which
+# starts at 2 and climbs with every enrollment and grant change. Without this
+# case a client that assumes revision 1 passes the whole gate and then rejects
+# its own authenticated media on the appliance.
+"$probe_bin" \
+  --node-id "$host_node_id" \
+  --identity "$probe_identity" \
+  --control-v2 \
+  --frames 4 \
+  >"$control_v2_log"
+wait_for_log_count 'MoQ control v2 client released' 1 \
+  || die 'enrolled control-v2 session did not drain'
+
+# A second enrolled viewer lands on a strictly higher revision, so a capability
+# check that is right for the first viewer can still be wrong for this one.
+"$host_bin" invitation create \
+  --config "$host_config" \
+  --peer "$second_node_id" \
+  --pointer-keyboard \
+  --output "$second_invitation" \
+  >/dev/null
+"$probe_bin" \
+  --node-id "$host_node_id" \
+  --identity "$second_identity" \
+  --invitation "$second_invitation" \
+  --control-v2 \
+  --spectator \
+  --frames 4 \
+  >"$second_v2_log"
+wait_for_log_count 'MoQ control v2 client released' 2 \
+  || die 'second enrolled control-v2 session did not drain'
+
+for v2_log in "$control_v2_log" "$second_v2_log"; do
+  grep -Fxq 'probe=ok' "$v2_log" || die "control-v2 evidence is missing from $v2_log"
+  grep -Fxq 'control_alpn=sigil/control/2' "$v2_log" \
+    || die "control-v2 ALPN is missing from $v2_log"
+done
+grep -Fxq 'media_authentication=ed25519-v1' "$control_v2_log" \
+  || die 'enrolled control-v2 media was not authenticated'
+grep -Fxq 'media_generation_certified=ok' "$control_v2_log" \
+  || die 'enrolled control-v2 generation certificate was not verified'
+
+# Pin the property that made the shipped defect invisible: these revisions are
+# not the development-bypass constant.
+# The subscriber writes ANSI field separators, so strip them before matching.
+ansi_escape=$'\033'
+enrolled_revisions="$(grep -F 'MoQ control v2 client accepted' "$host_log" \
+  | sed -e "s/${ansi_escape}\[[0-9;]*m//g" \
+  | sed -n 's/.* authorization_revision=\([0-9][0-9]*\) .*/\1/p')"
+if [[ -z "$enrolled_revisions" ]]; then
+  grep -F 'control v2 client accepted' "$host_log" >&2 || true
+  die 'host did not record an authorization revision for control-v2 admission'
+fi
+observed_revisions=0
+while read -r revision; do
+  [[ -n "$revision" ]] || continue
+  observed_revisions=$((observed_revisions + 1))
+  [[ "$revision" -ge 2 ]] \
+    || die "enrolled control-v2 admission used revision $revision, so this proof could not \
+detect a client that assumes the development-bypass constant"
+done <<<"$enrolled_revisions"
+[[ "$observed_revisions" -eq 2 ]] \
+  || die "expected two enrolled control-v2 admissions, saw $observed_revisions"
+[[ "$(sort -u <<<"$enrolled_revisions" | wc -l | tr -d ' ')" -eq 2 ]] \
+  || die 'the two enrolled viewers did not land on distinct authorization revisions'
+
 for proof_log in "$first_log" "$reconnect_log" "$compat_log"; do
   grep -Fxq 'probe=ok' "$proof_log" || die "probe evidence is missing from $proof_log"
   grep -Fxq 'sequence_gaps=0' "$proof_log" || die "sequence gap in $proof_log"
@@ -175,7 +250,7 @@ grep -Fq 'host rejected control stream: Portal peer is not authorized' "$replay_
   }
 enrollment="$($host_bin enrollment show --config "$host_config")"
 grep -Fxq 'enrollment=active' <<<"$enrollment" || die 'probe enrollment is not active'
-grep -Fxq 'viewer_count=1' <<<"$enrollment" || die 'probe enrollment count changed'
+grep -Fxq 'viewer_count=2' <<<"$enrollment" || die 'probe enrollment count changed'
 grep -Eq '^viewer=viewer-[0-9a-f]{16} grants=view,pointer-keyboard authorization_revision=[1-9][0-9]* enrolled_at_unix=[0-9]+$' \
   <<<"$enrollment" || die 'opaque enrollment handle or grants changed'
 if grep -Fq "$probe_node_id" <<<"$enrollment"; then
@@ -187,3 +262,5 @@ printf 'invitation_redemption=ok\n'
 printf 'ticket_free_reconnect=ok\n'
 printf 'grouped_v3_reconnect=ok\n'
 printf 'invitation_replay=rejected\n'
+printf 'enrolled_control_v2=ok\n'
+printf 'enrolled_multi_viewer_revisions=ok\n'

@@ -143,7 +143,16 @@ The tag is `v0.1.0`, matching the version already in every workspace manifest.
 3. **Run Sigil Release with `build-candidate`** against the tag. It creates the
    draft and attaches the unsigned candidate archive and its checksum.
 
-4. **Sign offline.** Move the candidate bytes to the publisher machine,
+4. **Run Portal release** against the same tag. It builds, verifies, and
+   attests the ad-hoc macOS arm64 assets, and separately builds and attests the
+   unpublished preview matrix. The draft stays a draft.
+
+   Signing comes after this, not before. The Portal job refuses to start unless
+   the draft holds *exactly* the two Sigil candidate assets, and it names its
+   own result the five-asset **pre-signature** contract. Attaching the
+   `.minisig` first makes that precondition fail.
+
+5. **Sign offline.** Move the candidate bytes to the publisher machine,
    independently confirm the tag commit, then:
 
    ```bash
@@ -155,12 +164,8 @@ The tag is `v0.1.0`, matching the version already in every workspace manifest.
      --public-key-file /absolute/offline/path/sigil-minisign.pub
    ```
 
-   Carry only the resulting `.minisig` back and attach it to the draft. Never
-   use `--clobber`.
-
-5. **Run Portal release** against the same tag. It builds, verifies, and
-   attests the ad-hoc macOS arm64 assets, and separately builds and attests the
-   unpublished preview matrix. The draft stays a draft.
+   Carry only the resulting `.minisig` back and attach it to the draft, taking
+   the draft from five assets to six. Never use `--clobber`.
 
 6. **Run Sigil Release with `promote-signed-draft`.** It requires the exact
    six-asset set, re-verifies both products against the same tag and commit,

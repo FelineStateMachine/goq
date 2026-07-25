@@ -141,7 +141,8 @@ fi
 source "$HOME/.cargo/env"
 (
   cd "$repo_dir"
-  cargo tauri build --locked --ci --target aarch64-apple-darwin --bundles app,dmg
+  # tauri-cli has no --locked flag; cargo args go after `--`.
+  cargo tauri build --ci --target aarch64-apple-darwin --bundles app,dmg -- --locked
 )
 
 bundle_root="$repo_dir/target/aarch64-apple-darwin/release/bundle"

@@ -102,9 +102,10 @@ jobs:
       - name: Build unsigned preview bundles
         shell: bash
         run: |
-          cargo tauri build --locked --ci \
+          cargo tauri build --ci \
             --target "${{ matrix.target }}" \
-            --bundles "${{ matrix.bundles }}"
+            --bundles "${{ matrix.bundles }}" \
+            -- --locked
 
       - name: Collect preview artifacts and digests
         id: collect

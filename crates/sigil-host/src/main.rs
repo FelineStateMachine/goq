@@ -770,6 +770,7 @@ async fn probe_test_pattern(args: CaptureProbeArgs) -> Result<()> {
         identity_path: PathBuf::from("unused-by-capture-probe"),
         state_path: PathBuf::from("."),
         max_viewers: config::DEFAULT_MAX_VIEWERS,
+        focus_owner: None,
         source: VideoSource::TestPattern,
         width: Some(width),
         height: Some(height),
@@ -980,7 +981,10 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     };
     let secret = identity::load(&config.identity_path)?;
     let host_secret = secret.to_bytes();
-    let sessions = Arc::new(SessionRegistry::new(config.max_viewers));
+    let sessions = Arc::new(SessionRegistry::new_with_focus_owner(
+        config.max_viewers,
+        config.focus_owner.clone(),
+    ));
     let publisher = appliance::RuntimePublisher::start(
         secret.public(),
         Arc::clone(&sessions),
@@ -1333,6 +1337,7 @@ fn load_serve_config(args: &ServeArgs) -> Result<LoadedServeConfig> {
             identity_path,
             state_path,
             max_viewers: config::DEFAULT_MAX_VIEWERS,
+            focus_owner: None,
             source: source.into(),
             width: Some(args.width),
             height: Some(args.height),

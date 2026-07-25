@@ -493,6 +493,22 @@ body.native-pointer-control * { cursor: none !important; }
 #tap-overlay .flow-step.active { color: var(--ochre); }
 .enrollment-content,
 .invitation-content { width: 460px; }
+.focus-overlay { z-index: 170; }
+.focus-overlay-content { width: 420px; }
+.focus-overlay-content::before {
+  background-image: repeating-linear-gradient(
+    90deg,
+    var(--sand) 0 8px,
+    transparent 8px 16px,
+    var(--moss) 16px 20px,
+    transparent 20px 32px
+  );
+}
+.focus-peer {
+  color: var(--sand);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
 .enrollment-peer {
   margin: 20px 0 4px;
   padding: 12px;
@@ -545,6 +561,11 @@ body.native-pointer-control * { cursor: none !important; }
 .overlay-btn.danger {
   color: var(--destructive);
   border-color: color-mix(in srgb, var(--destructive) 55%, var(--border));
+}
+.overlay-btn.danger:hover {
+  color: var(--paper);
+  background: var(--destructive);
+  text-decoration: none;
 }
 .shortcut-key {
   color: var(--foreground);

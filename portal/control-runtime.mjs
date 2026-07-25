@@ -55,6 +55,7 @@ export function createControlRuntime({
   let controlTransitionInProgress = false;
   let controlTransitionGeneration = 0;
   let nativeCursorCommand = Promise.resolve();
+  let hostReleaseCommand = Promise.resolve();
   let browserPointerLockRequired = true;
 
   function connection() {
@@ -137,6 +138,7 @@ export function createControlRuntime({
   }
 
   function exit({ resetEscape = false, releaseHostFocus = true } = {}) {
+    if (!controlMode && !controlTransitionInProgress) return false;
     controlTransitionGeneration += 1;
     controlTransitionInProgress = false;
     controllerActivationGate.reset();
@@ -146,7 +148,19 @@ export function createControlRuntime({
     controlMode = false;
     releasePointerLock();
     onChange();
-    if (releaseHostFocus) onExit();
+    if (releaseHostFocus) {
+      const releaseGeneration = controlTransitionGeneration;
+      hostReleaseCommand = Promise.resolve(inputRuntime.drain(250))
+        .then(() => {
+          if (releaseGeneration !== controlTransitionGeneration || controlMode) return false;
+          return onExit();
+        })
+        .catch((error) => {
+          logger.error('host focus release failed after local neutralization:', error);
+          return false;
+        });
+    }
+    return true;
   }
 
   function exitAfterBrowserPointerLockFailure() {
@@ -251,6 +265,7 @@ export function createControlRuntime({
 
   async function prepareDisconnect(timeoutMs = 250) {
     exit();
+    await hostReleaseCommand;
     await inputRuntime.drain(timeoutMs);
   }
 

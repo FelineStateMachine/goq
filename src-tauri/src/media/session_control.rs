@@ -120,6 +120,7 @@ pub(crate) async fn send_focus_command(
     action: FocusCommandActionV2,
     expected_revision: u64,
     expected_focus_generation: Option<u64>,
+    expected_proposal_id: Option<u64>,
 ) -> Result<bool, String> {
     let sender = sender
         .lock()
@@ -135,6 +136,7 @@ pub(crate) async fn send_focus_command(
             slot: sigil_protocol::ControllerSlot::ZERO,
             expected_revision,
             expected_focus_generation,
+            expected_proposal_id,
         },
     };
     command
@@ -183,6 +185,8 @@ mod tests {
             focus: FocusStateV2::Vacant {
                 slot: ControllerSlot::ZERO,
             },
+            focus_proposal: None,
+            self_is_focus_owner: false,
             transition_reason: FocusTransitionReasonV2::Initial,
             media: MediaGenerationDescriptorV2 {
                 generation_id: 7,
@@ -203,12 +207,12 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let state = tokio::sync::Mutex::new(Some((5, sender)));
         assert!(
-            send_focus_command(&state, 5, 1, FocusCommandActionV2::Request, 2, None)
+            send_focus_command(&state, 5, 1, FocusCommandActionV2::Request, 2, None, None)
                 .await
                 .unwrap()
         );
         assert!(
-            !send_focus_command(&state, 5, 2, FocusCommandActionV2::Request, 2, None)
+            !send_focus_command(&state, 5, 2, FocusCommandActionV2::Request, 2, None, None)
                 .await
                 .unwrap()
         );
@@ -217,7 +221,7 @@ mod tests {
             Some(ClientControlEnvelopeV2::Focus { .. })
         ));
         assert!(
-            send_focus_command(&state, 4, 3, FocusCommandActionV2::Request, 2, None)
+            send_focus_command(&state, 4, 3, FocusCommandActionV2::Request, 2, None, None)
                 .await
                 .is_err()
         );

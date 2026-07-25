@@ -310,13 +310,20 @@ fn apply_mutation(
 ) -> Result<AuthorizationAdminResult> {
     let effect = sessions.apply_authorization_mutation(&mutation)?;
     if effect.neutralize_input {
-        input_operations.reset()?;
-        if !effect.disconnected {
-            sessions.complete_authorization_neutralization(
-                mutation.peer,
-                mutation.authorization_revision,
+        if let Some(transition_id) = effect.focus_transition_id {
+            input_operations.neutralize_focus_transition(
+                sessions,
+                transition_id,
+                sigil_protocol::FocusTransitionReasonV2::Revoked,
             )?;
+        } else {
+            input_operations.reset()?;
         }
+        sessions.complete_authorization_neutralization(
+            mutation.peer,
+            mutation.authorization_revision,
+            None,
+        )?;
     }
     Ok(AuthorizationAdminResult::Mutation {
         handle: mutation.handle,
@@ -417,6 +424,7 @@ mod tests {
             identity_path: state_path.join("unused-identity"),
             state_path: state_path.to_path_buf(),
             max_viewers: crate::config::DEFAULT_MAX_VIEWERS,
+            focus_owner: None,
             source: VideoSource::TestPattern,
             width: Some(1280),
             height: Some(800),
@@ -568,6 +576,7 @@ mod tests {
                     slot: ControllerSlot::ZERO,
                     expected_revision: 1,
                     expected_focus_generation: None,
+                    expected_proposal_id: None,
                 },
             )
             .unwrap();

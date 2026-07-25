@@ -220,6 +220,32 @@ impl InputOperations {
         };
         self.backend.reset_session()
     }
+
+    pub(crate) fn neutralize_focus_transition(
+        &self,
+        sessions: &SessionRegistry,
+        transition_id: u64,
+        reason: FocusTransitionReasonV2,
+    ) -> Result<()> {
+        info!(
+            transition_id,
+            ?reason,
+            "focus transition entered no-inject neutralizing state"
+        );
+        self.reset()?;
+        info!(
+            transition_id,
+            ?reason,
+            "focus transition virtual input neutralized"
+        );
+        sessions.complete_v2_focus_transition(transition_id)?;
+        info!(
+            transition_id,
+            ?reason,
+            "focus transition successor committed after neutralization"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]

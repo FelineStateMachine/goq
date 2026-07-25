@@ -373,6 +373,10 @@ pub struct HostConfig {
     /// fixed bound and legacy transports remain exclusive.
     #[serde(default = "default_max_viewers")]
     pub max_viewers: u8,
+    /// Optional stable opaque authorization handle allowed to preempt slot 0.
+    /// Other viewers can request a holder-approved handoff but cannot preempt.
+    #[serde(default)]
+    pub focus_owner: Option<String>,
     #[serde(default = "default_source")]
     pub source: VideoSource,
     /// Optional encoded-size override. Gamescope uses its advertised native
@@ -482,6 +486,16 @@ impl HostConfig {
             (1..=MAX_VIEWERS).contains(&self.max_viewers),
             "max_viewers must be between 1 and {MAX_VIEWERS}"
         );
+        if let Some(handle) = &self.focus_owner {
+            ensure!(
+                handle.len() == 23
+                    && handle.starts_with("viewer-")
+                    && handle["viewer-".len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "focus_owner must be a stable opaque viewer- followed by 16 lowercase hexadecimal digits"
+            );
+        }
         match (self.width, self.height) {
             (Some(width), Some(height)) => validate_video_dimensions(width, height)?,
             (None, None) => {}
@@ -733,6 +747,24 @@ state_path = "/tmp/state"
         config.max_viewers = 0;
         assert!(config.validate().is_err());
         config.max_viewers = 9;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn focus_owner_accepts_only_stable_opaque_authorization_handles() {
+        let mut config: HostConfig = toml::from_str(
+            r#"
+identity_path = "/tmp/host.key"
+state_path = "/tmp/state"
+focus_owner = "viewer-0123456789abcdef"
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+
+        config.focus_owner = Some("viewer-owner".into());
+        assert!(config.validate().is_err());
+        config.focus_owner = Some("viewer-0123456789ABCDEF".into());
         assert!(config.validate().is_err());
     }
 

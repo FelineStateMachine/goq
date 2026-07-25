@@ -11,7 +11,7 @@ use sigil_protocol::{
 };
 use tauri::ipc::Channel;
 
-use crate::commands::state::AppState;
+use crate::commands::state::{AppState, SessionSnapshotState};
 use crate::media::network_diagnostics::{NetworkSessionDiagnostics, lock_network_diagnostics};
 use crate::media::transport::{NegotiatedV1Stream, negotiate_v1};
 use crate::platform_capabilities::relative_pointer_capture_enabled;
@@ -327,6 +327,8 @@ pub(crate) enum InputWire {
         session_id: u64,
         slot: ControllerSlot,
         focus_generation: u64,
+        native_generation: u64,
+        session_snapshot: Arc<tokio::sync::Mutex<Option<SessionSnapshotState>>>,
     },
 }
 
@@ -341,17 +343,35 @@ impl InputWire {
                 session_id,
                 slot,
                 focus_generation,
-            } => write_input_event_v2(
-                send,
-                &InputEventV2 {
-                    session_id: *session_id,
-                    slot: *slot,
-                    focus_generation: *focus_generation,
-                    event: event.clone(),
-                },
-            )
-            .await
-            .map_err(|error| error.to_string()),
+                native_generation,
+                session_snapshot,
+            } => {
+                let owns_focus =
+                    session_snapshot
+                        .lock()
+                        .await
+                        .as_ref()
+                        .is_some_and(|(generation, snapshot)| {
+                            *generation == *native_generation
+                                && snapshot.self_focus_generation() == Some(*focus_generation)
+                        });
+                if !owns_focus {
+                    return Err(
+                        "Authoritative focus changed before the input wire write".to_string()
+                    );
+                }
+                write_input_event_v2(
+                    send,
+                    &InputEventV2 {
+                        session_id: *session_id,
+                        slot: *slot,
+                        focus_generation: *focus_generation,
+                        event: event.clone(),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
         }
     }
 
@@ -413,6 +433,8 @@ pub(crate) async fn open_input_session_v2(
     nonce: [u8; 16],
     media_session_id: u64,
     focus_generation: u64,
+    native_generation: u64,
+    session_snapshot: Arc<tokio::sync::Mutex<Option<SessionSnapshotState>>>,
     grants: InvitationGrants,
 ) -> Result<InputSession, String> {
     let offered = input_capability_offers(grants)
@@ -477,6 +499,8 @@ pub(crate) async fn open_input_session_v2(
             session_id: media_session_id,
             slot: ControllerSlot::ZERO,
             focus_generation,
+            native_generation,
+            session_snapshot,
         },
         recv,
         capabilities,
@@ -517,6 +541,8 @@ pub(crate) async fn start_focused_input_v2(state: &AppState) -> Result<InputAvai
         context.nonce,
         context.media_session_id,
         focus_generation,
+        context.native_generation,
+        Arc::clone(&state.session_snapshot),
         context.grants,
     )
     .await?;

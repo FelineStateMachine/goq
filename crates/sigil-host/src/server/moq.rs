@@ -757,9 +757,17 @@ pub(super) async fn serve_control_moq_v2(
         Arc::clone(&shared.telemetry),
         shared.encoder_control.clone(),
     )?;
-    if lease.replacement_neutralize {
-        input_operations.reset()?;
-        initial_snapshot = sessions.complete_v2_replacement(remote, lease.session_id)?;
+    if let Some(transition) = lease.replacement_transition {
+        input_operations.neutralize_focus_transition(
+            sessions,
+            transition.transition_id,
+            FocusTransitionReasonV2::Replaced,
+        )?;
+        initial_snapshot = sessions
+            .subscribe_v2_snapshots(remote, lease.session_id)?
+            .borrow()
+            .clone()
+            .context("replacement completion did not publish a session snapshot")?;
     }
     // Keep the predecessor's generation lease alive until this viewer has
     // acquired the shared generation, then retire only that replaced control
@@ -848,14 +856,14 @@ pub(super) async fn serve_control_moq_v2(
     )
     .await;
 
-    if sessions.invalidate_v2_focus(
+    if let Some(transition) = sessions.invalidate_v2_focus(
         remote,
         lease.session_id,
         FocusTransitionReasonV2::Disconnected,
     )? {
-        input_operations.reset()?;
-        sessions.complete_v2_focus_neutralization(
-            lease.session_id,
+        input_operations.neutralize_focus_transition(
+            sessions,
+            transition.transition_id,
             FocusTransitionReasonV2::Disconnected,
         )?;
     }
@@ -920,8 +928,19 @@ async fn forward_control_v2_requests(
     keyframes: tokio::sync::watch::Sender<Option<MediaControlRequestV3>>,
 ) -> Result<()> {
     let mut snapshots = sessions.subscribe_v2_snapshots(remote, session_id)?;
+    let mut focus_deadlines = tokio::time::interval(Duration::from_millis(250));
+    focus_deadlines.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = focus_deadlines.tick() => {
+                if let Some(transition) = sessions.expire_v2_focus()? {
+                    input_operations.neutralize_focus_transition(
+                        &sessions,
+                        transition.transition_id,
+                        FocusTransitionReasonV2::ActivationExpired,
+                    )?;
+                }
+            }
             changed = snapshots.changed() => {
                 changed.context("v2 session snapshot publisher stopped")?;
                 let Some(snapshot) = snapshots.borrow_and_update().clone() else {
@@ -941,13 +960,17 @@ async fn forward_control_v2_requests(
                         let outcome = sessions.apply_focus_command(remote, session_id, &command);
                         let result = match outcome {
                             Ok(effect) => {
-                                if effect.neutralize {
-                                    input_operations.reset()?;
+                                if let Some(transition) = effect.neutralization {
+                                    input_operations.neutralize_focus_transition(
+                                        &sessions,
+                                        transition.transition_id,
+                                        effect.snapshot.transition_reason,
+                                    )?;
                                 }
                                 FocusCommandResultV2 {
                                     request_id,
                                     accepted: true,
-                                    revision: effect.snapshot.revision,
+                                    revision: sessions.v2_revision(remote, session_id)?,
                                     message: None,
                                 }
                             }

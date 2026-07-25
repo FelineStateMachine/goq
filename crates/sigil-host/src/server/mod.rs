@@ -49,6 +49,7 @@ const SOURCE_REAP_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 const ENCODER_CONTROL_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 mod adaptive;
+mod focus;
 mod generation;
 mod handlers;
 mod media_v3;
@@ -195,6 +196,7 @@ fn moq_test_config() -> HostConfig {
         identity_path: "identity".into(),
         state_path: "state".into(),
         max_viewers: crate::config::DEFAULT_MAX_VIEWERS,
+        focus_owner: None,
         source: VideoSource::TestPattern,
         width: Some(1280),
         height: Some(800),

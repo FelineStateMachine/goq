@@ -80,6 +80,22 @@ Concurrent capacity and durable enrollment are intentionally separate:
 | `max_viewers` | 3 | 8 | Simultaneously connected native-MoQ v2 viewers |
 | `MAX_ENROLLED_VIEWERS` | fixed | 32 | Durable authorization-v2 viewer records |
 
+Slot-0 focus uses one bounded holder-approved handoff proposal, not a FIFO.
+When the slot is free, the first eligible request wins. While occupied, one
+requester may wait up to 15 seconds for the holder to approve, deny, or release
+toward it; additional requests receive a busy response. A grant must activate
+an input-v2 sidecar within 10 seconds or Sigil revokes it. Every transfer first
+publishes a no-inject neutralizing state, resets all virtual input devices, and
+only then publishes a successor focus generation.
+
+An operator may set `focus_owner = "viewer-<16 lowercase hex digits>"` to the
+stable opaque handle shown by enrollment administration. That exact enrolled
+viewer may request controller-confirmed preemption. The setting does not grant
+view or input capability, does not allow another viewer to preempt, and does
+not create an administrative or arbitrary preemption path. Like
+`max_viewers`, it is a reviewed direct TOML setting and requires service
+restart; omission disables owner preemption.
+
 Requests are strict JSON and contain an optimistic-concurrency revision:
 
 ```json

@@ -64,6 +64,30 @@
     </div>
   </div>
 
+  <div class="overlay-screen hidden focus-overlay" id="focus-handoff-overlay" role="alertdialog" aria-modal="true" aria-labelledby="focus-handoff-title">
+    <div class="overlay-content focus-overlay-content">
+      <h1 id="focus-handoff-title">pass control?</h1>
+      <p><span class="focus-peer" id="focus-handoff-requester"></span> is asking for slot 0. Your held input is neutralized before control moves.</p>
+      <div class="overlay-actions">
+        <button class="overlay-btn" id="deny-focus-handoff" data-controller-focus onclick="denyFocusHandoff()">keep control</button>
+        <button class="overlay-btn primary" id="approve-focus-handoff" data-controller-focus onclick="approveFocusHandoff()">pass control</button>
+      </div>
+      <p class="controller-hint">Safe default: keep control · B dismisses the request</p>
+    </div>
+  </div>
+
+  <div class="overlay-screen hidden focus-overlay" id="focus-preempt-overlay" role="alertdialog" aria-modal="true" aria-labelledby="focus-preempt-title">
+    <div class="overlay-content focus-overlay-content">
+      <h1 id="focus-preempt-title">take control?</h1>
+      <p>This displaces <span class="focus-peer" id="focus-preempt-holder"></span> after Sigil neutralizes every held input.</p>
+      <div class="overlay-actions">
+        <button class="overlay-btn" id="cancel-focus-preempt" data-controller-focus onclick="cancelFocusPreempt()">cancel</button>
+        <button class="overlay-btn danger" id="confirm-focus-preempt" data-controller-focus onclick="confirmFocusPreempt()">take control</button>
+      </div>
+      <p class="controller-hint">Safe default: cancel · B closes</p>
+    </div>
+  </div>
+
   <div class="overlay-screen hidden" id="tap-overlay" style="z-index: 200;">
     <div class="overlay-content">
       <div class="flow-steps" aria-hidden="true">

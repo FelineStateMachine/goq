@@ -89,6 +89,10 @@ struct Args {
     /// against a roster revision that may advance while spectators join.
     #[arg(long, requires = "control_v2", conflicts_with = "spectator")]
     disconnect_with_focus: bool,
+    /// Participate in bounded holder-approved slot-0 handoffs and stop after
+    /// observing this many successor generations.
+    #[arg(long, default_value_t = 0, requires = "control_v2")]
+    focus_handoffs: u32,
     /// Request a configured recovery keyframe after three accepted frames,
     /// then prove no delta history is delivered before the recovery barrier.
     #[arg(long)]
@@ -760,6 +764,7 @@ async fn run_control_v2_smoke(
     expected_size: Option<(u16, u16)>,
     spectator: bool,
     disconnect_with_focus: bool,
+    focus_handoffs: u32,
 ) -> Result<()> {
     let control_connection = endpoint
         .connect(address.clone(), CONTROL_ALPN_V2)
@@ -802,7 +807,7 @@ async fn run_control_v2_smoke(
         initial.revision > 0,
         "initial control v2 snapshot was not revisioned"
     );
-    if !spectator {
+    if !spectator && focus_handoffs == 0 {
         ensure!(
             matches!(initial.focus, FocusStateV2::Vacant { .. }),
             "initial control v2 snapshot did not advertise a vacant slot"
@@ -828,6 +833,18 @@ async fn run_control_v2_smoke(
         }),
     )
     .await?;
+    if focus_handoffs > 0 {
+        return run_focus_handoff_participant(
+            control_connection,
+            control_send,
+            control_recv,
+            media,
+            initial,
+            focus_handoffs,
+            timeout_seconds,
+        )
+        .await;
+    }
     if spectator {
         let mut accepted = 0_u32;
         let mut last_sequence = None;
@@ -871,6 +888,7 @@ async fn run_control_v2_smoke(
         slot: ControllerSlot::ZERO,
         expected_revision: initial.revision,
         expected_focus_generation: None,
+        expected_proposal_id: None,
     };
     write_client_control_v2(
         &mut control_send,
@@ -985,6 +1003,7 @@ async fn run_control_v2_smoke(
             slot: ControllerSlot::ZERO,
             expected_revision: focused.revision,
             expected_focus_generation: Some(focus_generation),
+            expected_proposal_id: None,
         };
         write_client_control_v2(
             &mut control_send,
@@ -1028,6 +1047,158 @@ async fn run_control_v2_smoke(
         println!("focus_release_revision=disconnect");
         println!("focus_release=disconnect");
     }
+    Ok(())
+}
+
+fn focus_holder_identity(
+    snapshot: &sigil_protocol::SessionSnapshotV2,
+) -> Option<(String, u64, u64)> {
+    match &snapshot.focus {
+        FocusStateV2::Held {
+            holder,
+            session_id,
+            focus_generation,
+            ..
+        } => Some((holder.as_str().to_owned(), *session_id, *focus_generation)),
+        FocusStateV2::Vacant { .. } | FocusStateV2::Neutralizing { .. } => None,
+    }
+}
+
+fn next_handoff_command(
+    snapshot: &sigil_protocol::SessionSnapshotV2,
+    request_id: u64,
+) -> Option<FocusCommandV2> {
+    let self_viewer = snapshot.self_viewer();
+    match &snapshot.focus {
+        FocusStateV2::Vacant { slot } => Some(FocusCommandV2 {
+            request_id,
+            action: FocusCommandActionV2::Request,
+            slot: *slot,
+            expected_revision: snapshot.revision,
+            expected_focus_generation: None,
+            expected_proposal_id: None,
+        }),
+        FocusStateV2::Held {
+            slot,
+            holder,
+            session_id,
+            focus_generation,
+        } if holder == &snapshot.self_presence_id && *session_id == self_viewer.session_id => {
+            snapshot
+                .focus_proposal
+                .as_ref()
+                .map(|proposal| FocusCommandV2 {
+                    request_id,
+                    action: FocusCommandActionV2::Approve,
+                    slot: *slot,
+                    expected_revision: snapshot.revision,
+                    expected_focus_generation: Some(*focus_generation),
+                    expected_proposal_id: Some(proposal.proposal_id),
+                })
+        }
+        FocusStateV2::Held { slot, .. } if snapshot.focus_proposal.is_none() => {
+            Some(FocusCommandV2 {
+                request_id,
+                action: FocusCommandActionV2::Request,
+                slot: *slot,
+                expected_revision: snapshot.revision,
+                expected_focus_generation: None,
+                expected_proposal_id: None,
+            })
+        }
+        FocusStateV2::Held { .. } | FocusStateV2::Neutralizing { .. } => None,
+    }
+}
+
+async fn run_focus_handoff_participant(
+    control_connection: iroh::endpoint::Connection,
+    mut control_send: iroh::endpoint::SendStream,
+    mut control_recv: iroh::endpoint::RecvStream,
+    mut media: MoqProbeReceiver,
+    mut snapshot: sigil_protocol::SessionSnapshotV2,
+    required_handoffs: u32,
+    timeout_seconds: u64,
+) -> Result<()> {
+    let mut request_id = 1_u64;
+    let mut command_in_flight = false;
+    let mut observed_handoffs = 0_u32;
+    let mut accepted_frames = 0_u32;
+    let mut maximum_roster_viewers = snapshot.viewers.len();
+    let mut last_holder = focus_holder_identity(&snapshot);
+    let mut next_command_at = tokio::time::Instant::now();
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(timeout_seconds.max(1).saturating_mul(2));
+
+    while observed_handoffs < required_handoffs {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out after observing {observed_handoffs} of {required_handoffs} focus handoffs"
+        );
+        if !command_in_flight && tokio::time::Instant::now() >= next_command_at {
+            if let Some(command) = next_handoff_command(&snapshot, request_id) {
+                write_client_control_v2(
+                    &mut control_send,
+                    &ClientControlEnvelopeV2::Focus { command },
+                )
+                .await
+                .context("writing bounded focus handoff command")?;
+                request_id = request_id
+                    .checked_add(1)
+                    .context("focus handoff request id exhausted")?;
+                command_in_flight = true;
+                next_command_at = tokio::time::Instant::now() + Duration::from_millis(300);
+            }
+        }
+
+        tokio::select! {
+            envelope = read_server_control_v2(&mut control_recv) => {
+                let envelope = envelope?
+                    .context("host closed during bounded focus handoff proof")?;
+                match envelope {
+                    ServerControlEnvelopeV2::Snapshot { snapshot: next } => {
+                        ensure!(
+                            next.revision >= snapshot.revision,
+                            "focus handoff snapshot revision regressed"
+                        );
+                        if next.revision == snapshot.revision {
+                            continue;
+                        }
+                        if let Some(holder) = focus_holder_identity(&next) {
+                            if last_holder.as_ref().is_some_and(|previous| previous != &holder) {
+                                observed_handoffs = observed_handoffs.saturating_add(1);
+                            }
+                            last_holder = Some(holder);
+                        }
+                        maximum_roster_viewers = maximum_roster_viewers.max(next.viewers.len());
+                        snapshot = next;
+                        command_in_flight = false;
+                    }
+                    ServerControlEnvelopeV2::FocusResult { result } => {
+                        if !result.accepted {
+                            command_in_flight = false;
+                            next_command_at = tokio::time::Instant::now() + Duration::from_millis(300);
+                        }
+                    }
+                }
+            }
+            outcome = media.next() => {
+                if matches!(outcome?, Some(MoqProbeOutcome::Frame { .. })) {
+                    accepted_frames = accepted_frames.saturating_add(1);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                bail!("timed out after observing {observed_handoffs} of {required_handoffs} focus handoffs");
+            }
+        }
+    }
+
+    control_connection.close(0_u32.into(), b"focus handoff proof complete");
+    println!("probe=ok");
+    println!("control_alpn=sigil/control/2");
+    println!("focus_handoffs_observed={observed_handoffs}");
+    println!("roster_viewers={maximum_roster_viewers}");
+    println!("focus_handoff_media_frames={accepted_frames}");
+    println!("reset_before_successor=host-ordered");
     Ok(())
 }
 
@@ -1663,6 +1834,7 @@ async fn main() -> Result<()> {
             args.expect_size,
             args.spectator,
             args.disconnect_with_focus,
+            args.focus_handoffs,
         )
         .await;
     }

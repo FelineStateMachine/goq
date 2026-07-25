@@ -14,6 +14,8 @@ controller-runtime.mjs
 controller-state.mjs
 decoder-recovery.mjs
 enrollment.mjs
+focus-overlay.mjs
+focus-runtime.mjs
 frame-envelope.mjs
 frame-session.mjs
 frame-stats.mjs
@@ -24,6 +26,8 @@ keyboard-map.mjs
 main.js
 network-diagnostics.mjs
 pointer-feedback.mjs
+roster-ui.mjs
+session-state.mjs
 stream-metrics.mjs
 stream-runtime.mjs
 style.css

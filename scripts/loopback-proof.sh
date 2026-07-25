@@ -29,6 +29,8 @@ assert_shared_generation=false
 replace_viewer=0
 legacy_exclusive=false
 expect_second_rejected=false
+focus_handoffs=0
+assert_neutral_before_successor=false
 
 usage() {
   cat <<'EOF'
@@ -56,6 +58,9 @@ Options:
   --replace-viewer INDEX        Replace this 1-based control-v2 viewer identity
   --legacy-exclusive            Exercise the unchanged exclusive legacy path
   --expect-second-rejected      Require explicit legacy second-client rejection
+  --focus-handoffs COUNT        Run bounded holder-approved control transfers
+  --assert-neutral-before-successor
+                                Require host ordering evidence for every transfer
   --help                        Show this help
 EOF
 }
@@ -147,6 +152,15 @@ while [[ $# -gt 0 ]]; do
       expect_second_rejected=true
       shift
       ;;
+    --focus-handoffs)
+      [[ $# -ge 2 ]] || die "--focus-handoffs requires a value"
+      focus_handoffs="$2"
+      shift 2
+      ;;
+    --assert-neutral-before-successor)
+      assert_neutral_before_successor=true
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -171,6 +185,15 @@ require_positive_integer "--reconnect-cycles" "$reconnect_cycles"
 require_positive_integer "--reconnect-frames" "$reconnect_frames"
 require_positive_integer "--probe-timeout-seconds" "$probe_timeout_seconds"
 require_positive_integer "--viewers" "$viewers"
+case "$focus_handoffs" in
+  ''|*[!0-9]*) die "--focus-handoffs must be a non-negative integer" ;;
+esac
+if [[ "$focus_handoffs" -gt 0 && ( "$control_v2" != true || "$viewers" -lt 2 ) ]]; then
+  die "--focus-handoffs requires --control-v2 with at least two viewers"
+fi
+if [[ "$assert_neutral_before_successor" == true && "$focus_handoffs" -eq 0 ]]; then
+  die "--assert-neutral-before-successor requires --focus-handoffs"
+fi
 if [[ "$control_v2" == true && ( "$viewers" -lt 1 || "$viewers" -gt 3 ) ]]; then
   die "this bounded control-v2 proof supports --viewers 1 through 3"
 fi
@@ -584,7 +607,12 @@ if [[ "$control_v2" == true ]]; then
       viewer_identities+=("$viewer_identity")
       viewer_log="$tmp_root/control-v2-viewer-${viewer}.log"
       viewer_logs+=("$viewer_log")
-      if [[ "$viewer" -gt 1 ]]; then
+      if [[ "$focus_handoffs" -gt 0 && "$viewer" -le 2 ]]; then
+        "$probe_bin" --control-v2 --focus-handoffs "$focus_handoffs" \
+          --identity "$viewer_identity" --node-id "$node_id" --frames "$primary_frames" \
+          --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800 \
+          >"$viewer_log" 2>&1 &
+      elif [[ "$viewer" -gt 1 ]]; then
         "$probe_bin" --control-v2 --spectator \
           --identity "$viewer_identity" --node-id "$node_id" --frames "$primary_frames" \
           --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800 \
@@ -596,7 +624,7 @@ if [[ "$control_v2" == true ]]; then
           >"$viewer_log" 2>&1 &
       fi
       viewer_pids+=("$!")
-      if [[ "$viewer" -eq 1 ]]; then
+      if [[ "$viewer" -eq 1 && "$focus_handoffs" -eq 0 ]]; then
         wait_for_log_count "$host_log" 'input v2 client accepted' 1 "$host_pid" 'sigil' \
           || die "slot-0 holder did not acquire focused input before spectators joined"
       fi
@@ -639,8 +667,17 @@ if [[ "$control_v2" == true ]]; then
       viewer=$((viewer + 1))
     done
     viewer_pids=()
-    grep -Fxq 'slot_0_input=ok' "${viewer_logs[0]}" || die "slot-0 holder input failed"
-    spectator=2
+    if [[ "$focus_handoffs" -gt 0 ]]; then
+      participant=1
+      while [[ "$participant" -le 2 ]]; do
+        grep -Fxq "focus_handoffs_observed=${focus_handoffs}" "${viewer_logs[$((participant - 1))]}" \
+          || die "focus participant $participant did not observe all handoffs"
+        participant=$((participant + 1))
+      done
+    else
+      grep -Fxq 'slot_0_input=ok' "${viewer_logs[0]}" || die "slot-0 holder input failed"
+    fi
+    spectator=$([[ "$focus_handoffs" -gt 0 ]] && printf 3 || printf 2)
     while [[ "$spectator" -le "$viewers" ]]; do
       if [[ "$spectator" -eq "$replace_viewer" ]]; then
         spectator=$((spectator + 1))
@@ -660,6 +697,41 @@ if [[ "$control_v2" == true ]]; then
       || die "multi-viewer control-v2 started more than one generation"
     [[ "$(grep -Fc -- 'shared media generation stopped with all sources cleaned up' "$host_log" || true)" -eq 1 ]] \
       || die "multi-viewer control-v2 stopped the generation more than once"
+    if [[ "$assert_neutral_before_successor" == true ]]; then
+      clean_focus_log="$tmp_root/host-focus-transitions.log"
+      sed $'s/\033\[[0-9;]*m//g' "$host_log" >"$clean_focus_log"
+      if ! awk -v required="$focus_handoffs" '
+        function transition_id(line, value) {
+          if (match(line, /transition_id=[0-9]+/)) {
+            value = substr(line, RSTART + 14, RLENGTH - 14)
+            return value + 0
+          }
+          return 0
+        }
+        /focus transition entered no-inject neutralizing state/ {
+          id = transition_id($0); if (id > 0) entered[id] = NR
+        }
+        /focus transition virtual input neutralized/ {
+          id = transition_id($0); if (id > 0) neutral[id] = NR
+        }
+        /focus transition successor committed after neutralization/ {
+          id = transition_id($0)
+          if (id > 0) {
+            committed[id] = NR
+            count += 1
+          }
+        }
+        END {
+          if (count < required) exit 1
+          for (id in committed) {
+            if (!(id in entered) || !(id in neutral) || entered[id] >= neutral[id] || neutral[id] >= committed[id]) exit 1
+          }
+        }
+      ' "$clean_focus_log"; then
+        grep -F 'focus transition' "$clean_focus_log" >&2 || true
+        die "focus successor was published before complete neutralization evidence"
+      fi
+    fi
 
     kill -TERM "$host_pid" 2>/dev/null || true
     if wait "$host_pid"; then host_status=0; else host_status=$?; fi
@@ -673,6 +745,8 @@ if [[ "$control_v2" == true ]]; then
     printf 'same_peer_replacement=%s\n' "$([[ "$replace_viewer" -gt 0 ]] && printf ok || printf not-requested)"
     printf 'shared_generation=ok\n'
     printf 'slot_0_single_holder=ok\n'
+    printf 'focus_handoffs=%s\n' "$focus_handoffs"
+    printf 'neutral_before_successor=%s\n' "$([[ "$assert_neutral_before_successor" == true ]] && printf ok || printf not-requested)"
     printf 'spectator_progress=ok\n'
     exit 0
   fi

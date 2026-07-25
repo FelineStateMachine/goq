@@ -62,6 +62,7 @@ pub async fn iroh_client_request_focus(
         FocusCommandActionV2::Request,
         expected_revision,
         None,
+        None,
     )
     .await
 }
@@ -81,6 +82,69 @@ pub async fn iroh_client_release_focus(
         FocusCommandActionV2::Release,
         expected_revision,
         Some(expected_focus_generation),
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn iroh_client_approve_focus(
+    state: State<'_, AppState>,
+    generation: u64,
+    request_id: u64,
+    expected_revision: u64,
+    expected_focus_generation: u64,
+    expected_proposal_id: u64,
+) -> Result<bool, String> {
+    send_focus_command(
+        &state.session_control,
+        generation,
+        request_id,
+        FocusCommandActionV2::Approve,
+        expected_revision,
+        Some(expected_focus_generation),
+        Some(expected_proposal_id),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn iroh_client_deny_focus(
+    state: State<'_, AppState>,
+    generation: u64,
+    request_id: u64,
+    expected_revision: u64,
+    expected_focus_generation: u64,
+    expected_proposal_id: u64,
+) -> Result<bool, String> {
+    send_focus_command(
+        &state.session_control,
+        generation,
+        request_id,
+        FocusCommandActionV2::Deny,
+        expected_revision,
+        Some(expected_focus_generation),
+        Some(expected_proposal_id),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn iroh_client_preempt_focus(
+    state: State<'_, AppState>,
+    generation: u64,
+    request_id: u64,
+    expected_revision: u64,
+    expected_focus_generation: u64,
+) -> Result<bool, String> {
+    send_focus_command(
+        &state.session_control,
+        generation,
+        request_id,
+        FocusCommandActionV2::Preempt,
+        expected_revision,
+        Some(expected_focus_generation),
+        None,
     )
     .await
 }

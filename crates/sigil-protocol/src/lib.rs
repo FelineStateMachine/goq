@@ -23,11 +23,12 @@ mod subscription;
 pub use audio::{AUDIO_HEADER_LEN, AudioCodec, AudioFlags, AudioPacket, AudioPacketHeader};
 pub use control_v2::{
     ClientControlEnvelopeV2, ClientHelloV2, ControlKeyframeReasonV2, FocusCommandActionV2,
-    FocusCommandResultV2, FocusCommandV2, FocusStateV2, FocusTransitionReasonV2, HostHelloV2,
-    MAX_CONTROL_V2_MESSAGE_LEN, MAX_SESSION_ROSTER_VIEWERS, MediaGenerationDescriptorV2,
-    ServerControlEnvelopeV2, SessionSnapshotV2, ViewerPresenceId, ViewerPresenceV2,
-    read_client_control_v2, read_client_hello_v2, read_host_hello_v2, read_server_control_v2,
-    write_client_control_v2, write_client_hello_v2, write_host_hello_v2, write_server_control_v2,
+    FocusCommandResultV2, FocusCommandV2, FocusProposalV2, FocusStateV2, FocusTransitionReasonV2,
+    HostHelloV2, MAX_CONTROL_V2_MESSAGE_LEN, MAX_SESSION_ROSTER_VIEWERS,
+    MediaGenerationDescriptorV2, ServerControlEnvelopeV2, SessionSnapshotV2, ViewerPresenceId,
+    ViewerPresenceV2, read_client_control_v2, read_client_hello_v2, read_host_hello_v2,
+    read_server_control_v2, write_client_control_v2, write_client_hello_v2, write_host_hello_v2,
+    write_server_control_v2,
 };
 pub use error::{ProtocolError, Result};
 pub use feedback::{

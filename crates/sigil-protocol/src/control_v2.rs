@@ -119,6 +119,12 @@ impl ViewerPresenceV2 {
 pub enum FocusTransitionReasonV2 {
     Initial,
     Requested,
+    HandoffRequested,
+    HandoffApproved,
+    HandoffDenied,
+    ProposalExpired,
+    Preempted,
+    ActivationExpired,
     Released,
     Disconnected,
     Replaced,
@@ -196,6 +202,40 @@ impl FocusStateV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct FocusProposalV2 {
+    pub proposal_id: u64,
+    pub slot: ControllerSlot,
+    pub requester: ViewerPresenceId,
+    pub requester_session_id: u64,
+    pub holder: ViewerPresenceId,
+    pub holder_session_id: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+impl FocusProposalV2 {
+    pub fn validate(&self) -> Result<()> {
+        if self.proposal_id == 0
+            || self.requester_session_id == 0
+            || self.holder_session_id == 0
+            || self.expires_at_unix_ms == 0
+        {
+            return invalid(
+                "focus proposal",
+                "proposal, session, and expiry identifiers must be non-zero",
+            );
+        }
+        self.slot.validate()?;
+        self.requester.validate()?;
+        self.holder.validate()?;
+        if self.requester == self.holder && self.requester_session_id == self.holder_session_id {
+            return invalid("focus proposal", "holder cannot request focus from itself");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MediaGenerationDescriptorV2 {
     pub generation_id: u64,
     pub broadcast_name: String,
@@ -226,6 +266,9 @@ pub struct SessionSnapshotV2 {
     pub self_presence_id: ViewerPresenceId,
     pub viewers: Vec<ViewerPresenceV2>,
     pub focus: FocusStateV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_proposal: Option<FocusProposalV2>,
+    pub self_is_focus_owner: bool,
     pub transition_reason: FocusTransitionReasonV2,
     pub media: MediaGenerationDescriptorV2,
 }
@@ -273,6 +316,37 @@ impl SessionSnapshotV2 {
         {
             return invalid("session snapshot", "focus holder is absent from the roster");
         }
+        if let Some(proposal) = &self.focus_proposal {
+            proposal.validate()?;
+            let FocusStateV2::Held {
+                slot,
+                holder,
+                session_id,
+                ..
+            } = &self.focus
+            else {
+                return invalid("session snapshot", "focus proposals require a held slot");
+            };
+            if *slot != proposal.slot
+                || holder != &proposal.holder
+                || *session_id != proposal.holder_session_id
+            {
+                return invalid(
+                    "session snapshot",
+                    "focus proposal does not match the authoritative holder",
+                );
+            }
+            if !self.viewers.iter().any(|viewer| {
+                viewer.presence_id == proposal.requester
+                    && viewer.session_id == proposal.requester_session_id
+                    && viewer.input_capable
+            }) {
+                return invalid(
+                    "session snapshot",
+                    "focus proposal requester is absent or not input-capable",
+                );
+            }
+        }
         self.media.validate()
     }
 
@@ -304,7 +378,10 @@ impl SessionSnapshotV2 {
 #[serde(rename_all = "snake_case")]
 pub enum FocusCommandActionV2 {
     Request,
+    Approve,
+    Deny,
     Release,
+    Preempt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +393,8 @@ pub struct FocusCommandV2 {
     pub expected_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_focus_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_proposal_id: Option<u64>,
 }
 
 impl FocusCommandV2 {
@@ -327,19 +406,28 @@ impl FocusCommandV2 {
             );
         }
         self.slot.validate()?;
+        let focus_generation = self.expected_focus_generation.filter(|value| *value != 0);
+        let proposal_id = self.expected_proposal_id.filter(|value| *value != 0);
         match self.action {
-            FocusCommandActionV2::Request if self.expected_focus_generation.is_some() => invalid(
-                "focus command",
-                "focus requests must not carry an expected focus generation",
-            ),
-            FocusCommandActionV2::Release
-                if self
-                    .expected_focus_generation
-                    .is_none_or(|generation| generation == 0) =>
+            FocusCommandActionV2::Request
+                if focus_generation.is_some() || proposal_id.is_some() =>
+            {
+                invalid("focus command", "focus requests forbid expected ownership")
+            }
+            FocusCommandActionV2::Approve | FocusCommandActionV2::Deny
+                if focus_generation.is_none() || proposal_id.is_none() =>
             {
                 invalid(
                     "focus command",
-                    "focus release requires a non-zero expected focus generation",
+                    "handoff decisions require focus generation and proposal id",
+                )
+            }
+            FocusCommandActionV2::Release | FocusCommandActionV2::Preempt
+                if focus_generation.is_none() || proposal_id.is_some() =>
+            {
+                invalid(
+                    "focus command",
+                    "release and preempt require only a focus generation",
                 )
             }
             _ => Ok(()),
@@ -666,6 +754,8 @@ mod tests {
             focus: FocusStateV2::Vacant {
                 slot: ControllerSlot::ZERO,
             },
+            focus_proposal: None,
+            self_is_focus_owner: false,
             transition_reason: FocusTransitionReasonV2::Initial,
             media: MediaGenerationDescriptorV2 {
                 generation_id: 7,
@@ -678,7 +768,7 @@ mod tests {
     fn control_v2_snapshot_json_is_a_golden_vector() {
         assert_eq!(
             serde_json::to_string(&snapshot(1)).unwrap(),
-            r#"{"revision":1,"self_presence_id":"viewer-0001","viewers":[{"presence_id":"viewer-0001","session_id":7,"input_capable":true,"you":true}],"focus":{"state":"vacant","slot":0},"transition_reason":"initial","media":{"generation_id":7,"broadcast_name":"sigil/session/7/video"}}"#
+            r#"{"revision":1,"self_presence_id":"viewer-0001","viewers":[{"presence_id":"viewer-0001","session_id":7,"input_capable":true,"you":true}],"focus":{"state":"vacant","slot":0},"self_is_focus_owner":false,"transition_reason":"initial","media":{"generation_id":7,"broadcast_name":"sigil/session/7/video"}}"#
         );
     }
 
@@ -699,6 +789,7 @@ mod tests {
             slot: ControllerSlot::ZERO,
             expected_revision: 1,
             expected_focus_generation: None,
+            expected_proposal_id: None,
         };
         request.validate().unwrap();
         let mut release = request.clone();
@@ -719,6 +810,7 @@ mod tests {
                 slot: ControllerSlot::ZERO,
                 expected_revision: 1,
                 expected_focus_generation: None,
+                expected_proposal_id: None,
             },
         };
         let (mut sender, mut receiver) = duplex(4096);

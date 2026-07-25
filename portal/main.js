@@ -11,6 +11,11 @@ import { createInputRuntime } from './input-runtime.mjs';
 import { createControlRuntime } from './control-runtime.mjs';
 import { createSessionState } from './session-state.mjs';
 import { createFocusRuntime } from './focus-runtime.mjs';
+import {
+  focusOverlayStillCurrent,
+  handoffProposalForSelf,
+  preemptionCandidateForSelf,
+} from './focus-overlay.mjs';
 import { renderRoster, rosterPresentation } from './roster-ui.mjs';
 import { formatVideoDiscardTelemetry } from './frame-stats.mjs';
 import { networkDiagnosticsPresentation } from './network-diagnostics.mjs';
@@ -55,6 +60,7 @@ let controlRuntime = null;
 let controllerRuntime = null;
 let sessionStateRuntime = null;
 let focusRuntime = null;
+let activeFocusOverlay = null;
 
 const invoke = (...args) => window.__TAURI__.core.invoke(...args);
 const listen = (...args) => window.__TAURI__.event.listen(...args);
@@ -587,6 +593,68 @@ function togglePanel(force) {
   if (open) setTimeout(() => document.getElementById('panel-close').focus(), 0);
 }
 
+function closeFocusOverlay() {
+  activeFocusOverlay = null;
+  document.getElementById('focus-handoff-overlay').classList.add('hidden');
+  document.getElementById('focus-preempt-overlay').classList.add('hidden');
+}
+
+function renderFocusOverlay() {
+  const session = sessionStateRuntime?.snapshot();
+  if (!session) return;
+  const handoff = handoffProposalForSelf(session);
+  if (handoff) {
+    activeFocusOverlay = handoff;
+    document.getElementById('focus-preempt-overlay').classList.add('hidden');
+    document.getElementById('focus-handoff-requester').textContent = handoff.requester;
+    document.getElementById('focus-handoff-overlay').classList.remove('hidden');
+    setTimeout(() => setControllerFocus(document.getElementById('deny-focus-handoff')), 0);
+    return;
+  }
+  if (activeFocusOverlay && !focusOverlayStillCurrent(activeFocusOverlay, session)) {
+    closeFocusOverlay();
+  }
+}
+
+function openFocusPreempt() {
+  const candidate = preemptionCandidateForSelf(sessionStateRuntime.snapshot());
+  if (!candidate) return false;
+  activeFocusOverlay = candidate;
+  document.getElementById('focus-preempt-holder').textContent = candidate.holder;
+  document.getElementById('focus-preempt-overlay').classList.remove('hidden');
+  setTimeout(() => setControllerFocus(document.getElementById('cancel-focus-preempt')), 0);
+  return true;
+}
+
+function cancelFocusPreempt() {
+  if (activeFocusOverlay?.type !== 'preempt') return;
+  closeFocusOverlay();
+  setControllerFocus(document.getElementById('control-toggle'));
+}
+
+async function approveFocusHandoff() {
+  if (activeFocusOverlay?.type !== 'handoff'
+    || !focusOverlayStillCurrent(activeFocusOverlay, sessionStateRuntime.snapshot())) return false;
+  controlRuntime.exit({ releaseHostFocus: false, resetEscape: true });
+  await inputRuntime.drain(250);
+  closeFocusOverlay();
+  return focusRuntime.approve();
+}
+
+async function denyFocusHandoff() {
+  if (activeFocusOverlay?.type !== 'handoff'
+    || !focusOverlayStillCurrent(activeFocusOverlay, sessionStateRuntime.snapshot())) return false;
+  closeFocusOverlay();
+  return focusRuntime.deny();
+}
+
+async function confirmFocusPreempt() {
+  if (activeFocusOverlay?.type !== 'preempt'
+    || !focusOverlayStillCurrent(activeFocusOverlay, sessionStateRuntime.snapshot())) return false;
+  closeFocusOverlay();
+  return focusRuntime.preempt({ controllerInitiated: controllerActivationInProgress });
+}
+
 // ─── WebCodecs detection ──────────────────────────────────────────────────────
 // Finish the codec probe and publish the result to Rust before exposing any
 // connect handlers. Rust refuses to connect when WebCodecs is unavailable, so
@@ -644,8 +712,12 @@ controlRuntime = createControlRuntime({
   },
   onExit: () => {
     if (connectionState.controlProtocol === 'control-v2') {
-      void focusRuntime?.release().catch((error) => console.error('focus release failed:', error));
+      return focusRuntime?.release().catch((error) => {
+        console.error('focus release failed:', error);
+        return false;
+      });
     }
+    return false;
   },
   onReleaseFailure: () => setStatus('err', 'cursor release failed · quit app'),
 });
@@ -830,6 +902,10 @@ async function toggleControl() {
   // Capture synchronous controller provenance before cursor acquisition yields.
   // The DOM click dispatcher does not await this async handler.
   if (connectionState.controlProtocol === 'control-v2' && !sessionStateRuntime.focused) {
+    if (preemptionCandidateForSelf(sessionStateRuntime.snapshot())) {
+      openFocusPreempt();
+      return;
+    }
     await focusRuntime.request({ controllerInitiated: controllerActivationInProgress });
     updateControlUI();
     return;
@@ -892,8 +968,12 @@ function updateControlUI() {
   const occupiedByAnother = v2
     && sessionStateRuntime.snapshot().snapshot?.focus?.state === 'held'
     && !sessionStateRuntime.focused;
-  const controlAction = v2 && !sessionStateRuntime.focused
-    ? occupiedByAnother ? 'spectating · request control' : 'request control'
+  const focusPending = focusRuntime?.snapshot().pending === true;
+  const ownerCanPreempt = preemptionCandidateForSelf(sessionStateRuntime.snapshot()) !== null;
+  const controlAction = focusPending
+    ? 'control request pending'
+    : v2 && !sessionStateRuntime.focused
+      ? ownerCanPreempt ? 'spectating · take control' : occupiedByAnother ? 'spectating · request control' : 'request control'
     : controlling ? 'release control' : 'activate control';
   el.textContent = available
     ? `${controlAction} · ${describeInputCapabilities()}${controlling && capabilities.relativePointer ? ' · Ctrl+Alt+Esc to exit' : controlling && capabilities.gamepad ? ' · hold Back+Start to exit' : ''}`
@@ -919,6 +999,7 @@ function updateControlUI() {
 
 function updateSessionUI() {
   updateControlUI();
+  renderFocusOverlay();
   const viewerStatus = document.getElementById('viewer-status');
   const rosterSection = document.getElementById('roster-section');
   const rosterSummary = document.getElementById('roster-summary');
@@ -1066,6 +1147,11 @@ window.addEventListener('blur', () => {
   controlRuntime.exit();
 });
 
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden || (!controlRuntime.active && !controlRuntime.transitioning)) return;
+  controlRuntime.exit();
+});
+
 // ─── Controller PIN entry ─────────────────────────────────────────────────────
 let activePinInput = null;
 let pinPadReturnFocus = null;
@@ -1133,6 +1219,10 @@ for (const id of ['enrollment-pin', 'intro-pin', 'pin-input']) {
 function controllerScope() {
   const tap = document.getElementById('tap-overlay');
   if (!tap.classList.contains('hidden')) return tap;
+  const handoff = document.getElementById('focus-handoff-overlay');
+  if (!handoff.classList.contains('hidden')) return handoff;
+  const preempt = document.getElementById('focus-preempt-overlay');
+  if (!preempt.classList.contains('hidden')) return preempt;
   const pinPad = document.getElementById('pin-pad-overlay');
   if (!pinPad.classList.contains('hidden')) return pinPad;
   const resetEnrollment = document.getElementById('reset-enrollment-overlay');
@@ -1190,7 +1280,11 @@ function activateControllerFocus() {
 }
 
 function controllerBack() {
-  if (!document.getElementById('pin-pad-overlay').classList.contains('hidden')) {
+  if (!document.getElementById('focus-handoff-overlay').classList.contains('hidden')) {
+    void denyFocusHandoff();
+  } else if (!document.getElementById('focus-preempt-overlay').classList.contains('hidden')) {
+    cancelFocusPreempt();
+  } else if (!document.getElementById('pin-pad-overlay').classList.contains('hidden')) {
     closePinPad();
   } else if (!document.getElementById('reset-enrollment-overlay').classList.contains('hidden')) {
     cancelEnrollmentReset();
@@ -1297,6 +1391,7 @@ Object.assign(window, {
   openPinPad, closePinPad, pinPadDigit, pinPadBackspace, pinPadClear,
   openEnrollmentReset, cancelEnrollmentReset, confirmEnrollmentReset,
   derivePortalIdentity, chooseInvitationFile, confirmInvitation, cancelInvitation,
+  approveFocusHandoff, denyFocusHandoff, cancelFocusPreempt, confirmFocusPreempt,
   sigilController: Object.freeze({
     getLatestState: () => controllerRuntime.latest,
     setObserver: controllerRuntime.setObserver,

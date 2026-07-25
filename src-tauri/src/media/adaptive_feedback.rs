@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use iroh::Endpoint;
@@ -12,6 +13,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::commands::state::{AccumulatedMediaFeedback, AppState};
 use crate::media::frame_channel::take_generation_owned_triple;
+use crate::media::network_diagnostics::{NetworkSessionDiagnostics, lock_network_diagnostics};
 use crate::media::transport::{connect_error_is_unsupported_alpn, negotiate_v1};
 
 pub(crate) const CLIENT_MEDIA_FEEDBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -68,6 +70,9 @@ struct AdaptiveBitrateDecisionDiagnostic {
     state: &'static str,
     reasons: Vec<&'static str>,
     applied: bool,
+    contribution: &'static str,
+    recovery_state: &'static str,
+    scope: &'static str,
 }
 
 pub(crate) async fn open_negotiated_feedback_stream(
@@ -163,6 +168,41 @@ fn adaptive_bitrate_reason_names(reasons: AdaptiveBitrateReasonFlagsV1) -> Vec<&
 fn adaptive_bitrate_decision_diagnostic(
     decision: AdaptiveBitrateDecisionV1,
 ) -> AdaptiveBitrateDecisionDiagnostic {
+    let pressured = decision
+        .reasons
+        .contains(AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE)
+        || decision
+            .reasons
+            .contains(AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG)
+        || decision
+            .reasons
+            .contains(AdaptiveBitrateReasonFlagsV1::DELIVERY_LATENCY)
+        || decision
+            .reasons
+            .contains(AdaptiveBitrateReasonFlagsV1::LOSS_OR_CANCELLATION)
+        || decision
+            .reasons
+            .contains(AdaptiveBitrateReasonFlagsV1::RTT_INFLATION);
+    let contribution = if decision
+        .reasons
+        .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE)
+    {
+        "stale"
+    } else if pressured {
+        "limiting"
+    } else if decision
+        .reasons
+        .contains(AdaptiveBitrateReasonFlagsV1::CLEAN_RECOVERY)
+    {
+        "clean"
+    } else {
+        "steady"
+    };
+    let recovery_state = if pressured && decision.target_kbps == decision.floor_kbps {
+        "floor-limited"
+    } else {
+        "active"
+    };
     AdaptiveBitrateDecisionDiagnostic {
         decision_id: decision.decision_id,
         report_id: decision.report_id,
@@ -172,6 +212,9 @@ fn adaptive_bitrate_decision_diagnostic(
         state: adaptive_bitrate_state_name(decision.state),
         reasons: adaptive_bitrate_reason_names(decision.reasons),
         applied: decision.applied,
+        contribution,
+        recovery_state,
+        scope: "local-viewer",
     }
 }
 
@@ -242,7 +285,9 @@ pub(crate) async fn run_media_feedback_session(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     mut reports: tokio::sync::watch::Receiver<Option<AccumulatedMediaFeedback>>,
+    network_diagnostics: Arc<StdMutex<NetworkSessionDiagnostics>>,
 ) {
+    let writer_diagnostics = Arc::clone(&network_diagnostics);
     let (decision_tx, decision_rx) = tokio::sync::watch::channel(None);
     let writer = async {
         let mut last_written = None;
@@ -256,6 +301,7 @@ pub(crate) async fn run_media_feedback_session(
                 continue;
             };
             let report = accumulated.report_since(last_written);
+            lock_network_diagnostics(&writer_diagnostics).observe_adaptive_report(&report);
             tokio::time::timeout(
                 CLIENT_MEDIA_FEEDBACK_IO_TIMEOUT,
                 write_media_feedback_report_v1(&mut send, &report),
@@ -268,6 +314,7 @@ pub(crate) async fn run_media_feedback_session(
         #[allow(unreachable_code)]
         Ok::<(), String>(())
     };
+    let reader_diagnostics = Arc::clone(&network_diagnostics);
     let reader = async {
         let mut sequence = AdaptiveDecisionSequence::default();
         loop {
@@ -276,6 +323,7 @@ pub(crate) async fn run_media_feedback_session(
                 .map_err(|error| format!("adaptive decision read failed: {error}"))?
                 .ok_or_else(|| "adaptive decision stream closed".to_string())?;
             sequence.accept(&decision)?;
+            lock_network_diagnostics(&reader_diagnostics).observe_adaptive_decision(&decision);
             decision_tx.send_replace(Some(decision));
         }
         #[allow(unreachable_code)]
@@ -298,12 +346,14 @@ pub(crate) async fn run_media_feedback_session(
         terminal = decision_emitter => terminal,
     };
     if let Err(error) = terminal {
+        lock_network_diagnostics(&network_diagnostics).mark_adaptive_detached();
         eprintln!("[client] {error}");
         if let Err(emit_error) = app.emit(
             "adaptive-feedback-state",
             serde_json::json!({
                 "generation": generation,
                 "available": false,
+                "recovery_state": "detached",
                 "error": error,
             }),
         ) {
@@ -486,6 +536,9 @@ mod tests {
         assert_eq!(diagnostic.state, "decrease");
         assert_eq!(diagnostic.reasons, vec!["receiver-queue", "decode-backlog"]);
         assert!(!diagnostic.applied);
+        assert_eq!(diagnostic.contribution, "limiting");
+        assert_eq!(diagnostic.recovery_state, "active");
+        assert_eq!(diagnostic.scope, "local-viewer");
     }
 
     fn adaptive_decision(decision_id: u64, report_id: u64) -> AdaptiveBitrateDecisionV1 {

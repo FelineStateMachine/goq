@@ -859,7 +859,7 @@ function updateStreamStats() {
   document.getElementById('stream-network-audio').textContent = networkPresentation.audio;
   document.getElementById('stream-network-input-ack').textContent = networkPresentation.inputAck;
   document.getElementById('stream-adaptive-feedback').textContent = adaptiveFeedbackAvailable
-    ? 'authenticated · 1 Hz bounded reports'
+    ? `authenticated · 1 Hz bounded reports · ${networkPresentation.adaptive}`
     : adaptiveFeedbackError || 'unavailable';
   document.getElementById('stream-adaptive-decision').textContent = formatAdaptiveDecision(
     adaptiveDecision,

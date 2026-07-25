@@ -31,6 +31,8 @@ legacy_exclusive=false
 expect_second_rejected=false
 focus_handoffs=0
 assert_neutral_before_successor=false
+stall_viewer=0
+assert_survivor_recovery=false
 
 usage() {
   cat <<'EOF'
@@ -61,6 +63,9 @@ Options:
   --focus-handoffs COUNT        Run bounded holder-approved control transfers
   --assert-neutral-before-successor
                                 Require host ordering evidence for every transfer
+  --stall-viewer INDEX          Drive this control-v2 viewer persistently below
+                                the shared bitrate floor
+  --assert-survivor-recovery    Require clean viewers to recover after isolation
   --help                        Show this help
 EOF
 }
@@ -161,6 +166,15 @@ while [[ $# -gt 0 ]]; do
       assert_neutral_before_successor=true
       shift
       ;;
+    --stall-viewer)
+      [[ $# -ge 2 ]] || die "--stall-viewer requires a value"
+      stall_viewer="$2"
+      shift 2
+      ;;
+    --assert-survivor-recovery)
+      assert_survivor_recovery=true
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -202,6 +216,21 @@ case "$replace_viewer" in
 esac
 if [[ "$replace_viewer" -gt "$viewers" ]]; then
   die "--replace-viewer must identify one of the configured viewers"
+fi
+case "$stall_viewer" in
+  ''|*[!0-9]*) die "--stall-viewer must be a non-negative integer" ;;
+esac
+if [[ "$stall_viewer" -gt "$viewers" ]]; then
+  die "--stall-viewer must identify one of the configured viewers"
+fi
+if [[ "$stall_viewer" -gt 0 && ( "$control_v2" != true || "$viewers" -lt 2 ) ]]; then
+  die "--stall-viewer requires --control-v2 with at least two viewers"
+fi
+if [[ "$assert_survivor_recovery" == true && "$stall_viewer" -eq 0 ]]; then
+  die "--assert-survivor-recovery requires --stall-viewer"
+fi
+if [[ "$stall_viewer" -gt 0 && "$command_timeout_seconds" -lt 75 ]]; then
+  command_timeout_seconds=75
 fi
 if [[ "$control_v2" == true && "$media_v3" == true ]]; then
   die "--control-v2 conflicts with --media-v3"
@@ -607,7 +636,14 @@ if [[ "$control_v2" == true ]]; then
       viewer_identities+=("$viewer_identity")
       viewer_log="$tmp_root/control-v2-viewer-${viewer}.log"
       viewer_logs+=("$viewer_log")
-      if [[ "$focus_handoffs" -gt 0 && "$viewer" -le 2 ]]; then
+      if [[ "$stall_viewer" -gt 0 ]]; then
+        adaptive_profile="clean"
+        if [[ "$viewer" -eq "$stall_viewer" ]]; then adaptive_profile="floor-breach"; fi
+        "$probe_bin" --control-v2 --spectator --adaptive-profile "$adaptive_profile" \
+          --identity "$viewer_identity" --node-id "$node_id" --frames "$primary_frames" \
+          --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800 \
+          >"$viewer_log" 2>&1 &
+      elif [[ "$focus_handoffs" -gt 0 && "$viewer" -le 2 ]]; then
         "$probe_bin" --control-v2 --focus-handoffs "$focus_handoffs" \
           --identity "$viewer_identity" --node-id "$node_id" --frames "$primary_frames" \
           --timeout-seconds "$probe_timeout_seconds" --expect-size 1280x800 \
@@ -624,7 +660,7 @@ if [[ "$control_v2" == true ]]; then
           >"$viewer_log" 2>&1 &
       fi
       viewer_pids+=("$!")
-      if [[ "$viewer" -eq 1 && "$focus_handoffs" -eq 0 ]]; then
+      if [[ "$viewer" -eq 1 && "$focus_handoffs" -eq 0 && "$stall_viewer" -eq 0 ]]; then
         wait_for_log_count "$host_log" 'input v2 client accepted' 1 "$host_pid" 'sigil' \
           || die "slot-0 holder did not acquire focused input before spectators joined"
       fi
@@ -667,7 +703,25 @@ if [[ "$control_v2" == true ]]; then
       viewer=$((viewer + 1))
     done
     viewer_pids=()
-    if [[ "$focus_handoffs" -gt 0 ]]; then
+    if [[ "$stall_viewer" -gt 0 ]]; then
+      viewer=1
+      while [[ "$viewer" -le "$viewers" ]]; do
+        if [[ "$viewer" -eq "$stall_viewer" ]]; then
+          grep -Fxq 'adaptive_profile=floor-breach' "${viewer_logs[$((viewer - 1))]}" \
+            || die "stalled viewer did not run the floor-breach profile"
+          grep -Fxq 'adaptive_floor_detach=ok' "${viewer_logs[$((viewer - 1))]}" \
+            || die "stalled viewer was not detached after bounded isolated recovery"
+        elif [[ "$assert_survivor_recovery" == true ]]; then
+          grep -Fxq 'adaptive_profile=clean' "${viewer_logs[$((viewer - 1))]}" \
+            || die "survivor did not run the clean adaptive profile"
+          grep -Fxq 'adaptive_survivor_recovery=ok' "${viewer_logs[$((viewer - 1))]}" \
+            || die "survivor did not recover after the stalled viewer was isolated"
+        fi
+        viewer=$((viewer + 1))
+      done
+      grep -Fq 'detached persistently below-floor viewer after bounded isolated recovery' "$host_log" \
+        || die "host did not record terminal slow-viewer isolation"
+    elif [[ "$focus_handoffs" -gt 0 ]]; then
       participant=1
       while [[ "$participant" -le 2 ]]; do
         grep -Fxq "focus_handoffs_observed=${focus_handoffs}" "${viewer_logs[$((participant - 1))]}" \
@@ -678,6 +732,7 @@ if [[ "$control_v2" == true ]]; then
       grep -Fxq 'slot_0_input=ok' "${viewer_logs[0]}" || die "slot-0 holder input failed"
     fi
     spectator=$([[ "$focus_handoffs" -gt 0 ]] && printf 3 || printf 2)
+    if [[ "$stall_viewer" -gt 0 ]]; then spectator=1; fi
     while [[ "$spectator" -le "$viewers" ]]; do
       if [[ "$spectator" -eq "$replace_viewer" ]]; then
         spectator=$((spectator + 1))
@@ -744,9 +799,11 @@ if [[ "$control_v2" == true ]]; then
     printf 'viewers=%s\n' "$viewers"
     printf 'same_peer_replacement=%s\n' "$([[ "$replace_viewer" -gt 0 ]] && printf ok || printf not-requested)"
     printf 'shared_generation=ok\n'
-    printf 'slot_0_single_holder=ok\n'
+    printf 'slot_0_single_holder=%s\n' "$([[ "$stall_viewer" -gt 0 ]] && printf not-requested || printf ok)"
     printf 'focus_handoffs=%s\n' "$focus_handoffs"
     printf 'neutral_before_successor=%s\n' "$([[ "$assert_neutral_before_successor" == true ]] && printf ok || printf not-requested)"
+    printf 'stalled_viewer=%s\n' "$stall_viewer"
+    printf 'survivor_recovery=%s\n' "$([[ "$assert_survivor_recovery" == true ]] && printf ok || printf not-requested)"
     printf 'spectator_progress=ok\n'
     exit 0
   fi

@@ -8,6 +8,10 @@ use std::{
 
 use iroh::endpoint::{Connection, PathId};
 use serde::Serialize;
+use sigil_protocol::{
+    AdaptiveBitrateDecisionV1, AdaptiveBitrateReasonFlagsV1, AdaptiveBitrateStateV1,
+    MediaFeedbackFlags, MediaFeedbackReportV1,
+};
 
 const LATENCY_BUCKETS_MS: usize = 5_001;
 pub(crate) const INPUT_ACK_PENDING_CAPACITY: usize = 1_024;
@@ -62,6 +66,77 @@ struct MediaAuthenticationDiagnostics {
     generation_certified: bool,
     delivery_role: MediaDeliveryRole,
     verification_failures: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AdaptiveViewerSnapshot {
+    scope: &'static str,
+    local_pressure: &'static str,
+    aggregate_target_kbps: Option<u32>,
+    aggregate_state: &'static str,
+    recovery_state: &'static str,
+    applied: bool,
+}
+
+impl Default for AdaptiveViewerSnapshot {
+    fn default() -> Self {
+        Self {
+            scope: "local_viewer",
+            local_pressure: "awaiting_report",
+            aggregate_target_kbps: None,
+            aggregate_state: "unavailable",
+            recovery_state: "active",
+            applied: false,
+        }
+    }
+}
+
+impl AdaptiveViewerSnapshot {
+    fn observe_report(&mut self, report: &MediaFeedbackReportV1) {
+        let drops = report
+            .transport_dropped_delta
+            .saturating_add(report.frontend_dropped_delta)
+            .saturating_add(report.decoder_dropped_delta)
+            .saturating_add(report.presenter_dropped_delta);
+        let queued = report.frontend_queue_depth > 0
+            || report.decode_queue_depth > 0
+            || report.presenter_queue_depth > 0;
+        self.local_pressure = if report.flags.contains(MediaFeedbackFlags::RESYNC_ACTIVE) {
+            "recovering"
+        } else if drops > 0 || queued {
+            "pressured"
+        } else {
+            "clean"
+        };
+    }
+
+    fn observe_decision(&mut self, decision: &AdaptiveBitrateDecisionV1) {
+        self.aggregate_target_kbps = Some(decision.target_kbps);
+        self.aggregate_state = match decision.state {
+            AdaptiveBitrateStateV1::Hold => "hold",
+            AdaptiveBitrateStateV1::Decrease => "decrease",
+            AdaptiveBitrateStateV1::Increase => "increase",
+        };
+        let local_pressure = decision
+            .reasons
+            .contains(AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE)
+            || decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::DECODE_BACKLOG)
+            || decision
+                .reasons
+                .contains(AdaptiveBitrateReasonFlagsV1::DELIVERY_LATENCY);
+        self.recovery_state = if local_pressure && decision.target_kbps == decision.floor_kbps {
+            "floor_limited"
+        } else {
+            "active"
+        };
+        self.applied = decision.applied;
+    }
+
+    fn detach(&mut self) {
+        self.recovery_state = "detached";
+    }
 }
 
 impl Default for MediaAuthenticationDiagnostics {
@@ -536,6 +611,7 @@ pub(crate) struct NetworkSessionDiagnostics {
     audio: Option<LegDiagnostics>,
     input_ack: InputAckDiagnostics,
     media_authentication: MediaAuthenticationDiagnostics,
+    adaptive: AdaptiveViewerSnapshot,
 }
 
 impl NetworkSessionDiagnostics {
@@ -547,6 +623,7 @@ impl NetworkSessionDiagnostics {
             audio: None,
             input_ack: InputAckDiagnostics::new(input_ack_negotiated),
             media_authentication: MediaAuthenticationDiagnostics::default(),
+            adaptive: AdaptiveViewerSnapshot::default(),
         }
     }
 
@@ -594,6 +671,18 @@ impl NetworkSessionDiagnostics {
         }
     }
 
+    pub(crate) fn observe_adaptive_report(&mut self, report: &MediaFeedbackReportV1) {
+        self.adaptive.observe_report(report);
+    }
+
+    pub(crate) fn observe_adaptive_decision(&mut self, decision: &AdaptiveBitrateDecisionV1) {
+        self.adaptive.observe_decision(decision);
+    }
+
+    pub(crate) fn mark_adaptive_detached(&mut self) {
+        self.adaptive.detach();
+    }
+
     pub(crate) fn snapshot(&self, now: Instant) -> NetworkDiagnosticsSnapshot {
         NetworkDiagnosticsSnapshot {
             version: 1,
@@ -606,6 +695,7 @@ impl NetworkSessionDiagnostics {
             audio: self.audio.as_ref().map(LegDiagnostics::snapshot),
             input_ack: self.input_ack.snapshot(),
             media_authentication: self.media_authentication.snapshot(),
+            adaptive: self.adaptive.clone(),
         }
     }
 }
@@ -619,6 +709,7 @@ pub(crate) struct NetworkDiagnosticsSnapshot {
     audio: Option<NetworkLegSnapshot>,
     input_ack: InputAckSnapshot,
     media_authentication: MediaAuthenticationSnapshot,
+    adaptive: AdaptiveViewerSnapshot,
 }
 
 #[cfg(test)]
@@ -821,5 +912,53 @@ mod tests {
         assert!(!serialized.contains("certificate"));
         assert!(!serialized.contains("capability"));
         assert!(!serialized.contains("public_key"));
+    }
+
+    #[test]
+    fn adaptive_diagnostics_separate_local_pressure_from_the_aggregate_decision() {
+        let now = Instant::now();
+        let mut diagnostics = NetworkSessionDiagnostics::new(now, false);
+        let mut report = MediaFeedbackReportV1 {
+            report_id: 1,
+            interval_ms: 1_000,
+            flags: MediaFeedbackFlags::RESYNC_ACTIVE,
+            last_sequence: Some(10),
+            transport_dropped_delta: 1,
+            frontend_dropped_delta: 0,
+            decoder_dropped_delta: 0,
+            presenter_dropped_delta: 0,
+            frontend_queue_depth: 1,
+            frontend_queue_capacity: 4,
+            decode_queue_depth: 0,
+            decode_queue_capacity: 4,
+            presenter_queue_depth: 0,
+            presenter_queue_capacity: 2,
+            transport_delivery_p95_ms: Some(10),
+            decode_p95_ms: Some(3),
+            presentation_p95_ms: Some(5),
+        };
+        diagnostics.observe_adaptive_report(&report);
+        let decision = AdaptiveBitrateDecisionV1 {
+            decision_id: 1,
+            report_id: 1,
+            target_kbps: 1_000,
+            floor_kbps: 1_000,
+            ceiling_kbps: 12_000,
+            state: AdaptiveBitrateStateV1::Decrease,
+            reasons: AdaptiveBitrateReasonFlagsV1::RECEIVER_QUEUE,
+            applied: false,
+        };
+        diagnostics.observe_adaptive_decision(&decision);
+        let value = serde_json::to_value(diagnostics.snapshot(now)).unwrap();
+        assert_eq!(value["adaptive"]["scope"], "local_viewer");
+        assert_eq!(value["adaptive"]["local_pressure"], "recovering");
+        assert_eq!(value["adaptive"]["aggregate_target_kbps"], 1_000);
+        assert_eq!(value["adaptive"]["recovery_state"], "floor_limited");
+        report.flags = MediaFeedbackFlags::NONE;
+        diagnostics.observe_adaptive_report(&report);
+        assert_eq!(
+            serde_json::to_value(diagnostics.snapshot(now)).unwrap()["adaptive"]["local_pressure"],
+            "pressured"
+        );
     }
 }

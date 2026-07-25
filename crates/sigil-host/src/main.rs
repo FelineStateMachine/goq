@@ -1170,7 +1170,9 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
             MediaFeedbackHandler {
                 config: config.clone(),
                 sessions: Arc::clone(&sessions),
+                generations: Arc::clone(&media_generations),
                 authorization: authorization.clone(),
+                input_operations: Arc::clone(&input_operations),
             },
         )
         .accept(

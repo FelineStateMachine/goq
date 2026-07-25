@@ -12,6 +12,7 @@ use sigil_protocol::{
 use tokio::sync::{Notify, watch};
 use tracing::{debug, info, warn};
 
+use super::adaptive::GenerationAdaptiveCoordinator;
 use super::moq::{run_generation_audio_publisher, run_generation_video_publisher};
 use super::session::{MediaV3Telemetry, SourceTaskGuard};
 use crate::audio::spawn_pipewire_audio;
@@ -158,6 +159,22 @@ impl MediaGenerationManager {
         self.state_changed.notify_waiters();
     }
 
+    pub(super) async fn adaptive(
+        &self,
+        generation_id: u64,
+    ) -> Result<Arc<GenerationAdaptiveCoordinator>> {
+        let state = self.state.lock().await;
+        state
+            .active
+            .as_ref()
+            .filter(|active| {
+                state.lifecycle == MediaGenerationLifecycle::Active
+                    && active.shared.generation_id == generation_id
+            })
+            .map(|active| Arc::clone(&active.shared.adaptive))
+            .context("feedback does not match the active media generation")
+    }
+
     #[cfg(test)]
     async fn lifecycle(&self) -> MediaGenerationLifecycle {
         self.state.lock().await.lifecycle
@@ -175,6 +192,7 @@ pub(super) struct GenerationShared {
     pub(super) telemetry: Arc<MediaV3Telemetry>,
     pub(super) audio_enabled: bool,
     pub(super) keyframe_requests: watch::Sender<Option<sigil_protocol::MediaControlRequestV3>>,
+    pub(super) adaptive: Arc<GenerationAdaptiveCoordinator>,
 }
 
 impl std::fmt::Debug for GenerationShared {
@@ -247,6 +265,7 @@ struct ActiveGeneration {
     shutdown: watch::Sender<bool>,
     video_publisher: tokio::task::JoinHandle<Result<()>>,
     audio_publisher: Option<tokio::task::JoinHandle<Result<()>>>,
+    adaptive: tokio::task::JoinHandle<Result<()>>,
     video_source: SourceTaskGuard,
     audio_source: Option<SourceTaskGuard>,
     _frame_receiver: watch::Receiver<Option<EncodedFrame>>,
@@ -328,6 +347,14 @@ impl ActiveGeneration {
         let telemetry = Arc::new(MediaV3Telemetry::default());
         let (keyframe_requests, keyframes) = watch::channel(None);
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let (adaptive, adaptive_task) = GenerationAdaptiveCoordinator::start(
+            config.clone(),
+            generation_id,
+            encoder_control.clone(),
+            Arc::clone(&telemetry),
+            keyframe_requests.clone(),
+            shutdown_rx.clone(),
+        )?;
         let video_publisher = tokio::spawn(run_generation_video_publisher(
             config.clone(),
             current_gop,
@@ -375,6 +402,7 @@ impl ActiveGeneration {
             telemetry,
             audio_enabled,
             keyframe_requests,
+            adaptive,
         });
         info!(
             generation_id,
@@ -390,6 +418,7 @@ impl ActiveGeneration {
             shutdown,
             video_publisher,
             audio_publisher,
+            adaptive: adaptive_task,
             video_source,
             audio_source,
             _frame_receiver: frames,
@@ -404,6 +433,7 @@ impl ActiveGeneration {
             *broadcast = None;
         }
         self.shutdown.send_replace(true);
+        wait_or_abort_task(&mut self.adaptive, "adaptive coordinator").await;
         wait_or_abort_task(&mut self.video_publisher, "video publisher").await;
         if let Some(mut audio_publisher) = self.audio_publisher.take() {
             wait_or_abort_task(&mut audio_publisher, "audio publisher").await;

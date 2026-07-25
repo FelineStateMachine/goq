@@ -62,6 +62,14 @@ function snapshot(overrides = {}) {
       latency_overflow_total: 0,
       complete: true,
     },
+    adaptive: {
+      scope: 'local_viewer',
+      local_pressure: 'pressured',
+      aggregate_target_kbps: 6000,
+      aggregate_state: 'decrease',
+      recovery_state: 'active',
+      applied: true,
+    },
     ...overrides,
   };
 }
@@ -82,6 +90,14 @@ test('normalizes a bounded v1 snapshot and keeps transport legs separate', () =>
     overflowTotal: 0,
   });
   assert.equal(diagnostics.inputAck.pendingCount, 1);
+  assert.deepEqual(diagnostics.adaptive, {
+    scope: 'local-viewer',
+    localPressure: 'pressured',
+    aggregateTargetKbps: 6000,
+    aggregateState: 'decrease',
+    recoveryState: 'active',
+    applied: true,
+  });
 });
 
 test('validates exact counters, classified samples, percentiles, and completeness', () => {
@@ -155,6 +171,7 @@ test('renders legs and ACK health without exposing identifiers or addresses', ()
   assert.match(presentation.input, /^relay · RTT/);
   assert.equal(presentation.audio, 'unavailable');
   assert.match(presentation.inputAck, /^negotiated · 9\/10 acknowledged/);
+  assert.match(presentation.adaptive, /^local-viewer · local pressured · aggregate 6000 kbps decrease/);
   assert.doesNotMatch(JSON.stringify(presentation), /secret|192\.0\.2\.1|endpoint/i);
 });
 
@@ -165,5 +182,24 @@ test('formats a missing v4 snapshot as explicitly unavailable', () => {
     input: 'unavailable',
     audio: 'unavailable',
     inputAck: 'unavailable',
+    adaptive: 'unavailable',
   });
+});
+
+test('adaptive diagnostics expose only local contribution and aggregate decision', () => {
+  const diagnostics = normalizeNetworkDiagnostics(snapshot({
+    adaptive: {
+      scope: 'local_viewer',
+      local_pressure: 'recovering',
+      aggregate_target_kbps: 1000,
+      aggregate_state: 'hold',
+      recovery_state: 'floor_limited',
+      applied: false,
+      other_viewer_rtt_ms: 900,
+      contributor_peer: 'secret-peer',
+    },
+  }));
+  assert.equal(diagnostics.adaptive.localPressure, 'recovering');
+  assert.equal(diagnostics.adaptive.recoveryState, 'floor-limited');
+  assert.doesNotMatch(JSON.stringify(diagnostics.adaptive), /other|peer|rtt/i);
 });

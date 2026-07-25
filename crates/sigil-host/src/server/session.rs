@@ -602,7 +602,7 @@ impl SessionRegistry {
         publish_v2_snapshots(&state)?;
         let snapshot = v2_snapshot_for(&state, remote)?;
         let replaced_snapshots = replaced.map(|viewer| viewer.snapshots);
-        Ok(V2SessionLease {
+        let lease = V2SessionLease {
             registry: Arc::clone(self),
             remote,
             session_id,
@@ -613,7 +613,10 @@ impl SessionRegistry {
             authorization_committed_revision: authorized.committed_revision,
             replaced_snapshots,
             replacement_transition,
-        })
+        };
+        drop(state);
+        self.session_changed.notify_waiters();
+        Ok(lease)
     }
 
     pub(super) fn bind_v2_generation(
@@ -622,7 +625,7 @@ impl SessionRegistry {
         session_id: u64,
         generation_id: u64,
         session_clock: SessionClock,
-        telemetry: Arc<MediaV3Telemetry>,
+        _telemetry: Arc<MediaV3Telemetry>,
         encoder_control: Option<EncoderControl>,
     ) -> Result<SessionSnapshotV2> {
         let mut state = self.v2_state.lock().expect("v2 session state poisoned");
@@ -647,7 +650,8 @@ impl SessionRegistry {
         viewer.session.session_clock = session_clock;
         viewer.session.media_generation_id = generation_id;
         viewer.session.media_broadcast_name = descriptor.broadcast_name;
-        viewer.session.media_v3_telemetry = telemetry;
+        // Keep transport telemetry viewer-scoped. Producer telemetry belongs
+        // to the shared generation and is merged only by its adaptive owner.
         viewer.session.encoder_control = encoder_control;
         publish_v2_snapshots(&state)?;
         let snapshot = v2_snapshot_for(&state, remote)?;
@@ -1212,6 +1216,8 @@ impl SessionRegistry {
                 telemetry: Arc::clone(&session.media_v3_telemetry),
                 encoder_control: session.encoder_control.clone(),
                 authorization_revision: session.authorization_revision,
+                media_generation_id: session.media_generation_id,
+                scope: FeedbackScope::Legacy,
             });
         }
         drop(active);
@@ -1227,6 +1233,11 @@ impl SessionRegistry {
             "active Portal session lacks feedback view permission"
         );
         ensure!(
+            session.authorization_committed_revision
+                == self.authorization_committed_revision.load(Ordering::SeqCst),
+            "feedback claim used a stale committed authorization revision"
+        );
+        ensure!(
             !session.feedback_claimed,
             "active client already has a feedback connection"
         );
@@ -1238,6 +1249,8 @@ impl SessionRegistry {
             telemetry: Arc::clone(&session.media_v3_telemetry),
             encoder_control: session.encoder_control.clone(),
             authorization_revision: session.authorization_revision,
+            media_generation_id: session.media_generation_id,
+            scope: FeedbackScope::SharedGeneration,
         })
     }
 
@@ -1515,6 +1528,41 @@ impl SessionRegistry {
             })
     }
 
+    pub(super) fn disconnect_v2_viewer(&self, remote: EndpointId, session_id: u64) -> Result<bool> {
+        let mut state = self.v2_state.lock().expect("v2 session state poisoned");
+        let Some(viewer) = state
+            .viewers
+            .get(&remote)
+            .filter(|viewer| viewer.session.session_id == session_id)
+        else {
+            return Ok(false);
+        };
+        ensure!(
+            !matches!(
+                state.focus.state(),
+                FocusStateV2::Held {
+                    session_id: holder_session_id,
+                    ..
+                } if *holder_session_id == session_id
+            ),
+            "focused viewer must be neutralized before adaptive detachment"
+        );
+        viewer.snapshots.send_replace(None);
+        state.viewers.remove(&remote);
+        if state.viewers.is_empty() {
+            state.media = None;
+        }
+        advance_v2_revision(&mut state)?;
+        publish_v2_snapshots(&state)?;
+        drop(state);
+        self.pending_moq
+            .lock()
+            .expect("MoQ registry poisoned")
+            .remove(&(remote, session_id));
+        self.session_changed.notify_waiters();
+        Ok(true)
+    }
+
     fn release_input(&self, remote: EndpointId, session_id: u64) {
         let mut active = self.active.lock().expect("session registry poisoned");
         if let Some(session) = active.as_mut()
@@ -1729,6 +1777,14 @@ pub(super) struct FeedbackLease {
     pub(super) telemetry: Arc<MediaV3Telemetry>,
     pub(super) encoder_control: Option<EncoderControl>,
     pub(super) authorization_revision: u64,
+    pub(super) media_generation_id: u64,
+    pub(super) scope: FeedbackScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FeedbackScope {
+    Legacy,
+    SharedGeneration,
 }
 
 #[derive(Debug)]

@@ -195,6 +195,39 @@ function normalizeInputAck(value) {
   };
 }
 
+function normalizeAdaptive(value) {
+  const adaptive = record(value, 'network_diagnostics.adaptive');
+  const localPressure = new Set(['awaiting_report', 'clean', 'pressured', 'recovering']);
+  const aggregateState = new Set(['unavailable', 'hold', 'decrease', 'increase']);
+  const recoveryState = new Set(['active', 'floor_limited', 'detached']);
+  if (adaptive.scope !== 'local_viewer') {
+    throw new TypeError('network_diagnostics.adaptive.scope must be local_viewer');
+  }
+  if (!localPressure.has(adaptive.local_pressure)) {
+    throw new TypeError('network_diagnostics.adaptive.local_pressure is unsupported');
+  }
+  if (!aggregateState.has(adaptive.aggregate_state)) {
+    throw new TypeError('network_diagnostics.adaptive.aggregate_state is unsupported');
+  }
+  if (!recoveryState.has(adaptive.recovery_state)) {
+    throw new TypeError('network_diagnostics.adaptive.recovery_state is unsupported');
+  }
+  const aggregateTargetKbps = adaptive.aggregate_target_kbps === null
+    ? null
+    : exactUnsigned(
+      adaptive.aggregate_target_kbps,
+      'network_diagnostics.adaptive.aggregate_target_kbps',
+    );
+  return {
+    scope: 'local-viewer',
+    localPressure: adaptive.local_pressure.replace('_', '-'),
+    aggregateTargetKbps,
+    aggregateState: adaptive.aggregate_state,
+    recoveryState: adaptive.recovery_state.replace('_', '-'),
+    applied: boolean(adaptive.applied, 'network_diagnostics.adaptive.applied'),
+  };
+}
+
 /**
  * Strictly validates the versioned network snapshot and returns a presentation-safe
  * allowlist. Peer identities, addresses, and unknown future fields never cross this boundary.
@@ -217,6 +250,7 @@ export function normalizeNetworkDiagnostics(value) {
       ? null
       : normalizeLeg(diagnostics.audio, 'network_diagnostics.audio'),
     inputAck: normalizeInputAck(diagnostics.input_ack),
+    adaptive: normalizeAdaptive(diagnostics.adaptive),
   };
 }
 
@@ -263,6 +297,7 @@ export function networkDiagnosticsPresentation(diagnostics) {
       input: 'unavailable',
       audio: 'unavailable',
       inputAck: 'unavailable',
+      adaptive: 'unavailable',
     };
   }
   return {
@@ -271,5 +306,6 @@ export function networkDiagnosticsPresentation(diagnostics) {
     input: formatNetworkLeg(diagnostics.input),
     audio: formatNetworkLeg(diagnostics.audio),
     inputAck: formatInputAck(diagnostics.inputAck),
+    adaptive: `${diagnostics.adaptive.scope} · local ${diagnostics.adaptive.localPressure} · aggregate ${diagnostics.adaptive.aggregateTargetKbps === null ? 'awaiting decision' : `${diagnostics.adaptive.aggregateTargetKbps} kbps ${diagnostics.adaptive.aggregateState}`} · recovery ${diagnostics.adaptive.recoveryState} · ${diagnostics.adaptive.applied ? 'applied' : 'advisory'}`,
   };
 }

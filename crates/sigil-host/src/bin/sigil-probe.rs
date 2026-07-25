@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::presets};
 use iroh_moq::{Moq, MoqSession};
 use moq_net::{BroadcastConsumer, GroupConsumer, TrackConsumer};
@@ -46,6 +46,13 @@ use moq_catalog::{
 };
 
 const MEDIA_OBJECT_CAPACITY: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum AdaptiveProfile {
+    Clean,
+    FloorBreach,
+    Stale,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "sigil-probe", version, about = "Bounded Sigil transport probe")]
@@ -93,6 +100,15 @@ struct Args {
     /// observing this many successor generations.
     #[arg(long, default_value_t = 0, requires = "control_v2")]
     focus_handoffs: u32,
+    /// Drive a bounded per-viewer adaptive profile on control/2. Clean viewers
+    /// prove survivor recovery; floor-breach viewers prove isolated detach.
+    #[arg(
+        long,
+        value_enum,
+        requires = "control_v2",
+        conflicts_with = "focus_handoffs"
+    )]
+    adaptive_profile: Option<AdaptiveProfile>,
     /// Request a configured recovery keyframe after three accepted frames,
     /// then prove no delta history is delivered before the recovery barrier.
     #[arg(long)]
@@ -765,6 +781,7 @@ async fn run_control_v2_smoke(
     spectator: bool,
     disconnect_with_focus: bool,
     focus_handoffs: u32,
+    adaptive_profile: Option<AdaptiveProfile>,
 ) -> Result<()> {
     let control_connection = endpoint
         .connect(address.clone(), CONTROL_ALPN_V2)
@@ -846,6 +863,78 @@ async fn run_control_v2_smoke(
         .await;
     }
     if spectator {
+        if let Some(profile) = adaptive_profile {
+            let mut accepted = 0_u32;
+            let mut last_sequence = None;
+            let feedback =
+                run_v2_adaptive_profile(endpoint, address.clone(), nonce, session_id, profile);
+            tokio::pin!(feedback);
+            let mut media_open = true;
+            let evidence = loop {
+                tokio::select! {
+                    evidence = &mut feedback => break evidence?,
+                    outcome = media.next(), if media_open => {
+                        let Some(outcome) = outcome? else {
+                            if profile == AdaptiveProfile::FloorBreach {
+                                media_open = false;
+                                continue;
+                            }
+                            bail!("adaptive-profile spectator media ended early");
+                        };
+                    let MoqProbeOutcome::Frame { frame, .. } = outcome else {
+                        continue;
+                    };
+                    if let Some((width, height)) = expected_size {
+                        ensure!(
+                            frame.header.width == width && frame.header.height == height,
+                            "adaptive-profile media dimensions did not match {width}x{height}"
+                        );
+                    }
+                    if let Some(previous) = last_sequence {
+                        ensure!(
+                            frame.header.sequence > previous,
+                            "adaptive-profile media sequence regressed"
+                        );
+                    }
+                    last_sequence = Some(frame.header.sequence);
+                    accepted += 1;
+                    }
+                }
+            };
+            ensure!(
+                accepted >= frames.min(60),
+                "adaptive profile did not preserve media progress"
+            );
+            control_connection.close(0_u32.into(), b"adaptive profile complete");
+            println!("probe=ok");
+            println!("transport=iroh-moq");
+            println!("control_alpn=sigil/control/2");
+            println!("media_generation_id={generation_id}");
+            println!("media_broadcast_name={broadcast_name}");
+            println!("roster_viewers={}", initial.viewers.len());
+            println!("frames={accepted}");
+            println!("spectator=ok");
+            println!("adaptive_profile={}", profile.label());
+            println!("adaptive_minimum_kbps={}", evidence.minimum_kbps);
+            println!("adaptive_final_kbps={}", evidence.final_kbps);
+            println!(
+                "adaptive_survivor_recovery={}",
+                if evidence.survivor_recovery {
+                    "ok"
+                } else {
+                    "not-applicable"
+                }
+            );
+            println!(
+                "adaptive_floor_detach={}",
+                if evidence.floor_detach {
+                    "ok"
+                } else {
+                    "not-applicable"
+                }
+            );
+            return Ok(());
+        }
         let mut accepted = 0_u32;
         let mut last_sequence = None;
         while accepted < frames {
@@ -1493,6 +1582,134 @@ async fn run_feedback_smoke(
     Ok((decision, path_mode, path_rtt_ms))
 }
 
+impl AdaptiveProfile {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::FloorBreach => "floor-breach",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+struct AdaptiveProfileEvidence {
+    minimum_kbps: u32,
+    final_kbps: u32,
+    survivor_recovery: bool,
+    floor_detach: bool,
+}
+
+async fn run_v2_adaptive_profile(
+    endpoint: &Endpoint,
+    address: EndpointAddr,
+    nonce: [u8; 16],
+    session_id: u64,
+    profile: AdaptiveProfile,
+) -> Result<AdaptiveProfileEvidence> {
+    let connection = endpoint
+        .connect(address, MEDIA_FEEDBACK_ALPN_V1)
+        .await
+        .context("connecting control-v2 adaptive feedback profile")?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("opening control-v2 adaptive feedback stream")?;
+    let negotiation = negotiate(
+        &mut send,
+        &mut recv,
+        nonce,
+        vec![Capability::VideoH264],
+        Capability::VideoH264,
+        "control-v2 adaptive feedback",
+        None,
+    )
+    .await?;
+    ensure!(
+        negotiation.session_id == session_id,
+        "control-v2 media and adaptive feedback session IDs differ"
+    );
+
+    let report_count = match profile {
+        AdaptiveProfile::Clean => 36,
+        AdaptiveProfile::FloorBreach => 32,
+        AdaptiveProfile::Stale => 5,
+    };
+    let mut minimum_kbps = u32::MAX;
+    let mut maximum_kbps = 0_u32;
+    let mut final_kbps = 0_u32;
+    let mut saw_stale = false;
+    let mut floor_detach = false;
+    let mut final_reason_bits = 0_u16;
+    for report_id in 1..=report_count {
+        let mut report = complete_feedback_report(report_id, MediaFeedbackFlags::NONE, report_id);
+        match profile {
+            AdaptiveProfile::Clean => {}
+            AdaptiveProfile::FloorBreach => {
+                report.flags = MediaFeedbackFlags::RESYNC_ACTIVE;
+                report.transport_dropped_delta = 8;
+                report.frontend_dropped_delta = 8;
+                report.decoder_dropped_delta = 8;
+                report.presenter_dropped_delta = 8;
+                report.frontend_queue_depth = report.frontend_queue_capacity;
+                report.decode_queue_depth = report.decode_queue_capacity;
+                report.presenter_queue_depth = report.presenter_queue_capacity;
+                report.transport_delivery_p95_ms = Some(250);
+                report.decode_p95_ms = Some(125);
+                report.presentation_p95_ms = Some(125);
+            }
+            AdaptiveProfile::Stale => {
+                report.interval_ms = 5_000;
+            }
+        }
+        let decision = match exchange_feedback_report(&mut send, &mut recv, &report).await {
+            Ok(decision) => decision,
+            Err(error) if profile == AdaptiveProfile::FloorBreach && minimum_kbps <= 1_000 => {
+                floor_detach = true;
+                eprintln!("[probe] floor-breach feedback stream detached as expected: {error}");
+                break;
+            }
+            Err(error) => return Err(error).context("running control-v2 adaptive profile"),
+        };
+        minimum_kbps = minimum_kbps.min(decision.target_kbps);
+        maximum_kbps = maximum_kbps.max(decision.target_kbps);
+        final_kbps = decision.target_kbps;
+        final_reason_bits = decision.reasons.bits();
+        saw_stale |= decision
+            .reasons
+            .contains(AdaptiveBitrateReasonFlagsV1::FEEDBACK_STALE);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+    }
+    ensure!(
+        minimum_kbps != u32::MAX,
+        "adaptive profile received no decisions"
+    );
+    let survivor_recovery = profile == AdaptiveProfile::Clean
+        && minimum_kbps < maximum_kbps
+        && final_kbps > minimum_kbps;
+    match profile {
+        AdaptiveProfile::Clean => ensure!(
+            survivor_recovery,
+            "clean survivor did not observe aggregate downshift and recovery: min={minimum_kbps}, max={maximum_kbps}, final={final_kbps}, reasons={final_reason_bits}"
+        ),
+        AdaptiveProfile::FloorBreach => ensure!(
+            floor_detach && minimum_kbps <= 1_000,
+            "floor-breach viewer was not detached after bounded recovery"
+        ),
+        AdaptiveProfile::Stale => ensure!(saw_stale, "stale profile was not classified stale"),
+    }
+    if profile != AdaptiveProfile::FloorBreach {
+        send.finish()
+            .context("finishing control-v2 adaptive feedback profile")?;
+        connection.close(0_u32.into(), b"adaptive profile complete");
+    }
+    Ok(AdaptiveProfileEvidence {
+        minimum_kbps,
+        final_kbps,
+        survivor_recovery,
+        floor_detach,
+    })
+}
+
 async fn next_resolution_stall_moq_frame(receiver: &mut MoqProbeReceiver) -> Result<AcceptedMedia> {
     loop {
         match receiver.next().await? {
@@ -1835,6 +2052,7 @@ async fn main() -> Result<()> {
             args.spectator,
             args.disconnect_with_focus,
             args.focus_handoffs,
+            args.adaptive_profile,
         )
         .await;
     }

@@ -418,6 +418,7 @@ pub(crate) async fn connect_client(
             send,
             recv,
             feedback_rx,
+            Arc::clone(&network_diagnostics),
         ));
     } else {
         *state.media_feedback.lock().await = None;

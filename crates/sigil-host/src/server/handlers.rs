@@ -78,7 +78,9 @@ pub struct ControlV2Handler {
 pub struct MediaFeedbackHandler {
     pub config: HostConfig,
     pub sessions: Arc<SessionRegistry>,
+    pub generations: Arc<MediaGenerationManager>,
     pub authorization: AuthorizationPolicy,
+    pub input_operations: Arc<InputOperations>,
 }
 
 /// Upstream MoQ admission guarded by an already-authenticated control lease.
@@ -134,7 +136,9 @@ impl ProtocolHandler for MediaFeedbackHandler {
             connection,
             &self.config,
             &self.sessions,
+            &self.generations,
             &self.authorization,
+            &self.input_operations,
         )
         .await
         {

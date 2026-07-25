@@ -547,6 +547,12 @@ pub(crate) async fn start_focused_input_v2(state: &AppState) -> Result<InputAvai
         context.grants,
     )
     .await?;
+    // The v1 path records this at negotiation time. Without the same call here
+    // the ack diagnostics stay "not negotiated" while the input stream really
+    // did negotiate InputAck, so the host's first acknowledgement is rejected
+    // as unsolicited and control v2 tears the session down.
+    lock_network_diagnostics(&context.network_diagnostics)
+        .set_input_ack_negotiated(availability.input_ack);
     let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent>(CLIENT_INPUT_QUEUE_CAPACITY);
     *state.input_send.lock().await = Some(tx);
     *state.input_connection.lock().await = Some((context.native_generation, connection));
@@ -762,16 +768,23 @@ pub(crate) async fn run_input_feedback_v2(
             || response.slot != ControllerSlot::ZERO
             || response.focus_generation != focus_generation
         {
+            eprintln!(
+                "[client] input v2 feedback binding mismatch: got session={} slot={:?} focus={}, expected session={} slot=0 focus={}",
+                response.session_id,
+                response.slot,
+                response.focus_generation,
+                session_id,
+                focus_generation
+            );
             break PointerFeedbackTerminalReason::Malformed;
         }
-        if observe_input_ack_if_negotiated(
+        if let Err(error) = observe_input_ack_if_negotiated(
             &feedback_diagnostics,
             input_ack_enabled,
             response.ack.sequence,
             Instant::now(),
-        )
-        .is_err()
-        {
+        ) {
+            eprintln!("[client] input v2 acknowledgement rejected: {error}");
             break PointerFeedbackTerminalReason::Malformed;
         }
         if pointer_feedback_enabled

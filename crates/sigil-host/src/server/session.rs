@@ -58,6 +58,7 @@ struct PendingMoqAttachment {
     closed: tokio::sync::oneshot::Sender<()>,
     telemetry: Arc<MediaV3Telemetry>,
     subscription_capability: Option<SignedSubscriptionCapability>,
+    expected_host: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for PendingMoqAttachment {
@@ -646,13 +647,16 @@ impl SessionRegistry {
                 == authorized.committed_revision,
             "viewer admission used a stale authorization revision"
         );
-        ensure!(
-            self.active
-                .lock()
-                .expect("session registry poisoned")
-                .is_none(),
-            "host already has an active legacy client"
-        );
+        // Hold the legacy registry lock across the whole v2 admission. `claim`
+        // takes `active` and then `v2_state`; releasing `active` here first
+        // would let a legacy client and a v2 viewer both pass their mutual
+        // exclusion check and be admitted together.
+        // Hold the legacy registry lock across the whole v2 admission. `claim`
+        // takes `active` and then `v2_state`; releasing `active` here first
+        // would let a legacy client and a v2 viewer both pass their mutual
+        // exclusion check and be admitted together.
+        let active = self.active.lock().expect("session registry poisoned");
+        ensure!(active.is_none(), "host already has an active legacy client");
         let mut state = self.v2_state.lock().expect("v2 session state poisoned");
         let replacing = state.viewers.contains_key(&remote);
         ensure!(
@@ -745,6 +749,7 @@ impl SessionRegistry {
             replacement_transition,
         };
         drop(state);
+        drop(active);
         self.session_changed.notify_waiters();
         info!(
             viewer_handle,
@@ -1085,6 +1090,10 @@ impl SessionRegistry {
                 .remove(&mutation.peer)
                 .expect("validated authorization viewer disappeared");
             viewer.snapshots.send_replace(None);
+            // `release` reclaims focus rate-limit state only for a viewer it
+            // still finds in the roster. Revocation removes it here, so retire
+            // the candidate now or its timestamps outlive the host.
+            state.focus.retire_candidate(&focus_candidate);
             let mut pending = self.pending_moq.lock().expect("MoQ registry poisoned");
             pending.remove(&(mutation.peer, viewer.session.session_id));
         } else if let Some(grants) = mutation.current_grants {
@@ -1482,6 +1491,7 @@ impl SessionRegistry {
                 closed,
                 telemetry,
                 subscription_capability: None,
+                expected_host: None,
             },
         );
         Ok(MoqAttachmentWait {
@@ -1497,6 +1507,7 @@ impl SessionRegistry {
         broadcast_name: String,
         broadcast: BroadcastConsumer,
         subscription_capability: SignedSubscriptionCapability,
+        expected_host: [u8; 32],
     ) -> Result<MoqAttachmentWait> {
         let state = self.v2_state.lock().expect("v2 session state poisoned");
         let session = state
@@ -1506,7 +1517,9 @@ impl SessionRegistry {
             .map(|viewer| &viewer.session)
             .context("authenticated MoQ expectation does not match the active v2 session")?;
         ensure!(
-            subscription_capability.claims.media_generation_id == session.media_generation_id
+            subscription_capability.claims.host_node_id == expected_host
+                && subscription_capability.claims.media_generation_id
+                    == session.media_generation_id
                 && subscription_capability.claims.subscriber_endpoint_id == *remote.as_bytes()
                 && subscription_capability
                     .claims
@@ -1535,6 +1548,7 @@ impl SessionRegistry {
                 closed,
                 telemetry,
                 subscription_capability: Some(subscription_capability),
+                expected_host: Some(expected_host),
             },
         );
         Ok(MoqAttachmentWait {
@@ -1588,9 +1602,12 @@ impl SessionRegistry {
                 .subscription_capability
                 .as_ref()
                 .context("v2 MoQ attachment has no subscription capability")?;
+            let expected_host = attachment
+                .expected_host
+                .context("v2 MoQ attachment has no expected host identity")?;
             capability
                 .verify_binding(
-                    capability.claims.host_node_id,
+                    expected_host,
                     session.media_generation_id,
                     *remote.as_bytes(),
                     capability.claims.tracks,
@@ -1635,6 +1652,15 @@ impl SessionRegistry {
             MAX_KEYFRAME_REQUESTS_PER_WINDOW,
             "keyframe request",
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn focus_rate_limit_entries(&self) -> usize {
+        self.v2_state
+            .lock()
+            .expect("v2 session state poisoned")
+            .focus
+            .tracked_command_candidates()
     }
 
     fn release(&self, remote: EndpointId, session_id: u64) {
@@ -1762,8 +1788,15 @@ impl SessionRegistry {
             ),
             "focused viewer must be neutralized before adaptive detachment"
         );
+        let retired = FocusCandidate {
+            presence_id: viewer.presence_id.clone(),
+            session_id,
+        };
         viewer.snapshots.send_replace(None);
         state.viewers.remove(&remote);
+        // Detaching bypasses `release`'s roster lookup, so reclaim this
+        // viewer's focus rate-limit timestamps explicitly.
+        state.focus.retire_candidate(&retired);
         if state.viewers.is_empty() {
             state.media = None;
         }
@@ -2288,6 +2321,186 @@ mod tests {
         }
     }
 
+    // Regression: `claim_v2_authorized` used to drop the legacy registry lock
+    // before taking the v2 lock, so a legacy client and a v2 viewer could both
+    // clear their mutual-exclusion check and be admitted at the same time.
+    //
+    // The interleaving is too narrow to reproduce by racing threads, so assert
+    // the lock discipline that closes it directly: while v2 admission is parked
+    // on the v2 lock it must still be holding the legacy registry lock. Under
+    // the old ordering it had already released it, and `claim` could walk in.
+    #[test]
+    fn v2_admission_holds_the_legacy_registry_lock_across_the_v2_mutation() {
+        let sessions = Arc::new(SessionRegistry::default());
+        let blocked = Arc::clone(&sessions);
+        let state_guard = sessions.v2_state.lock().expect("v2 session state poisoned");
+
+        let admission = std::thread::spawn(move || {
+            blocked.claim_v2_authorized(
+                endpoint(2),
+                [2; 16],
+                authorized_viewer("viewer-0000000000000002", InvitationGrants::ALL),
+            )
+        });
+        // Generous settle time: the thread is now parked on `v2_state`.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            sessions.active.try_lock().is_err(),
+            "v2 admission released the legacy registry lock before mutating v2 state, \
+             which lets `claim` admit a legacy client concurrently"
+        );
+
+        drop(state_guard);
+        // Hold the lease: dropping it would release the viewer and make the
+        // exclusion assertion below vacuous.
+        let _viewer = admission
+            .join()
+            .expect("v2 admission thread panicked")
+            .unwrap_or_else(|error| {
+                panic!("v2 admission must succeed once the v2 lock is free: {error:#}")
+            });
+        assert!(
+            sessions
+                .claim(endpoint(1), [1; 16], InvitationGrants::ALL)
+                .is_err(),
+            "a legacy client must be refused while a v2 viewer holds a control lease"
+        );
+    }
+
+    #[test]
+    fn legacy_and_v2_admission_stay_mutually_exclusive_under_contention() {
+        for round in 0..300_u16 {
+            let sessions = Arc::new(SessionRegistry::default());
+            let legacy_registry = Arc::clone(&sessions);
+            let v2_registry = Arc::clone(&sessions);
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let legacy_gate = Arc::clone(&gate);
+            let v2_gate = Arc::clone(&gate);
+
+            let legacy = std::thread::spawn(move || {
+                legacy_gate.wait();
+                legacy_registry
+                    .claim(endpoint(1), [1; 16], InvitationGrants::ALL)
+                    .ok()
+            });
+            let v2 = std::thread::spawn(move || {
+                v2_gate.wait();
+                v2_registry
+                    .claim_v2_authorized(
+                        endpoint(2),
+                        [2; 16],
+                        authorized_viewer("viewer-0000000000000002", InvitationGrants::ALL),
+                    )
+                    .ok()
+            });
+            let legacy = legacy.join().expect("legacy admission thread panicked");
+            let v2 = v2.join().expect("v2 admission thread panicked");
+            assert!(
+                legacy.is_none() || v2.is_none(),
+                "round {round} admitted a legacy client and a v2 viewer at once"
+            );
+            assert!(
+                legacy.is_some() || v2.is_some(),
+                "round {round} admitted neither client"
+            );
+        }
+    }
+
+    // Regression: focus rate-limit timestamps were reclaimed only by `release`,
+    // which cannot find a viewer that revocation or adaptive detachment already
+    // removed from the roster.
+    #[test]
+    fn focus_rate_limit_state_is_reclaimed_on_every_viewer_exit() {
+        let request = FocusCommandV2 {
+            request_id: 1,
+            action: FocusCommandActionV2::Request,
+            slot: ControllerSlot::ZERO,
+            expected_revision: 1,
+            expected_focus_generation: None,
+            expected_proposal_id: None,
+        };
+
+        // Ordinary disconnect.
+        let sessions = Arc::new(SessionRegistry::default());
+        let remote = endpoint(1);
+        let lease = sessions
+            .claim_v2_authorized(
+                remote,
+                [1; 16],
+                authorized_viewer("viewer-0000000000000001", InvitationGrants::ALL),
+            )
+            .unwrap();
+        sessions
+            .apply_focus_command(remote, lease.session_id, &request)
+            .unwrap();
+        assert_eq!(sessions.focus_rate_limit_entries(), 1);
+        drop(lease);
+        assert_eq!(
+            sessions.focus_rate_limit_entries(),
+            0,
+            "disconnect must reclaim focus rate-limit state"
+        );
+
+        // Adaptive slow-viewer detachment.
+        let sessions = Arc::new(SessionRegistry::default());
+        let holder = endpoint(1);
+        let spectator = endpoint(2);
+        let holder_lease = sessions
+            .claim_v2_authorized(
+                holder,
+                [1; 16],
+                authorized_viewer("viewer-0000000000000001", InvitationGrants::ALL),
+            )
+            .unwrap();
+        let spectator_lease = sessions
+            .claim_v2_authorized(
+                spectator,
+                [2; 16],
+                authorized_viewer("viewer-0000000000000002", InvitationGrants::ALL),
+            )
+            .unwrap();
+        let mut spectator_request = request.clone();
+        spectator_request.expected_revision = sessions
+            .v2_revision(spectator, spectator_lease.session_id)
+            .unwrap();
+        sessions
+            .apply_focus_command(spectator, spectator_lease.session_id, &spectator_request)
+            .unwrap();
+        assert_eq!(sessions.focus_rate_limit_entries(), 1);
+        // The spectator now holds focus, so release it before detaching.
+        let mut release = spectator_request.clone();
+        release.action = FocusCommandActionV2::Release;
+        release.expected_revision = sessions
+            .v2_revision(spectator, spectator_lease.session_id)
+            .unwrap();
+        release.expected_focus_generation = match sessions.v2_state.lock().unwrap().focus.state() {
+            FocusStateV2::Held {
+                focus_generation, ..
+            } => Some(*focus_generation),
+            other => panic!("expected held focus, got {other:?}"),
+        };
+        let effect = sessions
+            .apply_focus_command(spectator, spectator_lease.session_id, &release)
+            .unwrap();
+        if let Some(transition) = effect.neutralization {
+            sessions
+                .complete_v2_focus_transition(transition.transition_id)
+                .unwrap();
+        }
+        assert!(
+            sessions
+                .disconnect_v2_viewer(spectator, spectator_lease.session_id)
+                .unwrap()
+        );
+        assert_eq!(
+            sessions.focus_rate_limit_entries(),
+            0,
+            "adaptive detachment must reclaim focus rate-limit state"
+        );
+        drop(spectator_lease);
+        drop(holder_lease);
+    }
+
     #[test]
     fn v2_admits_bounded_viewers_and_publishes_personalized_complete_rosters() {
         let sessions = Arc::new(SessionRegistry::new(3));
@@ -2649,6 +2862,36 @@ mod tests {
         assert!(sessions.claim_moq(endpoint(1)).is_err());
     }
 
+    // Regression: `claim_moq` compared the capability's host field against
+    // itself, so the host-binding leg of `verify_binding` was a no-op. It only
+    // matters once a capability can arrive from anywhere but the host's own
+    // issuance path, which is exactly what the relay design contemplates.
+    #[test]
+    fn v2_moq_attachment_rejects_a_capability_minted_by_another_host() {
+        let host = iroh::SecretKey::from_bytes(&[9; 32]);
+        let impostor = iroh::SecretKey::from_bytes(&[31; 32]);
+        let remote = endpoint(1);
+        let sessions = Arc::new(SessionRegistry::default());
+        let lease = sessions
+            .claim_v2(remote, [1; 16], InvitationGrants::VIEW)
+            .unwrap();
+        let forged = test_subscription(&impostor, remote, lease.session_id, 100, 200);
+        let (_producer, consumer) = test_moq_broadcast();
+        assert!(
+            sessions
+                .expect_moq_v2(
+                    remote,
+                    lease.session_id,
+                    media_moq_broadcast_name(lease.session_id).unwrap(),
+                    consumer,
+                    forged,
+                    *host.public().as_bytes(),
+                )
+                .is_err(),
+            "a capability signed by another host must never be attached"
+        );
+    }
+
     #[test]
     fn v2_moq_attachment_requires_a_fresh_endpoint_bound_subscription() {
         let host = iroh::SecretKey::from_bytes(&[9; 32]);
@@ -2666,6 +2909,7 @@ mod tests {
                 media_moq_broadcast_name(lease.session_id).unwrap(),
                 consumer,
                 capability,
+                *host.public().as_bytes(),
             )
             .unwrap();
         assert!(sessions.claim_moq_at(endpoint(2), 150).is_err());
@@ -2685,6 +2929,7 @@ mod tests {
                 media_moq_broadcast_name(expired_lease.session_id).unwrap(),
                 consumer,
                 expired,
+                *host.public().as_bytes(),
             )
             .unwrap();
         assert!(expired_sessions.claim_moq_at(remote, 201).is_err());

@@ -116,6 +116,11 @@ impl FocusArbiter {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn tracked_command_candidates(&self) -> usize {
+        self.command_times.len()
+    }
+
     pub(super) fn retire_candidate(&mut self, candidate: &FocusCandidate) {
         self.command_times
             .remove(&(candidate.presence_id.clone(), candidate.session_id));

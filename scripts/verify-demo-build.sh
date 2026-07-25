@@ -124,6 +124,9 @@ fi
 ./scripts/loopback-proof.sh
 ./scripts/loopback-proof.sh --profile debug --control-v2 --viewers 3 \
   --primary-frames 600 --reconnect-cycles 3
+./scripts/loopback-proof.sh --profile debug --control-v2 --viewers 3 \
+  --focus-handoffs 3 --assert-neutral-before-successor \
+  --primary-frames 600 --reconnect-cycles 3
 ./scripts/loopback-proof.sh --profile release --legacy-exclusive --viewers 2 \
   --expect-second-rejected
 

@@ -261,7 +261,20 @@ if [[ "$stress" == true ]]; then
 fi
 if [[ "$control_v2" == true && "$viewers" -gt 1 && "$reconnect_cycles" -gt 0 \
   && "$replace_viewer" -eq 0 ]]; then
-  replace_viewer=2
+  if [[ "$focus_handoffs" -gt 0 ]]; then
+    # Viewers 1 and 2 are the focus-handoff participants. Replacing one tears
+    # down its control session mid-exchange, so it can never observe the
+    # required handoffs. Replace a viewer outside the participant set, and
+    # leave replacement off entirely when the roster has no spare viewer.
+    if [[ "$viewers" -gt 2 ]]; then
+      replace_viewer=3
+    fi
+  else
+    replace_viewer=2
+  fi
+fi
+if [[ "$focus_handoffs" -gt 0 && "$replace_viewer" -gt 0 && "$replace_viewer" -le 2 ]]; then
+  die "--replace-viewer must target a viewer above 2 when --focus-handoffs is requested"
 fi
 [[ "$primary_frames" -ge 4 ]] \
   || die "--primary-frames must be at least 4 for keyframe recovery"
@@ -735,8 +748,23 @@ if [[ "$control_v2" == true ]]; then
           grep -Eq '^roster_viewers=(7|8)$' "$replacement_log" \
             || die "replacement cycle $cycle exceeded the bounded stress roster"
         else
-          grep -Fxq "roster_viewers=${viewers}" "$replacement_log" \
-            || die "replacement cycle $cycle did not preserve bounded roster cardinality"
+          observed_roster="$(sed -n 's/^roster_viewers=\([0-9][0-9]*\)$/\1/p' \
+            "$replacement_log" | head -1)"
+          [[ -n "$observed_roster" ]] \
+            || die "replacement cycle $cycle did not report a roster cardinality"
+          # Cycle 1 runs immediately after every viewer attached and long
+          # before any of them exhausts its frame budget, so the full roster is
+          # deterministic there. Later cycles race the primaries' own exit, so
+          # assert only what same-peer replacement actually governs: the roster
+          # never grows past the configured bound, and the replacement joined a
+          # generation that still has at least one survivor.
+          if [[ "$cycle" -eq 1 ]]; then
+            [[ "$observed_roster" -eq "$viewers" ]] \
+              || die "replacement cycle 1 observed roster $observed_roster instead of $viewers"
+          else
+            [[ "$observed_roster" -ge 2 && "$observed_roster" -le "$viewers" ]] \
+              || die "replacement cycle $cycle observed unbounded roster $observed_roster"
+          fi
         fi
         grep -Fxq 'media_progress=monotonic' "$replacement_log" \
           || die "replacement cycle $cycle did not report monotonic progress"

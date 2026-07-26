@@ -380,8 +380,6 @@
     "windows-x86": null,
   };
   var ARCH_NAMES = { arm: "arm64", x86: "x86_64" };
-  var portalManifestStatus = "loading";
-  var portalManifestReason = "checking the signed release manifest";
 
   function portalBuildFromManifest(manifest) {
     if (!manifest || manifest.format !== 1 || manifest.product !== "portal-client" ||
@@ -393,7 +391,6 @@
       if (build.available !== false || typeof build.reason !== "string" || !build.reason.trim()) {
         throw new Error("invalid unavailable Portal release entry");
       }
-      portalManifestReason = build.reason.trim();
       return null;
     }
     var version = build.version;
@@ -410,7 +407,6 @@
     return {
       href: build.download_url,
       label: "download Portal " + version + " · macOS arm64",
-      note: "Portal " + version + " · macOS arm64 · not notarized: macOS will block the first launch until you allow it in System Settings › Privacy & Security. Verify the SHA-256 before opening.",
     };
   }
 
@@ -419,39 +415,29 @@
     return el ? el.value : null;
   }
 
+  // The button label already carries the state. The hero does not repeat it as
+  // prose, so nothing writes release notes into the panel.
   function updatePortalDownload() {
     var button = document.getElementById("portal-download");
-    var note = document.getElementById("portal-release-status");
     var os = pickedPortalValue("portal-os");
     var arch = pickedPortalValue("portal-arch");
-    if (!button || !note || !os || !arch) return;
+    if (!button || !os || !arch) return;
     var build = PORTAL_BUILDS[os + "-" + arch];
     if (build) {
       button.classList.remove("disabled");
       button.removeAttribute("aria-disabled");
       button.setAttribute("href", build.href);
       button.textContent = build.label;
-      note.textContent = build.note;
     } else {
       button.classList.add("disabled");
       button.setAttribute("aria-disabled", "true");
       button.removeAttribute("href"); // href-less anchor: unfocusable, unclickable
       button.textContent = "no " + os + " " + ARCH_NAMES[arch] + " build yet";
-      if (os === "macos" && arch === "arm" && portalManifestStatus !== "loaded") {
-        note.textContent = portalManifestReason + " · no download offered";
-      } else if (os === "macos" && arch === "arm" && portalManifestReason) {
-        note.textContent = portalManifestReason;
-      } else {
-        note.textContent = "portal for " + os + "/" + ARCH_NAMES[arch] +
-          " is not released yet · macos arm64 comes first";
-      }
     }
   }
 
   function loadPortalReleaseManifest() {
     if (typeof window.fetch !== "function") {
-      portalManifestStatus = "failed";
-      portalManifestReason = "signed release manifest could not be loaded";
       updatePortalDownload();
       return;
     }
@@ -464,11 +450,8 @@
       return response.json();
     }).then(function (manifest) {
       PORTAL_BUILDS["macos-arm"] = portalBuildFromManifest(manifest);
-      portalManifestStatus = "loaded";
     }).catch(function () {
       PORTAL_BUILDS["macos-arm"] = null;
-      portalManifestStatus = "failed";
-      portalManifestReason = "signed release manifest is unavailable or invalid";
     }).then(updatePortalDownload);
   }
 

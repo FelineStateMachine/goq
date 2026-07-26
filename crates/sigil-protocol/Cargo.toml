@@ -1,6 +1,6 @@
 [package]
 name = "sigil-protocol"
-version = "0.1.0"
+version = "0.1.1"
 description = "Versioned, bounded wire protocol for Sigil"
 authors = ["Dami"]
 license = "MIT"

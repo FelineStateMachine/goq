@@ -1,8 +1,20 @@
 {
   "builds": {
     "macos-arm64": {
-      "available": false,
-      "reason": "No public Portal release has been promoted yet. Portal is ad-hoc signed and GitHub-attested, never Apple-notarized."
+      "architecture": "arm64",
+      "asset": "Portal-0.1.1-arm64.dmg",
+      "available": true,
+      "checksum_asset": "Portal-0.1.1-arm64.dmg.sha256",
+      "checksum_url": "https://github.com/FelineStateMachine/goq/releases/download/v0.1.1/Portal-0.1.1-arm64.dmg.sha256",
+      "download_url": "https://github.com/FelineStateMachine/goq/releases/download/v0.1.1/Portal-0.1.1-arm64.dmg",
+      "manifest_asset": "Portal-0.1.1-arm64.json",
+      "manifest_url": "https://github.com/FelineStateMachine/goq/releases/download/v0.1.1/Portal-0.1.1-arm64.json",
+      "platform": "macos",
+      "release_tag": "v0.1.1",
+      "release_url": "https://github.com/FelineStateMachine/goq/releases/tag/v0.1.1",
+      "sha256": "d354f4dff9ed96eb7405afd3ac7c4f36507c888de595b6aabcffaa891436afb2",
+      "verification": "adhoc-signed+github-attested+sha256",
+      "version": "0.1.1"
     }
   },
   "format": 1,
